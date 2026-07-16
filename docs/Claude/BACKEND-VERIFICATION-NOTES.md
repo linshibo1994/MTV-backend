@@ -43,6 +43,7 @@
 ## 当前状态
 
 - T0-T10、全端点机械清点、跨模块安全/事务复审和静态质量分诊均已完成。
+- 逐 TASK 二级项的可追溯结论已整理到 `BACKEND-FUNCTION-MATRIX.md`。
 - 尚未修改生产代码。按 brainstorming 流程等待用户批准分阶段修复设计；
   获批后先为确定性 P0/P1 写失败测试，再按互不重叠的文件边界并发修复。
 - 数据库初始迁移仍等待单独授权，未获授权前不创建或执行。
@@ -52,6 +53,7 @@
 - `docs/Claude/TASK.md`
 - `docs/Claude/PLAN.md`
 - `backend/pyproject.toml`
+- `docs/Claude/BACKEND-FUNCTION-MATRIX.md`
 - 第一批代理报告：`/tmp/mtv-audit-*.md`
 - 第二批代理报告：`/tmp/mtv-audit-t4.md`、`/tmp/mtv-audit-t5.md`、`/tmp/mtv-audit-t10.md`
 - 第三批代理报告：`/tmp/mtv-audit-t6.md`、`/tmp/mtv-audit-t7.md`、`/tmp/mtv-audit-t8.md`
