@@ -11,9 +11,8 @@ Provider 客户端在本模块单例初始化，按需懒加载。
 
 from __future__ import annotations
 
-from typing import cast
-
 from app.providers.llm import LLMProvider
+from app.providers.registry import ProviderCapability, require_capability
 
 __all__ = [
     "get_llm_provider",
@@ -25,28 +24,34 @@ _text_provider: LLMProvider | None = None
 _chat_provider: LLMProvider | None = None
 
 
-def _build_llm(provider: str, api_key: str, model: str, base_url: str) -> LLMProvider:
+def _build_llm(
+    provider: str,
+    api_key: str,
+    model: str,
+    base_url: str,
+    capability: ProviderCapability = "text",
+) -> LLMProvider:
     """按 provider 标识构造 LLM 实例。
 
     openai/deepseek/bailian/gemini 走 OpenAI 兼容实现；claude 走 Anthropic 原生实现。
     """
-    key = (provider or "").strip().lower()
-    if key in ("openai", "deepseek", "bailian", "gemini"):
-        from app.providers.llm_openai_compat import LLMVendor, OpenAICompatLLMProvider
+    key = require_capability(provider, capability)
+    if key in ("openai", "openai_compatible", "deepseek", "bailian", "gemini"):
+        from app.providers.llm_openai_compat import OpenAICompatLLMProvider
 
         return OpenAICompatLLMProvider(  # type: ignore[return-value]
-            vendor=cast(LLMVendor, key),
+            vendor=key,
             api_key=api_key,
             model=model,
             base_url=base_url,
         )
-    if key == "claude":
+    if key == "anthropic":
         from app.providers.llm_anthropic import AnthropicLLMProvider
 
         return AnthropicLLMProvider(  # type: ignore[return-value]
             api_key=api_key, model=model, base_url=base_url
         )
-    raise RuntimeError(f"不支持的 LLM provider: {provider}")
+    raise AssertionError(f"遗漏的 LLM provider 实现: {key}")
 
 
 def get_llm_provider() -> LLMProvider:
@@ -63,6 +68,7 @@ def get_llm_provider() -> LLMProvider:
             settings.text_llm_api_key,
             settings.text_llm_model,
             settings.text_llm_base_url,
+            "text",
         )
     return _text_provider
 
@@ -81,6 +87,7 @@ def get_chat_llm_provider() -> LLMProvider:
             settings.chat_llm_api_key,
             settings.chat_llm_model,
             settings.chat_llm_base_url,
+            "chat",
         )
     return _chat_provider
 

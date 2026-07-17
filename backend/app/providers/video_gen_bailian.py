@@ -25,6 +25,7 @@ from urllib.parse import urlsplit
 import httpx
 
 from app.core.config import settings
+from app.providers.registry import ProviderConfigurationError
 from app.providers.video_gen import (
     VideoGenerationProgress,
     VideoGenerationRequest,
@@ -51,9 +52,10 @@ class BailianVideoGenProvider:
         return self._provider_key
 
     def _check_keys(self) -> None:
-        if not settings.dashscope_api_key:
-            raise RuntimeError(
-                "未配置 DASHSCOPE_API_KEY，无法调用通义万相视频生成"
+        if not self._api_key():
+            raise ProviderConfigurationError(
+                "未配置 VIDEO_GEN_API_KEY（或 DASHSCOPE_API_KEY），"
+                "无法调用通义万相视频生成"
             )
 
     async def generate_all_reference(
@@ -104,8 +106,8 @@ class BailianVideoGenProvider:
                     logger.warning("视频生成进度回调失败", exc_info=True)
 
         _notify("submitting", "正在提交视频生成任务", 10)
-        base_url = settings.dashscope_base_url.rstrip("/")
-        api_key = settings.dashscope_api_key
+        base_url = self._base_url()
+        api_key = self._api_key()
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
@@ -246,13 +248,32 @@ class BailianVideoGenProvider:
     def _validate_download_host(url: str) -> None:
         parsed = urlsplit(url)
         hostname = (parsed.hostname or "").lower()
-        dashscope_host = (urlsplit(settings.dashscope_base_url).hostname or "").lower()
+        configured_url = BailianVideoGenProvider._base_url()
+        dashscope_host = (urlsplit(configured_url).hostname or "").lower()
         if parsed.scheme != "https" or not (
             hostname == dashscope_host
             or hostname.endswith(".aliyuncs.com")
             or hostname.endswith(".aliyuncs.com.cn")
         ):
             raise RuntimeError("provider_download_url_invalid")
+
+    @staticmethod
+    def _api_key() -> str:
+        if (
+            settings.is_explicitly_configured("video_gen_api_key")
+            and settings.video_gen_api_key
+        ):
+            return settings.video_gen_api_key
+        return settings.dashscope_api_key or settings.video_gen_api_key
+
+    @staticmethod
+    def _base_url() -> str:
+        if (
+            settings.is_explicitly_configured("video_gen_base_url")
+            and settings.video_gen_base_url
+        ):
+            return settings.video_gen_base_url.rstrip("/")
+        return settings.dashscope_base_url.rstrip("/")
 
     async def _store_video(self, video_bytes: bytes, task_id: str, job_id: str | None) -> str:
         """将视频字节存入对象存储，返回 storage_key。"""

@@ -1,8 +1,8 @@
-"""banana-2 文生图 Provider — Google Nano Banana (Gemini 2.5 Flash Image)。
+"""Google Gemini 图片生成 Provider（兼容旧 banana-2 别名）。
 
 通过 google-genai SDK 的 generate_content 接口，开启 IMAGE 输出模态生成图片。
-模型由 settings.google_image_model 配置（Nano Banana / gemini-2.5-flash-image）。
-缺 GOOGLE_API_KEY 时抛 RuntimeError，由 worker 捕获后 release 积分（不卡死队列）。
+模型优先读取 IMAGE_GEN_MODEL；Key 和网关同样优先读取图片能力级配置。
+缺 Key 时抛 RuntimeError，由 worker 捕获后 release 积分（不卡死队列）。
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ from google.genai import types as gtypes
 
 from app.core.config import settings
 from app.providers.image_gen import ImageResult
+from app.providers.registry import ProviderConfigurationError
 
 
 class GoogleImageGenProvider:
@@ -22,7 +23,7 @@ class GoogleImageGenProvider:
     """
 
     async def _generate_one(
-        self, client: genai.Client, prompt: str, aspect: str
+        self, client: genai.Client, prompt: str, aspect: str, model: str
     ) -> ImageResult:
         """单次调用 Nano Banana 生成一张图片。"""
         # 开启图像输出模态，Nano Banana 据此返回 inline 图片数据。
@@ -35,7 +36,7 @@ class GoogleImageGenProvider:
             image_config=image_config,
         )
         response = await client.aio.models.generate_content(
-            model=settings.google_image_model,
+            model=model,
             contents=prompt,
             config=config,
         )
@@ -68,13 +69,44 @@ class GoogleImageGenProvider:
     async def generate(
         self, prompt: str, model: str, size: str, aspect: str, count: int = 1
     ) -> list[ImageResult]:
-        if not settings.google_api_key:
-            raise RuntimeError("未配置 GOOGLE_API_KEY，无法调用 Nano Banana 文生图")
+        api_key = (
+            settings.image_gen_api_key
+            if settings.is_explicitly_configured("image_gen_api_key")
+            and settings.image_gen_api_key
+            else settings.gemini_api_key or settings.google_api_key
+        )
+        if not api_key:
+            raise ProviderConfigurationError(
+                "未配置 IMAGE_GEN_API_KEY（或 GOOGLE_API_KEY/GEMINI_API_KEY），"
+                "无法调用 Gemini 图片生成"
+            )
+        use_model = (
+            settings.image_gen_model
+            if (
+                settings.is_explicitly_configured("image_gen_provider")
+                or settings.is_explicitly_configured("image_gen_model")
+            )
+            and settings.image_gen_model
+            else (
+                model
+                if model and model != "banana-2"
+                else settings.google_image_model
+            )
+        )
+        http_options = (
+            gtypes.HttpOptions(base_url=settings.image_gen_base_url.rstrip("/"))
+            if settings.is_explicitly_configured("image_gen_base_url")
+            and settings.image_gen_base_url
+            else None
+        )
 
-        client = genai.Client(api_key=settings.google_api_key)
+        client = genai.Client(api_key=api_key, http_options=http_options)
         # Nano Banana 单次仅返回一张，count>1 时循环调用
         results: list[ImageResult] = []
-        for _ in range(max(count, 1)):
-            data = await self._generate_one(client, prompt, aspect)
-            results.append(data)
+        try:
+            for _ in range(max(count, 1)):
+                data = await self._generate_one(client, prompt, aspect, use_model)
+                results.append(data)
+        finally:
+            await client.aio.aclose()
         return results

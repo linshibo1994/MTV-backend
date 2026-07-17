@@ -52,40 +52,52 @@ def _provider_for_model(model: str) -> str | None:
     return None
 
 
-def get_image_provider(model: str | None = None) -> ImageGenProvider:
+def get_image_provider(
+    model: str | None = None, *, provider: str | None = None
+) -> ImageGenProvider:
     """按 model 别名优先、否则按 .env image_gen_provider 路由到供应商实现。
 
     缺少对应 API key 时由具体实现抛 RuntimeError，worker 捕获后 release 积分。
     """
     from app.core.config import settings
 
-    # 1) model 别名优先
+    # 1) 调用方显式 provider 优先。
+    if provider:
+        return _instantiate(provider)
+
+    # 2) 仅当 provider 确实来自环境变量/显式 Settings 入参时由配置主导；
+    # 类默认值不能冒充用户配置，否则会破坏旧 model 别名路由。
+    configured = (settings.image_gen_provider or "").strip().lower()
+    if configured and settings.is_explicitly_configured("image_gen_provider"):
+        return _instantiate(configured)
+
+    # 3) 未显式配置 provider 时保留旧 model 别名路由。
     if model:
         vendor = _provider_for_model(model)
         if vendor:
             return _instantiate(vendor)
 
-    # 2) .env provider 主导
-    configured = (settings.image_gen_provider or "").strip().lower()
-    if configured in ("openai", "google", "bailian"):
-        return _instantiate(configured)
-
-    # 3) 兜底：openai
-    return _instantiate("openai")
+    # 4) 最后使用 Settings 默认值，旧部署仍默认为 OpenAI。
+    return _instantiate(configured or "openai")
 
 
 def _instantiate(vendor: str) -> ImageGenProvider:
-    if vendor == "google":
+    from app.providers.registry import require_capability
+
+    normalized = require_capability(vendor, "image")
+    if normalized == "gemini":
         from app.providers.image_gen_google import GoogleImageGenProvider
 
         return GoogleImageGenProvider()  # type: ignore[return-value]
-    if vendor == "bailian":
+    if normalized == "bailian":
         from app.providers.image_gen_bailian import BailianImageGenProvider
 
         return BailianImageGenProvider()  # type: ignore[return-value]
-    from app.providers.image_gen_openai import OpenAIImageGenProvider
+    if normalized == "openai":
+        from app.providers.image_gen_openai import OpenAIImageGenProvider
 
-    return OpenAIImageGenProvider()  # type: ignore[return-value]
+        return OpenAIImageGenProvider()  # type: ignore[return-value]
+    raise AssertionError(f"遗漏的图片 provider 实现: {normalized}")
 
 
 async def image_result_from_url(url: str) -> ImageResult:

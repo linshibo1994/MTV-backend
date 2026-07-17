@@ -22,6 +22,7 @@ from typing import Any
 import httpx
 
 from app.core.config import settings
+from app.providers.registry import ProviderConfigurationError
 
 _API_VERSION = "2023-06-01"
 _MAX_TOKENS_DEFAULT = 4096
@@ -49,12 +50,15 @@ class AnthropicLLMProvider:
         base_url: str = "",
     ) -> None:
         if not api_key:
-            raise RuntimeError("ANTHROPIC_API_KEY 未配置，无法初始化 Claude LLM 供应商")
+            raise ProviderConfigurationError(
+                "CHAT_LLM_API_KEY/TEXT_LLM_API_KEY（或 ANTHROPIC_API_KEY）未配置，"
+                "无法初始化 Claude LLM 供应商"
+            )
         self._api_key = api_key
         self._model = model
         self._base_url = (base_url or settings.anthropic_base_url).rstrip("/")
         if not self._base_url:
-            raise RuntimeError("Anthropic base_url 未配置")
+            raise ProviderConfigurationError("Anthropic base_url 未配置")
 
     def _headers(self) -> dict[str, str]:
         return {

@@ -16,6 +16,7 @@ from openai import AsyncOpenAI
 
 from app.core.config import settings
 from app.providers.image_gen import ImageResult
+from app.providers.registry import ProviderConfigurationError
 
 OpenAIImageSize = Literal[
     "1024x1024",
@@ -49,21 +50,43 @@ class OpenAIImageGenProvider:
     async def generate(
         self, prompt: str, model: str, size: str, aspect: str, count: int = 1
     ) -> list[ImageResult]:
-        api_key = settings.image_gen_api_key or settings.openai_api_key
+        api_key = (
+            settings.image_gen_api_key
+            if settings.is_explicitly_configured("image_gen_api_key")
+            and settings.image_gen_api_key
+            else settings.openai_api_key or settings.image_gen_api_key
+        )
         if not api_key:
-            raise RuntimeError("未配置图片生成 API key，无法调用 GPT image 文生图")
-        use_model = model or settings.image_gen_model or settings.openai_image_model
-        base_url = settings.image_gen_base_url or None
+            raise ProviderConfigurationError(
+                "未配置 IMAGE_GEN_API_KEY（或 OPENAI_API_KEY），无法调用 GPT image 文生图"
+            )
+        use_model = (
+            settings.image_gen_model
+            if (
+                settings.is_explicitly_configured("image_gen_provider")
+                or settings.is_explicitly_configured("image_gen_model")
+            )
+            and settings.image_gen_model
+            else model or settings.openai_image_model
+        )
+        base_url = (
+            settings.image_gen_base_url
+            if settings.is_explicitly_configured("image_gen_base_url")
+            else None
+        )
 
         client = AsyncOpenAI(api_key=api_key, base_url=base_url)
         openai_size = _map_size(size, aspect)
         n = max(count, 1)
-        resp = await client.images.generate(
-            model=use_model,
-            prompt=prompt,
-            size=openai_size,
-            n=n,
-        )
+        try:
+            resp = await client.images.generate(
+                model=use_model,
+                prompt=prompt,
+                size=openai_size,
+                n=n,
+            )
+        finally:
+            await client.close()
 
         image_data = None if resp is None else resp.data
         if not image_data:

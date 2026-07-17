@@ -1,17 +1,19 @@
 """应用配置 — 通过环境变量注入，默认值与 .env.example 对齐。"""
 
+import ipaddress
 from collections import Counter
 from functools import lru_cache
 from math import log2
 from typing import Literal
 from urllib.parse import urlsplit
 
-from pydantic import Field, model_validator
+from pydantic import Field, PrivateAttr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+    _explicit_fields: frozenset[str] = PrivateAttr(default_factory=frozenset)
 
     # 应用
     app_env: Literal["dev", "test", "prod", "production"] = "dev"
@@ -61,9 +63,10 @@ class Settings(BaseSettings):
     openai_llm_model: str = "gpt-4o"
     openai_image_model: str = "gpt-image-2"
 
-    # Google Gemini (旧字段，banana-2 / Nano Banana)
+    # Google Gemini (旧字段，图片 / Veo 视频)
     google_api_key: str = ""
-    google_image_model: str = "gemini-2.5-flash-image"
+    google_image_model: str = "gemini-3.1-flash-image"
+    google_video_model: str = "veo-3.1-generate-preview"
 
     # 字节豆包 Seedance (旧字段)
     volcengine_access_key: str = ""
@@ -95,8 +98,12 @@ class Settings(BaseSettings):
     image_gen_api_key: str = ""
     image_gen_model: str = ""
 
-    # 视频生成 —— volcengine | bailian | openai
+    # 视频生成 —— volcengine | bailian | openai | gemini
+    # database 保持历史后台切换；env 让 VIDEO_GEN_* 成为权威配置。
+    video_provider_selection_mode: Literal["database", "env"] = "database"
     video_gen_provider: str = "volcengine"
+    video_gen_base_url: str = ""
+    video_gen_api_key: str = ""
     video_gen_model: str = ""
     # 百炼 DashScope（文生图/视频/LLM 共用同一 API Key）
     dashscope_api_key: str = ""
@@ -142,6 +149,10 @@ class Settings(BaseSettings):
         文本与对话能力优先使用通用字段，未显式配置时再按厂商读取专属
         Key、模型和基础地址；图片与视频能力同样保留旧字段兼容。
         """
+        # 在回退赋值前保存真实输入字段；Pydantic 对 validator 内 setattr 也会更新
+        # model_fields_set，因此不能在工厂阶段直接用 model_fields_set 判断显式配置。
+        self._explicit_fields = frozenset(self.model_fields_set)
+
         self.text_llm_provider = self.text_llm_provider.strip().lower()
         self.chat_llm_provider = self.chat_llm_provider.strip().lower()
         self.image_gen_provider = self.image_gen_provider.strip().lower()
@@ -160,7 +171,13 @@ class Settings(BaseSettings):
                 self.anthropic_model,
                 self.anthropic_base_url,
             ),
+            "anthropic": (
+                self.anthropic_api_key,
+                self.anthropic_model,
+                self.anthropic_base_url,
+            ),
             "gemini": (self.gemini_api_key, self.gemini_llm_model, ""),
+            "google": (self.gemini_api_key or self.google_api_key, self.gemini_llm_model, ""),
         }
         for capability in ("text_llm", "chat_llm"):
             provider = getattr(self, f"{capability}_provider")
@@ -182,7 +199,12 @@ class Settings(BaseSettings):
                 self.image_gen_model = self.openai_image_model
         elif self.image_gen_provider == "google":
             if not self.image_gen_api_key:
-                self.image_gen_api_key = self.google_api_key
+                self.image_gen_api_key = self.google_api_key or self.gemini_api_key
+            if not self.image_gen_model:
+                self.image_gen_model = self.google_image_model
+        elif self.image_gen_provider == "gemini":
+            if not self.image_gen_api_key:
+                self.image_gen_api_key = self.gemini_api_key or self.google_api_key
             if not self.image_gen_model:
                 self.image_gen_model = self.google_image_model
         elif self.image_gen_provider == "bailian":
@@ -192,15 +214,37 @@ class Settings(BaseSettings):
                 self.image_gen_base_url = self.dashscope_base_url
             if not self.image_gen_model:
                 self.image_gen_model = "wan2.1-t2i-plus"
-        if not self.video_gen_model:
-            self.video_gen_model = {
-                "volcengine": self.seedance_model,
-                "doubao": self.seedance_model,
-                "seedance": self.seedance_model,
-                "bailian": self.dashscope_video_model,
-                "openai": self.openai_video_model,
-                "sora": self.openai_video_model,
-            }.get(self.video_gen_provider, self.seedance_model)
+        video_defaults = {
+            "volcengine": ("", self.seedance_model, ""),
+            "doubao": ("", self.seedance_model, ""),
+            "seedance": ("", self.seedance_model, ""),
+            "bailian": (
+                self.dashscope_api_key,
+                self.dashscope_video_model,
+                self.dashscope_base_url,
+            ),
+            "openai": (self.openai_api_key, self.openai_video_model, ""),
+            "sora": (self.openai_api_key, self.openai_video_model, ""),
+            "gemini": (
+                self.gemini_api_key or self.google_api_key,
+                self.google_video_model,
+                "",
+            ),
+            "google": (
+                self.google_api_key or self.gemini_api_key,
+                self.google_video_model,
+                "",
+            ),
+        }
+        video_default = video_defaults.get(self.video_gen_provider)
+        if video_default is not None:
+            default_key, default_model, default_base_url = video_default
+            if not self.video_gen_api_key:
+                self.video_gen_api_key = default_key
+            if not self.video_gen_model:
+                self.video_gen_model = default_model
+            if not self.video_gen_base_url:
+                self.video_gen_base_url = default_base_url
         return self
 
     @model_validator(mode="after")
@@ -212,6 +256,27 @@ class Settings(BaseSettings):
             self.cors_origins = [_normalize_cors_origin(origin) for origin in self.cors_origins]
         except ValueError as exc:
             raise ValueError(f"CORS_ORIGINS 必须配置合法的 http/https origin：{exc}") from exc
+
+        for field_name in (
+            "text_llm_base_url",
+            "chat_llm_base_url",
+            "image_gen_base_url",
+            "video_gen_base_url",
+            "dashscope_base_url",
+            "anthropic_base_url",
+        ):
+            value = getattr(self, field_name).strip()
+            if not value:
+                continue
+            try:
+                normalized = _normalize_provider_base_url(
+                    value,
+                    allow_local_http=not self.is_prod,
+                )
+            except ValueError as exc:
+                env_name = field_name.upper()
+                raise ValueError(f"{env_name} 配置不安全：{exc}") from exc
+            setattr(self, field_name, normalized)
 
         if self.is_prod:
             secret = self.session_secret.strip()
@@ -232,6 +297,10 @@ class Settings(BaseSettings):
     @property
     def is_dev(self) -> bool:
         return self.app_env == "dev"
+
+    def is_explicitly_configured(self, field_name: str) -> bool:
+        """判断字段是否来自环境变量或 Settings 显式入参，而不是类默认值。"""
+        return field_name in self._explicit_fields
 
 
 def _normalize_cors_origin(origin: str) -> str:
@@ -261,6 +330,45 @@ def _normalize_cors_origin(origin: str) -> str:
         raise ValueError("必须是无用户信息、查询、片段和非根路径的 http/https origin")
 
     return parsed._replace(scheme=parsed.scheme.lower(), path="").geturl()
+
+
+def _normalize_provider_base_url(value: str, *, allow_local_http: bool) -> str:
+    """校验携带模型密钥的出站 Base URL，防止凭据经明文 HTTP 或用户信息外泄。"""
+    try:
+        parsed = urlsplit(value)
+        hostname = parsed.hostname
+        parsed.port
+    except ValueError as exc:
+        raise ValueError("URL 格式无效") from exc
+
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or not parsed.netloc
+        or not hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or any(char.isspace() or char == "\\" for char in parsed.netloc)
+    ):
+        raise ValueError("必须是不含用户信息、查询参数或片段的 http/https URL")
+
+    scheme = parsed.scheme.lower()
+    if scheme == "http" and not (
+        allow_local_http and _is_local_development_host(hostname)
+    ):
+        raise ValueError("携带 API Key 的远程 Base URL 必须使用 HTTPS")
+    return parsed._replace(scheme=scheme).geturl().rstrip("/")
+
+
+def _is_local_development_host(hostname: str) -> bool:
+    host = hostname.rstrip(".").lower()
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 def _is_low_strength_secret(secret: str) -> bool:

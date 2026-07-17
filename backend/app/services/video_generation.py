@@ -31,6 +31,7 @@ from app.core.config import settings
 from app.crud import video as video_crud
 from app.models.episode import Episode
 from app.models.shot_group import ShotGroup
+from app.providers.registry import ProviderConfigurationError, normalize_provider
 from app.services.reference_aggregator import aggregate_references
 from app.services.task_dispatch import enqueue_task
 
@@ -81,6 +82,15 @@ async def create_video_job(
 
     from app.core.errors import BadRequestError, ConflictError, ForbiddenError
 
+    if (
+        settings.video_provider_selection_mode == "env"
+        and normalize_provider(settings.video_gen_provider) == "gemini"
+    ):
+        raise ProviderConfigurationError(
+            "Gemini Veo Provider 已实现，但当前数据库约束尚未启用 provider_key=gemini；"
+            "需先执行经确认的 Alembic 迁移"
+        )
+
     if not idempotency_key:
         raise BadRequestError("Idempotency-Key 必填")
     unit_id = f"group:{shot_group_id}"
@@ -129,7 +139,11 @@ async def create_video_job(
 
     # 5. 取激活供应商配置，缺失兜底
     provider_cfg = await video_crud.get_active_provider(db, "all_reference")
-    if provider_cfg is None:
+    if settings.video_provider_selection_mode == "env":
+        # env 模式下部署级环境变量是权威配置，不再被数据库历史 active 行覆盖。
+        provider_key = settings.video_gen_provider
+        model = settings.video_gen_model or settings.seedance_model
+    elif provider_cfg is None:
         provider_key = settings.video_default_provider
         model = settings.video_gen_model or settings.seedance_model
     else:

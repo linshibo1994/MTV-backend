@@ -22,6 +22,7 @@ import httpx
 
 from app.core.config import settings
 from app.providers.image_gen import ImageResult
+from app.providers.registry import ProviderConfigurationError
 
 logger = logging.getLogger(__name__)
 
@@ -53,11 +54,31 @@ class BailianImageGenProvider:
     async def generate(
         self, prompt: str, model: str, size: str, aspect: str, count: int = 1
     ) -> list[ImageResult]:
-        api_key = settings.image_gen_api_key or settings.dashscope_api_key
+        api_key = (
+            settings.image_gen_api_key
+            if settings.is_explicitly_configured("image_gen_api_key")
+            and settings.image_gen_api_key
+            else settings.dashscope_api_key or settings.image_gen_api_key
+        )
         if not api_key:
-            raise RuntimeError("未配置 DASHSCOPE_API_KEY，无法调用通义万相文生图")
-        use_model = model or settings.image_gen_model or "wan2.1-t2i-plus"
-        base_url = (settings.image_gen_base_url or settings.dashscope_base_url).rstrip("/")
+            raise ProviderConfigurationError(
+                "未配置 IMAGE_GEN_API_KEY（或 DASHSCOPE_API_KEY），无法调用通义万相文生图"
+            )
+        use_model = (
+            settings.image_gen_model
+            if (
+                settings.is_explicitly_configured("image_gen_provider")
+                or settings.is_explicitly_configured("image_gen_model")
+            )
+            and settings.image_gen_model
+            else model or "wan2.1-t2i-plus"
+        )
+        base_url = (
+            settings.image_gen_base_url
+            if settings.is_explicitly_configured("image_gen_base_url")
+            and settings.image_gen_base_url
+            else settings.dashscope_base_url
+        ).rstrip("/")
         wanx_size = _map_size(size, aspect)
         n = max(count, 1)
 

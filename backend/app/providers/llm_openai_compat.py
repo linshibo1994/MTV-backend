@@ -26,7 +26,9 @@ from openai import (
     RateLimitError,
 )
 
-LLMVendor = Literal["openai", "deepseek", "bailian", "gemini"]
+from app.providers.registry import ProviderConfigurationError
+
+LLMVendor = Literal["openai", "openai_compatible", "deepseek", "bailian", "gemini"]
 
 # 各厂商 OpenAI 兼容端点默认 base_url（.env 未显式配置时使用）
 _DEFAULT_BASE_URL: dict[str, str] = {
@@ -55,12 +57,14 @@ class OpenAICompatLLMProvider:
         base_url: str = "",
     ) -> None:
         if not api_key:
-            raise RuntimeError(f"{vendor} LLM API key 未配置，无法初始化 LLM 供应商")
+            raise ProviderConfigurationError(
+                f"{vendor} LLM API key 未配置，无法初始化 LLM 供应商"
+            )
         self._vendor = vendor
         self._model = model
         self._base_url = base_url or _DEFAULT_BASE_URL.get(vendor, "")
         if not self._base_url:
-            raise RuntimeError(f"{vendor} LLM base_url 未配置")
+            raise ProviderConfigurationError(f"{vendor} LLM base_url 未配置")
         self._client = AsyncOpenAI(api_key=api_key, base_url=self._base_url)
 
     async def complete_json(self, system: str, user: str) -> dict:

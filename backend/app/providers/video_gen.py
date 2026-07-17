@@ -1,7 +1,7 @@
-"""视频生成供应商抽象 + 工厂 — VideoGenProvider Protocol。
+"""视频生成供应商抽象与工厂。
 
-按 provider_key (jianyu / modelsai) 路由到底层实现。两者均走字节豆包 Seedance 2.0
-(volcengine)，仅 provider_key 不同，便于前端切换供应商标识。
+统一覆盖火山方舟 Seedance、阿里百炼万相、OpenAI Sora 和 Google Gemini Veo；
+未知厂商立即失败，避免静默切换后产生错误计费。
 """
 
 from collections.abc import Callable
@@ -97,10 +97,12 @@ def get_video_provider(provider_key: str | None = None) -> VideoGenProvider:
     - jianyu / modelsai / volcengine / doubao / seedance -> 豆包 Seedance (volcengine)
     - bailian / wanx / wan2 / qwen-video -> 阿里百炼通义万相视频
     - openai / sora -> OpenAI Sora
-    - 未识别 -> 按 settings.video_gen_provider 选厂商
+    - gemini / google / veo -> Google Gemini Veo
+    - 未传 provider_key -> 按 settings.video_gen_provider 选厂商
+    - 未识别 -> 明确报错，不静默回退
     缺少对应密钥时实例可创建，但调用 generate 时抛 RuntimeError。
     """
-    key = (provider_key or "").strip().lower()
+    key = (provider_key or settings.video_gen_provider or "").strip().lower()
     # 1) 已知别名
     if key in ("jianyu", "modelsai", "volcengine", "doubao", "seedance"):
         from app.providers.video_gen_volcengine import VolcengineVideoGenProvider
@@ -114,21 +116,13 @@ def get_video_provider(provider_key: str | None = None) -> VideoGenProvider:
         from app.providers.video_gen_openai import OpenAIVideoGenProvider
 
         return OpenAIVideoGenProvider(provider_key=key or "openai")
-    # 2) .env video_gen_provider 主导
-    configured = (settings.video_gen_provider or "").strip().lower()
-    if configured in ("volcengine", "doubao", "seedance"):
-        from app.providers.video_gen_volcengine import VolcengineVideoGenProvider
+    if key in ("gemini", "google", "veo"):
+        from app.providers.video_gen_google import GoogleVideoGenProvider
 
-        return VolcengineVideoGenProvider(provider_key=configured)
-    if configured == "bailian":
-        from app.providers.video_gen_bailian import BailianVideoGenProvider
+        return GoogleVideoGenProvider(provider_key=key)
 
-        return BailianVideoGenProvider(provider_key="bailian")
-    if configured in ("openai", "sora"):
-        from app.providers.video_gen_openai import OpenAIVideoGenProvider
+    # 未识别的非空 key 必须失败，不能静默调用并产生其他厂商费用。
+    from app.providers.registry import require_capability
 
-        return OpenAIVideoGenProvider(provider_key="openai")
-    # 3) 兜底：volcengine（保持向后兼容）
-    from app.providers.video_gen_volcengine import VolcengineVideoGenProvider
-
-    return VolcengineVideoGenProvider(provider_key=settings.video_default_provider)
+    require_capability(key, "video")
+    raise AssertionError(f"遗漏的视频 provider 实现: {key}")

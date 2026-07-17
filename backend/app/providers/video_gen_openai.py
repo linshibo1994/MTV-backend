@@ -18,6 +18,7 @@ import logging
 from typing import Any
 
 from app.core.config import settings
+from app.providers.registry import ProviderConfigurationError
 from app.providers.video_gen import (
     VideoGenerationProgress,
     VideoGenerationRequest,
@@ -52,13 +53,31 @@ class OpenAIVideoGenProvider:
         return self._provider_key
 
     def _check_keys(self) -> None:
-        if not settings.openai_api_key:
-            raise RuntimeError("未配置 OPENAI_API_KEY，无法调用 Sora 视频生成")
+        if not self._api_key():
+            raise ProviderConfigurationError(
+                "未配置 VIDEO_GEN_API_KEY（或 OPENAI_API_KEY），无法调用 Sora 视频生成"
+            )
 
     def _build_client(self):
         from openai import AsyncOpenAI
 
-        return AsyncOpenAI(api_key=settings.openai_api_key)
+        return AsyncOpenAI(
+            api_key=self._api_key(),
+            base_url=(
+                settings.video_gen_base_url
+                if settings.is_explicitly_configured("video_gen_base_url")
+                else None
+            ),
+        )
+
+    @staticmethod
+    def _api_key() -> str:
+        if (
+            settings.is_explicitly_configured("video_gen_api_key")
+            and settings.video_gen_api_key
+        ):
+            return settings.video_gen_api_key
+        return settings.openai_api_key or settings.video_gen_api_key
 
     async def generate_all_reference(
         self,
@@ -92,6 +111,9 @@ class OpenAIVideoGenProvider:
         on_progress=None,
     ) -> VideoGenerationResult:
         """文生/图生视频 → 返回视频 storage_key。"""
+        logger.warning(
+            "OpenAI Sora Videos API 已弃用并计划于 2026-09-24 关闭，请迁移视频供应商"
+        )
         self._check_keys()
         use_model = request.model or settings.video_gen_model or "sora-2"
 
