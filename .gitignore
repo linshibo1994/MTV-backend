@@ -1,0 +1,42 @@
+.DS_Store
+
+# 本地环境变量与虚拟环境（保留可提交的示例配置）
+.env
+.env.*
+!.env.example
+!.env.*.example
+.venv/
+venv/
+env/
+
+# 本地 AI 编程工具配置
+.codex/
+.claude/
+
+# Python 与包管理器缓存
+__pycache__/
+*.py[cod]
+*$py.class
+.cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.npm/
+.pnpm-store/
+.yarn/cache/
+
+# 测试、覆盖率与浏览器自动化产物（不忽略测试源码）
+.coverage
+.coverage.*
+htmlcov/
+coverage/
+.nyc_output/
+test-results/
+playwright-report/
+junit.xml
+
+# 原始探索证据可能包含账号展示、积分、业务文本和内部 Prompt，仅保留在本地。
+/docs/exploration/
+/docs/Claude/exploration/
