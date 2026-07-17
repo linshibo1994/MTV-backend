@@ -15,7 +15,8 @@ generate_images_task(job_id) 流程：
 - Celery 任务体内通过 asyncio.run 执行异步主体，复用 async DB session 与 async provider。
 - 存储统一经 app.providers.storage.get_storage() 抽象（与 video_generation/timeline_render 一致），
   支持 local / s3 两种 driver，S3 模式下生成图正确写入对象存储、media 代理经同一 provider 读取。
-- 积分 actual 按张数差异化结算：actual = settings.price_image_gen * count。
+- 积分 actual 按实际成功张数差异化结算：actual = settings.price_image_gen *
+  len(image_outputs)，Provider 少图时不对未生成图片收费。
   后续接入 provider 返回的真实计费字段时，用真实值替换 actual。
 """
 
@@ -289,8 +290,11 @@ def validate_image_result(result: ImageResult) -> ValidatedImage:
 
 
 def ensure_provider_result_count(results: list[ImageResult], *, expected: int) -> None:
-    if len(results) != expected:
-        raise ValueError("Provider 返回图片数量与请求不一致")
+    """允许 Provider 少图成功，但拒绝空结果和超出请求数的异常结果。"""
+    if not results:
+        raise ValueError("Provider 未返回图片")
+    if len(results) > expected:
+        raise ValueError("Provider 返回图片数量超过请求数")
 
 
 async def _persist_validated_image(
@@ -685,8 +689,6 @@ async def run_generation_once(
             job_id=job_id,
             lease_token=claim.lease_token,
         )
-        if not raw_results:
-            return
         if not await _heartbeat_or_stop(db, job_id, claim.lease_token):
             return
         normalized = [

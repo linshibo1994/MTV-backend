@@ -1083,7 +1083,7 @@ def test_generation_job_output_sanitizes_public_metrics_and_errors() -> None:
     assert generation_api._to_out(failed).error_message == "生成失败，请稍后重试"
 
 
-def test_provider_result_validation_is_fail_closed_and_rejects_ssrf_url():
+def test_provider_result_validation_accepts_partial_and_rejects_invalid_counts_and_ssrf_url():
     assert generation_worker.validate_image_result(
         ImageResult(data=_png(), mime_type="image/png")
     ).mime_type == "image/png"
@@ -1092,16 +1092,28 @@ def test_provider_result_validation_is_fail_closed_and_rejects_ssrf_url():
     ).mime_type == "image/webp"
     with pytest.raises(ValueError):
         generation_worker.validate_image_result(ImageResult(data=b"not-image", mime_type="image/png"))
-    with pytest.raises(ValueError):
+    generation_worker.ensure_provider_result_count(
+        [ImageResult(data=_png(), mime_type="image/png")],
+        expected=2,
+    )
+    with pytest.raises(ValueError, match="未返回图片"):
+        generation_worker.ensure_provider_result_count([], expected=2)
+    with pytest.raises(ValueError, match="超过请求数"):
         generation_worker.ensure_provider_result_count(
-            [ImageResult(data=_png(), mime_type="image/png")],
-            expected=2,
+            [
+                ImageResult(data=_png(), mime_type="image/png"),
+                ImageResult(data=_png(), mime_type="image/png"),
+            ],
+            expected=1,
         )
     with pytest.raises(RuntimeError):
         asyncio.run(image_result_from_url("http://127.0.0.1/private.png"))
 
 
-def test_run_generation_persists_candidates_settles_actual_and_guards_old_version(monkeypatch):
+@pytest.mark.parametrize(("provider_count", "expected_actual"), [(2, 20), (1, 10)])
+def test_run_generation_persists_candidates_settles_actual_and_guards_old_version(
+    monkeypatch, provider_count, expected_actual
+):
     async def scenario() -> None:
         _, raw = _make_db()
         _seed(raw)
@@ -1150,7 +1162,7 @@ def test_run_generation_persists_candidates_settles_actual_and_guards_old_versio
                 return [
                     ImageResult(data=_png(), mime_type="image/png"),
                     ImageResult(data=_png((0, 0, 255)), mime_type="image/png"),
-                ]
+                ][:provider_count]
 
         stored: list[tuple[str, str]] = []
 
@@ -1168,12 +1180,13 @@ def test_run_generation_persists_candidates_settles_actual_and_guards_old_versio
         )
         finished = raw.get(GenerationJob, "job-1")
         assert finished.status == "succeeded"
-        assert finished.metrics["actual_points"] == 20
-        assert len(finished.output_json["imageOutputs"]) == 2
+        assert finished.metrics["actual_points"] == expected_actual
+        assert finished.metrics["count"] == provider_count
+        assert len(finished.output_json["imageOutputs"]) == provider_count
         assert {entry.mime_type for entry in raw.scalars(select(AssetEntry)).all()} == {"image/png"}
         assert raw.get(Subject, "subject-1").review_status == "pending"
         assert raw.get(CreditReservation, "reservation-1").status == "captured"
-        assert raw.get(CreditReservation, "reservation-1").actual_points == 20
+        assert raw.get(CreditReservation, "reservation-1").actual_points == expected_actual
         assert all(key.endswith(".png") for key, _ in stored)
 
         stale = GenerationJob(
