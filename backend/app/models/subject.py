@@ -13,6 +13,12 @@ class Subject(UUIDPKMixin, TimestampMixin, Base):
     __tablename__ = "subjects"
     __table_args__ = (
         UniqueConstraint("script_id", "id", name="uq_subjects_script_id_id"),
+        UniqueConstraint(
+            "script_id",
+            "type",
+            "pipeline_name",
+            name="uq_subjects_script_type_pipeline_name",
+        ),
         Index("ix_subjects_script_review_type", "script_id", "review_status", "type"),
     )
 
@@ -22,9 +28,20 @@ class Subject(UUIDPKMixin, TimestampMixin, Base):
     # character | scene | prop | sound
     type: Mapped[str] = mapped_column(String(32), nullable=False)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
+    # 流水线首次创建时的稳定名称身份；人工改名不得修改此字段。
+    pipeline_name: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+        default=lambda context: str(context.get_current_parameters().get("name") or ""),
+    )
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     subject_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     enrich_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    # 人工修改后锁定；流水线只能生成差异建议，不能静默覆盖。
+    name_locked: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    description_locked: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
 
     is_child: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     is_parent: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)

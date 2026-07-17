@@ -611,18 +611,65 @@ def test_volcengine_provider_builds_async_ark_client(monkeypatch) -> None:
         captured.update(kwargs)
         return sentinel
 
-    monkeypatch.setattr(settings, "volcengine_access_key", "test-ak")
-    monkeypatch.setattr(settings, "volcengine_secret_key", "test-sk")
-    monkeypatch.setattr(settings, "volcengine_region", "cn-beijing")
+    monkeypatch.setattr(settings, "volcengine_api_key", "test-ark-key")
     monkeypatch.setattr("volcenginesdkarkruntime.AsyncArk", fake_async_ark)
 
     provider = VolcengineVideoGenProvider(provider_key="modelsai")
     assert provider._build_client() is sentinel
     assert captured == {
-        "ak": "test-ak",
-        "sk": "test-sk",
-        "region": "cn-beijing",
+        "api_key": "test-ark-key",
+        "base_url": "https://ark.cn-beijing.volces.com/api/v3",
     }
+
+
+def test_volcengine_provider_prefers_explicit_video_gen_api_key(monkeypatch) -> None:
+    """显式 VIDEO_GEN_API_KEY 优先于 VOLCENGINE_API_KEY 回退。"""
+    from app.core.config import Settings
+    from app.providers.video_gen_volcengine import VolcengineVideoGenProvider
+
+    explicit = Settings(
+        _env_file=None,
+        video_gen_api_key="explicit-ark-key",
+        volcengine_api_key="fallback-ark-key",
+    )
+    monkeypatch.setattr("app.providers.video_gen_volcengine.settings", explicit)
+    monkeypatch.setattr("volcenginesdkarkruntime.AsyncArk", lambda **kw: kw)
+
+    provider = VolcengineVideoGenProvider(provider_key="modelsai")
+    client = provider._build_client()
+    assert client["api_key"] == "explicit-ark-key"
+
+
+def test_volcengine_provider_explicit_base_url_overrides_default(monkeypatch) -> None:
+    """显式 VIDEO_GEN_BASE_URL 覆盖 Ark 默认端点。"""
+    from app.core.config import Settings
+    from app.providers.video_gen_volcengine import VolcengineVideoGenProvider
+
+    explicit = Settings(
+        _env_file=None,
+        volcengine_api_key="ark-key",
+        video_gen_base_url="https://ark.example.com/api/v3",
+    )
+    monkeypatch.setattr("app.providers.video_gen_volcengine.settings", explicit)
+    monkeypatch.setattr("volcenginesdkarkruntime.AsyncArk", lambda **kw: kw)
+
+    provider = VolcengineVideoGenProvider(provider_key="modelsai")
+    client = provider._build_client()
+    assert client["base_url"] == "https://ark.example.com/api/v3"
+    assert client["api_key"] == "ark-key"
+
+
+def test_volcengine_provider_check_keys_raises_when_missing(monkeypatch) -> None:
+    """Ark API Key 均缺失时 _check_keys 抛 RuntimeError。"""
+    from app.core.config import Settings
+    from app.providers.video_gen_volcengine import VolcengineVideoGenProvider
+
+    empty = Settings(_env_file=None)  # video_gen_api_key 与 volcengine_api_key 均为空
+    monkeypatch.setattr("app.providers.video_gen_volcengine.settings", empty)
+
+    provider = VolcengineVideoGenProvider(provider_key="modelsai")
+    with pytest.raises(RuntimeError, match="缺少火山方舟 Ark API Key"):
+        provider._check_keys()
 
 
 def test_volcengine_provider_builds_ark_content_with_private_media() -> None:

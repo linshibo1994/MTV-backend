@@ -54,6 +54,19 @@ class ScriptCreateIn(BaseModel):
     scope: Literal["personal", "team"] = "personal"
 
 
+class ScriptUpdateIn(BaseModel):
+    """重命名剧本入参 — PATCH /scripts/<id>。"""
+
+    title: str = Field(min_length=1, max_length=512)
+
+
+class ScriptCopyIn(BaseModel):
+    """复制剧本入参；缺省沿用来源标题与范围。"""
+
+    title: str | None = Field(default=None, min_length=1, max_length=512)
+    scope: Literal["personal", "team"] | None = None
+
+
 class ScriptPageOut(BaseModel):
     """剧本分页响应。"""
 
@@ -109,6 +122,7 @@ class EpisodeSaveIn(BaseModel):
 
     script_text: str | None = None
     title: str | None = None
+    episode_no: int | None = Field(default=None, ge=1)
     episode_version: int
     client_save_seq: int
 
@@ -120,6 +134,43 @@ class EpisodeCreateIn(BaseModel):
     script_text: str | None = None
     # 集号可选，缺省自动取最大集号 + 1
     episode_no: int | None = Field(default=None, ge=1)
+
+
+class LifecycleDependencySummary(BaseModel):
+    """剧本/分集删除前的派生资源依赖摘要。"""
+
+    episode_count: int = 0
+    subject_count: int = 0
+    asset_count: int = 0
+    shot_group_count: int = 0
+    shot_count: int = 0
+    video_count: int = 0
+    job_count: int = 0
+    active_job_count: int = 0
+    canvas_count: int = 0
+
+    @property
+    def has_dependencies(self) -> bool:
+        return any(
+            (
+                self.episode_count,
+                self.subject_count,
+                self.asset_count,
+                self.shot_group_count,
+                self.shot_count,
+                self.video_count,
+                self.job_count,
+                self.active_job_count,
+                self.canvas_count,
+            )
+        )
+
+
+class LifecycleDeleteOut(BaseModel):
+    """显式确认删除后的响应。"""
+
+    detail: str
+    dependencies: LifecycleDependencySummary
 
 
 # --------------------------------------------------------------------------- #

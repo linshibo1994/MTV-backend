@@ -4,12 +4,14 @@
 ``AsyncArk.content_generation.tasks`` 接口。jianyu / modelsai 两个 provider_key
 路由到同一底层模型。
 
-参考: PLAN 5.2 模型映射表。真实接入需 VOLCENGINE_ACCESS_KEY / VOLCENGINE_SECRET_KEY；
+参考: PLAN 5.2 模型映射表。真实接入需火山方舟 Ark API Key
+（VOLCENGINE_API_KEY 或 VIDEO_GEN_API_KEY），使用
+https://ark.cn-beijing.volces.com/api/v3 端点与 Bearer Token 鉴权；
 缺 key 或缺 SDK 时 generate_all_reference 抛 RuntimeError，由 worker 捕获后 release 积分，
 不阻塞队列（PLAN 5.4 / 5.5）。
 
 实现要点:
-1. _check_keys: 校验 ak/sk，缺失抛 RuntimeError。
+1. _check_keys: 校验 Ark API Key，缺失抛 RuntimeError。
 2. _submit_and_poll: 用 AsyncArk 提交内容生成任务并轮询至终态，成功后下载 video_url。
 3. _store_video: 将视频字节经 storage.put 存入对象存储，返回 storage_key。
 
@@ -54,11 +56,32 @@ class VolcengineVideoGenProvider:
     def provider_key(self) -> str:
         return self._provider_key
 
+    def _resolve_ark_api_key(self) -> str:
+        """解析 Ark API Key：显式 VIDEO_GEN_API_KEY 优先，否则回退 VOLCENGINE_API_KEY。"""
+        if settings.is_explicitly_configured("video_gen_api_key") and settings.video_gen_api_key:
+            return settings.video_gen_api_key
+        return settings.volcengine_api_key
+
+    def _resolve_ark_base_url(self) -> str:
+        """解析 Ark Base URL：显式 VIDEO_GEN_BASE_URL 优先，否则回退 Ark 默认端点。"""
+        if settings.is_explicitly_configured("video_gen_base_url") and settings.video_gen_base_url:
+            return settings.video_gen_base_url
+        return settings.volcengine_ark_base_url
+
     def _check_keys(self) -> None:
-        """校验 volcengine 密钥，缺失抛 RuntimeError（不阻塞队列）。"""
-        if not settings.volcengine_access_key or not settings.volcengine_secret_key:
+        """校验火山方舟 Ark API Key，缺失抛 RuntimeError（不阻塞队列）。"""
+        # 存量部署可能仍只配了 AK/SK，给出明确迁移提示，避免静默不可用。
+        if (
+            not self._resolve_ark_api_key()
+            and (settings.volcengine_access_key or settings.volcengine_secret_key)
+        ):
+            logger.warning(
+                "VOLCENGINE_ACCESS_KEY/SECRET_KEY 已废弃，视频生成改用 Ark API Key，"
+                "请在 .env 配置 VOLCENGINE_API_KEY 或 VIDEO_GEN_API_KEY"
+            )
+        if not self._resolve_ark_api_key():
             raise RuntimeError(
-                "缺少 volcengine 密钥（VOLCENGINE_ACCESS_KEY / VOLCENGINE_SECRET_KEY），"
+                "缺少火山方舟 Ark API Key（VOLCENGINE_API_KEY 或 VIDEO_GEN_API_KEY），"
                 "无法调用豆包 Seedance 视频生成"
             )
 
@@ -72,9 +95,8 @@ class VolcengineVideoGenProvider:
             ) from exc
 
         return AsyncArk(
-            ak=settings.volcengine_access_key,
-            sk=settings.volcengine_secret_key,
-            region=settings.volcengine_region,
+            api_key=self._resolve_ark_api_key(),
+            base_url=self._resolve_ark_base_url(),
         )
 
     async def generate_all_reference(

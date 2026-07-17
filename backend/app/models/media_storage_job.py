@@ -23,6 +23,7 @@ class MediaStorageJob(TimestampMixin, Base):
     source_key: Mapped[str] = mapped_column(String(512), nullable=False)
     final_key: Mapped[str | None] = mapped_column(String(512), nullable=True)
     asset_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    # pending/running/retry/succeeded/failed/canceled
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending", index=True)
     attempt: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     available_at: Mapped[datetime] = mapped_column(

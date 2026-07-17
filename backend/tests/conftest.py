@@ -44,6 +44,10 @@ _TEST_ENV = {
     "GOOGLE_API_KEY": "",
     "VOLCENGINE_ACCESS_KEY": "",
     "VOLCENGINE_SECRET_KEY": "",
+    "VOLCENGINE_API_KEY": "",
+    "VOLCENGINE_ARK_BASE_URL": "https://ark.cn-beijing.volces.com/api/v3",
+    "VIDEO_GEN_API_KEY": "",
+    "VIDEO_GEN_BASE_URL": "",
     "EDITOR_CAN_REVIEW": "false",
 }
 _ORIGINAL_ENV = {key: os.environ.get(key) for key in _TEST_ENV}

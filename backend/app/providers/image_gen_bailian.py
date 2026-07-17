@@ -1,6 +1,8 @@
-"""阿里百炼通义万相文生图 Provider — DashScope 异步任务接口。
+"""阿里百炼文生图 Provider。
 
-非 OpenAI 兼容协议，走原生 DashScope REST：
+非 OpenAI 兼容协议，按模型选择原生 DashScope REST 接口：
+- qwen-image-2.0 系列走同步多模态生成接口
+  POST {base_url}/api/v1/services/aigc/multimodal-generation/generation
 - 提交 POST {base_url}/api/v1/services/aigc/text2image/image-synthesis
   请求头必带 X-DashScope-Async: enable（缺则报错 current user api does not support
   synchronous calls）
@@ -8,7 +10,7 @@
 - 成功后 results[].url 为 OSS 临时链接（24h 过期），立即下载为 bytes 返回
 - size 格式用星号分隔（1024*1024），非 OpenAI 的 1024x1024
 
-模型：wan2.1-t2i-plus / wan2.1-t2i-turbo / wanx-v1 / qwen-image 等。
+模型：qwen-image-2.0 / wan2.1-t2i-plus / wan2.1-t2i-turbo / wanx-v1 等。
 缺 dashscope_api_key 时抛 RuntimeError，由 worker 捕获后 release 积分。
 """
 
@@ -48,6 +50,28 @@ def _map_size(size: str, aspect: str) -> str:
     return _ASPECT_TO_SIZE["16:9"]
 
 
+def _uses_sync_multimodal_api(model: str) -> bool:
+    """Qwen Image 2.0 仅支持同步多模态生成接口。"""
+    return model.strip().lower().startswith("qwen-image-2.0")
+
+
+def _extract_multimodal_urls(payload: dict) -> list[str]:
+    """从同步多模态响应中提取图片 URL，并兼容网关的常见包装格式。"""
+    output = payload.get("output") or {}
+    urls: list[str] = []
+    for choice in output.get("choices") or []:
+        message = choice.get("message") or {}
+        for item in message.get("content") or []:
+            if not isinstance(item, dict):
+                continue
+            candidate = item.get("image") or item.get("image_url") or item.get("url")
+            if isinstance(candidate, dict):
+                candidate = candidate.get("url")
+            if isinstance(candidate, str) and candidate:
+                urls.append(candidate)
+    return urls
+
+
 class BailianImageGenProvider:
     """阿里百炼通义万相文生图实现（httpx 直连，零额外依赖）。"""
 
@@ -56,8 +80,7 @@ class BailianImageGenProvider:
     ) -> list[ImageResult]:
         api_key = (
             settings.image_gen_api_key
-            if settings.is_explicitly_configured("image_gen_api_key")
-            and settings.image_gen_api_key
+            if settings.is_explicitly_configured("image_gen_api_key") and settings.image_gen_api_key
             else settings.dashscope_api_key or settings.image_gen_api_key
         )
         if not api_key:
@@ -75,12 +98,73 @@ class BailianImageGenProvider:
         )
         base_url = (
             settings.image_gen_base_url
-            if settings.is_explicitly_configured("image_gen_base_url")
-            and settings.image_gen_base_url
+            if settings.is_explicitly_configured("image_gen_base_url") and settings.image_gen_base_url
             else settings.dashscope_base_url
         ).rstrip("/")
         wanx_size = _map_size(size, aspect)
         n = max(count, 1)
+
+        async with httpx.AsyncClient(timeout=60.0) as http:
+            if _uses_sync_multimodal_api(use_model):
+                urls = await self._generate_sync_multimodal(
+                    http, base_url, api_key, prompt, use_model, wanx_size, n
+                )
+            else:
+                urls = await self._generate_legacy_async(
+                    http, base_url, api_key, prompt, use_model, wanx_size, n
+                )
+            if len(urls) < n:
+                logger.warning("百炼返回图片数 %d 少于请求 %d", len(urls), n)
+            return [await self._download(url, base_url=base_url) for url in urls]
+
+    async def _generate_sync_multimodal(
+        self,
+        http: httpx.AsyncClient,
+        base_url: str,
+        api_key: str,
+        prompt: str,
+        model: str,
+        size: str,
+        count: int,
+    ) -> list[str]:
+        """调用 Qwen Image 2.0 同步多模态生成接口。"""
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        body = {
+            "model": model,
+            "input": {"messages": [{"role": "user", "content": [{"text": prompt}]}]},
+            "parameters": {
+                "size": size,
+                "n": count,
+                "prompt_extend": True,
+                "watermark": False,
+            },
+        }
+        submit = await http.post(
+            f"{base_url}/api/v1/services/aigc/multimodal-generation/generation",
+            headers=headers,
+            json=body,
+        )
+        if submit.status_code != 200:
+            raise RuntimeError(f"百炼 Qwen Image 文生图失败 status={submit.status_code}")
+        urls = _extract_multimodal_urls(submit.json())
+        if not urls:
+            raise RuntimeError("百炼 Qwen Image 文生图未返回图片 URL")
+        return urls
+
+    async def _generate_legacy_async(
+        self,
+        http: httpx.AsyncClient,
+        base_url: str,
+        api_key: str,
+        prompt: str,
+        model: str,
+        size: str,
+        count: int,
+    ) -> list[str]:
+        """调用通义万相兼容模型的异步任务接口。"""
 
         headers = {
             "Authorization": f"Bearer {api_key}",
@@ -88,36 +172,26 @@ class BailianImageGenProvider:
             "X-DashScope-Async": "enable",
         }
         body = {
-            "model": use_model,
+            "model": model,
             "input": {"prompt": prompt},
-            "parameters": {"size": wanx_size, "n": n, "prompt_extend": True, "watermark": False},
+            "parameters": {
+                "size": size,
+                "n": count,
+                "prompt_extend": True,
+                "watermark": False,
+            },
         }
-
-        async with httpx.AsyncClient(timeout=60.0) as http:
-            submit = await http.post(
-                f"{base_url}/api/v1/services/aigc/text2image/image-synthesis",
-                headers=headers,
-                json=body,
-            )
-            if submit.status_code != 200:
-                raise RuntimeError(
-                    f"通义万相文生图提交失败 status={submit.status_code}"
-                )
-            task_id = (submit.json().get("output") or {}).get("task_id")
-            if not task_id:
-                raise RuntimeError("通义万相文生图提交未返回 task_id")
-
-            # 轮询
-            urls = await self._poll(http, base_url, api_key, task_id)
-            if len(urls) < n:
-                logger.warning(
-                    "通义万相返回图片数 %d 少于请求 %d task_id=%s", len(urls), n, task_id
-                )
-            # 立即下载（URL 24h 过期）
-            results: list[ImageResult] = []
-            for url in urls:
-                results.append(await self._download(url, base_url=base_url))
-            return results
+        submit = await http.post(
+            f"{base_url}/api/v1/services/aigc/text2image/image-synthesis",
+            headers=headers,
+            json=body,
+        )
+        if submit.status_code != 200:
+            raise RuntimeError(f"通义万相文生图提交失败 status={submit.status_code}")
+        task_id = (submit.json().get("output") or {}).get("task_id")
+        if not task_id:
+            raise RuntimeError("通义万相文生图提交未返回 task_id")
+        return await self._poll(http, base_url, api_key, task_id)
 
     async def _poll(
         self,
@@ -130,13 +204,9 @@ class BailianImageGenProvider:
         poll_headers = {"Authorization": f"Bearer {api_key}"}
         deadline = asyncio.get_event_loop().time() + _POLL_TIMEOUT
         while True:
-            resp = await http.get(
-                f"{base_url}/api/v1/tasks/{task_id}", headers=poll_headers
-            )
+            resp = await http.get(f"{base_url}/api/v1/tasks/{task_id}", headers=poll_headers)
             if resp.status_code != 200:
-                raise RuntimeError(
-                    f"通义万相轮询失败 status={resp.status_code}"
-                )
+                raise RuntimeError(f"通义万相轮询失败 status={resp.status_code}")
             data = resp.json().get("output") or {}
             status = (data.get("task_status") or "").upper()
             if status == "SUCCEEDED":
@@ -148,9 +218,7 @@ class BailianImageGenProvider:
                 raise RuntimeError(f"通义万相文生图轮询超时 task_id={task_id}")
             await asyncio.sleep(_POLL_INTERVAL)
 
-    async def _download(
-        self, url: str, *, base_url: str
-    ) -> ImageResult:
+    async def _download(self, url: str, *, base_url: str) -> ImageResult:
         """下载图片 URL 字节流。"""
         from app.providers._url_safety import safe_download_bytes
 
@@ -158,9 +226,7 @@ class BailianImageGenProvider:
             url,
             max_bytes=50 * 1024 * 1024,
             timeout=60.0,
-            url_validator=lambda current: self._validate_download_host(
-                current, base_url
-            ),
+            url_validator=lambda current: self._validate_download_host(current, base_url),
         )
         path = urlsplit(url).path.lower()
         mime_type = "image/jpeg" if path.endswith((".jpg", ".jpeg")) else "image/png"

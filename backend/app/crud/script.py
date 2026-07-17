@@ -5,25 +5,41 @@
 - get_breakdown: 返回 {episode, subjects, shots, shot_groups}
 """
 
+import hashlib
+import logging
 from typing import Any, cast
 
 from fastapi import HTTPException
-from sqlalchemy import false, func, select
+from sqlalchemy import delete, false, func, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import ConflictError, ForbiddenError
 from app.core.ids import new_id
+from app.models.asset_entry import AssetEntry
+from app.models.canvas_edge import CanvasEdge
+from app.models.canvas_node import CanvasNode
 from app.models.episode import Episode
+from app.models.generation_job import GenerationJob
+from app.models.materials import Materials
 from app.models.parent_subject import ParentSubject
+from app.models.pipeline_job import PipelineJob
+from app.models.pipeline_stage import PipelineStage
 from app.models.project_member import ProjectMember
 from app.models.scene import Scene
 from app.models.script import Script
 from app.models.shot import Shot
 from app.models.shot_group import ShotGroup
+from app.models.storyboard_job import StoryboardJob
 from app.models.subject import Subject
+from app.models.timeline_render_job import TimelineRenderJob
 from app.models.user import User
+from app.models.video_generation_job import VideoGenerationJob
+from app.models.video_timeline_arrangement import VideoTimelineArrangement
+from app.schemas.script import LifecycleDependencySummary
+
+logger = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------- #
 # 内部辅助
@@ -39,6 +55,17 @@ class NotFoundError(HTTPException):
 
 async def _load_script_or_404(db: AsyncSession, script_id: str) -> Script:
     result = await db.execute(select(Script).where(Script.id == script_id))
+    script = result.scalar_one_or_none()
+    if script is None:
+        raise NotFoundError("剧本不存在")
+    return script
+
+
+async def get_script_for_update(db: AsyncSession, script_id: str) -> Script:
+    """锁定剧本父行，使依赖检查与删除不会被并发子资源插入穿透。"""
+    result = await db.execute(
+        select(Script).where(Script.id == script_id).with_for_update()
+    )
     script = result.scalar_one_or_none()
     if script is None:
         raise NotFoundError("剧本不存在")
@@ -114,6 +141,8 @@ async def create_script(
     title: str,
     scope: str,
     user: User,
+    *,
+    commit: bool = True,
 ) -> Script:
     active_org_id = getattr(user, "active_org_id", None)
     if scope == "team" and not active_org_id:
@@ -138,9 +167,399 @@ async def create_script(
                 project_role="owner",
             )
         )
-    await db.commit()
-    await db.refresh(script)
+    if commit:
+        await db.commit()
+        await db.refresh(script)
+    else:
+        await db.flush()
     return script
+
+
+async def rename_script(
+    db: AsyncSession,
+    script: Script,
+    title: str,
+    *,
+    commit: bool = True,
+) -> Script:
+    """重命名剧本，并允许调用方把审计纳入同一事务。"""
+    script.title = title
+    if commit:
+        await db.commit()
+        await db.refresh(script)
+    else:
+        await db.flush()
+    return script
+
+
+async def copy_script(
+    db: AsyncSession,
+    source: Script,
+    user: User,
+    *,
+    title: str | None = None,
+    scope: str | None = None,
+    commit: bool = True,
+) -> Script:
+    """仅复制剧本和分集文本，所有派生任务、媒体与审核资产均不复制。"""
+    target_scope = scope or source.scope
+    suffix = "（副本）"
+    target_title = title or f"{source.title[: 512 - len(suffix)]}{suffix}"
+    target = await create_script(
+        db,
+        target_title,
+        target_scope,
+        user,
+        commit=False,
+    )
+    episodes = await list_episodes(db, source.id)
+    for episode in episodes:
+        db.add(
+            Episode(
+                episode_id=new_id(),
+                script_id=target.id,
+                episode_no=episode.episode_no,
+                title=episode.title,
+                script_text=episode.script_text,
+                schema_version=episode.schema_version,
+                episode_version=1,
+                client_save_seq=0,
+            )
+        )
+    if commit:
+        await db.commit()
+        await db.refresh(target)
+    else:
+        await db.flush()
+    return target
+
+
+async def _count(db: AsyncSession, model: type, *criteria: Any) -> int:
+    result = await db.execute(select(func.count()).select_from(model).where(*criteria))
+    return int(result.scalar_one() or 0)
+
+
+_STORAGE_KEY_FIELDS = {
+    "storage_key",
+    "storagekey",
+    "video_storage_key",
+    "output_storage_key",
+    "last_frame",
+    "first_frame",
+    "reference_frame",
+}
+
+
+def _collect_storage_keys(value: Any, destination: set[str]) -> None:
+    """从任务输出或镜头帧 JSON 中递归提取对象存储键。"""
+    if isinstance(value, dict):
+        for field, item in value.items():
+            normalized_field = str(field).replace("-", "_").lower()
+            if normalized_field in _STORAGE_KEY_FIELDS and isinstance(item, str):
+                destination.add(item)
+            _collect_storage_keys(item, destination)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _collect_storage_keys(item, destination)
+
+
+async def _enqueue_storage_deletes(
+    db: AsyncSession,
+    storage_keys: set[str],
+    *,
+    asset_ids_by_key: dict[str, str] | None = None,
+) -> None:
+    """在业务事务中先阻断关联晋升，再幂等写入物理对象删除任务。"""
+    from app.providers.storage import validate_key_prefix
+    from app.services.media_storage_jobs import cancel_promotes_for_delete, enqueue_delete
+
+    normalized_asset_ids: dict[str, str] = {}
+    for key, asset_id in (asset_ids_by_key or {}).items():
+        try:
+            normalized_asset_ids[validate_key_prefix(key)] = asset_id
+        except ValueError:
+            # 存量非法 key 无法安全交给存储驱动；不应因此阻断业务资源删除。
+            logger.warning("跳过不受支持的存量媒体键 asset_id=%s", asset_id)
+
+    normalized_keys: set[str] = set()
+    for raw_key in storage_keys:
+        try:
+            normalized_keys.add(validate_key_prefix(raw_key))
+        except ValueError:
+            logger.warning("跳过不受支持的存量媒体键")
+
+    promote_keys = await cancel_promotes_for_delete(
+        db,
+        asset_ids=set((asset_ids_by_key or {}).values()),
+        final_keys=normalized_keys,
+    )
+    for raw_key in promote_keys:
+        try:
+            normalized_keys.add(validate_key_prefix(raw_key))
+        except ValueError:
+            logger.warning("跳过不受支持的晋升任务媒体键")
+
+    for key in sorted(normalized_keys):
+        digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+        await enqueue_delete(
+            db,
+            idempotency_key=f"lifecycle-delete:{digest}",
+            source_key=key,
+            asset_id=normalized_asset_ids.get(key),
+        )
+
+
+async def _collect_script_storage_keys(
+    db: AsyncSession,
+    script_id: str,
+) -> tuple[set[str], dict[str, str]]:
+    """收集删除整个剧本时归属于该剧本的全部已知媒体对象。"""
+    keys: set[str] = set()
+    asset_ids_by_key: dict[str, str] = {}
+
+    asset_rows = (
+        await db.execute(
+            select(AssetEntry.id, AssetEntry.storage_key).where(
+                AssetEntry.script_id == script_id
+            )
+        )
+    ).all()
+    for asset_id, storage_key in asset_rows:
+        if storage_key:
+            keys.add(storage_key)
+            asset_ids_by_key[storage_key] = asset_id
+
+    episode_keys = (
+        await db.execute(
+            select(Episode.script_file_storage_key).where(Episode.script_id == script_id)
+        )
+    ).scalars().all()
+    keys.update(key for key in episode_keys if key)
+
+    for model, field in (
+        (GenerationJob, GenerationJob.output_json),
+        (VideoGenerationJob, VideoGenerationJob.output_json),
+        (TimelineRenderJob, TimelineRenderJob.output_json),
+    ):
+        values = (
+            await db.execute(select(field).where(model.script_id == script_id))
+        ).scalars().all()
+        for value in values:
+            _collect_storage_keys(value, keys)
+
+    material_ids = select(Materials.id).where(Materials.script_id == script_id)
+    canvas_values = (
+        await db.execute(
+            select(CanvasNode.data).where(CanvasNode.material_id.in_(material_ids))
+        )
+    ).scalars().all()
+    for value in canvas_values:
+        _collect_storage_keys(value, keys)
+
+    render_keys = (
+        await db.execute(
+            select(TimelineRenderJob.output_storage_key).where(
+                TimelineRenderJob.script_id == script_id
+            )
+        )
+    ).scalars().all()
+    keys.update(key for key in render_keys if key)
+
+    frame_values = (
+        await db.execute(
+            select(ShotGroup.reference_frames).where(ShotGroup.script_id == script_id)
+        )
+    ).scalars().all()
+    for value in frame_values:
+        _collect_storage_keys(value, keys)
+    return keys, asset_ids_by_key
+
+
+async def _collect_episode_storage_keys(
+    db: AsyncSession,
+    *,
+    script_id: str,
+    episode_id: str,
+    deleted_subject_ids: set[str],
+) -> tuple[set[str], dict[str, str]]:
+    """收集删除单集时会失去业务引用的媒体对象。"""
+    keys: set[str] = set()
+    asset_ids_by_key: dict[str, str] = {}
+
+    if deleted_subject_ids:
+        asset_rows = (
+            await db.execute(
+                select(AssetEntry.id, AssetEntry.storage_key).where(
+                    AssetEntry.script_id == script_id,
+                    AssetEntry.subject_id.in_(deleted_subject_ids),
+                )
+            )
+        ).all()
+        for asset_id, storage_key in asset_rows:
+            if storage_key:
+                keys.add(storage_key)
+                asset_ids_by_key[storage_key] = asset_id
+
+    episode_key = (
+        await db.execute(
+            select(Episode.script_file_storage_key).where(
+                Episode.script_id == script_id,
+                Episode.episode_id == episode_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if episode_key:
+        keys.add(episode_key)
+
+    for model, field in (
+        (GenerationJob, GenerationJob.output_json),
+        (VideoGenerationJob, VideoGenerationJob.output_json),
+        (TimelineRenderJob, TimelineRenderJob.output_json),
+    ):
+        values = (
+            await db.execute(select(field).where(model.episode_id == episode_id))
+        ).scalars().all()
+        for value in values:
+            _collect_storage_keys(value, keys)
+
+    render_keys = (
+        await db.execute(
+            select(TimelineRenderJob.output_storage_key).where(
+                TimelineRenderJob.episode_id == episode_id
+            )
+        )
+    ).scalars().all()
+    keys.update(key for key in render_keys if key)
+
+    frame_values = (
+        await db.execute(
+            select(ShotGroup.reference_frames).where(
+                ShotGroup.episode_id == episode_id
+            )
+        )
+    ).scalars().all()
+    for value in frame_values:
+        _collect_storage_keys(value, keys)
+    return keys, asset_ids_by_key
+
+
+async def get_script_dependency_summary(
+    db: AsyncSession, script_id: str
+) -> LifecycleDependencySummary:
+    """汇总硬删除剧本会清理的派生资源。"""
+    shot_group_ids = select(ShotGroup.shot_group_id).where(ShotGroup.script_id == script_id)
+    job_count = sum(
+        (
+            await _count(db, PipelineJob, PipelineJob.script_id == script_id),
+            await _count(db, StoryboardJob, StoryboardJob.script_id == script_id),
+            await _count(db, GenerationJob, GenerationJob.script_id == script_id),
+            await _count(db, TimelineRenderJob, TimelineRenderJob.script_id == script_id),
+        )
+    )
+    active_job_count = sum(
+        (
+            await _count(
+                db,
+                PipelineJob,
+                PipelineJob.script_id == script_id,
+                PipelineJob.status.in_(["pending", "ready", "retry", "running"]),
+            ),
+            await _count(
+                db,
+                StoryboardJob,
+                StoryboardJob.script_id == script_id,
+                StoryboardJob.status.in_(["pending", "ready", "retry", "running"]),
+            ),
+            await _count(
+                db,
+                GenerationJob,
+                GenerationJob.script_id == script_id,
+                GenerationJob.status.in_(["pending", "ready", "retry", "starting", "processing"]),
+            ),
+            await _count(
+                db,
+                VideoGenerationJob,
+                VideoGenerationJob.script_id == script_id,
+                VideoGenerationJob.status.in_(["pending", "ready", "retry", "starting", "processing"]),
+            ),
+            await _count(
+                db,
+                TimelineRenderJob,
+                TimelineRenderJob.script_id == script_id,
+                TimelineRenderJob.status.in_(["pending", "ready", "retry", "starting", "processing"]),
+            ),
+        )
+    )
+    return LifecycleDependencySummary(
+        episode_count=await _count(db, Episode, Episode.script_id == script_id),
+        subject_count=await _count(db, Subject, Subject.script_id == script_id),
+        asset_count=await _count(db, AssetEntry, AssetEntry.script_id == script_id),
+        shot_group_count=await _count(db, ShotGroup, ShotGroup.script_id == script_id),
+        shot_count=await _count(db, Shot, Shot.shot_group_id.in_(shot_group_ids)),
+        video_count=await _count(
+            db, VideoGenerationJob, VideoGenerationJob.script_id == script_id
+        ),
+        job_count=job_count,
+        active_job_count=active_job_count,
+        canvas_count=await _count(db, Materials, Materials.script_id == script_id),
+    )
+
+
+async def delete_script(db: AsyncSession, script: Script, *, commit: bool = True) -> None:
+    """按外键拓扑硬删除剧本及派生数据。"""
+    script_id = script.id
+    material_ids = select(Materials.id).where(Materials.script_id == script_id)
+    subject_ids = select(Subject.id).where(Subject.script_id == script_id)
+    asset_ids = select(AssetEntry.id).where(AssetEntry.script_id == script_id)
+    shot_group_ids = select(ShotGroup.shot_group_id).where(ShotGroup.script_id == script_id)
+
+    storage_keys, asset_ids_by_key = await _collect_script_storage_keys(db, script_id)
+    await _enqueue_storage_deletes(
+        db,
+        storage_keys,
+        asset_ids_by_key=asset_ids_by_key,
+    )
+
+    # 先断开 Subject.image_entry_id 与资产版本自引用，再删除叶子资源。
+    await db.execute(
+        update(Subject).where(Subject.script_id == script_id).values(image_entry_id=None)
+    )
+    await db.execute(
+        update(AssetEntry)
+        .where(AssetEntry.superseded_by_id.in_(asset_ids))
+        .values(status="deleted", is_approved=False, superseded=False, superseded_by_id=None)
+    )
+    for model, criterion in (
+        (VideoTimelineArrangement, VideoTimelineArrangement.script_id == script_id),
+        (TimelineRenderJob, TimelineRenderJob.script_id == script_id),
+        (VideoGenerationJob, VideoGenerationJob.script_id == script_id),
+        (StoryboardJob, StoryboardJob.script_id == script_id),
+        (GenerationJob, GenerationJob.script_id == script_id),
+        (Shot, Shot.shot_group_id.in_(shot_group_ids)),
+        (ShotGroup, ShotGroup.script_id == script_id),
+        (
+            Scene,
+            Scene.episode_id.in_(
+                select(Episode.episode_id).where(Episode.script_id == script_id)
+            ),
+        ),
+        (PipelineJob, PipelineJob.script_id == script_id),
+        (PipelineStage, PipelineStage.script_id == script_id),
+        (CanvasEdge, CanvasEdge.material_id.in_(material_ids)),
+        (CanvasNode, CanvasNode.material_id.in_(material_ids)),
+        (AssetEntry, AssetEntry.script_id == script_id),
+        (Subject, Subject.id.in_(subject_ids)),
+        (ParentSubject, ParentSubject.script_id == script_id),
+        (Materials, Materials.script_id == script_id),
+        (ProjectMember, ProjectMember.script_id == script_id),
+        (Episode, Episode.script_id == script_id),
+    ):
+        await db.execute(delete(model).where(criterion))
+    await db.execute(delete(Script).where(Script.id == script_id))
+    if commit:
+        await db.commit()
+    else:
+        await db.flush()
 
 
 # --------------------------------------------------------------------------- #
@@ -159,6 +578,25 @@ async def get_episode(
     db: AsyncSession, script_id: str, episode_id: str
 ) -> Episode:
     return await _load_episode_for_script(db, script_id, episode_id)
+
+
+async def get_episode_for_update(
+    db: AsyncSession, script_id: str, episode_id: str
+) -> Episode:
+    """在剧本父行之后锁定分集，串行化依赖检查、任务创建与删除。"""
+    result = await db.execute(
+        select(Episode)
+        .where(
+            Episode.episode_id == episode_id,
+            Episode.script_id == script_id,
+        )
+        .with_for_update()
+    )
+    episode = result.scalar_one_or_none()
+    if episode is None:
+        # 保留跨剧本资源使用 403 的既有 IDOR 契约。
+        return await _load_episode_for_script(db, script_id, episode_id)
+    return episode
 
 
 async def _load_episode_for_script(
@@ -220,6 +658,7 @@ async def save_episode(
     episode_version: int,
     client_save_seq: int,
     title: str | None = None,
+    episode_no: int | None = None,
     *,
     commit: bool = True,
 ) -> Episode:
@@ -231,8 +670,6 @@ async def save_episode(
     await _load_episode_for_script(db, script_id, episode_id)
 
     # 原子更新，避免并发覆盖
-    from sqlalchemy import update
-
     values: dict = {
         "episode_version": episode_version + 1,
         "client_save_seq": client_save_seq + 1,
@@ -241,6 +678,8 @@ async def save_episode(
         values["script_text"] = script_text
     if title is not None:
         values["title"] = title
+    if episode_no is not None:
+        values["episode_no"] = episode_no
 
     stmt = (
         update(Episode)
@@ -252,7 +691,10 @@ async def save_episode(
         )
         .values(**values)
     )
-    result = cast(CursorResult[Any], await db.execute(stmt))
+    try:
+        result = cast(CursorResult[Any], await db.execute(stmt))
+    except IntegrityError as exc:
+        raise ConflictError(f"集号已存在: {episode_no}") from exc
     if result.rowcount == 0:
         await _load_episode_for_script(db, script_id, episode_id)
         raise ConflictError("版本冲突，请刷新后重试")
@@ -262,6 +704,160 @@ async def save_episode(
         await db.flush()
     # 重新加载以拿到递增后的版本号
     episode = await get_episode(db, script_id, episode_id)
+    return episode
+
+
+async def get_episode_dependency_summary(
+    db: AsyncSession, script_id: str, episode_id: str
+) -> LifecycleDependencySummary:
+    """返回分集关联的主体、镜头、资产、视频与任务数量。"""
+    episode = await _load_episode_for_script(db, script_id, episode_id)
+    subjects = list(
+        (
+            await db.execute(select(Subject).where(Subject.script_id == script_id))
+        ).scalars().all()
+    )
+    related_subject_ids = [
+        subject.id
+        for subject in subjects
+        if episode.episode_no in (subject.episode_nos or [])
+    ]
+    shot_group_ids = select(ShotGroup.shot_group_id).where(
+        ShotGroup.episode_id == episode_id
+    )
+    job_count = sum(
+        (
+            await _count(db, PipelineJob, PipelineJob.episode_id == episode_id),
+            await _count(db, StoryboardJob, StoryboardJob.episode_id == episode_id),
+            await _count(db, GenerationJob, GenerationJob.episode_id == episode_id),
+            await _count(db, TimelineRenderJob, TimelineRenderJob.episode_id == episode_id),
+        )
+    )
+    active_job_count = sum(
+        (
+            await _count(
+                db,
+                PipelineJob,
+                PipelineJob.episode_id == episode_id,
+                PipelineJob.status.in_(["pending", "ready", "retry", "running"]),
+            ),
+            await _count(
+                db,
+                StoryboardJob,
+                StoryboardJob.episode_id == episode_id,
+                StoryboardJob.status.in_(["pending", "ready", "retry", "running"]),
+            ),
+            await _count(
+                db,
+                GenerationJob,
+                GenerationJob.episode_id == episode_id,
+                GenerationJob.status.in_(["pending", "ready", "retry", "starting", "processing"]),
+            ),
+            await _count(
+                db,
+                VideoGenerationJob,
+                VideoGenerationJob.episode_id == episode_id,
+                VideoGenerationJob.status.in_(["pending", "ready", "retry", "starting", "processing"]),
+            ),
+            await _count(
+                db,
+                TimelineRenderJob,
+                TimelineRenderJob.episode_id == episode_id,
+                TimelineRenderJob.status.in_(["pending", "ready", "retry", "starting", "processing"]),
+            ),
+        )
+    )
+    return LifecycleDependencySummary(
+        subject_count=len(related_subject_ids),
+        asset_count=(
+            await _count(db, AssetEntry, AssetEntry.subject_id.in_(related_subject_ids))
+            if related_subject_ids
+            else 0
+        ),
+        shot_group_count=await _count(
+            db, ShotGroup, ShotGroup.episode_id == episode_id
+        ),
+        shot_count=await _count(db, Shot, Shot.shot_group_id.in_(shot_group_ids)),
+        video_count=await _count(
+            db, VideoGenerationJob, VideoGenerationJob.episode_id == episode_id
+        ),
+        job_count=job_count,
+        active_job_count=active_job_count,
+    )
+
+
+async def delete_episode(
+    db: AsyncSession,
+    script_id: str,
+    episode_id: str,
+    *,
+    commit: bool = True,
+) -> Episode:
+    """删除分集派生数据；共享主体仅移除该集号，单集主体及其资产一并删除。"""
+    from app.crud import asset as asset_crud
+
+    episode = await _load_episode_for_script(db, script_id, episode_id)
+    subjects = list(
+        (
+            await db.execute(select(Subject).where(Subject.script_id == script_id))
+        ).scalars().all()
+    )
+    related = [s for s in subjects if episode.episode_no in (s.episode_nos or [])]
+    deleted_subject_ids = {
+        subject.id
+        for subject in related
+        if not [
+            no
+            for no in (subject.episode_nos or [])
+            if no != episode.episode_no
+        ]
+    }
+    shot_group_ids = select(ShotGroup.shot_group_id).where(
+        ShotGroup.episode_id == episode_id
+    )
+
+    storage_keys, asset_ids_by_key = await _collect_episode_storage_keys(
+        db,
+        script_id=script_id,
+        episode_id=episode_id,
+        deleted_subject_ids=deleted_subject_ids,
+    )
+    await _enqueue_storage_deletes(
+        db,
+        storage_keys,
+        asset_ids_by_key=asset_ids_by_key,
+    )
+
+    for model, criterion in (
+        (VideoTimelineArrangement, VideoTimelineArrangement.episode_id == episode_id),
+        (TimelineRenderJob, TimelineRenderJob.episode_id == episode_id),
+        (VideoGenerationJob, VideoGenerationJob.episode_id == episode_id),
+        (StoryboardJob, StoryboardJob.episode_id == episode_id),
+        (GenerationJob, GenerationJob.episode_id == episode_id),
+        (Shot, Shot.shot_group_id.in_(shot_group_ids)),
+        (ShotGroup, ShotGroup.episode_id == episode_id),
+        (Scene, Scene.episode_id == episode_id),
+        (PipelineJob, PipelineJob.episode_id == episode_id),
+    ):
+        await db.execute(delete(model).where(criterion))
+
+    # 只有该分集引用的主体可安全删除；跨集主体保留资产，仅移除当前集号。
+    for subject in related:
+        remaining = [no for no in (subject.episode_nos or []) if no != episode.episode_no]
+        if remaining:
+            subject.episode_nos = remaining
+        else:
+            # 防御性清理没有 episode_id 的遗留图片任务。
+            await db.execute(
+                delete(GenerationJob).where(GenerationJob.subject_id == subject.id)
+            )
+            await asset_crud.delete_subject(db, subject)
+
+    await db.execute(delete(Episode).where(Episode.episode_id == episode_id))
+    if commit:
+        await db.commit()
+    else:
+        await db.flush()
     return episode
 
 

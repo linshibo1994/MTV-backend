@@ -3,6 +3,7 @@
 端点清单:
   GET    /scripts/{script_id}/asset/entries                        资产条目（列表页取计数）
   GET    /scripts/{script_id}/asset-library/subjects               主体列表
+  POST   /scripts/{script_id}/asset-library/subjects               手动新增主体
   GET    /scripts/{script_id}/asset-library/parent-subjects       父主体列表
   PATCH  /scripts/{script_id}/asset-library/subjects/{sid}        编辑主体
   DELETE /scripts/{script_id}/asset-library/subjects/{sid}        删除主体
@@ -14,6 +15,8 @@
 
 prefix 由 Phase C 统一挂载（/v3api），本文件 router 不设 prefix。
 """
+
+from typing import Literal
 
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -34,11 +37,16 @@ from app.schemas.asset import (
     ImpactSummaryOut,
     ParentSubjectListOut,
     SubjectAssetOut,
+    SubjectChangeSuggestionListOut,
+    SubjectChangeSuggestionOut,
+    SubjectCreateIn,
     SubjectListOut,
+    SubjectSuggestionResolveIn,
     SubjectUpdateIn,
 )
 from app.services import review as review_service
 from app.services.audit import best_effort_log as audit_log
+from app.services.audit import log as strict_audit_log
 
 router = APIRouter()
 
@@ -121,6 +129,54 @@ async def list_subjects(
     )
 
 
+@router.post(
+    "/scripts/{script_id}/asset-library/subjects",
+    response_model=SubjectAssetOut,
+    status_code=201,
+)
+async def create_subject(
+    script_id: str,
+    payload: SubjectCreateIn,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> SubjectAssetOut:
+    """手动新增角色、场景、道具或声音主体。"""
+    await _load_script_or_403(db, script_id, user, action=Action.EDIT)
+    subject = await asset_crud.create_subject(
+        db,
+        script_id=script_id,
+        subject_type=payload.type,
+        name=payload.name,
+        description=payload.description,
+        episode_nos=[int(episode_no) for episode_no in payload.episode_nos],
+    )
+    # 主体与审计共用同一事务：审计失败时请求依赖统一 rollback，不能留下无审计主体。
+    await strict_audit_log(
+        db,
+        actor=user,
+        action="subject_create",
+        resource_type="subject",
+        resource_id=subject.id,
+        before=None,
+        after={
+            "script_id": script_id,
+            "type": subject.type,
+            "name": subject.name,
+            "description": subject.description,
+            "episode_nos": list(subject.episode_nos or []),
+            "review_status": subject.review_status,
+        },
+    )
+    await db.commit()
+
+    fresh = await asset_crud.get_subject(db, subject.id)
+    target = fresh if fresh is not None else subject
+    return asset_crud.serialize_subject(
+        target,
+        await asset_crud.get_episode_id_map(db, script_id),
+    )
+
+
 @router.get(
     "/scripts/{script_id}/asset-library/parent-subjects",
     response_model=ParentSubjectListOut,
@@ -157,19 +213,127 @@ async def update_subject(
     """编辑主体 — name/description/type/episode_nos。"""
     await _load_script_or_403(db, script_id, user, action=Action.EDIT)
 
-    subject = await _load_subject_for_script(db, script_id, subject_id)
+    subject = await asset_crud.get_subject_for_identity_update(
+        db, script_id, subject_id
+    )
+    if subject is None:
+        raise NotFoundError("主体不存在")
+    if subject.script_id != script_id:
+        raise ForbiddenError("主体不属于当前剧本")
+    before = {
+        "name": subject.name,
+        "description": subject.description,
+        "name_locked": bool(subject.name_locked),
+        "description_locked": bool(subject.description_locked),
+        "subject_version": int(subject.subject_version or 1),
+    }
 
     update_data = payload.model_dump(exclude_none=True)
-    # 资产库用 background，模型约定 scene — 统一转 scene 存储
-    if update_data.get("type") == "background":
-        update_data["type"] = "scene"
-
-    await asset_crud.update_subject(db, subject, update_data)
+    expected_subject_version = update_data.pop("expected_subject_version", None)
+    await asset_crud.update_subject(
+        db,
+        subject,
+        update_data,
+        expected_subject_version=expected_subject_version,
+    )
+    await audit_log(
+        db,
+        actor=user,
+        action="subject_update",
+        resource_type="subject",
+        resource_id=subject_id,
+        before=before,
+        after={
+            "name": subject.name,
+            "description": subject.description,
+            "name_locked": bool(subject.name_locked),
+            "description_locked": bool(subject.description_locked),
+            "subject_version": int(subject.subject_version or 1),
+        },
+    )
     await db.commit()
 
     fresh = await asset_crud.get_subject(db, subject_id)
     target = fresh if fresh is not None else subject
     return asset_crud.serialize_subject(target, await asset_crud.get_episode_id_map(db, script_id))
+
+
+@router.get(
+    "/scripts/{script_id}/asset-library/subjects/{subject_id}/suggestions",
+    response_model=SubjectChangeSuggestionListOut,
+)
+async def list_subject_suggestions(
+    script_id: str,
+    subject_id: str,
+    status: Literal["pending", "accepted", "ignored", "all"] = Query("pending"),
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> SubjectChangeSuggestionListOut:
+    """查询人工锁字段的流水线差异建议。"""
+    await _load_script_or_403(db, script_id, user, action=Action.READ)
+    await _load_subject_for_script(db, script_id, subject_id)
+    items, total = await asset_crud.list_subject_suggestions(
+        db,
+        script_id,
+        subject_id,
+        None if status == "all" else status,
+    )
+    return SubjectChangeSuggestionListOut(
+        items=[SubjectChangeSuggestionOut.model_validate(item) for item in items],
+        total=total,
+    )
+
+
+@router.post(
+    "/scripts/{script_id}/asset-library/subjects/{subject_id}/suggestions/{suggestion_id}/resolve",
+    response_model=SubjectChangeSuggestionOut,
+)
+async def resolve_subject_suggestion(
+    script_id: str,
+    subject_id: str,
+    suggestion_id: str,
+    payload: SubjectSuggestionResolveIn,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> SubjectChangeSuggestionOut:
+    """接受或忽略差异建议；接受使用主体版本栅栏防并发覆盖。"""
+    await _load_script_or_403(db, script_id, user, action=Action.EDIT)
+    subject = await asset_crud.get_subject_for_identity_update(
+        db, script_id, subject_id
+    )
+    if subject is None:
+        raise NotFoundError("主体不存在")
+    if subject.script_id != script_id:
+        raise ForbiddenError("主体不属于当前剧本")
+    before = {
+        "name": subject.name,
+        "description": subject.description,
+        "subject_version": int(subject.subject_version or 1),
+    }
+    suggestion = await asset_crud.resolve_subject_suggestion(
+        db,
+        subject,
+        suggestion_id,
+        action=payload.action,
+        expected_subject_version=payload.expected_subject_version,
+        actor_user_id=user.user_id,
+    )
+    await audit_log(
+        db,
+        actor=user,
+        action=f"subject_suggestion_{payload.action}",
+        resource_type="subject_change_suggestion",
+        resource_id=suggestion_id,
+        before={**before, "suggestion_status": "pending"},
+        after={
+            "name": subject.name,
+            "description": subject.description,
+            "subject_version": int(subject.subject_version or 1),
+            "suggestion_status": suggestion.status,
+        },
+    )
+    await db.commit()
+    return SubjectChangeSuggestionOut.model_validate(suggestion)
 
 
 @router.delete(
@@ -184,7 +348,13 @@ async def delete_subject(
     """删除主体 — 连带清理其资产条目。"""
     await _load_script_or_403(db, script_id, user, action=Action.EDIT)
 
-    subject = await _load_subject_for_script(db, script_id, subject_id)
+    subject = await asset_crud.get_subject_for_identity_update(
+        db, script_id, subject_id
+    )
+    if subject is None:
+        raise NotFoundError("主体不存在")
+    if subject.script_id != script_id:
+        raise ForbiddenError("主体不属于当前剧本")
     before = {
         "name": subject.name,
         "type": subject.type,

@@ -13,6 +13,8 @@ from app.api.v1 import (
     credits,
     generation_jobs,
     materials,
+    pipeline_runs,
+    project_members,
     scripts,
     shots,
     timeline,
@@ -35,6 +37,9 @@ api_router.include_router(auth.router, tags=["鉴权"])
 api_router.include_router(credits.router, tags=["积分"])
 # T3 剧本 (router 自带 prefix=/scripts)
 api_router.include_router(scripts.router, tags=["剧本"])
+api_router.include_router(pipeline_runs.router)
+# T3.1 团队项目成员（独立路由，共享剧本资源权限）
+api_router.include_router(project_members.router, tags=["项目成员"])
 # T4 资产库 (router 内部路由含 /scripts/{script_id}/asset-library/* 全路径)
 api_router.include_router(asset_library.router, tags=["资产库"])
 # T5 画布 (router 自带 prefix=/materials)

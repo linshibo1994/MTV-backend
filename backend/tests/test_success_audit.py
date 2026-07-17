@@ -44,6 +44,7 @@ async def test_delete_subject_writes_success_audit(monkeypatch) -> None:
     user = SimpleNamespace(user_id="user-1", username="alice")
     subject = SimpleNamespace(
         id="subject-1",
+        script_id="script-1",
         name="主角",
         type="character",
         review_status="approved",
@@ -52,7 +53,9 @@ async def test_delete_subject_writes_success_audit(monkeypatch) -> None:
     audit = AsyncMock()
     monkeypatch.setattr(asset_library, "_load_script_or_403", AsyncMock())
     monkeypatch.setattr(
-        asset_library, "_load_subject_for_script", AsyncMock(return_value=subject)
+        asset_library.asset_crud,
+        "get_subject_for_identity_update",
+        AsyncMock(return_value=subject),
     )
     monkeypatch.setattr(asset_library.asset_crud, "delete_subject", AsyncMock())
     monkeypatch.setattr(asset_library, "audit_log", audit)

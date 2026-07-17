@@ -8,6 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.ids import new_id
+from app.crud import asset as asset_crud
 from app.crud.script import replace_subjects
 from app.models.subject import Subject
 from app.providers import get_llm_provider
@@ -58,10 +59,34 @@ async def _prepare_staged_subjects(
         .all()
     )
     existing_by_key = {(subject.type, subject.name): subject for subject in existing}
+    existing_by_pipeline_key = {
+        (subject.type, subject.pipeline_name): subject
+        for subject in existing
+        if subject.pipeline_name
+    }
     staged: list[dict] = []
+    matched_ids: set[str] = set()
     for raw in merged_subjects:
         item = dict(raw)
         subject = existing_by_key.get((item["type"], item["name"]))
+        if subject is None:
+            # pipeline_name 是首次流水线识别出的名称，人工改名不会改变它；
+            # 因此同集存在多个同类型锁主体时也无需按集号猜测身份。
+            subject = existing_by_pipeline_key.get((item["type"], item["name"]))
+        if subject is None:
+            # 仅兼容尚未经过新迁移的测试/瞬时对象；生产数据迁移后均有稳定身份。
+            incoming_episodes = set(item.get("episode_nos") or [])
+            locked_candidates = [
+                candidate
+                for candidate in existing
+                if candidate.type == item["type"]
+                and not candidate.pipeline_name
+                and candidate.name_locked
+                and incoming_episodes.intersection(candidate.episode_nos or [])
+                and candidate.id not in matched_ids
+            ]
+            if len(locked_candidates) == 1:
+                subject = locked_candidates[0]
         if subject is None:
             item.update(
                 id=new_id(),
@@ -71,6 +96,29 @@ async def _prepare_staged_subjects(
                 enrich_version=1,
             )
         else:
+            matched_ids.add(subject.id)
+            suggestions: list[dict] = []
+            if subject.name_locked and subject.name != item["name"]:
+                suggestions.append(
+                    {
+                        "field": "name",
+                        "current_value": subject.name,
+                        "suggested_value": item["name"],
+                    }
+                )
+                item["name"] = subject.name
+            if (
+                subject.description_locked
+                and subject.description != item.get("description")
+            ):
+                suggestions.append(
+                    {
+                        "field": "description",
+                        "current_value": subject.description,
+                        "suggested_value": item.get("description"),
+                    }
+                )
+                item["description"] = subject.description
             changed = (
                 subject.description != item.get("description")
                 or bool(subject.is_child) != bool(item.get("is_child", True))
@@ -91,7 +139,32 @@ async def _prepare_staged_subjects(
                     else base_enrich_version
                 ),
             )
+            if suggestions:
+                item["field_suggestions"] = suggestions
         staged.append(item)
+
+    # 匹配歧义时也绝不能让人工锁主体被整体替换逻辑删除。
+    for subject in existing:
+        if subject.id in matched_ids or not (
+            subject.name_locked or subject.description_locked
+        ):
+            continue
+        version = int(subject.subject_version or 1)
+        enrich_version = int(subject.enrich_version or 1)
+        staged.append(
+            {
+                "id": subject.id,
+                "name": subject.name,
+                "type": subject.type,
+                "description": subject.description,
+                "is_child": bool(subject.is_child),
+                "episode_nos": list(subject.episode_nos or []),
+                "base_subject_version": version,
+                "base_enrich_version": enrich_version,
+                "subject_version": version,
+                "enrich_version": enrich_version,
+            }
+        )
     return staged
 
 
@@ -178,22 +251,26 @@ async def run_merge(
     ):
         return 0
 
-    staged_subjects: list[dict] | None = None
+    staged_subjects = await _prepare_staged_subjects(db, script_id, merged_subjects)
     if run_id is None:
-        await replace_subjects(db, script_id, merged_subjects)
-    else:
-        staged_subjects = await _prepare_staged_subjects(db, script_id, merged_subjects)
+        await asset_crud.persist_subject_suggestions(
+            db,
+            script_id,
+            staged_subjects,
+            source_run_id=None,
+        )
+        await replace_subjects(db, script_id, staged_subjects)
     await set_stage(
         db,
         script_id,
         "merge",
         status="done",
         detail={
-            "count": len(merged_subjects),
+            "count": len(staged_subjects),
             "input_version": input_version,
             "input_client_save_seq": input_client_save_seq,
         },
     )
-    if staged_subjects is not None:
+    if run_id is not None:
         return {"count": len(staged_subjects), "subjects": staged_subjects}
-    return len(merged_subjects)
+    return len(staged_subjects)

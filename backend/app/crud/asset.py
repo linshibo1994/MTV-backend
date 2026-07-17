@@ -3,12 +3,14 @@
 纯数据访问，不含状态机与并发控制逻辑（见 app.services.review）。
 """
 
-from sqlalchemy import func, select
+from datetime import UTC, datetime
+
+from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.core.errors import ForbiddenError, NotFoundError
+from app.core.errors import BadRequestError, ConflictError, ForbiddenError, NotFoundError
 from app.core.ids import new_id
 from app.models.asset_entry import AssetEntry
 from app.models.episode import Episode
@@ -16,6 +18,7 @@ from app.models.materials import Materials
 from app.models.parent_subject import ParentSubject
 from app.models.script import Script
 from app.models.subject import Subject
+from app.models.subject_change_suggestion import SubjectChangeSuggestion
 from app.schemas.asset import (
     AssetEntryOut,
     CandidateOut,
@@ -115,9 +118,194 @@ async def get_subject_for_update(
     return (await db.execute(q)).scalar_one_or_none()
 
 
-async def update_subject(db: AsyncSession, subject: Subject, data: dict) -> Subject:
-    """部分更新主体字段。"""
-    versioned_fields = {"name", "description", "type", "episode_nos"}
+async def get_subject_for_identity_update(
+    db: AsyncSession,
+    script_id: str,
+    subject_id: str,
+) -> Subject | None:
+    """按 Script→Subject 固定锁序加载身份写入目标，避免并发重名与删除死锁。"""
+    await db.execute(
+        select(Script.id).where(Script.id == script_id).with_for_update()
+    )
+    return await get_subject_for_update(db, subject_id)
+
+
+def _stored_subject_type(subject_type: str) -> str:
+    """将 API 的 background 同义值归一为数据库使用的 scene。"""
+    return "scene" if subject_type in {"scene", "background"} else subject_type
+
+
+async def _validate_subject_episode_nos(
+    db: AsyncSession,
+    *,
+    script_id: str,
+    episode_nos: list[int],
+) -> list[int]:
+    """验证集号均为正整数、唯一且真实属于当前剧本。"""
+    if not episode_nos:
+        raise BadRequestError("主体必须至少属于一个分集")
+    if any(type(episode_no) is not int or episode_no <= 0 for episode_no in episode_nos):
+        raise BadRequestError("所属集号必须为正整数")
+    if len(episode_nos) != len(set(episode_nos)):
+        raise BadRequestError("所属集号不得重复")
+
+    requested_episode_nos = sorted(episode_nos)
+    episode_rows = await db.execute(
+        select(Episode.episode_no).where(
+            Episode.script_id == script_id,
+            Episode.episode_no.in_(requested_episode_nos),
+        )
+    )
+    existing_episode_nos = set(episode_rows.scalars().all())
+    missing_episode_nos = [
+        episode_no
+        for episode_no in requested_episode_nos
+        if episode_no not in existing_episode_nos
+    ]
+    if missing_episode_nos:
+        missing = ", ".join(str(episode_no) for episode_no in missing_episode_nos)
+        raise BadRequestError(f"所属集号不存在: {missing}")
+    return requested_episode_nos
+
+
+async def _ensure_subject_name_type_unique(
+    db: AsyncSession,
+    *,
+    script_id: str,
+    subject_type: str,
+    name: str,
+    pipeline_name: str | None = None,
+    exclude_subject_id: str | None = None,
+) -> None:
+    """校验展示名称与稳定身份在同类主体中均唯一。"""
+    stored_type = _stored_subject_type(subject_type)
+    equivalent_types = {"scene", "background"} if stored_type == "scene" else {stored_type}
+    identity_conditions = [Subject.name == name]
+    if pipeline_name is not None:
+        identity_conditions.append(Subject.pipeline_name == pipeline_name)
+    query = select(Subject.id).where(
+        Subject.script_id == script_id,
+        Subject.type.in_(equivalent_types),
+        or_(*identity_conditions),
+    )
+    if exclude_subject_id is not None:
+        query = query.where(Subject.id != exclude_subject_id)
+    duplicate = (await db.execute(query.limit(1))).scalar_one_or_none()
+    if duplicate is not None:
+        raise ConflictError("同剧本下已存在同名同类主体")
+
+
+async def create_subject(
+    db: AsyncSession,
+    *,
+    script_id: str,
+    subject_type: str,
+    name: str,
+    description: str,
+    episode_nos: list[int],
+) -> Subject:
+    """手动新增主体，并保证同一剧本内的同名同类唯一。
+
+    对剧本行加锁使同一剧本的手动新增串行化；在锁内同时验证分集归属和
+    重复主体，避免两个并发请求同时通过“先查后写”。
+    """
+    await db.execute(
+        select(Script.id).where(Script.id == script_id).with_for_update()
+    )
+
+    requested_episode_nos = await _validate_subject_episode_nos(
+        db,
+        script_id=script_id,
+        episode_nos=episode_nos,
+    )
+    stored_type = _stored_subject_type(subject_type)
+    await _ensure_subject_name_type_unique(
+        db,
+        script_id=script_id,
+        subject_type=stored_type,
+        name=name,
+    )
+
+    subject = Subject(
+        id=new_id(),
+        script_id=script_id,
+        type=stored_type,
+        name=name,
+        pipeline_name=name,
+        description=description,
+        subject_version=1,
+        enrich_version=1,
+        name_locked=True,
+        description_locked=True,
+        is_child=True,
+        is_parent=False,
+        parent_id=None,
+        episode_nos=requested_episode_nos,
+        is_active=True,
+        review_status="not_designed",
+    )
+    db.add(subject)
+    await db.flush()
+    return subject
+
+
+async def update_subject(
+    db: AsyncSession,
+    subject: Subject,
+    data: dict,
+    *,
+    expected_subject_version: int | None = None,
+) -> Subject:
+    """部分更新主体；人工修改名称/描述时默认锁定并递增版本。"""
+    current_version = int(subject.subject_version or 1)
+    if (
+        expected_subject_version is not None
+        and current_version != expected_subject_version
+    ):
+        raise ConflictError("主体版本已变化，请刷新后重试")
+
+    if "type" in data and data["type"] is not None:
+        data["type"] = _stored_subject_type(data["type"])
+    identity_changed = (
+        "name" in data
+        and data["name"] is not None
+        and data["name"] != subject.name
+    ) or (
+        "type" in data
+        and data["type"] is not None
+        and data["type"] != subject.type
+    )
+    if identity_changed:
+        prospective_name = data.get("name", subject.name)
+        prospective_type = data.get("type", subject.type)
+        await _ensure_subject_name_type_unique(
+            db,
+            script_id=subject.script_id,
+            subject_type=prospective_type,
+            name=prospective_name,
+            pipeline_name=subject.pipeline_name,
+            exclude_subject_id=subject.id,
+        )
+    if "episode_nos" in data and data["episode_nos"] is not None:
+        data["episode_nos"] = await _validate_subject_episode_nos(
+            db,
+            script_id=subject.script_id,
+            episode_nos=data["episode_nos"],
+        )
+
+    if "name" in data and data["name"] != subject.name:
+        data.setdefault("name_locked", True)
+    if "description" in data and data["description"] != subject.description:
+        data.setdefault("description_locked", True)
+
+    versioned_fields = {
+        "name",
+        "description",
+        "type",
+        "episode_nos",
+        "name_locked",
+        "description_locked",
+    }
     should_bump_version = any(
         key in versioned_fields
         and value is not None
@@ -129,9 +317,160 @@ async def update_subject(db: AsyncSession, subject: Subject, data: dict) -> Subj
         if value is not None and hasattr(subject, key):
             setattr(subject, key, value)
     if should_bump_version:
-        subject.subject_version = int(subject.subject_version or 1) + 1
+        subject.subject_version = current_version + 1
     await db.flush()
     return subject
+
+
+async def list_subject_suggestions(
+    db: AsyncSession,
+    script_id: str,
+    subject_id: str,
+    status: str | None = "pending",
+) -> tuple[list[SubjectChangeSuggestion], int]:
+    """列出主体差异建议，默认仅返回待处理项。"""
+    conditions = [
+        SubjectChangeSuggestion.script_id == script_id,
+        SubjectChangeSuggestion.subject_id == subject_id,
+    ]
+    if status is not None:
+        conditions.append(SubjectChangeSuggestion.status == status)
+    result = await db.execute(
+        select(SubjectChangeSuggestion)
+        .where(*conditions)
+        .order_by(SubjectChangeSuggestion.created_at.desc())
+    )
+    items = list(result.scalars().all())
+    return items, len(items)
+
+
+async def persist_subject_suggestions(
+    db: AsyncSession,
+    script_id: str,
+    staged_subjects: list[dict],
+    *,
+    source_run_id: str | None,
+) -> list[SubjectChangeSuggestion]:
+    """幂等保存 merge 暂存结果中的锁字段差异建议。"""
+    created: list[SubjectChangeSuggestion] = []
+    for item in staged_subjects:
+        subject_id = item.get("id")
+        target_version = item.get("subject_version")
+        if not isinstance(subject_id, str) or not isinstance(target_version, int):
+            continue
+        for suggestion in item.get("field_suggestions") or []:
+            field = suggestion.get("field")
+            if field not in {"name", "description"}:
+                continue
+            current_value = suggestion.get("current_value")
+            suggested_value = suggestion.get("suggested_value")
+            pending = list(
+                (
+                    await db.execute(
+                        select(SubjectChangeSuggestion).where(
+                            SubjectChangeSuggestion.subject_id == subject_id,
+                            SubjectChangeSuggestion.field == field,
+                            SubjectChangeSuggestion.status == "pending",
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            duplicate = next(
+                (
+                    row
+                    for row in pending
+                    if row.base_subject_version == target_version
+                ),
+                None,
+            )
+            if duplicate is not None:
+                continue
+            resolved_at = datetime.now(UTC)
+            for stale in pending:
+                stale.status = "ignored"
+                stale.resolved_at = resolved_at
+            if pending:
+                # 先释放部分唯一索引中的旧 pending 槽位，再插入新版本建议。
+                await db.flush()
+            row = SubjectChangeSuggestion(
+                id=new_id(),
+                script_id=script_id,
+                subject_id=subject_id,
+                field=field,
+                current_value=current_value,
+                suggested_value=suggested_value,
+                base_subject_version=target_version,
+                source_run_id=source_run_id,
+                status="pending",
+            )
+            db.add(row)
+            created.append(row)
+    await db.flush()
+    return created
+
+
+async def resolve_subject_suggestion(
+    db: AsyncSession,
+    subject: Subject,
+    suggestion_id: str,
+    *,
+    action: str,
+    expected_subject_version: int,
+    actor_user_id: str,
+) -> SubjectChangeSuggestion:
+    """行锁串行化接受/忽略，接受时以主体版本栅栏防止覆盖新人工值。"""
+    result = await db.execute(
+        select(SubjectChangeSuggestion)
+        .where(SubjectChangeSuggestion.id == suggestion_id)
+        .with_for_update()
+    )
+    suggestion = result.scalar_one_or_none()
+    if suggestion is None:
+        raise NotFoundError("差异建议不存在")
+    if (
+        suggestion.script_id != subject.script_id
+        or suggestion.subject_id != subject.id
+    ):
+        raise ForbiddenError("差异建议不属于当前主体")
+    if suggestion.status != "pending":
+        raise ConflictError("差异建议已处理")
+
+    current_version = int(subject.subject_version or 1)
+    if current_version != expected_subject_version:
+        raise ConflictError("主体版本已变化，请刷新后重试")
+    if action == "accept":
+        if suggestion.base_subject_version != current_version:
+            raise ConflictError("差异建议已过期，请忽略后等待新建议")
+        if suggestion.field == "name":
+            if not suggestion.suggested_value:
+                raise ConflictError("主体名称建议不能为空")
+            await _ensure_subject_name_type_unique(
+                db,
+                script_id=subject.script_id,
+                subject_type=subject.type,
+                name=suggestion.suggested_value,
+                pipeline_name=subject.pipeline_name,
+                exclude_subject_id=subject.id,
+            )
+            subject.name = suggestion.suggested_value
+            subject.name_locked = True
+        elif suggestion.field == "description":
+            subject.description = suggestion.suggested_value
+            subject.description_locked = True
+        else:
+            raise ConflictError("差异建议字段无效")
+        subject.subject_version = current_version + 1
+        suggestion.status = "accepted"
+    elif action == "ignore":
+        suggestion.status = "ignored"
+    else:
+        raise ConflictError("差异建议操作无效")
+    suggestion.resolved_by_user_id = actor_user_id
+    suggestion.resolved_at = datetime.now(UTC)
+    await db.flush()
+    return suggestion
 
 
 async def delete_subject(db: AsyncSession, subject: Subject) -> None:
@@ -462,6 +801,9 @@ def serialize_subject(
         subject_type=norm_type,
         subject_type_label=subject_type_label(norm_type),
         subject_description=subject.description,
+        name_locked=bool(getattr(subject, "name_locked", False)),
+        description_locked=bool(getattr(subject, "description_locked", False)),
+        subject_version=int(getattr(subject, "subject_version", 1) or 1),
         episodes=episodes,
         episode_ids=episode_ids,
         episode_nos=episode_nos,

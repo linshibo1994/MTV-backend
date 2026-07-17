@@ -118,6 +118,60 @@ async def enqueue_delete(
     )
 
 
+async def cancel_promotes_for_delete(
+    db,
+    *,
+    asset_ids: set[str],
+    final_keys: set[str],
+) -> set[str]:
+    """阻塞等待相关晋升任务结束，并取消仍未执行的任务。
+
+    worker 从领取任务到存储 I/O、状态落库始终持有任务行锁。因此这里使用不带
+    ``SKIP LOCKED`` 的行锁：若晋升已经运行，则等待它完成；若尚未运行，则先取消
+    再安排源对象和目标对象删除，避免删除后又被晋升任务重新写回。
+    """
+    relations = []
+    if asset_ids:
+        relations.append(MediaStorageJob.asset_id.in_(sorted(asset_ids)))
+    if final_keys:
+        relations.append(MediaStorageJob.final_key.in_(sorted(final_keys)))
+    if not relations:
+        return set()
+
+    rows = list(
+        (
+            await db.execute(
+                select(MediaStorageJob)
+                .where(
+                    MediaStorageJob.job_type == "promote",
+                    or_(*relations),
+                )
+                # 故意不按状态过滤：等待运行中行锁后，仍须读取其最新完成态并清理两端键。
+                # 所有删除事务按稳定顺序取锁，降低多个资源批量删除时的死锁风险。
+                .order_by(MediaStorageJob.id.asc())
+                .with_for_update()
+            )
+        )
+        .scalars()
+        .all()
+    )
+    cleanup_keys: set[str] = set()
+    now = _now_like()
+    for row in rows:
+        cleanup_keys.add(row.source_key)
+        if row.final_key:
+            cleanup_keys.add(row.final_key)
+        if row.status not in {"pending", "retry", "running"}:
+            continue
+        row.status = "canceled"
+        row.lease_owner = None
+        row.lease_token = None
+        row.lease_until = None
+        row.completed_at = _now_like(row.created_at) if row.created_at else now
+    await db.flush()
+    return cleanup_keys
+
+
 async def claim_next_job(
     db, *, owner: str, lease_seconds: int = 300
 ) -> MediaStorageJobClaim | None:

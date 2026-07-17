@@ -68,10 +68,13 @@ class Settings(BaseSettings):
     google_image_model: str = "gemini-3.1-flash-image"
     google_video_model: str = "veo-3.1-generate-preview"
 
-    # 字节豆包 Seedance (旧字段)
+    # 字节豆包 Seedance（旧 AK/SK 字段已废弃，代码不再读取，仅保留用于存量 .env 兼容）
     volcengine_access_key: str = ""
     volcengine_secret_key: str = ""
     volcengine_region: str = "cn-north-1"
+    # 火山方舟 Ark 大模型专用 API Key（Bearer Token 鉴权，Seedance 2.0 视频用）
+    volcengine_api_key: str = ""
+    volcengine_ark_base_url: str = "https://ark.cn-beijing.volces.com/api/v3"
     seedance_model: str = "doubao-seedance-2-0-260128"
     video_default_provider: str = "modelsai"
 
@@ -215,9 +218,21 @@ class Settings(BaseSettings):
             if not self.image_gen_model:
                 self.image_gen_model = "wan2.1-t2i-plus"
         video_defaults = {
-            "volcengine": ("", self.seedance_model, ""),
-            "doubao": ("", self.seedance_model, ""),
-            "seedance": ("", self.seedance_model, ""),
+            "volcengine": (
+                self.volcengine_api_key,
+                self.seedance_model,
+                self.volcengine_ark_base_url,
+            ),
+            "doubao": (
+                self.volcengine_api_key,
+                self.seedance_model,
+                self.volcengine_ark_base_url,
+            ),
+            "seedance": (
+                self.volcengine_api_key,
+                self.seedance_model,
+                self.volcengine_ark_base_url,
+            ),
             "bailian": (
                 self.dashscope_api_key,
                 self.dashscope_video_model,

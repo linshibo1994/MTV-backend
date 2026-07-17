@@ -517,6 +517,14 @@ async def finalize_pipeline_jobs(
         await _settle_pipeline(db, script_id, reservation_id, estimated)
 
     # settle、业务发布和 job/stage 终态共用当前事务；任一步失败将整体回滚。
+    from app.crud import asset as asset_crud
+
+    await asset_crud.persist_subject_suggestions(
+        db,
+        script_id,
+        merge_output["subjects"],
+        source_run_id=run_id,
+    )
     await replace_subjects(db, script_id, merge_output["subjects"])
     await replace_parent_subjects(
         db, script_id, parents_output.get("parent_subjects") or []

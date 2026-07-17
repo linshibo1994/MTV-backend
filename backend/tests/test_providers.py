@@ -146,9 +146,7 @@ async def test_openai_compatible_chat_preserves_multi_turn_messages() -> None:
     from app.providers.llm_openai_compat import OpenAICompatLLMProvider
 
     create = AsyncMock(
-        return_value=SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content="最终回答"))]
-        )
+        return_value=SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="最终回答"))])
     )
     provider = OpenAICompatLLMProvider.__new__(OpenAICompatLLMProvider)
     provider._model = "vendor-model"
@@ -186,9 +184,7 @@ async def test_anthropic_chat_moves_system_messages_to_top_level(monkeypatch) ->
     from app.providers.llm_anthropic import AnthropicLLMProvider
 
     provider = AnthropicLLMProvider(api_key="key", model="claude-model")
-    create = AsyncMock(
-        return_value={"content": [{"type": "text", "text": "Claude 回答"}]}
-    )
+    create = AsyncMock(return_value={"content": [{"type": "text", "text": "Claude 回答"}]})
     monkeypatch.setattr(provider, "_create", create)
 
     result = await provider.chat(
@@ -259,6 +255,73 @@ async def test_google_image_provider_uses_capability_key_url_and_model(monkeypat
     assert calls["client"]["api_key"] == "image-key"
     assert calls["client"]["http_options"].base_url == "https://gemini-gateway.example"
     assert calls["generate"]["model"] == "gemini-image-custom"
+
+
+@pytest.mark.asyncio
+async def test_bailian_qwen_image_2_uses_sync_multimodal_api(monkeypatch) -> None:
+    from app.providers import image_gen_bailian
+    from app.providers.image_gen import ImageResult
+    from app.providers.image_gen_bailian import BailianImageGenProvider
+
+    configured = _settings(
+        image_gen_provider="bailian",
+        image_gen_api_key="image-key",
+        image_gen_base_url="https://dashscope.example",
+        image_gen_model="qwen-image-2.0",
+    )
+    monkeypatch.setattr(image_gen_bailian, "settings", configured)
+    calls: dict = {}
+
+    class Response:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {
+                "output": {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": [
+                                    {"text": "已生成"},
+                                    {"image": "https://oss.aliyuncs.com/result.png"},
+                                ]
+                            }
+                        }
+                    ]
+                }
+            }
+
+    class Client:
+        def __init__(self, **kwargs):
+            calls["client"] = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def post(self, url, *, headers, json):
+            calls["post"] = {"url": url, "headers": headers, "json": json}
+            return Response()
+
+    monkeypatch.setattr(image_gen_bailian.httpx, "AsyncClient", Client)
+    provider = BailianImageGenProvider()
+    download = AsyncMock(return_value=ImageResult(data=b"image", mime_type="image/png"))
+    monkeypatch.setattr(provider, "_download", download)
+
+    result = await provider.generate("一只纸飞机", "ignored", "2k", "1:1")
+
+    assert result[0].data == b"image"
+    assert calls["post"]["url"].endswith("/api/v1/services/aigc/multimodal-generation/generation")
+    assert "X-DashScope-Async" not in calls["post"]["headers"]
+    assert calls["post"]["json"]["input"]["messages"][0]["content"] == [{"text": "一只纸飞机"}]
+    assert calls["post"]["json"]["parameters"]["size"] == "1024*1024"
+    download.assert_awaited_once_with(
+        "https://oss.aliyuncs.com/result.png",
+        base_url="https://dashscope.example",
+    )
 
 
 @pytest.mark.asyncio
@@ -363,9 +426,7 @@ async def test_google_video_provider_submits_polls_and_stores(monkeypatch) -> No
     assert calls["generate"]["source"].prompt == "镜头提示词"
     assert calls["generate"]["config"].duration_seconds == 8
     assert calls["generate"]["config"].aspect_ratio == "16:9"
-    storage.put.assert_awaited_once_with(
-        "generate_images/video/job-veo.mp4", b"video-bytes"
-    )
+    storage.put.assert_awaited_once_with("generate_images/video/job-veo.mp4", b"video-bytes")
     assert result.provider_job_id == "operations/veo-1"
     client.aio.aclose.assert_awaited_once()
 
@@ -440,9 +501,7 @@ async def test_google_video_resumes_polls_and_downloads_uri(monkeypatch) -> None
         name="operations/veo-resume",
         done=True,
         error=None,
-        result=SimpleNamespace(
-            generated_videos=[SimpleNamespace(video=video)]
-        ),
+        result=SimpleNamespace(generated_videos=[SimpleNamespace(video=video)]),
         response=None,
     )
     operations = SimpleNamespace(get=AsyncMock(return_value=completed))
@@ -479,9 +538,7 @@ async def test_google_video_resumes_polls_and_downloads_uri(monkeypatch) -> None
 
     operations.get.assert_awaited_once()
     files.download.assert_awaited_once_with(file=video)
-    storage.put.assert_awaited_once_with(
-        "generate_images/video/job-veo-resume.mp4", b"downloaded-video"
-    )
+    storage.put.assert_awaited_once_with("generate_images/video/job-veo-resume.mp4", b"downloaded-video")
     assert result.provider_job_id == "operations/veo-resume"
 
 
@@ -496,7 +553,9 @@ async def test_google_video_operation_error_is_reported() -> None:
     )
     with pytest.raises(RuntimeError, match="Gemini Veo 生成失败"):
         await GoogleVideoGenProvider()._poll(
-            SimpleNamespace(), operation, lambda *_args: None  # type: ignore[arg-type]
+            SimpleNamespace(),
+            operation,
+            lambda *_args: None,  # type: ignore[arg-type]
         )
 
 

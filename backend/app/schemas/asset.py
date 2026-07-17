@@ -4,9 +4,9 @@ background 类型在 schema 层统一 label 为 "场景"（scene 与 background 
 """
 
 from datetime import datetime
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 # ---- 枚举常量 ----
 
@@ -99,6 +99,9 @@ class SubjectAssetOut(BaseModel):
     subject_type: str  # 统一为 background（scene 归一）
     subject_type_label: str  # 中文标签，background -> "场景"
     subject_description: str | None = None
+    name_locked: bool = False
+    description_locked: bool = False
+    subject_version: int = 1
     # 出现的集（契约 02§3.2.3 / 04§1.7 三字段）：
     # episode_nos 为集号(int)，episodes/episode_ids 为兼容层冗余字段(str)。
     episodes: list[str] = Field(default_factory=list)
@@ -135,16 +138,109 @@ class ParentSubjectOut(BaseModel):
 
 # ---- 入参 ----
 
+SubjectEpisodeNo = Annotated[int, Field(strict=True, gt=0)]
+
+
+class SubjectCreateIn(BaseModel):
+    """手动新增主体入参。
+
+    手动主体必须具备可用于后续生成的完整描述，并且至少归属一个已有分集。
+    scene/background 在 API 层均可接受，存储时由 CRUD 统一归一为 scene。
+    """
+
+    type: Literal["character", "background", "scene", "prop", "sound"]
+    name: str = Field(min_length=1, max_length=255)
+    description: str = Field(min_length=1, max_length=10_000)
+    episode_nos: list[SubjectEpisodeNo] = Field(
+        min_length=1,
+        max_length=1_000,
+    )
+
+    @field_validator("name", "description")
+    @classmethod
+    def strip_non_empty_text(cls, value: str) -> str:
+        """去除用户输入的首尾空白，避免产生伪不同名主体。"""
+        value = value.strip()
+        if not value:
+            raise ValueError("不得为空")
+        return value
+
+    @model_validator(mode="after")
+    def episode_numbers_are_unique(self) -> "SubjectCreateIn":
+        """所属集号不允许重复，并固定按集号升序存储。"""
+        if len(self.episode_nos) != len(set(self.episode_nos)):
+            raise ValueError("episode_nos 不得重复")
+        self.episode_nos = sorted(self.episode_nos)
+        return self
+
 
 class SubjectUpdateIn(BaseModel):
-    """编辑主体入参 — name/description/type/episode_nos 均可选。"""
+    """编辑主体入参；人工修改名称/描述时服务端默认锁定对应字段。"""
 
-    name: str | None = None
-    description: str | None = None
+    name: str | None = Field(default=None, min_length=1, max_length=255)
+    description: str | None = Field(default=None, min_length=1, max_length=10_000)
     # character | background | scene | prop | sound（scene 与 background 同义，
     # normalize_subject_type 会将 scene 归一为 background；Literal 拒绝非法枚举值）
     type: Literal["character", "background", "scene", "prop", "sound"] | None = None
-    episode_nos: list[int] | None = None
+    episode_nos: list[SubjectEpisodeNo] | None = Field(
+        default=None,
+        min_length=1,
+        max_length=1_000,
+    )
+    name_locked: bool | None = None
+    description_locked: bool | None = None
+    expected_subject_version: int | None = Field(default=None, ge=1)
+
+    @field_validator("name", "description")
+    @classmethod
+    def strip_optional_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        if not value:
+            raise ValueError("不得为空")
+        return value
+
+    @model_validator(mode="after")
+    def episode_numbers_are_unique(self) -> "SubjectUpdateIn":
+        """PATCH 与 POST 使用相同的正整数、唯一和排序规则。"""
+        if self.episode_nos is None:
+            return self
+        if len(self.episode_nos) != len(set(self.episode_nos)):
+            raise ValueError("episode_nos 不得重复")
+        self.episode_nos = sorted(self.episode_nos)
+        return self
+
+
+class SubjectSuggestionResolveIn(BaseModel):
+    """接受或忽略一条待处理差异建议。"""
+
+    action: Literal["accept", "ignore"]
+    expected_subject_version: int = Field(ge=1)
+
+
+class SubjectChangeSuggestionOut(BaseModel):
+    """流水线对人工锁字段提出的非破坏性差异建议。"""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    suggestion_id: str = Field(validation_alias="id")
+    subject_id: str
+    field: Literal["name", "description"]
+    current_value: str | None = None
+    suggested_value: str | None = None
+    base_subject_version: int
+    source_run_id: str | None = None
+    status: Literal["pending", "accepted", "ignored"]
+    resolved_by_user_id: str | None = None
+    resolved_at: datetime | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class SubjectChangeSuggestionListOut(BaseModel):
+    items: list[SubjectChangeSuggestionOut]
+    total: int
 
 
 class ApproveImageIn(BaseModel):

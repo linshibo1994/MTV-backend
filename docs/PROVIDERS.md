@@ -9,9 +9,9 @@
 | `openai` / `gpt` | 是 | 是 | 是 | 是（兼容保留） | Chat Completions、Images、Videos |
 | `anthropic` / `claude` | 是 | 是 | 否 | 否 | Anthropic Messages |
 | `gemini` / `google` | 是 | 是 | 是 | 适配器预览 | OpenAI 兼容文本、Google GenAI 图片/Veo |
-| `bailian` / `dashscope` | 是 | 是 | 是 | 是 | OpenAI 兼容文本、DashScope 原生异步媒体 API |
+| `bailian` / `dashscope` | 是 | 是 | 是 | 是 | OpenAI 兼容文本、DashScope 原生同步/异步媒体 API |
 | `deepseek` | 是 | 是 | 否 | 否 | OpenAI 兼容 Chat Completions |
-| `volcengine` / `seedance` | 否 | 否 | 否 | 是 | 火山方舟 SDK（AK/SK） |
+| `volcengine` / `seedance` | 否 | 否 | 否 | 是 | 火山方舟 Ark SDK（API Key） |
 | `openai_compatible` / `custom` | 是 | 是 | 否 | 否 | 自定义 OpenAI 兼容端点 |
 
 “Claude Code”是编码 Agent 产品，不是独立模型推理协议。配置 `TEXT_LLM_PROVIDER=anthropic` 或 `CHAT_LLM_PROVIDER=anthropic` 时，后端调用的是 Anthropic 官方 `/v1/messages`。
@@ -103,7 +103,7 @@ TEXT_LLM_MODEL=qwen-plus
 IMAGE_GEN_PROVIDER=bailian
 IMAGE_GEN_BASE_URL=https://dashscope.aliyuncs.com
 IMAGE_GEN_API_KEY=your-key
-IMAGE_GEN_MODEL=wan2.1-t2i-plus
+IMAGE_GEN_MODEL=qwen-image-2.0
 
 VIDEO_GEN_PROVIDER=bailian
 VIDEO_GEN_BASE_URL=https://dashscope.aliyuncs.com
@@ -111,7 +111,19 @@ VIDEO_GEN_API_KEY=your-key
 VIDEO_GEN_MODEL=wan2.7-t2v
 ```
 
-文本/对话走 OpenAI 兼容地址，图片/视频走 DashScope 原生地址，两者不能混用。API Key、WorkspaceId 与 Base URL 必须属于同一地域；北京、新加坡、东京、法兰克福和弗吉尼亚的地址不同。图片与视频结果 URL 有效期短，Provider 会立即下载并写入对象存储。
+文本/对话走 OpenAI 兼容地址，图片/视频走 DashScope 原生地址，两者不能混用。`qwen-image-2.0` 使用同步多模态生成接口；`wan2.1-t2i-*` 等兼容模型继续使用异步文生图任务接口，Provider 会按模型自动选择。`IMAGE_GEN_BASE_URL` 必须填写地域根地址（例如 `https://dashscope.aliyuncs.com`），不要附加 `/api/v1`，否则会与 Provider 路径重复。API Key、WorkspaceId 与 Base URL 必须属于同一地域；北京、新加坡、东京、法兰克福和弗吉尼亚的地址不同。图片与视频结果 URL 有效期短，Provider 会立即下载并写入对象存储。
+
+### 火山方舟 Seedance
+
+```dotenv
+VIDEO_GEN_PROVIDER=volcengine
+VIDEO_PROVIDER_SELECTION_MODE=env
+VIDEO_GEN_BASE_URL=https://ark.cn-beijing.volces.com/api/v3
+VIDEO_GEN_API_KEY=your-ark-api-key
+VIDEO_GEN_MODEL=doubao-seedance-2-0-260128
+```
+
+Seedance 使用火山方舟 Ark API Key 的 Bearer Token 鉴权，不使用云账号 AK/SK。旧 `VOLCENGINE_ACCESS_KEY/VOLCENGINE_SECRET_KEY` 字段仅用于迁移提示，不能完成视频调用。
 
 ### DeepSeek
 

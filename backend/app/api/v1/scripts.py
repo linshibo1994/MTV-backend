@@ -25,8 +25,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth import get_current_user
 from app.core.database import get_db
+from app.core.errors import ConflictError, ForbiddenError
 from app.core.permissions import Action, check_script_access
 from app.crud import script as script_crud
+from app.models.episode import Episode
 from app.models.user import User
 from app.schemas.script import (
     BreakdownOut,
@@ -39,13 +41,18 @@ from app.schemas.script import (
     EpisodeSaveIn,
     ExtractEpisodeStatus,
     ExtractSubjectsStatusOut,
+    LifecycleDeleteOut,
+    LifecycleDependencySummary,
     PipelineStageOut,
     PipelineStatusOut,
+    ScriptCopyIn,
     ScriptCreateIn,
     ScriptListItem,
     ScriptOut,
     ScriptPageOut,
+    ScriptUpdateIn,
 )
+from app.services.audit import best_effort_log as audit_log
 from app.services.pipeline import get_stage
 from app.services.pipeline.orchestrator import get_pipeline_status, trigger_pipeline
 
@@ -129,6 +136,133 @@ async def get_script(
     return ScriptOut.model_validate(script)
 
 
+@router.patch("/{script_id}", response_model=ScriptOut)
+async def rename_script(
+    script_id: str,
+    body: ScriptUpdateIn,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> ScriptOut:
+    """重命名剧本。"""
+    script = await script_crud.get_script(db, script_id)
+    await check_script_access(db, user, script, action=Action.EDIT)
+    before = {"title": script.title}
+    try:
+        await script_crud.rename_script(db, script, body.title, commit=False)
+        await audit_log(
+            db,
+            actor=user,
+            action="script_rename",
+            resource_type="script",
+            resource_id=script_id,
+            before=before,
+            after={"title": body.title},
+        )
+        await db.commit()
+        await db.refresh(script)
+    except Exception:
+        await db.rollback()
+        raise
+    return ScriptOut.model_validate(script)
+
+
+@router.post("/{script_id}/copy", response_model=ScriptOut, status_code=201)
+async def copy_script(
+    script_id: str,
+    body: ScriptCopyIn | None = None,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> ScriptOut:
+    """复制剧本与分集文本；派生任务、媒体和审核资产不会进入副本。"""
+    source = await script_crud.get_script(db, script_id)
+    await check_script_access(db, user, source, action=Action.EDIT)
+    payload = body or ScriptCopyIn()
+    target_scope = payload.scope or source.scope
+    if target_scope != source.scope and source.scope == "team":
+        role = await script_crud.get_project_role(db, source.id, user.user_id)
+        if role not in {"owner", "manager"}:
+            raise ForbiddenError("仅项目所有者或管理员可跨范围复制剧本")
+    try:
+        target = await script_crud.copy_script(
+            db,
+            source,
+            user,
+            title=payload.title,
+            scope=target_scope,
+            commit=False,
+        )
+        await audit_log(
+            db,
+            actor=user,
+            action="script_copy",
+            resource_type="script",
+            resource_id=target.id,
+            before={"source_script_id": source.id},
+            after={"title": target.title, "scope": target.scope},
+        )
+        await db.commit()
+        await db.refresh(target)
+    except Exception:
+        await db.rollback()
+        raise
+    return ScriptOut.model_validate(target)
+
+
+def _dependency_conflict(
+    detail: str, summary: LifecycleDependencySummary
+) -> ConflictError:
+    values = summary.model_dump()
+    counts = "、".join(f"{key}={value}" for key, value in values.items() if value)
+    return ConflictError(f"{detail}（{counts}）；请使用 confirm=true 明确确认")
+
+
+def _reject_active_jobs(summary: LifecycleDependencySummary) -> None:
+    if summary.active_job_count:
+        raise ConflictError(
+            f"仍有 {summary.active_job_count} 个活动、待投递或重试任务，"
+            "请先取消或等待任务进入终态后再删除"
+        )
+
+
+@router.delete("/{script_id}", response_model=LifecycleDeleteOut)
+async def delete_script(
+    script_id: str,
+    confirm: bool = Query(False),
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> LifecycleDeleteOut:
+    """删除剧本；派生资源存在时必须显式确认。"""
+    # FOR UPDATE 父行锁会与并发子资源 FK 插入互斥；锁内重查后再删除，
+    # 避免活动任务在依赖检查与批量删除之间提交。
+    script = await script_crud.get_script_for_update(db, script_id)
+    await check_script_access(db, user, script, action=Action.DELETE)
+    summary = await script_crud.get_script_dependency_summary(db, script_id)
+    _reject_active_jobs(summary)
+    if summary.has_dependencies and not confirm:
+        raise _dependency_conflict("剧本存在依赖资源", summary)
+    before = {
+        "title": script.title,
+        "scope": script.scope,
+        "dependencies": summary.model_dump(),
+    }
+    try:
+        await script_crud.delete_script(db, script, commit=False)
+        await audit_log(
+            db,
+            actor=user,
+            action="script_delete",
+            resource_type="script",
+            resource_id=script_id,
+            before=before,
+            after=None,
+        )
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise
+    return LifecycleDeleteOut(detail="剧本已删除", dependencies=summary)
+
+
 # --------------------------------------------------------------------------- #
 # 分集
 # --------------------------------------------------------------------------- #
@@ -177,8 +311,19 @@ async def save_episode(
     script = await script_crud.get_script(db, script_id)
     await check_script_access(db, user, script, action=Action.EDIT)
 
+    db_get = getattr(db, "get", None)
+    before = await db_get(Episode, episode_id) if db_get is not None else None
+    if before is None or before.script_id != script_id:
+        before = await script_crud.get_episode(db, script_id, episode_id)
+    before_snapshot = {
+        "title": before.title,
+        "episode_no": before.episode_no,
+        "episode_version": before.episode_version,
+        "client_save_seq": getattr(before, "client_save_seq", body.client_save_seq),
+    }
     try:
-        await check_script_access(db, user, script, action=Action.RUN_AI)
+        if body.script_text is not None:
+            await check_script_access(db, user, script, action=Action.RUN_AI)
         episode = await script_crud.save_episode(
             db,
             script_id,
@@ -187,14 +332,76 @@ async def save_episode(
             body.episode_version,
             body.client_save_seq,
             body.title,
+            getattr(body, "episode_no", None),
             commit=False,
         )
-        await trigger_pipeline(db, script_id, episode_id)
+        await audit_log(
+            db,
+            actor=user,
+            action="episode_update",
+            resource_type="episode",
+            resource_id=episode_id,
+            before=before_snapshot,
+            after={
+                "title": episode.title,
+                "episode_no": episode.episode_no,
+                "episode_version": episode.episode_version,
+                "client_save_seq": getattr(
+                    episode, "client_save_seq", body.client_save_seq + 1
+                ),
+            },
+        )
+        if body.script_text is not None:
+            await trigger_pipeline(db, script_id, episode_id)
+        else:
+            await db.commit()
     except Exception:
         await db.rollback()
         raise
 
     return EpisodeListItem.model_validate(episode)
+
+
+@router.delete(
+    "/{script_id}/episodes/{episode_id}", response_model=LifecycleDeleteOut
+)
+async def delete_episode(
+    script_id: str,
+    episode_id: str,
+    confirm: bool = Query(False),
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> LifecycleDeleteOut:
+    """删除分集；返回并审计删除前依赖摘要。"""
+    # 锁序固定为 Script -> Episode，和任务创建的 FK 父行顺序一致。
+    script = await script_crud.get_script_for_update(db, script_id)
+    await check_script_access(db, user, script, action=Action.EDIT)
+    episode = await script_crud.get_episode_for_update(db, script_id, episode_id)
+    summary = await script_crud.get_episode_dependency_summary(db, script_id, episode_id)
+    _reject_active_jobs(summary)
+    if summary.has_dependencies and not confirm:
+        raise _dependency_conflict("分集存在依赖资源", summary)
+    before = {
+        "title": episode.title,
+        "episode_no": episode.episode_no,
+        "dependencies": summary.model_dump(),
+    }
+    try:
+        await script_crud.delete_episode(db, script_id, episode_id, commit=False)
+        await audit_log(
+            db,
+            actor=user,
+            action="episode_delete",
+            resource_type="episode",
+            resource_id=episode_id,
+            before=before,
+            after=None,
+        )
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise
+    return LifecycleDeleteOut(detail="分集已删除", dependencies=summary)
 
 
 @router.get(
