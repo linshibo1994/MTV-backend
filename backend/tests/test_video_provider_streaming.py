@@ -1257,6 +1257,7 @@ async def test_volcengine_close_compatibility_hook_stays_inside_managed_deadline
     "url",
     [
         "https://ark-content-generation-cn-beijing.tos-cn-beijing.volces.com/model/video.mp4",
+        "https://ark-acg-cn-beijing.tos-cn-beijing.volces.com/model/video.mp4",
         "https://ark-content-generation-ap-southeast-1.tos-ap-southeast-1.volces.com/video.mp4",
         "https://ark-content-generation-cn-beijing.tos-cn-beijing.volces.com:443/video.mp4",
         "https://ark.cn-beijing.volces.com/api/v3/video.mp4",
@@ -1277,6 +1278,7 @@ def test_volcengine_download_host_allows_official_ark_origins(url: str) -> None:
         "https://ark-content-generation-cn-beijing.tos-cn-beijing.volces.com:8443/video.mp4",
         "https://ark-content-generation-cn-beijing.tos-cn-beijing.volces.com.evil.test/video.mp4",
         "https://ark-content-generation-cn-beijing.tos-ap-southeast-1.volces.com/video.mp4",
+        "https://ark-acg-cn-beijing.tos-ap-southeast-1.volces.com/video.mp4",
         "https://ark-content-generation-cn-beijing.tos-cn-beijing.volces.com:bad/video.mp4",
     ],
 )

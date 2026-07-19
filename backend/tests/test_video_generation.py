@@ -3852,6 +3852,7 @@ def test_video_service_persists_gemini_aliases_as_canonical_provider(
             video_provider_selection_mode="env",
             video_gen_provider=alias,
             video_gen_api_key="test-video-key",
+            video_gen_model="",
             google_video_model="veo-google-test",
         )
         monkeypatch.setattr(api, "settings", configured, raising=False)
@@ -3936,6 +3937,7 @@ def test_gemini_service_job_routes_through_google_worker_factory(monkeypatch) ->
             video_provider_selection_mode="env",
             video_gen_provider="veo",
             video_gen_api_key="test-video-key",
+            video_gen_model="",
             google_video_model="veo-google-test",
         )
         monkeypatch.setattr(video_generation, "settings", configured)

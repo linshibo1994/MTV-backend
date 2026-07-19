@@ -1,5 +1,7 @@
 import asyncio
 import io
+import os
+import secrets
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
@@ -16,6 +18,7 @@ from sqlalchemy import (
     update,
 )
 from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import Session
 
@@ -372,6 +375,31 @@ def test_generation_rejects_too_long_idempotency_key():
         generation_service._normalize_idempotency_key("x" * 129)
 
 
+@pytest.mark.parametrize(
+    ("job_ids", "loaded_job_ids"),
+    [
+        pytest.param(["job-1"], [], id="empty-single-reload"),
+        pytest.param(["job-1", "job-2"], ["job-1"], id="partial-batch-reload"),
+    ],
+)
+def test_load_batch_jobs_rejects_incomplete_reload(job_ids, loaded_job_ids):
+    async def scenario() -> None:
+        loaded = [SimpleNamespace(job_id=job_id) for job_id in loaded_job_ids]
+
+        async def execute(_statement):
+            return SimpleNamespace(
+                scalars=lambda: SimpleNamespace(all=lambda: loaded),
+            )
+
+        with pytest.raises(RuntimeError, match="generation job reload is incomplete"):
+            await generation_service._load_batch_jobs(
+                SimpleNamespace(execute=execute),
+                job_ids,
+            )
+
+    asyncio.run(scenario())
+
+
 def test_create_generation_job_requires_server_prompt_and_idempotent_outbox(monkeypatch):
     async def scenario() -> None:
         _, raw = _make_db()
@@ -721,6 +749,159 @@ def test_single_idempotency_unique_conflict_uses_savepoint_not_outer_rollback(mo
         assert raw.get(User, seeded.user.user_id).username == "alice-renamed"
 
     asyncio.run(scenario())
+
+
+@pytest.mark.skipif(
+    not os.getenv("MTV_TEST_POSTGRES_URL"),
+    reason="未提供 MTV_TEST_POSTGRES_URL，跳过 expire_on_commit PostgreSQL 回归",
+)
+async def test_generation_returns_loaded_jobs_with_expire_on_commit(monkeypatch) -> None:
+    database_url = os.environ["MTV_TEST_POSTGRES_URL"]
+    if database_url.startswith("postgresql://"):
+        database_url = database_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+    engine = create_async_engine(database_url)
+    connection = await engine.connect()
+    transaction = await connection.begin()
+    session_factory = async_sessionmaker(
+        connection,
+        expire_on_commit=True,
+        join_transaction_mode="create_savepoint",
+    )
+    suffix = secrets.token_hex(4)
+    user_id = f"user-expire-{suffix}"
+    script_id = f"script-expire-{suffix}"
+    material_id = f"material-expire-{suffix}"
+    subject_id = f"subject-expire-{suffix}"
+    raced_job_id = f"job-raced-{suffix}"
+    user = SimpleNamespace(user_id=user_id)
+    payload = CreateJobIn(
+        material_id=material_id,
+        subject_id=subject_id,
+        count=1,
+    )
+
+    async def load_material_script(*args, **kwargs):
+        return SimpleNamespace(id=material_id), SimpleNamespace(id=script_id)
+
+    async def load_credit_account(*args, **kwargs):
+        return SimpleNamespace(id=f"account-{suffix}")
+
+    async def subject_snapshot(*args, **kwargs):
+        return None, 1, None, {}
+
+    async def resolved_prompt(*args, **kwargs):
+        return _twelve_sections()
+
+    async def reserve_without_persistence(*args, **kwargs):
+        return f"reservation-{kwargs['source_id']}"
+
+    monkeypatch.setattr(generation_service, "_load_material_script", load_material_script)
+    monkeypatch.setattr(generation_service, "_load_credit_account", load_credit_account)
+    monkeypatch.setattr(generation_service, "_subject_episode_snapshot", subject_snapshot)
+    monkeypatch.setattr(generation_service, "_load_server_resolved_prompt", resolved_prompt)
+    monkeypatch.setattr(generation_service, "reserve", reserve_without_persistence)
+
+    try:
+        async with session_factory() as db:
+            db.add_all(
+                [
+                    User(
+                        user_id=user_id,
+                        username=f"expire-{suffix}",
+                        password_hash="hash",
+                        enabled=True,
+                        account_type="personal",
+                    ),
+                    Script(
+                        id=script_id,
+                        title="expire_on_commit 回归",
+                        scope="personal",
+                        owner_user_id=user_id,
+                        created_by_user_id=user_id,
+                    ),
+                    Materials(id=material_id, name="画布", script_id=script_id),
+                    Subject(
+                        id=subject_id,
+                        script_id=script_id,
+                        type="character",
+                        name="主角",
+                        description="原始主体描述",
+                        episode_nos=[1],
+                        review_status="not_designed",
+                    ),
+                ]
+            )
+            await db.commit()
+
+            single = await generation_service.create_generation_job(
+                db,
+                user=user,
+                payload=payload,
+                idempotency_key=f"expire-single-{suffix}",
+            )
+            assert generation_api._to_out(single).status == "starting"
+
+            created, skipped, failed = await generation_service.create_batch_generation_jobs(
+                db,
+                user=user,
+                payload=BatchCreateJobIn(
+                    material_id=material_id,
+                    subject_ids=[subject_id],
+                    count=1,
+                ),
+                idempotency_key=f"expire-batch-{suffix}",
+            )
+            assert skipped == []
+            assert failed == []
+            assert len(created) == 1
+            assert generation_api._to_out(created[0]).status == "starting"
+
+            original_find = generation_service._find_idempotent_job
+            original_create_one_job = generation_service._create_one_job
+            find_calls = 0
+
+            async def racing_find(db, owner_user_id, idempotency_key):
+                nonlocal find_calls
+                find_calls += 1
+                if find_calls == 1:
+                    return None
+                return await original_find(db, owner_user_id, idempotency_key)
+
+            async def create_conflicting_job(*args, **kwargs):
+                db.add(
+                    GenerationJob(
+                        job_id=raced_job_id,
+                        owner_user_id=user_id,
+                        material_id=material_id,
+                        script_id=script_id,
+                        subject_id=subject_id,
+                        idempotency_key=kwargs["idempotency_key"],
+                        request_hash=kwargs["request_hash"],
+                        input_version=kwargs["input_version"],
+                        attempt=1,
+                        job_type="generate_images",
+                        status="starting",
+                        progress=0,
+                        input_json={},
+                    )
+                )
+                await db.flush()
+                return await original_create_one_job(*args, **kwargs)
+
+            monkeypatch.setattr(generation_service, "_find_idempotent_job", racing_find)
+            monkeypatch.setattr(generation_service, "_create_one_job", create_conflicting_job)
+            raced = await generation_service.create_generation_job(
+                db,
+                user=user,
+                payload=payload,
+                idempotency_key=f"expire-race-{suffix}",
+            )
+            assert raced.job_id == raced_job_id
+            assert generation_api._to_out(raced).status == "starting"
+    finally:
+        await transaction.rollback()
+        await connection.close()
+        await engine.dispose()
 
 
 def test_batch_explicit_subject_ids_404_and_403_without_partial_create(monkeypatch):

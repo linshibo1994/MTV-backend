@@ -220,6 +220,7 @@ async def _create_one_job(
         )
     if commit:
         await db.commit()
+        return (await _load_batch_jobs(db, [job_id]))[0]
 
     return job
 
@@ -398,8 +399,11 @@ async def _load_batch_jobs(db: AsyncSession, job_ids: list[str]) -> list[Generat
         .where(GenerationJob.job_id.in_(job_ids))
         .options(noload(GenerationJob.material))
     )
-    by_id = {job.job_id: job for job in result.scalars().all()}
-    return [by_id[job_id] for job_id in job_ids if job_id in by_id]
+    loaded = list(result.scalars().all())
+    by_id = {job.job_id: job for job in loaded}
+    if len(loaded) != len(job_ids) or set(by_id) != set(job_ids):
+        raise RuntimeError("generation job reload is incomplete")
+    return [by_id[job_id] for job_id in job_ids]
 
 
 async def _load_batch_manifest(
@@ -540,8 +544,9 @@ async def create_generation_job(
     except IntegrityError:
         raced = await _find_idempotent_job(db, user.user_id, idempotency_key)
         if raced is not None and raced.request_hash == req_hash:
+            raced_job_id = raced.job_id
             await db.commit()
-            return raced
+            return (await _load_batch_jobs(db, [raced_job_id]))[0]
         raise ConflictError("Idempotency-Key 已用于不同请求") from None
 
 
@@ -624,7 +629,7 @@ async def create_batch_generation_jobs(
     if batch.job_ids or batch.skipped_subject_ids or batch.failed_items:
         return await _load_batch_manifest(db, batch)
 
-    created: list[GenerationJob] = []
+    created_job_ids: list[str] = []
     skipped: list[str] = []
     failed: list[dict] = []
     for subject in subjects:
@@ -672,8 +677,9 @@ async def create_batch_generation_jobs(
                 count=payload.count,
                 commit=False,
             )
-            created.append(job)
-            batch.job_ids = [*batch.job_ids, job.job_id]
+            job_id = job.job_id
+            created_job_ids.append(job_id)
+            batch.job_ids = [*batch.job_ids, job_id]
             await db.flush()
         except Exception:  # noqa: BLE001 - 收集失败而非冒泡
             failed.append(
@@ -689,4 +695,5 @@ async def create_batch_generation_jobs(
     batch.status = "failed" if failed else "created"
     await db.flush()
     await db.commit()
+    created = await _load_batch_jobs(db, created_job_ids)
     return created, skipped, failed

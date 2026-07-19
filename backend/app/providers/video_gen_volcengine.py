@@ -61,7 +61,7 @@ _CANCEL_SDK_TIMEOUT = 5.0
 _CANCEL_TOTAL_TIMEOUT = 8.0
 _MAX_TOTAL_REFERENCE_BYTES = 200 * 1024 * 1024
 _ARK_CONTENT_DOWNLOAD_HOST = re.compile(
-    r"ark-content-generation-(?P<region>[a-z0-9]+(?:-[a-z0-9]+)*)\."
+    r"(?:ark-content-generation|ark-acg)-(?P<region>[a-z0-9]+(?:-[a-z0-9]+)*)\."
     r"tos-(?P=region)\.volces\.com"
 )
 

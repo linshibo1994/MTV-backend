@@ -260,6 +260,10 @@ async def complete_job(
     row.lease_token = None
     row.lease_until = None
     row.finished_at = datetime.now(UTC)
+    if status == "succeeded":
+        row.progress = 100
+        row.progress_stage = "completed"
+        row.progress_message = "分镜生成完成"
     if detail is not None:
         row.detail = detail
     if error_type is not None:

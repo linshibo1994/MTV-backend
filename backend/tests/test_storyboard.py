@@ -726,6 +726,9 @@ async def test_storyboard_claim_lease_cas_and_cancel() -> None:
     assert token_2 and token_2 != token_1
     assert not await complete_job(db, "job-1", token_1, status="succeeded", detail={})
     assert await complete_job(db, "job-1", token_2, status="succeeded", detail={})
+    assert job.progress == 100
+    assert job.progress_stage == "completed"
+    assert job.progress_message == "分镜生成完成"
 
     job.status = "running"
     job.lease_token = "cancel-token"

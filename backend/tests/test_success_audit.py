@@ -177,6 +177,7 @@ async def test_approve_audio_and_remove_candidate_write_success_audits(monkeypat
 
 
 async def test_provider_switch_writes_before_and_after_audit(monkeypatch) -> None:
+    monkeypatch.setattr(video_generation.settings, "video_provider_selection_mode", "database")
     db = SimpleNamespace(commit=AsyncMock())
     user = SimpleNamespace(user_id="admin-1", username="admin", is_admin=True)
     old = SimpleNamespace(
