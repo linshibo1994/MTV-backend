@@ -66,6 +66,7 @@ class GenerationJobOut(BaseModel):
     job_id: str
     material_id: str | None = None
     script_id: str | None = None
+    subject_id: str
     episode_id: str | None = None
     scene_no: int | None = None
     job_type: str | None = None

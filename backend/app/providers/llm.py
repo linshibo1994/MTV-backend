@@ -13,12 +13,28 @@ from __future__ import annotations
 
 from typing import Protocol, runtime_checkable
 
+from app.providers.registry import ProviderError
+
+
+class LLMResponseContractError(ProviderError):
+    """LLM 响应不满足 Provider 对外契约。"""
+
+    def __init__(self) -> None:
+        super().__init__("LLM 供应商返回了无效的 assistant 正文")
+
+
+def require_non_empty_chat_content(content: object) -> str:
+    """校验并返回非空 assistant 正文，不在异常中暴露响应内容。"""
+    if not isinstance(content, str) or not content.strip():
+        raise LLMResponseContractError
+    return content
+
 
 @runtime_checkable
 class LLMProvider(Protocol):
     """LLM 供应商协议。
 
-    实现方需保证 complete_json 返回可被 json.loads 解析的 dict；chat 返回纯文本。
+    实现方需保证 complete_json 返回可被 json.loads 解析的 dict；chat 返回非空纯文本。
     缺少 API key 时应在初始化或调用时抛出 RuntimeError，由调用方
     捕获后标记任务失败并释放积分，避免 worker 卡死。
     """
@@ -40,7 +56,7 @@ class LLMProvider(Protocol):
         temperature: float | None = None,
         max_tokens: int | None = None,
     ) -> str:
-        """多轮对话补全，返回 assistant 文本。
+        """多轮对话补全，返回非空 assistant 文本。
 
         参数:
             messages: OpenAI 风格消息列表 [{role, content}, ...]，role ∈ user/assistant。

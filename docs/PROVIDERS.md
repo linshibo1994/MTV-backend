@@ -153,7 +153,9 @@ TEXT_LLM_MODEL=vendor-model
 
 新增视频厂商若要贯通数据库任务，还必须同步更新 `video_provider_configs` 与 `video_generation_jobs` 的检查约束并执行 Alembic 迁移。迁移前，Provider 工厂可测试 Gemini Veo，但数据库任务不能持久化 `provider_key=gemini`。
 
-当前对象存储接口以完整 `bytes` 接收视频，OpenAI/Google SDK 下载也会先在内存中取得完整结果，再执行 1 GiB 上限检查；这不能防止下载阶段的内存峰值。生产部署应限制并发与 worker 内存，后续需要把下载和存储协议一起升级为流式接口。
+阿里百炼、OpenAI、Gemini Veo 与火山方舟四类视频 Provider 均把下载内容流式写入临时文件，再通过对象存储的 `put_file → promote` 原子发布，不会先把完整视频聚合到内存。远端视频下载上限统一为 512 MiB，最多跟随 3 次重定向；单项参考媒体上限为 50 MiB，火山多参考媒体聚合上限为 200 MiB，Gemini SDK 内联视频上限为 16 MiB。Provider 返回的下载 URL 会逐跳校验，连接点只解析一次 DNS，并只直连通过公网校验的 IP；跨域重定向会移除鉴权和 Cookie 等敏感请求头。
+
+OpenAI 视频内容端点只允许 `VIDEO_GEN_BASE_URL`（未配置时为 `https://api.openai.com/v1`）的精确 HTTPS 443 源，跨源重定向关闭失败。百炼视频只允许配置的 DashScope 精确源和已审计的官方结果桶 `dashscope-result.oss-cn-hangzhou.aliyuncs.com`；新增官方结果域名必须先加入精确清单和允许/拒绝测试，不能用 `*.aliyuncs.com` 通配。
 
 ## 官方文档（核验日期：2026-07-17）
 

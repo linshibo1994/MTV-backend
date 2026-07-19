@@ -703,11 +703,29 @@ async def test_full_backend_flow_reaches_succeeded_render_job(monkeypatch, tmp_p
     monkeypatch.setattr(timeline_worker, "async_session_factory", _SessionFactory(engine))
     monkeypatch.setattr(timeline_worker, "get_storage", lambda: storage)
 
-    def fake_trim(src: str, start: float, end: float | None, out: str) -> None:
+    async def fake_trim(
+        src: str,
+        start: float,
+        end: float | None,
+        out: str,
+        *,
+        job_id: str,
+        token: str,
+        output_limit_bytes: int | None,
+    ) -> None:
+        assert job_id == render_id and token and output_limit_bytes
         assert start == 0.0 and end is None
         shutil.copyfile(src, out)
 
-    def fake_concat(inputs: list[str], out: str) -> None:
+    async def fake_concat(
+        inputs: list[str],
+        out: str,
+        *,
+        job_id: str,
+        token: str,
+        output_limit_bytes: int | None,
+    ) -> None:
+        assert job_id == render_id and token and output_limit_bytes
         Path(out).write_bytes(b"".join(Path(path).read_bytes() for path in inputs))
 
     monkeypatch.setattr(timeline_worker, "_trim_segment", fake_trim)

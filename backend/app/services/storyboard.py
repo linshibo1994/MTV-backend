@@ -485,6 +485,7 @@ async def generate_storyboard(
             Episode.episode_id == episode_id,
             Episode.script_id == script_id,
         )
+        .execution_options(populate_existing=True)
         .with_for_update()
     )
     fresh_episode = fresh_ep_result.scalar_one_or_none()
@@ -651,47 +652,36 @@ async def _cleanup_existing_storyboard(db: AsyncSession, episode_id: str) -> Non
     """清理已存在的分镜数据 (重新生成前)。
 
     删除该分集下所有 Scene/ShotGroup/Shot, 以重新生成覆盖。
-    若存在未结束 (starting/processing) 或已成功 (succeeded) 的视频生成任务引用
-    这些镜头组 (unit_id=group:<id>), 抛 ConflictError 提示先删除/等待相关视频任务,
-    避免删除进行中的视频任务所依赖的镜头组而产生悬挂引用 (unit_id 指向已删除 group)。
-    已终态的 failed/canceled 任务不再依赖镜头组, 可安全清理。
+    若任何视频生成任务仍通过 shot_group_id 外键引用这些镜头组，抛 ConflictError
+    提示先删除/等待相关视频任务，避免让数据库外键错误泄漏为 500。
+    failed/canceled 任务仍是可审计的持久事实，不能隐式级联删除。
     """
-    # 查询该分集下所有镜头组的 unit_id (group:<shot_group_id>)
-    groups_result = await db.execute(
-        select(ShotGroup.shot_group_id, ShotGroup.unit_id).where(
-            ShotGroup.episode_id == episode_id
-        )
+    shot_group_ids = list(
+        (
+            await db.execute(
+                select(ShotGroup.shot_group_id).where(
+                    ShotGroup.episode_id == episode_id
+                )
+            )
+        ).scalars().all()
     )
-    group_rows = groups_result.all()
-    if not group_rows:
+    if not shot_group_ids:
         # 无旧分镜，无需清理
         return
 
-    shot_group_ids = [row[0] for row in group_rows]
-    unit_ids = [row[1] for row in group_rows if row[1]]
-
-    # 拦截未结束或已成功的视频生成任务引用这些镜头组 — 拒绝级联删除
-    # (VideoGenerationJob.status: starting | processing | succeeded | failed | canceled)
-    if unit_ids:
-        blocking_result = await db.execute(
-            select(VideoGenerationJob.job_id).where(
-                VideoGenerationJob.unit_id.in_(unit_ids),
-                VideoGenerationJob.status.in_(
-                    ["starting", "processing", "succeeded"]
-                ),
-            ).limit(1)
+    blocking_result = await db.execute(
+        select(VideoGenerationJob.job_id)
+        .where(VideoGenerationJob.shot_group_id.in_(shot_group_ids))
+        .limit(1)
+    )
+    if blocking_result.scalar_one_or_none() is not None:
+        raise ConflictError(
+            "该分集存在进行中或已生成视频的镜头组，"
+            "请先删除或等待相关视频任务结束后再重新生成分镜"
         )
-        if blocking_result.scalar_one_or_none() is not None:
-            raise ConflictError(
-                "该分集存在进行中或已生成视频的镜头组，"
-                "请先删除或等待相关视频任务结束后再重新生成分镜"
-            )
 
     # 先删 Shot (依赖 ShotGroup)
-    if shot_group_ids:
-        await db.execute(
-            delete(Shot).where(Shot.shot_group_id.in_(shot_group_ids))
-        )
+    await db.execute(delete(Shot).where(Shot.shot_group_id.in_(shot_group_ids)))
 
     # 删 ShotGroup
     await db.execute(

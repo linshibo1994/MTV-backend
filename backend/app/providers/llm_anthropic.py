@@ -22,6 +22,7 @@ from typing import Any
 import httpx
 
 from app.core.config import settings
+from app.providers.llm import LLMResponseContractError, require_non_empty_chat_content
 from app.providers.registry import ProviderConfigurationError
 
 _API_VERSION = "2023-06-01"
@@ -157,12 +158,17 @@ class AnthropicLLMProvider:
             max_tokens=max_tokens,
             temperature=temperature,
         )
-        texts = [
-            block.get("text", "")
-            for block in data.get("content", [])
-            if block.get("type") == "text"
-        ]
-        return "".join(texts)
+        texts: list[str] = []
+        blocks = data.get("content", [])
+        if isinstance(blocks, list):
+            for block in blocks:
+                if not isinstance(block, dict) or block.get("type") != "text":
+                    continue
+                text = block.get("text")
+                if not isinstance(text, str):
+                    raise LLMResponseContractError
+                texts.append(text)
+        return require_non_empty_chat_content("".join(texts))
 
 
 def _normalize_messages(

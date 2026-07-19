@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
@@ -14,6 +15,32 @@ from app.core.config import Settings
 def _settings(**kwargs: Any) -> Settings:
     """构造不读取真实 .env 的确定性测试配置。"""
     return Settings(_env_file=None, **kwargs)  # type: ignore[call-arg]
+
+
+class _AtomicFileStorage:
+    """测试视频输出仅允许文件上传与原子提升。"""
+
+    def __init__(self) -> None:
+        self.objects: dict[str, bytes] = {}
+        self.deleted: list[str] = []
+
+    async def put(self, _key: str, _data: bytes) -> str:
+        raise AssertionError("视频输出禁止使用 storage.put(bytes)")
+
+    async def put_file(self, key: str, path: str) -> str:
+        self.objects[key] = Path(path).read_bytes()
+        return key
+
+    async def promote(self, source_key: str, final_key: str) -> str:
+        self.objects[final_key] = self.objects.pop(source_key)
+        return final_key
+
+    async def delete(self, key: str) -> None:
+        self.deleted.append(key)
+        self.objects.pop(key, None)
+
+    async def exists(self, key: str) -> bool:
+        return key in self.objects
 
 
 def test_registry_normalizes_vendor_aliases_and_rejects_wrong_capability() -> None:
@@ -180,6 +207,50 @@ async def test_openai_compatible_chat_preserves_multi_turn_messages() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "response",
+    [
+        SimpleNamespace(choices=[]),
+        SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=None,
+                        reasoning_content="不得返回或泄露的推理内容",
+                    )
+                )
+            ]
+        ),
+        SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=["非字符串正文"]))]
+        ),
+        SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=" \n"))]
+        ),
+    ],
+    ids=["empty-choices", "none-with-reasoning", "non-string", "blank"],
+)
+async def test_openai_compatible_chat_rejects_invalid_assistant_content(response) -> None:
+    from app.providers.llm import LLMResponseContractError
+    from app.providers.llm_openai_compat import OpenAICompatLLMProvider
+
+    create = AsyncMock(return_value=response)
+    provider = OpenAICompatLLMProvider.__new__(OpenAICompatLLMProvider)
+    provider._model = "vendor-model"
+    provider._client = SimpleNamespace(  # type: ignore[assignment]
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+    )
+
+    with pytest.raises(LLMResponseContractError) as exc_info:
+        await provider.chat([{"role": "user", "content": "问题"}])
+
+    assert str(exc_info.value) == "LLM 供应商返回了无效的 assistant 正文"
+    assert "不得返回或泄露的推理内容" not in str(exc_info.value)
+    assert "非字符串正文" not in str(exc_info.value)
+    create.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_anthropic_chat_moves_system_messages_to_top_level(monkeypatch) -> None:
     from app.providers.llm_anthropic import AnthropicLLMProvider
 
@@ -204,15 +275,98 @@ async def test_anthropic_chat_moves_system_messages_to_top_level(monkeypatch) ->
     )
 
 
+@pytest.mark.asyncio
+async def test_anthropic_chat_concatenates_multiple_text_blocks_in_order(
+    monkeypatch,
+) -> None:
+    from app.providers.llm_anthropic import AnthropicLLMProvider
+
+    provider = AnthropicLLMProvider(api_key="key", model="claude-model")
+    create = AsyncMock(
+        return_value={
+            "content": [
+                {"type": "text", "text": "第一段"},
+                {"type": "tool_use", "input": {"ignored": True}},
+                {"type": "text", "text": "\n第二段"},
+            ]
+        }
+    )
+    monkeypatch.setattr(provider, "_create", create)
+
+    result = await provider.chat([{"role": "user", "content": "问题"}])
+
+    assert result == "第一段\n第二段"
+    create.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_anthropic_chat_rejects_malformed_text_mixed_with_valid_text(
+    monkeypatch,
+) -> None:
+    from app.providers.llm import LLMResponseContractError
+    from app.providers.llm_anthropic import AnthropicLLMProvider
+
+    provider = AnthropicLLMProvider(api_key="key", model="claude-model")
+    create = AsyncMock(
+        return_value={
+            "content": [
+                {"type": "text", "text": "不可返回的部分正文"},
+                {"type": "text", "text": None},
+            ]
+        }
+    )
+    monkeypatch.setattr(provider, "_create", create)
+
+    with pytest.raises(LLMResponseContractError) as exc_info:
+        await provider.chat([{"role": "user", "content": "问题"}])
+
+    assert str(exc_info.value) == "LLM 供应商返回了无效的 assistant 正文"
+    assert "不可返回的部分正文" not in str(exc_info.value)
+    create.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"content": []},
+        {"content": [{"type": "tool_use", "input": {"secret": "不得泄露"}}]},
+        {"content": [{"type": "text", "text": None}]},
+        {"content": [{"type": "text", "text": " \n"}]},
+    ],
+    ids=["empty-content", "no-text-block", "non-string-text", "blank-text"],
+)
+async def test_anthropic_chat_rejects_responses_without_valid_text(
+    monkeypatch, response
+) -> None:
+    from app.providers.llm import LLMResponseContractError
+    from app.providers.llm_anthropic import AnthropicLLMProvider
+
+    provider = AnthropicLLMProvider(api_key="key", model="claude-model")
+    create = AsyncMock(return_value=response)
+    monkeypatch.setattr(provider, "_create", create)
+
+    with pytest.raises(LLMResponseContractError) as exc_info:
+        await provider.chat([{"role": "user", "content": "问题"}])
+
+    assert str(exc_info.value) == "LLM 供应商返回了无效的 assistant 正文"
+    assert "不得泄露" not in str(exc_info.value)
+    create.assert_awaited_once()
+
+
 def test_video_factory_routes_gemini_and_rejects_unknown_vendor(monkeypatch) -> None:
     from app.core import config
     from app.providers.registry import UnsupportedProviderError
     from app.providers.video_gen import get_video_provider
     from app.providers.video_gen_google import GoogleVideoGenProvider
+    from app.providers.video_gen_volcengine import VolcengineVideoGenProvider
 
     monkeypatch.setattr(config, "settings", _settings())
 
-    assert isinstance(get_video_provider("veo"), GoogleVideoGenProvider)
+    for alias in ("gemini", "google", "veo"):
+        assert isinstance(get_video_provider(alias), GoogleVideoGenProvider)
+    for alias in ("volcengine", "doubao", "jianyu", "modelsai"):
+        assert isinstance(get_video_provider(alias), VolcengineVideoGenProvider)
     with pytest.raises(UnsupportedProviderError, match="unknown-vendor"):
         get_video_provider("unknown-vendor")
 
@@ -404,7 +558,7 @@ async def test_google_video_provider_submits_polls_and_stores(monkeypatch) -> No
         aclose = AsyncMock()
 
     client = SimpleNamespace(aio=Aio())
-    storage = SimpleNamespace(put=AsyncMock())
+    storage = _AtomicFileStorage()
     provider = GoogleVideoGenProvider()
     monkeypatch.setattr(provider, "_build_client", lambda: client)
     monkeypatch.setattr("app.providers.storage.get_storage", lambda: storage)
@@ -426,7 +580,7 @@ async def test_google_video_provider_submits_polls_and_stores(monkeypatch) -> No
     assert calls["generate"]["source"].prompt == "镜头提示词"
     assert calls["generate"]["config"].duration_seconds == 8
     assert calls["generate"]["config"].aspect_ratio == "16:9"
-    storage.put.assert_awaited_once_with("generate_images/video/job-veo.mp4", b"video-bytes")
+    assert storage.objects == {"generate_images/video/job-veo.mp4": b"video-bytes"}
     assert result.provider_job_id == "operations/veo-1"
     client.aio.aclose.assert_awaited_once()
 
@@ -496,7 +650,10 @@ async def test_google_video_resumes_polls_and_downloads_uri(monkeypatch) -> None
         video_gen_model="veo-custom",
     )
     monkeypatch.setattr(video_gen_google, "settings", configured)
-    video = SimpleNamespace(video_bytes=None, uri="https://files.example/video.mp4")
+    video = SimpleNamespace(
+        video_bytes=None,
+        uri="https://generativelanguage.googleapis.com/v1beta/files/veo-resume",
+    )
     completed = SimpleNamespace(
         name="operations/veo-resume",
         done=True,
@@ -505,7 +662,9 @@ async def test_google_video_resumes_polls_and_downloads_uri(monkeypatch) -> None
         response=None,
     )
     operations = SimpleNamespace(get=AsyncMock(return_value=completed))
-    files = SimpleNamespace(download=AsyncMock(return_value=b"downloaded-video"))
+    files = SimpleNamespace(
+        download=AsyncMock(side_effect=AssertionError("禁止 eager files.download"))
+    )
 
     class Models:
         async def generate_videos(self, **kwargs):
@@ -518,11 +677,19 @@ async def test_google_video_resumes_polls_and_downloads_uri(monkeypatch) -> None
         aclose=AsyncMock(),
     )
     client = SimpleNamespace(aio=aio)
-    storage = SimpleNamespace(put=AsyncMock())
+    storage = _AtomicFileStorage()
     provider = GoogleVideoGenProvider()
     monkeypatch.setattr(provider, "_build_client", lambda: client)
     monkeypatch.setattr("app.providers.storage.get_storage", lambda: storage)
     monkeypatch.setattr(video_gen_google.asyncio, "sleep", AsyncMock())
+    download_calls: list[tuple[str, dict]] = []
+
+    async def download(url: str, path: str | Path, **kwargs) -> int:
+        download_calls.append((url, kwargs))
+        kwargs["url_validator"](url)
+        return Path(path).write_bytes(b"downloaded-video")
+
+    monkeypatch.setattr(video_gen_google, "safe_download_to_file", download)
     request = VideoGenerationRequest(
         prompt="镜头提示词",
         reference_images=[],
@@ -537,13 +704,20 @@ async def test_google_video_resumes_polls_and_downloads_uri(monkeypatch) -> None
     result = await provider.generate(request)
 
     operations.get.assert_awaited_once()
-    files.download.assert_awaited_once_with(file=video)
-    storage.put.assert_awaited_once_with("generate_images/video/job-veo-resume.mp4", b"downloaded-video")
+    files.download.assert_not_awaited()
+    assert download_calls[0][0] == (
+        "https://generativelanguage.googleapis.com/v1beta/files/veo-resume:download?alt=media"
+    )
+    assert download_calls[0][1]["extra_headers"] == {"x-goog-api-key": "video-key"}
+    assert storage.objects == {
+        "generate_images/video/job-veo-resume.mp4": b"downloaded-video"
+    }
     assert result.provider_job_id == "operations/veo-resume"
 
 
 @pytest.mark.asyncio
 async def test_google_video_operation_error_is_reported() -> None:
+    from app.providers.video_gen import VideoGenerationRemoteTerminalError
     from app.providers.video_gen_google import GoogleVideoGenProvider
 
     operation = SimpleNamespace(
@@ -551,32 +725,109 @@ async def test_google_video_operation_error_is_reported() -> None:
         done=True,
         error={"code": 13},
     )
-    with pytest.raises(RuntimeError, match="Gemini Veo 生成失败"):
+    with pytest.raises(VideoGenerationRemoteTerminalError) as exc_info:
         await GoogleVideoGenProvider()._poll(
             SimpleNamespace(),
             operation,
             lambda *_args: None,  # type: ignore[arg-type]
         )
 
+    assert exc_info.value.provider_task_id == "operations/veo-failed"
+    assert exc_info.value.terminal_status == "failed"
+
 
 @pytest.mark.asyncio
-async def test_video_service_rejects_gemini_before_database_migration(monkeypatch) -> None:
-    from app.providers.registry import ProviderConfigurationError
-    from app.services import video_generation
+async def test_openai_video_explicit_failed_status_is_typed_terminal_error(tmp_path) -> None:
+    from app.providers.video_gen import VideoGenerationRemoteTerminalError
+    from app.providers.video_gen_openai import OpenAIVideoGenProvider
 
-    configured = _settings(
-        video_provider_selection_mode="env",
-        video_gen_provider="gemini",
-        video_gen_api_key="video-key",
-    )
-    monkeypatch.setattr(video_generation, "settings", configured)
-
-    with pytest.raises(ProviderConfigurationError, match="Alembic 迁移"):
-        await video_generation.create_video_job(
-            SimpleNamespace(),  # type: ignore[arg-type]
-            script_id="script-1",
-            episode_id="episode-1",
-            shot_group_id="group-1",
-            user_id="user-1",
-            idempotency_key="idem-1",
+    client = SimpleNamespace(
+        videos=SimpleNamespace(
+            retrieve=AsyncMock(return_value=SimpleNamespace(status="failed"))
         )
+    )
+    provider = OpenAIVideoGenProvider()
+    with pytest.raises(VideoGenerationRemoteTerminalError) as exc_info:
+        await provider._poll_and_download_to_file(
+            client,
+            "openai-terminal-task",
+            tmp_path / "video.mp4",
+            lambda *_args: None,
+        )
+
+    assert exc_info.value.provider_task_id == "openai-terminal-task"
+    assert exc_info.value.terminal_status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_bailian_video_explicit_failed_status_is_typed_terminal_error() -> None:
+    from app.providers.video_gen import VideoGenerationRemoteTerminalError
+    from app.providers.video_gen_bailian import BailianVideoGenProvider
+
+    response = SimpleNamespace(
+        status_code=200,
+        json=lambda: {"output": {"task_status": "FAILED"}},
+    )
+    http = SimpleNamespace(get=AsyncMock(return_value=response))
+    with pytest.raises(VideoGenerationRemoteTerminalError) as exc_info:
+        await BailianVideoGenProvider()._poll(
+            http,
+            "https://dashscope.example",
+            "redacted-test-key",
+            "bailian-terminal-task",
+            lambda *_args: None,
+        )
+
+    assert exc_info.value.provider_task_id == "bailian-terminal-task"
+    assert exc_info.value.terminal_status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_bailian_video_unknown_status_is_not_confirmed_terminal() -> None:
+    from app.providers.video_gen_bailian import BailianVideoGenProvider
+
+    response = SimpleNamespace(
+        status_code=200,
+        json=lambda: {"output": {"task_status": "UNKNOWN"}},
+    )
+    http = SimpleNamespace(get=AsyncMock(return_value=response))
+    with pytest.raises(RuntimeError, match="status_unknown"):
+        await BailianVideoGenProvider()._poll(
+            http,
+            "https://dashscope.example",
+            "redacted-test-key",
+            "bailian-unknown-task",
+            lambda *_args: None,
+        )
+
+
+@pytest.mark.asyncio
+async def test_volcengine_video_explicit_cancelled_status_is_typed_terminal_error(
+    monkeypatch,
+) -> None:
+    from app.providers.video_gen import VideoGenerationRemoteTerminalError
+    from app.providers.video_gen_volcengine import VolcengineVideoGenProvider
+
+    tasks = SimpleNamespace(
+        create=AsyncMock(side_effect=AssertionError("恢复任务不得重复提交")),
+        get=AsyncMock(return_value=SimpleNamespace(status="cancelled")),
+    )
+    client = SimpleNamespace(content_generation=SimpleNamespace(tasks=tasks))
+    provider = VolcengineVideoGenProvider()
+    monkeypatch.setattr(provider, "_build_client", lambda: client)
+    monkeypatch.setattr(provider, "_close_client_safely", AsyncMock())
+
+    with pytest.raises(VideoGenerationRemoteTerminalError) as exc_info:
+        await provider._submit_and_poll(
+            "video-model",
+            "prompt",
+            [],
+            [],
+            None,
+            lambda *_args: None,
+            provider_task_id="volcengine-terminal-task",
+        )
+
+    assert exc_info.value.provider_task_id == "volcengine-terminal-task"
+    assert exc_info.value.terminal_status == "canceled"
+    tasks.create.assert_not_awaited()

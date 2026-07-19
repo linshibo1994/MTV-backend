@@ -20,6 +20,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from urllib.parse import urlsplit
 
 import httpx
@@ -27,15 +29,31 @@ import httpx
 from app.core.config import settings
 from app.providers.registry import ProviderConfigurationError
 from app.providers.video_gen import (
+    CancellationProbe,
+    VideoCancellationResult,
     VideoGenerationProgress,
+    VideoGenerationRemoteTerminalError,
     VideoGenerationRequest,
     VideoGenerationResult,
+    VideoGenerationSubmitRejected,
+    await_video_task_checkpoint,
+    execute_video_submission,
+    managed_video_client,
+    raise_if_video_cancel_requested,
+    raise_if_video_cancel_requested_before_submit,
+    raise_video_submission_uncertain,
+    unsupported_video_cancellation,
 )
 
 logger = logging.getLogger(__name__)
 
 _POLL_INTERVAL = 15.0  # 官方建议 15s
 _POLL_TIMEOUT = 600  # 10 分钟
+_BAILIAN_RESULT_DOWNLOAD_HOSTS = frozenset(
+    {
+        "dashscope-result.oss-cn-hangzhou.aliyuncs.com",
+    }
+)
 
 # 图生视频模型前缀（input 用 img_url）；其余视为文生视频（input 用 prompt）
 _I2V_PREFIXES = ("wanx2.1-i2v", "wan2.2-i2v", "wan2.5-i2v", "wan2.6-i2v", "wanx2.1-kf2v")
@@ -50,6 +68,10 @@ class BailianVideoGenProvider:
     @property
     def provider_key(self) -> str:
         return self._provider_key
+
+    async def cancel(self, provider_task_id: str) -> VideoCancellationResult:
+        """当前 DashScope 视频接口未接入可靠的运行中取消语义。"""
+        return unsupported_video_cancellation(self.provider_key, provider_task_id)
 
     def _check_keys(self) -> None:
         if not self._api_key():
@@ -90,6 +112,16 @@ class BailianVideoGenProvider:
         on_progress=None,
     ) -> VideoGenerationResult:
         """文生/图生视频 → 返回视频 storage_key。"""
+        task_id = str((request.metadata or {}).get("provider_task_id") or "")
+        if task_id:
+            await await_video_task_checkpoint(
+                request.on_task_created,
+                task_id,
+            )
+        else:
+            await raise_if_video_cancel_requested_before_submit(
+                request.cancel_requested
+            )
         self._check_keys()
         use_model = request.model or settings.video_gen_model or "wanx2.1-t2v-turbo"
 
@@ -113,33 +145,93 @@ class BailianVideoGenProvider:
             "Content-Type": "application/json",
             "X-DashScope-Async": "enable",
         }
-        task_id = str((request.metadata or {}).get("provider_task_id") or "")
-
-        async with httpx.AsyncClient(timeout=60.0) as http:
+        http = httpx.AsyncClient(timeout=60.0)
+        async with managed_video_client(
+            http,
+            http.aclose,
+            provider_key=self.provider_key,
+        ):
             if task_id:
+                await raise_if_video_cancel_requested(
+                    request.cancel_requested,
+                    task_id,
+                    self.cancel,
+                )
                 _notify("resuming", "正在恢复视频生成任务", 15, task_id)
             else:
                 body = await self._build_body(request, use_model, _notify)
-                submit = await http.post(
-                    f"{base_url}/api/v1/services/aigc/video-generation/video-synthesis",
-                    headers=headers,
-                    json=body,
+                await raise_if_video_cancel_requested_before_submit(
+                    request.cancel_requested
+                )
+                async def _submit_video():
+                    return await http.post(
+                        f"{base_url}/api/v1/services/aigc/video-generation/video-synthesis",
+                        headers=headers,
+                        json=body,
+                    )
+
+                submit = await execute_video_submission(
+                    _submit_video,
+                    before_submit=request.before_submit,
+                    on_submission_uncertain=request.on_submission_uncertain,
                 )
                 if submit.status_code != 200:
-                    raise RuntimeError(
-                        f"通义万相视频提交失败 status={submit.status_code}"
+                    if 400 <= submit.status_code < 500 and submit.status_code != 408:
+                        raise VideoGenerationSubmitRejected()
+                    await raise_video_submission_uncertain(
+                        request.on_submission_uncertain
                     )
-                task_id = str((submit.json().get("output") or {}).get("task_id") or "")
+                try:
+                    task_id = str((submit.json().get("output") or {}).get("task_id") or "")
+                except Exception:
+                    await raise_video_submission_uncertain(
+                        request.on_submission_uncertain
+                    )
                 if not task_id:
-                    raise RuntimeError("通义万相视频提交未返回 task_id")
+                    await raise_video_submission_uncertain(
+                        request.on_submission_uncertain
+                    )
+                await await_video_task_checkpoint(
+                    request.on_task_created,
+                    task_id,
+                )
+                await raise_if_video_cancel_requested(
+                    request.cancel_requested,
+                    task_id,
+                    self.cancel,
+                )
                 _notify("submitted", "视频生成任务已提交", 15, task_id)
 
-            video_url = await self._poll(http, base_url, api_key, task_id, _notify)
-            _notify("downloading", "正在下载生成视频", 90, task_id)
-            video_bytes = await self._download(video_url)
+            video_url = await self._poll(
+                http,
+                base_url,
+                api_key,
+                task_id,
+                _notify,
+                cancel_requested=request.cancel_requested,
+            )
 
-        _notify("storing", "正在存储视频", 95)
-        storage_key = await self._store_video(video_bytes, task_id, request.job_id)
+        with TemporaryDirectory(prefix="mtv-bailian-video-") as temp_dir:
+            video_path = Path(temp_dir) / "video.mp4"
+            await raise_if_video_cancel_requested(
+                request.cancel_requested,
+                task_id,
+                self.cancel,
+            )
+            _notify("downloading", "正在下载生成视频", 90, task_id)
+            await self._download_to_file(video_url, video_path)
+            await raise_if_video_cancel_requested(
+                request.cancel_requested,
+                task_id,
+                self.cancel,
+            )
+            _notify("storing", "正在存储视频", 95)
+            storage_key = await self._store_video_file(
+                video_path,
+                task_id,
+                request.job_id,
+                request.metadata,
+            )
         _notify("succeeded", "视频生成完成", 100)
         return VideoGenerationResult(
             video_storage_key=storage_key,
@@ -180,16 +272,14 @@ class BailianVideoGenProvider:
     async def _encode_single(self, storage_key: str) -> str:
         """读取首帧/参考图并编码为 data URL（百炼 img_url 支持 data:image base64）。"""
         from app.providers.storage import get_storage
+        from app.providers.streaming_io import read_storage_bytes_limited
 
         storage = get_storage()
-        try:
-            data = await storage.get(storage_key)
-        except Exception as exc:  # noqa: BLE001
-            raise RuntimeError("reference_read_failed") from exc
-        if not data:
-            raise RuntimeError("reference_read_failed")
-        if len(data) > 50 * 1024 * 1024:
-            raise RuntimeError("reference_image_too_large")
+        data = await read_storage_bytes_limited(
+            storage,
+            storage_key,
+            too_large_error="reference_image_too_large",
+        )
         b64 = base64.b64encode(data).decode("ascii")
         return f"data:image/png;base64,{b64}"
 
@@ -200,6 +290,8 @@ class BailianVideoGenProvider:
         api_key: str,
         task_id: str,
         _notify,
+        *,
+        cancel_requested: CancellationProbe | None = None,
     ) -> str:
         """轮询任务至终态，返回 video_url。"""
         poll_headers = {"Authorization": f"Bearer {api_key}"}
@@ -208,8 +300,18 @@ class BailianVideoGenProvider:
         last_progress = 20
         _notify("polling", "视频生成中，轮询任务状态", 20, task_id)
         while True:
+            await raise_if_video_cancel_requested(
+                cancel_requested,
+                task_id,
+                self.cancel,
+            )
             resp = await http.get(
                 f"{base_url}/api/v1/tasks/{task_id}", headers=poll_headers
+            )
+            await raise_if_video_cancel_requested(
+                cancel_requested,
+                task_id,
+                self.cancel,
             )
             if resp.status_code != 200:
                 raise RuntimeError(
@@ -222,8 +324,13 @@ class BailianVideoGenProvider:
                 if not url:
                     raise RuntimeError(f"通义万相视频完成但未返回 video_url task_id={task_id}")
                 return str(url)
-            if status in ("FAILED", "UNKNOWN"):
-                raise RuntimeError(f"通义万相视频任务失败 task_id={task_id} status={status}")
+            if status in ("FAILED", "ERROR", "CANCELLED", "CANCELED"):
+                raise VideoGenerationRemoteTerminalError(
+                    provider_task_id=task_id,
+                    terminal_status=status,
+                )
+            if status == "UNKNOWN":
+                raise RuntimeError("bailian_video_task_status_unknown")
             elapsed = asyncio.get_event_loop().time() - started_at
             pct = min(90, 20 + int(elapsed / _POLL_TIMEOUT * 70))
             if pct > last_progress:
@@ -233,27 +340,47 @@ class BailianVideoGenProvider:
                 raise RuntimeError(f"通义万相视频轮询超时 task_id={task_id}")
             await asyncio.sleep(_POLL_INTERVAL)
 
-    async def _download(self, url: str) -> bytes:
-        """下载视频 URL 字节流。"""
-        from app.providers._url_safety import safe_download_bytes
+    async def _download_to_file(self, url: str, path: str | Path) -> int:
+        """逐跳校验厂商 URL，并把视频流写入临时文件。"""
+        from app.providers._url_safety import MAX_PROVIDER_VIDEO_BYTES, safe_download_to_file
 
-        return await safe_download_bytes(
+        return await safe_download_to_file(
             url,
-            max_bytes=1024 * 1024 * 1024,
+            path,
+            max_bytes=MAX_PROVIDER_VIDEO_BYTES,
             timeout=120.0,
             url_validator=self._validate_download_host,
         )
 
     @staticmethod
     def _validate_download_host(url: str) -> None:
-        parsed = urlsplit(url)
-        hostname = (parsed.hostname or "").lower()
-        configured_url = BailianVideoGenProvider._base_url()
-        dashscope_host = (urlsplit(configured_url).hostname or "").lower()
-        if parsed.scheme != "https" or not (
-            hostname == dashscope_host
-            or hostname.endswith(".aliyuncs.com")
-            or hostname.endswith(".aliyuncs.com.cn")
+        try:
+            parsed = urlsplit(url)
+            configured = urlsplit(BailianVideoGenProvider._base_url())
+            hostname = (parsed.hostname or "").lower()
+            configured_host = (configured.hostname or "").lower()
+            port = parsed.port or 443
+            configured_port = configured.port or 443
+        except ValueError as exc:
+            raise RuntimeError("provider_download_url_invalid") from exc
+        configured_origin = (
+            configured.scheme.lower() == "https"
+            and bool(configured_host)
+            and configured_port == 443
+            and configured.username is None
+            and configured.password is None
+            and hostname == configured_host
+        )
+        if (
+            parsed.scheme.lower() != "https"
+            or not hostname
+            or port != 443
+            or parsed.username is not None
+            or parsed.password is not None
+            or not (
+                configured_origin
+                or hostname in _BAILIAN_RESULT_DOWNLOAD_HOSTS
+            )
         ):
             raise RuntimeError("provider_download_url_invalid")
 
@@ -275,15 +402,29 @@ class BailianVideoGenProvider:
             return settings.video_gen_base_url.rstrip("/")
         return settings.dashscope_base_url.rstrip("/")
 
-    async def _store_video(self, video_bytes: bytes, task_id: str, job_id: str | None) -> str:
-        """将视频字节存入对象存储，返回 storage_key。"""
+    async def _store_video_file(
+        self,
+        path: str | Path,
+        task_id: str,
+        job_id: str | None,
+        metadata: dict,
+    ) -> str:
+        """将临时视频文件原子提升为本次尝试的正式对象。"""
         from app.providers.storage import get_storage
+        from app.providers.streaming_io import atomic_put_file, storage_attempt_suffix
 
         storage = get_storage()
         ident = job_id or task_id or "unknown"
-        storage_key = f"generate_images/video/{ident}.mp4"
-        await storage.put(storage_key, video_bytes)
-        return storage_key
+        attempt_suffix = storage_attempt_suffix(metadata)
+        suffix = f"-{attempt_suffix}" if attempt_suffix else ""
+        storage_key = f"generate_images/video/{ident}{suffix}.mp4"
+        return await atomic_put_file(
+            storage,
+            storage_key,
+            path,
+            attempt_id=attempt_suffix or "legacy",
+            preserve_existing_final=not attempt_suffix,
+        )
 
 
 def _legacy_progress(on_progress):

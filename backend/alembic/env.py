@@ -11,9 +11,12 @@ import app.models  # noqa: F401
 from alembic import context
 from app.core.config import settings
 from app.models import Base  # noqa: F401  (触发各模型注册)
+from app.models.storage_reference_guard import STORAGE_REFERENCE_GUARD_BYPASS
 
 config = context.config
-config.set_main_option("sqlalchemy.url", settings.database_url)
+# Alembic 的 ConfigParser 会把 ``%`` 解释为插值语法；URL 中的百分号编码必须
+# 先转义为 ``%%``，读取配置时会还原为原始 ``%``，不会解码或暴露凭据。
+config.set_main_option("sqlalchemy.url", settings.database_url.replace("%", "%%"))
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
@@ -35,6 +38,7 @@ def run_migrations_offline() -> None:
 
 
 def do_run_migrations(connection: Connection) -> None:
+    connection = connection.execution_options(**{STORAGE_REFERENCE_GUARD_BYPASS: True})
     context.configure(connection=connection, target_metadata=target_metadata, compare_type=True)
     with context.begin_transaction():
         context.run_migrations()

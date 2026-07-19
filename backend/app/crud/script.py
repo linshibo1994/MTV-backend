@@ -5,8 +5,8 @@
 - get_breakdown: 返回 {episode, subjects, shots, shot_groups}
 """
 
-import hashlib
 import logging
+from datetime import UTC, datetime
 from typing import Any, cast
 
 from fastapi import HTTPException
@@ -14,15 +14,18 @@ from sqlalchemy import delete, false, func, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import noload
 
 from app.core.errors import ConflictError, ForbiddenError
 from app.core.ids import new_id
 from app.models.asset_entry import AssetEntry
 from app.models.canvas_edge import CanvasEdge
 from app.models.canvas_node import CanvasNode
+from app.models.credit_reservation import CreditReservation
 from app.models.episode import Episode
 from app.models.generation_job import GenerationJob
 from app.models.materials import Materials
+from app.models.media_upload import MediaUpload
 from app.models.parent_subject import ParentSubject
 from app.models.pipeline_job import PipelineJob
 from app.models.pipeline_stage import PipelineStage
@@ -38,8 +41,26 @@ from app.models.user import User
 from app.models.video_generation_job import VideoGenerationJob
 from app.models.video_timeline_arrangement import VideoTimelineArrangement
 from app.schemas.script import LifecycleDependencySummary
+from app.services.storage_references import (
+    StorageReferenceExclusions,
+    acquire_storage_reference_barrier,
+    collect_storage_keys,
+    decide_storage_key_deletes,
+    enqueue_storage_deletes,
+    normalize_storage_keys,
+)
+from app.services.task_dispatch import cancel_outbox_task
 
 logger = logging.getLogger(__name__)
+
+_VIDEO_ACTIVE_STATUSES = frozenset(
+    {"pending", "ready", "retry", "starting", "processing"}
+)
+_STORYBOARD_ACTIVE_STATUSES = frozenset({"pending", "ready", "retry", "running"})
+_PIPELINE_ACTIVE_STATUSES = frozenset({"pending", "ready", "retry", "running"})
+_PROVIDER_CANCELLATION_KEY = "provider_cancellation"
+_ATTEMPT_OUTPUT_CLEANUP_KEY = "attempt_output_cleanup"
+_RETRYABLE_PROVIDER_CANCELLATION_OUTCOMES = frozenset({"pending", "failed"})
 
 # --------------------------------------------------------------------------- #
 # 内部辅助
@@ -159,6 +180,8 @@ async def create_script(
     db.add(script)
     # 团队项目：创建者为 owner 成员
     if scope == "team":
+        # 先写入父行，避免未声明 ORM relationship 时成员行抢先触发外键约束。
+        await db.flush()
         db.add(
             ProjectMember(
                 id=new_id(),
@@ -239,83 +262,41 @@ async def _count(db: AsyncSession, model: type, *criteria: Any) -> int:
     return int(result.scalar_one() or 0)
 
 
-_STORAGE_KEY_FIELDS = {
-    "storage_key",
-    "storagekey",
-    "video_storage_key",
-    "output_storage_key",
-    "last_frame",
-    "first_frame",
-    "reference_frame",
-}
-
-
-def _collect_storage_keys(value: Any, destination: set[str]) -> None:
-    """从任务输出或镜头帧 JSON 中递归提取对象存储键。"""
-    if isinstance(value, dict):
-        for field, item in value.items():
-            normalized_field = str(field).replace("-", "_").lower()
-            if normalized_field in _STORAGE_KEY_FIELDS and isinstance(item, str):
-                destination.add(item)
-            _collect_storage_keys(item, destination)
-    elif isinstance(value, (list, tuple)):
-        for item in value:
-            _collect_storage_keys(item, destination)
-
-
 async def _enqueue_storage_deletes(
     db: AsyncSession,
     storage_keys: set[str],
     *,
+    exclusions: StorageReferenceExclusions | None = None,
     asset_ids_by_key: dict[str, str] | None = None,
+    upload_ids_by_key: dict[str, str] | None = None,
+    protected_storage_keys: set[str] | None = None,
 ) -> None:
-    """在业务事务中先阻断关联晋升，再幂等写入物理对象删除任务。"""
-    from app.providers.storage import validate_key_prefix
-    from app.services.media_storage_jobs import cancel_promotes_for_delete, enqueue_delete
-
-    normalized_asset_ids: dict[str, str] = {}
-    for key, asset_id in (asset_ids_by_key or {}).items():
-        try:
-            normalized_asset_ids[validate_key_prefix(key)] = asset_id
-        except ValueError:
-            # 存量非法 key 无法安全交给存储驱动；不应因此阻断业务资源删除。
-            logger.warning("跳过不受支持的存量媒体键 asset_id=%s", asset_id)
-
-    normalized_keys: set[str] = set()
-    for raw_key in storage_keys:
-        try:
-            normalized_keys.add(validate_key_prefix(raw_key))
-        except ValueError:
-            logger.warning("跳过不受支持的存量媒体键")
-
-    promote_keys = await cancel_promotes_for_delete(
+    """兼容既有内部调用；实际清理由全局判权服务统一实现。"""
+    await enqueue_storage_deletes(
         db,
-        asset_ids=set((asset_ids_by_key or {}).values()),
-        final_keys=normalized_keys,
+        storage_keys,
+        exclusions=exclusions or StorageReferenceExclusions(),
+        asset_ids_by_key=asset_ids_by_key,
+        upload_ids_by_key=upload_ids_by_key,
+        protected_storage_keys=protected_storage_keys,
     )
-    for raw_key in promote_keys:
-        try:
-            normalized_keys.add(validate_key_prefix(raw_key))
-        except ValueError:
-            logger.warning("跳过不受支持的晋升任务媒体键")
-
-    for key in sorted(normalized_keys):
-        digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
-        await enqueue_delete(
-            db,
-            idempotency_key=f"lifecycle-delete:{digest}",
-            source_key=key,
-            asset_id=normalized_asset_ids.get(key),
-        )
 
 
 async def _collect_script_storage_keys(
     db: AsyncSession,
     script_id: str,
-) -> tuple[set[str], dict[str, str]]:
+    uploads: list[MediaUpload],
+) -> tuple[
+    set[str],
+    dict[str, str],
+    dict[str, str],
+    StorageReferenceExclusions,
+]:
     """收集删除整个剧本时归属于该剧本的全部已知媒体对象。"""
     keys: set[str] = set()
     asset_ids_by_key: dict[str, str] = {}
+    upload_ids_by_key: dict[str, str] = {}
+    exclusions = StorageReferenceExclusions()
 
     asset_rows = (
         await db.execute(
@@ -325,54 +306,134 @@ async def _collect_script_storage_keys(
         )
     ).all()
     for asset_id, storage_key in asset_rows:
-        if storage_key:
-            keys.add(storage_key)
-            asset_ids_by_key[storage_key] = asset_id
+        exclusions.asset_entry_ids.add(asset_id)
+        collect_storage_keys(storage_key, keys)
+        asset_ids_by_key[storage_key] = asset_id
 
-    episode_keys = (
+    episode_rows = (
         await db.execute(
-            select(Episode.script_file_storage_key).where(Episode.script_id == script_id)
-        )
-    ).scalars().all()
-    keys.update(key for key in episode_keys if key)
-
-    for model, field in (
-        (GenerationJob, GenerationJob.output_json),
-        (VideoGenerationJob, VideoGenerationJob.output_json),
-        (TimelineRenderJob, TimelineRenderJob.output_json),
-    ):
-        values = (
-            await db.execute(select(field).where(model.script_id == script_id))
-        ).scalars().all()
-        for value in values:
-            _collect_storage_keys(value, keys)
-
-    material_ids = select(Materials.id).where(Materials.script_id == script_id)
-    canvas_values = (
-        await db.execute(
-            select(CanvasNode.data).where(CanvasNode.material_id.in_(material_ids))
-        )
-    ).scalars().all()
-    for value in canvas_values:
-        _collect_storage_keys(value, keys)
-
-    render_keys = (
-        await db.execute(
-            select(TimelineRenderJob.output_storage_key).where(
-                TimelineRenderJob.script_id == script_id
+            select(Episode.episode_id, Episode.script_file_storage_key).where(
+                Episode.script_id == script_id
             )
         )
-    ).scalars().all()
-    keys.update(key for key in render_keys if key)
+    ).all()
+    for episode_id, storage_key in episode_rows:
+        exclusions.episode_ids.add(episode_id)
+        collect_storage_keys(storage_key, keys)
 
-    frame_values = (
+    generation_rows = (
         await db.execute(
-            select(ShotGroup.reference_frames).where(ShotGroup.script_id == script_id)
+            select(
+                GenerationJob.job_id,
+                GenerationJob.output_json,
+                GenerationJob.metrics,
+            ).where(GenerationJob.script_id == script_id)
         )
-    ).scalars().all()
-    for value in frame_values:
-        _collect_storage_keys(value, keys)
-    return keys, asset_ids_by_key
+    ).all()
+    for job_id, output_json, metrics in generation_rows:
+        exclusions.generation_job_ids.add(job_id)
+        collect_storage_keys(output_json, keys)
+        collect_storage_keys(metrics, keys)
+
+    video_rows = (
+        await db.execute(
+            select(
+                VideoGenerationJob.job_id,
+                VideoGenerationJob.input_json,
+                VideoGenerationJob.output_json,
+                VideoGenerationJob.metrics,
+            ).where(VideoGenerationJob.script_id == script_id)
+        )
+    ).all()
+    for job_id, input_json, output_json, metrics in video_rows:
+        exclusions.video_generation_job_ids.add(job_id)
+        collect_storage_keys(input_json, keys)
+        collect_storage_keys(output_json, keys)
+        collect_storage_keys(metrics, keys)
+
+    timeline_rows = (
+        await db.execute(
+            select(
+                TimelineRenderJob.job_id,
+                TimelineRenderJob.input_json,
+                TimelineRenderJob.output_json,
+                TimelineRenderJob.output_storage_key,
+            ).where(TimelineRenderJob.script_id == script_id)
+        )
+    ).all()
+    for job_id, input_json, output_json, output_storage_key in timeline_rows:
+        exclusions.timeline_render_job_ids.add(job_id)
+        collect_storage_keys(input_json, keys)
+        collect_storage_keys(output_json, keys)
+        collect_storage_keys(output_storage_key, keys)
+
+    storyboard_rows = (
+        await db.execute(
+            select(StoryboardJob.job_id, StoryboardJob.detail).where(
+                StoryboardJob.script_id == script_id
+            )
+        )
+    ).all()
+    for job_id, detail in storyboard_rows:
+        exclusions.storyboard_job_ids.add(job_id)
+        collect_storage_keys(detail, keys)
+
+    pipeline_rows = (
+        await db.execute(
+            select(PipelineJob.id, PipelineJob.output_json).where(
+                PipelineJob.script_id == script_id
+            )
+        )
+    ).all()
+    for job_id, output_json in pipeline_rows:
+        exclusions.pipeline_job_ids.add(job_id)
+        collect_storage_keys(output_json, keys)
+
+    material_ids = select(Materials.id).where(Materials.script_id == script_id)
+    canvas_node_rows = (
+        await db.execute(
+            select(CanvasNode.id, CanvasNode.data).where(
+                CanvasNode.material_id.in_(material_ids)
+            )
+        )
+    ).all()
+    for node_id, data in canvas_node_rows:
+        exclusions.canvas_node_ids.add(node_id)
+        collect_storage_keys(data, keys)
+    canvas_edge_rows = (
+        await db.execute(
+            select(CanvasEdge.id, CanvasEdge.data).where(
+                CanvasEdge.material_id.in_(material_ids)
+            )
+        )
+    ).all()
+    for edge_id, data in canvas_edge_rows:
+        exclusions.canvas_edge_ids.add(edge_id)
+        collect_storage_keys(data, keys)
+
+    shot_group_rows = (
+        await db.execute(
+            select(
+                ShotGroup.shot_group_id,
+                ShotGroup.reference_frames,
+                ShotGroup.materials,
+                ShotGroup.audio_elements,
+            ).where(ShotGroup.script_id == script_id)
+        )
+    ).all()
+    for group_id, reference_frames, materials, audio_elements in shot_group_rows:
+        exclusions.shot_group_ids.add(group_id)
+        collect_storage_keys(reference_frames, keys)
+        collect_storage_keys(materials, keys)
+        collect_storage_keys(audio_elements, keys)
+
+    for upload in uploads:
+        exclusions.media_upload_ids.add(upload.id)
+        collect_storage_keys(upload.temp_storage_key, keys)
+        collect_storage_keys(upload.final_storage_key, keys)
+        upload_ids_by_key[upload.temp_storage_key] = upload.id
+        upload_ids_by_key[upload.final_storage_key] = upload.id
+    return keys, asset_ids_by_key, upload_ids_by_key, exclusions
 
 
 async def _collect_episode_storage_keys(
@@ -381,10 +442,19 @@ async def _collect_episode_storage_keys(
     script_id: str,
     episode_id: str,
     deleted_subject_ids: set[str],
-) -> tuple[set[str], dict[str, str]]:
+    generation_criterion: Any,
+    uploads: list[MediaUpload],
+) -> tuple[
+    set[str],
+    dict[str, str],
+    dict[str, str],
+    StorageReferenceExclusions,
+]:
     """收集删除单集时会失去业务引用的媒体对象。"""
     keys: set[str] = set()
     asset_ids_by_key: dict[str, str] = {}
+    upload_ids_by_key: dict[str, str] = {}
+    exclusions = StorageReferenceExclusions(episode_ids={episode_id})
 
     if deleted_subject_ids:
         asset_rows = (
@@ -396,9 +466,9 @@ async def _collect_episode_storage_keys(
             )
         ).all()
         for asset_id, storage_key in asset_rows:
-            if storage_key:
-                keys.add(storage_key)
-                asset_ids_by_key[storage_key] = asset_id
+            exclusions.asset_entry_ids.add(asset_id)
+            collect_storage_keys(storage_key, keys)
+            asset_ids_by_key[storage_key] = asset_id
 
     episode_key = (
         await db.execute(
@@ -408,39 +478,504 @@ async def _collect_episode_storage_keys(
             )
         )
     ).scalar_one_or_none()
-    if episode_key:
-        keys.add(episode_key)
+    collect_storage_keys(episode_key, keys)
 
-    for model, field in (
-        (GenerationJob, GenerationJob.output_json),
-        (VideoGenerationJob, VideoGenerationJob.output_json),
-        (TimelineRenderJob, TimelineRenderJob.output_json),
-    ):
-        values = (
-            await db.execute(select(field).where(model.episode_id == episode_id))
+    generation_rows = (
+        await db.execute(
+            select(
+                GenerationJob.job_id,
+                GenerationJob.output_json,
+                GenerationJob.metrics,
+            ).where(generation_criterion)
+        )
+    ).all()
+    for job_id, output_json, metrics in generation_rows:
+        exclusions.generation_job_ids.add(job_id)
+        collect_storage_keys(output_json, keys)
+        collect_storage_keys(metrics, keys)
+
+    video_rows = (
+        await db.execute(
+            select(
+                VideoGenerationJob.job_id,
+                VideoGenerationJob.input_json,
+                VideoGenerationJob.output_json,
+                VideoGenerationJob.metrics,
+            ).where(VideoGenerationJob.episode_id == episode_id)
+        )
+    ).all()
+    for job_id, input_json, output_json, metrics in video_rows:
+        exclusions.video_generation_job_ids.add(job_id)
+        collect_storage_keys(input_json, keys)
+        collect_storage_keys(output_json, keys)
+        collect_storage_keys(metrics, keys)
+
+    timeline_rows = (
+        await db.execute(
+            select(
+                TimelineRenderJob.job_id,
+                TimelineRenderJob.input_json,
+                TimelineRenderJob.output_json,
+                TimelineRenderJob.output_storage_key,
+            ).where(TimelineRenderJob.episode_id == episode_id)
+        )
+    ).all()
+    for job_id, input_json, output_json, output_storage_key in timeline_rows:
+        exclusions.timeline_render_job_ids.add(job_id)
+        collect_storage_keys(input_json, keys)
+        collect_storage_keys(output_json, keys)
+        collect_storage_keys(output_storage_key, keys)
+
+    storyboard_rows = (
+        await db.execute(
+            select(StoryboardJob.job_id, StoryboardJob.detail).where(
+                StoryboardJob.episode_id == episode_id
+            )
+        )
+    ).all()
+    for job_id, detail in storyboard_rows:
+        exclusions.storyboard_job_ids.add(job_id)
+        collect_storage_keys(detail, keys)
+
+    pipeline_rows = (
+        await db.execute(
+            select(PipelineJob.id, PipelineJob.output_json).where(
+                PipelineJob.episode_id == episode_id
+            )
+        )
+    ).all()
+    for job_id, output_json in pipeline_rows:
+        exclusions.pipeline_job_ids.add(job_id)
+        collect_storage_keys(output_json, keys)
+
+    shot_group_rows = (
+        await db.execute(
+            select(
+                ShotGroup.shot_group_id,
+                ShotGroup.reference_frames,
+                ShotGroup.materials,
+                ShotGroup.audio_elements,
+            ).where(ShotGroup.episode_id == episode_id)
+        )
+    ).all()
+    for group_id, reference_frames, materials, audio_elements in shot_group_rows:
+        exclusions.shot_group_ids.add(group_id)
+        collect_storage_keys(reference_frames, keys)
+        collect_storage_keys(materials, keys)
+        collect_storage_keys(audio_elements, keys)
+
+    for upload in uploads:
+        exclusions.media_upload_ids.add(upload.id)
+        collect_storage_keys(upload.temp_storage_key, keys)
+        collect_storage_keys(upload.final_storage_key, keys)
+        upload_ids_by_key[upload.temp_storage_key] = upload.id
+        upload_ids_by_key[upload.final_storage_key] = upload.id
+    return keys, asset_ids_by_key, upload_ids_by_key, exclusions
+
+
+def _has_retryable_financial_cleanup_debt(
+    status: str,
+    error_type: str | None,
+    retryable: bool,
+) -> bool:
+    """Generation/Video reconciler 共享的权威财务补偿谓词。"""
+    return (
+        status == "failed"
+        and error_type == "financial_cleanup"
+        and retryable is True
+    )
+
+
+def _has_retryable_video_cleanup_debt(
+    status: str,
+    output_json: dict[str, Any] | None,
+    error_type: str | None,
+    retryable: bool,
+) -> bool:
+    """识别删除视频任务会丢失的远端取消、媒体或财务补偿债务。"""
+    if _has_retryable_financial_cleanup_debt(status, error_type, retryable):
+        return True
+
+    if not isinstance(output_json, dict):
+        return False
+
+    cancellation = output_json.get(_PROVIDER_CANCELLATION_KEY)
+    if status == "canceled" and isinstance(cancellation, dict):
+        provider_task_id = str(
+            cancellation.get("provider_task_id")
+            or output_json.get("provider_task_id")
+            or ""
+        ).strip()
+        if (
+            provider_task_id
+            and cancellation.get("retryable") is True
+            and str(cancellation.get("outcome") or "")
+            in _RETRYABLE_PROVIDER_CANCELLATION_OUTCOMES
+        ):
+            return True
+
+    attempt_cleanup = output_json.get(_ATTEMPT_OUTPUT_CLEANUP_KEY)
+    return isinstance(attempt_cleanup, dict) and any(
+        isinstance(record, dict) and record.get("retryable") is True
+        for record in attempt_cleanup.values()
+    )
+
+
+def _has_pending_storyboard_financial_cleanup(
+    financial_cleanup_status: str | None,
+) -> bool:
+    """分镜 reconciler 只以专用 pending 标记作为待清债事实。"""
+    return financial_cleanup_status == "pending"
+
+
+def _has_pending_timeline_financial_cleanup(
+    status: str,
+    output_json: dict[str, Any] | None,
+) -> bool:
+    """与 timeline reconciler 的候选及锁后校验保持完全一致。"""
+    if status not in {"failed", "canceled"} or not isinstance(output_json, dict):
+        return False
+    cleanup = output_json.get("financial_cleanup")
+    return (
+        isinstance(cleanup, dict)
+        and cleanup.get("status") == "pending"
+        and cleanup.get("action") == "release"
+        and bool(cleanup.get("reservation_id"))
+    )
+
+
+def _generation_jobs_for_episode(
+    episode_id: str,
+    deleted_subject_ids: set[str],
+) -> Any:
+    """覆盖显式 episode_id 及随独占主体删除的历史图片任务。"""
+    criterion = GenerationJob.episode_id == episode_id
+    if deleted_subject_ids:
+        criterion = criterion | (
+            GenerationJob.episode_id.is_(None)
+            & GenerationJob.subject_id.in_(deleted_subject_ids)
+        )
+    return criterion
+
+
+async def _deleted_subject_ids_for_episode(
+    db: AsyncSession,
+    *,
+    script_id: str,
+    episode_id: str,
+    episode_no: int,
+    subjects: list[Subject],
+) -> set[str]:
+    """计算删除分集时会真正硬删、而非共享或归档保留的主体。"""
+    exclusive_subject_ids = {
+        subject.id
+        for subject in subjects
+        if episode_no in (subject.episode_nos or [])
+        and not [no for no in (subject.episode_nos or []) if no != episode_no]
+    }
+    if not exclusive_subject_ids:
+        return set()
+    retained_subject_ids = set(
+        (
+            await db.execute(
+                select(GenerationJob.subject_id).where(
+                    GenerationJob.script_id == script_id,
+                    GenerationJob.subject_id.in_(exclusive_subject_ids),
+                    GenerationJob.episode_id.is_not(None),
+                    GenerationJob.episode_id != episode_id,
+                )
+            )
+        ).scalars()
+    )
+    return exclusive_subject_ids - retained_subject_ids
+
+
+async def _count_blocking_generation_jobs(
+    db: AsyncSession,
+    criterion: Any,
+) -> int:
+    rows = (
+        await db.execute(
+            select(
+                GenerationJob.status,
+                GenerationJob.error_type,
+                GenerationJob.retryable,
+            ).where(criterion)
+        )
+    ).all()
+    return sum(
+        status in _VIDEO_ACTIVE_STATUSES
+        or _has_retryable_financial_cleanup_debt(status, error_type, retryable)
+        for status, error_type, retryable in rows
+    )
+
+
+async def _count_blocking_storyboard_jobs(
+    db: AsyncSession,
+    criterion: Any,
+) -> int:
+    rows = (
+        await db.execute(
+            select(
+                StoryboardJob.status,
+                StoryboardJob.financial_cleanup_status,
+            ).where(criterion)
+        )
+    ).all()
+    return sum(
+        status in _STORYBOARD_ACTIVE_STATUSES
+        or _has_pending_storyboard_financial_cleanup(financial_cleanup_status)
+        for status, financial_cleanup_status in rows
+    )
+
+
+async def _count_blocking_timeline_jobs(
+    db: AsyncSession,
+    criterion: Any,
+) -> int:
+    """以 Python 检查 JSON，保持 SQLite 与 PostgreSQL 行为一致。"""
+    rows = (
+        await db.execute(
+            select(
+                TimelineRenderJob.status,
+                TimelineRenderJob.output_json,
+            ).where(criterion)
+        )
+    ).all()
+    return sum(
+        status in _VIDEO_ACTIVE_STATUSES
+        or _has_pending_timeline_financial_cleanup(status, output_json)
+        for status, output_json in rows
+    )
+
+
+async def _count_blocking_video_jobs(db: AsyncSession, criterion: Any) -> int:
+    """以 Python 检查 JSON，保持 SQLite 与 PostgreSQL 行为一致。"""
+    rows = (
+        await db.execute(
+            select(
+                VideoGenerationJob.status,
+                VideoGenerationJob.output_json,
+                VideoGenerationJob.error_type,
+                VideoGenerationJob.retryable,
+            ).where(criterion)
+        )
+    ).all()
+    return sum(
+        status in _VIDEO_ACTIVE_STATUSES
+        or _has_retryable_video_cleanup_debt(
+            status,
+            output_json,
+            error_type,
+            retryable,
+        )
+        for status, output_json, error_type, retryable in rows
+    )
+
+
+async def _count_blocking_pipeline_jobs(
+    db: AsyncSession,
+    criterion: Any,
+) -> int:
+    """按 reconciler 的 source 约定识别失败 run 遗留的 reserved 预约。"""
+    rows = (
+        await db.execute(
+            select(
+                PipelineJob.status,
+                PipelineJob.run_id,
+            ).where(criterion)
+        )
+    ).all()
+    failed_run_ids = {run_id for status, run_id in rows if status == "failed"}
+    reserved_run_ids: set[str] = set()
+    if failed_run_ids:
+        reserved_run_ids = set(
+            (
+                await db.execute(
+                    select(CreditReservation.source_id).where(
+                        CreditReservation.source_type == "pipeline",
+                        CreditReservation.source_id.in_(failed_run_ids),
+                        CreditReservation.status == "reserved",
+                    )
+                )
+            ).scalars()
+        )
+    return sum(
+        status in _PIPELINE_ACTIVE_STATUSES
+        or (status == "failed" and run_id in reserved_run_ids)
+        for status, run_id in rows
+    )
+
+
+def _raise_financial_cleanup_conflict(kind: str, debt_count: int) -> None:
+    if debt_count:
+        raise ConflictError(
+            f"仍有 {debt_count} 个{kind}任务存在可重试的财务清理债务，"
+            "请等待后台清理完成后再删除"
+        )
+
+
+async def _lock_generation_jobs_for_delete(
+    db: AsyncSession,
+    criterion: Any,
+) -> list[GenerationJob]:
+    jobs = list(
+        (
+            await db.execute(
+                select(GenerationJob)
+                .where(criterion)
+                .order_by(GenerationJob.job_id.asc())
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
         ).scalars().all()
-        for value in values:
-            _collect_storage_keys(value, keys)
-
-    render_keys = (
-        await db.execute(
-            select(TimelineRenderJob.output_storage_key).where(
-                TimelineRenderJob.episode_id == episode_id
+    )
+    _raise_financial_cleanup_conflict(
+        "图片生成",
+        sum(
+            _has_retryable_financial_cleanup_debt(
+                job.status,
+                job.error_type,
+                job.retryable,
             )
-        )
-    ).scalars().all()
-    keys.update(key for key in render_keys if key)
+            for job in jobs
+        ),
+    )
+    return jobs
 
-    frame_values = (
-        await db.execute(
-            select(ShotGroup.reference_frames).where(
-                ShotGroup.episode_id == episode_id
+
+async def _lock_storyboard_jobs_for_delete(
+    db: AsyncSession,
+    criterion: Any,
+) -> list[StoryboardJob]:
+    jobs = list(
+        (
+            await db.execute(
+                select(StoryboardJob)
+                .where(criterion)
+                .order_by(StoryboardJob.job_id.asc())
+                .options(noload(StoryboardJob.script))
+                .with_for_update()
+                .execution_options(populate_existing=True)
             )
+        ).scalars().all()
+    )
+    _raise_financial_cleanup_conflict(
+        "分镜生成",
+        sum(
+            _has_pending_storyboard_financial_cleanup(
+                job.financial_cleanup_status
+            )
+            for job in jobs
+        ),
+    )
+    return jobs
+
+
+async def _lock_timeline_jobs_for_delete(
+    db: AsyncSession,
+    criterion: Any,
+) -> list[TimelineRenderJob]:
+    jobs = list(
+        (
+            await db.execute(
+                select(TimelineRenderJob)
+                .where(criterion)
+                .order_by(TimelineRenderJob.job_id.asc())
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalars().all()
+    )
+    _raise_financial_cleanup_conflict(
+        "时间线渲染",
+        sum(
+            _has_pending_timeline_financial_cleanup(
+                job.status,
+                job.output_json,
+            )
+            for job in jobs
+        ),
+    )
+    return jobs
+
+
+async def _lock_video_jobs_for_delete(
+    db: AsyncSession,
+    criterion: Any,
+) -> list[VideoGenerationJob]:
+    """锁定并刷新视频行，阻止删除穿透并发写入的外部清理债务。"""
+    jobs = list(
+        (
+            await db.execute(
+                select(VideoGenerationJob)
+                .where(criterion)
+                .order_by(VideoGenerationJob.job_id.asc())
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalars().all()
+    )
+    debt_count = sum(
+        _has_retryable_video_cleanup_debt(
+            job.status,
+            job.output_json,
+            job.error_type,
+            job.retryable,
         )
-    ).scalars().all()
-    for value in frame_values:
-        _collect_storage_keys(value, keys)
-    return keys, asset_ids_by_key
+        for job in jobs
+    )
+    if debt_count:
+        raise ConflictError(
+            f"仍有 {debt_count} 个视频任务存在可重试的远端取消、"
+            "媒体清理债务或财务清理债务，"
+            "请等待后台清理完成后再删除"
+        )
+    return jobs
+
+
+async def _lock_pipeline_jobs_for_delete(
+    db: AsyncSession,
+    criterion: Any,
+) -> list[PipelineJob]:
+    """锁定流水线行后按 run source 锁预约，避免删除丢失可恢复冻结积分。"""
+    jobs = list(
+        (
+            await db.execute(
+                select(PipelineJob)
+                .where(criterion)
+                .options(noload(PipelineJob.script))
+                .order_by(PipelineJob.run_id.asc(), PipelineJob.id.asc())
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalars().all()
+    )
+    failed_run_ids = {job.run_id for job in jobs if job.status == "failed"}
+    reservations: list[CreditReservation] = []
+    if failed_run_ids:
+        reservations = list(
+            (
+                await db.execute(
+                    select(CreditReservation)
+                    .where(
+                        CreditReservation.source_type == "pipeline",
+                        CreditReservation.source_id.in_(failed_run_ids),
+                    )
+                    .order_by(
+                        CreditReservation.source_id.asc(),
+                        CreditReservation.id.asc(),
+                    )
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).scalars().all()
+        )
+    _raise_financial_cleanup_conflict(
+        "流水线",
+        sum(reservation.status == "reserved" for reservation in reservations),
+    )
+    return jobs
 
 
 async def get_script_dependency_summary(
@@ -458,35 +993,24 @@ async def get_script_dependency_summary(
     )
     active_job_count = sum(
         (
-            await _count(
+            await _count_blocking_pipeline_jobs(
                 db,
-                PipelineJob,
                 PipelineJob.script_id == script_id,
-                PipelineJob.status.in_(["pending", "ready", "retry", "running"]),
             ),
-            await _count(
+            await _count_blocking_storyboard_jobs(
                 db,
-                StoryboardJob,
                 StoryboardJob.script_id == script_id,
-                StoryboardJob.status.in_(["pending", "ready", "retry", "running"]),
             ),
-            await _count(
+            await _count_blocking_generation_jobs(
                 db,
-                GenerationJob,
                 GenerationJob.script_id == script_id,
-                GenerationJob.status.in_(["pending", "ready", "retry", "starting", "processing"]),
             ),
-            await _count(
-                db,
-                VideoGenerationJob,
-                VideoGenerationJob.script_id == script_id,
-                VideoGenerationJob.status.in_(["pending", "ready", "retry", "starting", "processing"]),
+            await _count_blocking_video_jobs(
+                db, VideoGenerationJob.script_id == script_id
             ),
-            await _count(
+            await _count_blocking_timeline_jobs(
                 db,
-                TimelineRenderJob,
                 TimelineRenderJob.script_id == script_id,
-                TimelineRenderJob.status.in_(["pending", "ready", "retry", "starting", "processing"]),
             ),
         )
     )
@@ -505,19 +1029,144 @@ async def get_script_dependency_summary(
     )
 
 
+async def _cancel_lifecycle_dispatches(
+    db: AsyncSession,
+    *,
+    video_criterion: Any,
+    generation_criterion: Any,
+    timeline_criterion: Any,
+    storyboard_criterion: Any,
+    pipeline_criterion: Any,
+) -> None:
+    """按固定表序锁定、复检债务，再收敛无外键活动投递。"""
+    video_jobs = await _lock_video_jobs_for_delete(db, video_criterion)
+    generation_jobs = await _lock_generation_jobs_for_delete(
+        db,
+        generation_criterion,
+    )
+    timeline_jobs = await _lock_timeline_jobs_for_delete(db, timeline_criterion)
+    storyboard_jobs = await _lock_storyboard_jobs_for_delete(
+        db,
+        storyboard_criterion,
+    )
+    pipeline_jobs = await _lock_pipeline_jobs_for_delete(db, pipeline_criterion)
+    pipeline_run_ids = {job.run_id for job in pipeline_jobs}
+
+    for task_type, jobs in (
+        ("video.generate", video_jobs),
+        ("generation.generate_images", generation_jobs),
+        ("timeline.render", timeline_jobs),
+        ("storyboard.generate", storyboard_jobs),
+    ):
+        for job in jobs:
+            await cancel_outbox_task(
+                db,
+                task_type=task_type,
+                job_id=job.job_id,
+                attempt=job.attempt,
+            )
+
+    for run_id in pipeline_run_ids:
+        await cancel_outbox_task(
+            db,
+            task_type="pipeline.dag",
+            job_id=run_id,
+        )
+
+
+async def _cancel_script_dispatches(db: AsyncSession, script_id: str) -> None:
+    """剧本硬删除前锁定任务并收敛全部活动投递。"""
+    await _cancel_lifecycle_dispatches(
+        db,
+        video_criterion=VideoGenerationJob.script_id == script_id,
+        generation_criterion=GenerationJob.script_id == script_id,
+        timeline_criterion=TimelineRenderJob.script_id == script_id,
+        storyboard_criterion=StoryboardJob.script_id == script_id,
+        pipeline_criterion=PipelineJob.script_id == script_id,
+    )
+
+
+async def _cancel_episode_dispatches(
+    db: AsyncSession,
+    *,
+    episode_id: str,
+    generation_criterion: Any,
+) -> None:
+    """分集硬删除沿用与剧本删除相同的任务锁序和投递收敛。"""
+    await _cancel_lifecycle_dispatches(
+        db,
+        video_criterion=VideoGenerationJob.episode_id == episode_id,
+        generation_criterion=generation_criterion,
+        timeline_criterion=TimelineRenderJob.episode_id == episode_id,
+        storyboard_criterion=StoryboardJob.episode_id == episode_id,
+        pipeline_criterion=PipelineJob.episode_id == episode_id,
+    )
+
+
 async def delete_script(db: AsyncSession, script: Script, *, commit: bool = True) -> None:
     """按外键拓扑硬删除剧本及派生数据。"""
     script_id = script.id
+    locked_script = (
+        await db.execute(select(Script).where(Script.id == script_id).with_for_update())
+    ).scalar_one_or_none()
+    if locked_script is None:
+        raise NotFoundError("剧本不存在")
+    await acquire_storage_reference_barrier(db)
+    await _cancel_script_dispatches(db, script_id)
     material_ids = select(Materials.id).where(Materials.script_id == script_id)
     subject_ids = select(Subject.id).where(Subject.script_id == script_id)
     asset_ids = select(AssetEntry.id).where(AssetEntry.script_id == script_id)
     shot_group_ids = select(ShotGroup.shot_group_id).where(ShotGroup.script_id == script_id)
 
-    storage_keys, asset_ids_by_key = await _collect_script_storage_keys(db, script_id)
-    await _enqueue_storage_deletes(
+    locked_uploads = list(
+        (
+            await db.execute(
+                select(MediaUpload)
+                .where(MediaUpload.owner_script_id == script_id)
+                .order_by(MediaUpload.id.asc())
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalars().all()
+    )
+    (
+        storage_keys,
+        asset_ids_by_key,
+        upload_ids_by_key,
+        exclusions,
+    ) = await _collect_script_storage_keys(db, script_id, locked_uploads)
+    decision = await decide_storage_key_deletes(
         db,
         storage_keys,
+        exclusions=exclusions,
+    )
+    protected_keys = set(decision.protected_keys)
+    deletion_keys = set(decision.deletable_keys)
+    now = datetime.now(UTC)
+    for upload in locked_uploads:
+        final_key = next(
+            iter(normalize_storage_keys({upload.final_storage_key})),
+            "",
+        )
+        temp_key = next(
+            iter(normalize_storage_keys({upload.temp_storage_key})),
+            "",
+        )
+        if upload.asset_id:
+            asset_ids_by_key.setdefault(upload.final_storage_key, upload.asset_id)
+        if final_key in protected_keys:
+            if upload.status == "staging":
+                deletion_keys.discard(temp_key)
+            continue
+        upload.status = "deleted"
+        upload.completed_at = now
+    await enqueue_storage_deletes(
+        db,
+        deletion_keys,
+        exclusions=exclusions,
         asset_ids_by_key=asset_ids_by_key,
+        upload_ids_by_key=upload_ids_by_key,
+        protected_storage_keys=protected_keys,
     )
 
     # 先断开 Subject.image_entry_id 与资产版本自引用，再删除叶子资源。
@@ -590,6 +1239,7 @@ async def get_episode_for_update(
             Episode.episode_id == episode_id,
             Episode.script_id == script_id,
         )
+        .execution_options(populate_existing=True)
         .with_for_update()
     )
     episode = result.scalar_one_or_none()
@@ -667,6 +1317,29 @@ async def save_episode(
     WHERE episode_version=? AND client_save_seq=?，affected==0 则 409。
     成功后 episode_version 与 client_save_seq 均递增。
     """
+    if script_text is not None:
+        # 自动流水线会在同一事务插入子任务；必须先锁 Script，再触碰 Episode。
+        locked_script_id = (
+            await db.execute(
+                select(Script.id)
+                .where(Script.id == script_id)
+                .with_for_update(read=True, key_share=True)
+            )
+        ).scalar_one_or_none()
+        if locked_script_id is None:
+            raise NotFoundError("剧本不存在")
+        bind = getattr(db, "bind", None)
+        if bind is None:
+            bind = getattr(getattr(db, "session", None), "bind", None)
+        if getattr(getattr(bind, "dialect", None), "name", None) == "postgresql":
+            await db.execute(
+                select(
+                    func.pg_advisory_xact_lock(
+                        func.hashtext("pipeline_trigger"),
+                        func.hashtext(script_id),
+                    )
+                )
+            )
     await _load_episode_for_script(db, script_id, episode_id)
 
     # 原子更新，避免并发覆盖
@@ -722,6 +1395,17 @@ async def get_episode_dependency_summary(
         for subject in subjects
         if episode.episode_no in (subject.episode_nos or [])
     ]
+    deleted_subject_ids = await _deleted_subject_ids_for_episode(
+        db,
+        script_id=script_id,
+        episode_id=episode_id,
+        episode_no=episode.episode_no,
+        subjects=subjects,
+    )
+    generation_criterion = _generation_jobs_for_episode(
+        episode_id,
+        deleted_subject_ids,
+    )
     shot_group_ids = select(ShotGroup.shot_group_id).where(
         ShotGroup.episode_id == episode_id
     )
@@ -729,49 +1413,38 @@ async def get_episode_dependency_summary(
         (
             await _count(db, PipelineJob, PipelineJob.episode_id == episode_id),
             await _count(db, StoryboardJob, StoryboardJob.episode_id == episode_id),
-            await _count(db, GenerationJob, GenerationJob.episode_id == episode_id),
+            await _count(db, GenerationJob, generation_criterion),
             await _count(db, TimelineRenderJob, TimelineRenderJob.episode_id == episode_id),
         )
     )
     active_job_count = sum(
         (
-            await _count(
+            await _count_blocking_pipeline_jobs(
                 db,
-                PipelineJob,
                 PipelineJob.episode_id == episode_id,
-                PipelineJob.status.in_(["pending", "ready", "retry", "running"]),
             ),
-            await _count(
+            await _count_blocking_storyboard_jobs(
                 db,
-                StoryboardJob,
                 StoryboardJob.episode_id == episode_id,
-                StoryboardJob.status.in_(["pending", "ready", "retry", "running"]),
             ),
-            await _count(
+            await _count_blocking_generation_jobs(
                 db,
-                GenerationJob,
-                GenerationJob.episode_id == episode_id,
-                GenerationJob.status.in_(["pending", "ready", "retry", "starting", "processing"]),
+                generation_criterion,
             ),
-            await _count(
-                db,
-                VideoGenerationJob,
-                VideoGenerationJob.episode_id == episode_id,
-                VideoGenerationJob.status.in_(["pending", "ready", "retry", "starting", "processing"]),
+            await _count_blocking_video_jobs(
+                db, VideoGenerationJob.episode_id == episode_id
             ),
-            await _count(
+            await _count_blocking_timeline_jobs(
                 db,
-                TimelineRenderJob,
                 TimelineRenderJob.episode_id == episode_id,
-                TimelineRenderJob.status.in_(["pending", "ready", "retry", "starting", "processing"]),
             ),
         )
     )
     return LifecycleDependencySummary(
         subject_count=len(related_subject_ids),
         asset_count=(
-            await _count(db, AssetEntry, AssetEntry.subject_id.in_(related_subject_ids))
-            if related_subject_ids
+            await _count(db, AssetEntry, AssetEntry.subject_id.in_(deleted_subject_ids))
+            if deleted_subject_ids
             else 0
         ),
         shot_group_count=await _count(
@@ -796,36 +1469,94 @@ async def delete_episode(
     """删除分集派生数据；共享主体仅移除该集号，单集主体及其资产一并删除。"""
     from app.crud import asset as asset_crud
 
-    episode = await _load_episode_for_script(db, script_id, episode_id)
+    # 统一锁序为 Script -> Episode -> Video -> Generation -> Timeline -> Storyboard -> Pipeline。
+    await get_script_for_update(db, script_id)
+    episode = await get_episode_for_update(db, script_id, episode_id)
+    await acquire_storage_reference_barrier(db)
     subjects = list(
         (
             await db.execute(select(Subject).where(Subject.script_id == script_id))
         ).scalars().all()
     )
     related = [s for s in subjects if episode.episode_no in (s.episode_nos or [])]
-    deleted_subject_ids = {
-        subject.id
-        for subject in related
-        if not [
-            no
-            for no in (subject.episode_nos or [])
-            if no != episode.episode_no
-        ]
-    }
+    deleted_subject_ids = await _deleted_subject_ids_for_episode(
+        db,
+        script_id=script_id,
+        episode_id=episode_id,
+        episode_no=episode.episode_no,
+        subjects=subjects,
+    )
+    generation_criterion = _generation_jobs_for_episode(
+        episode_id,
+        deleted_subject_ids,
+    )
+    await _cancel_episode_dispatches(
+        db,
+        episode_id=episode_id,
+        generation_criterion=generation_criterion,
+    )
     shot_group_ids = select(ShotGroup.shot_group_id).where(
         ShotGroup.episode_id == episode_id
     )
 
-    storage_keys, asset_ids_by_key = await _collect_episode_storage_keys(
+    locked_uploads: list[MediaUpload] = []
+    if deleted_subject_ids:
+        locked_uploads = list(
+            (
+                await db.execute(
+                    select(MediaUpload)
+                    .where(MediaUpload.subject_id.in_(deleted_subject_ids))
+                    .order_by(MediaUpload.id.asc())
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).scalars().all()
+        )
+    (
+        storage_keys,
+        asset_ids_by_key,
+        upload_ids_by_key,
+        exclusions,
+    ) = await _collect_episode_storage_keys(
         db,
         script_id=script_id,
         episode_id=episode_id,
         deleted_subject_ids=deleted_subject_ids,
+        generation_criterion=generation_criterion,
+        uploads=locked_uploads,
     )
-    await _enqueue_storage_deletes(
+    decision = await decide_storage_key_deletes(
         db,
         storage_keys,
+        exclusions=exclusions,
+    )
+    protected_keys = set(decision.protected_keys)
+    deletion_keys = set(decision.deletable_keys)
+    now = datetime.now(UTC)
+    for upload in locked_uploads:
+        final_key = next(
+            iter(normalize_storage_keys({upload.final_storage_key})),
+            "",
+        )
+        temp_key = next(
+            iter(normalize_storage_keys({upload.temp_storage_key})),
+            "",
+        )
+        if upload.asset_id:
+            asset_ids_by_key.setdefault(upload.final_storage_key, upload.asset_id)
+        if final_key in protected_keys:
+            if upload.status == "staging":
+                deletion_keys.discard(temp_key)
+            continue
+        upload.status = "deleted"
+        upload.completed_at = now
+    await enqueue_storage_deletes(
+        db,
+        deletion_keys,
+        exclusions=exclusions,
         asset_ids_by_key=asset_ids_by_key,
+        upload_ids_by_key=upload_ids_by_key,
+        protected_storage_keys=protected_keys,
     )
 
     for model, criterion in (
@@ -833,7 +1564,7 @@ async def delete_episode(
         (TimelineRenderJob, TimelineRenderJob.episode_id == episode_id),
         (VideoGenerationJob, VideoGenerationJob.episode_id == episode_id),
         (StoryboardJob, StoryboardJob.episode_id == episode_id),
-        (GenerationJob, GenerationJob.episode_id == episode_id),
+        (GenerationJob, generation_criterion),
         (Shot, Shot.shot_group_id.in_(shot_group_ids)),
         (ShotGroup, ShotGroup.episode_id == episode_id),
         (Scene, Scene.episode_id == episode_id),
@@ -841,17 +1572,20 @@ async def delete_episode(
     ):
         await db.execute(delete(model).where(criterion))
 
-    # 只有该分集引用的主体可安全删除；跨集主体保留资产，仅移除当前集号。
+    # 其他显式分集任务仍通过非空 FK 引用的主体转为归档，不能连同资产删除。
     for subject in related:
         remaining = [no for no in (subject.episode_nos or []) if no != episode.episode_no]
         if remaining:
             subject.episode_nos = remaining
+        elif subject.id not in deleted_subject_ids:
+            subject.episode_nos = []
+            subject.is_active = False
         else:
-            # 防御性清理没有 episode_id 的遗留图片任务。
-            await db.execute(
-                delete(GenerationJob).where(GenerationJob.subject_id == subject.id)
+            await asset_crud.delete_subject(
+                db,
+                subject,
+                parent_delete_prepared=True,
             )
-            await asset_crud.delete_subject(db, subject)
 
     await db.execute(delete(Episode).where(Episode.episode_id == episode_id))
     if commit:

@@ -6,13 +6,18 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import secrets
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from fastapi import HTTPException
+from pydantic import ValidationError
 from sqlalchemy import CheckConstraint, UniqueConstraint, create_engine, select
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import Session
@@ -23,13 +28,17 @@ from app.models.credit import CreditAccount
 from app.models.credit_log import CreditLog
 from app.models.credit_reservation import CreditReservation
 from app.models.episode import Episode
+from app.models.media_storage_job import MediaStorageJob
 from app.models.script import Script
 from app.models.shot import Shot
 from app.models.shot_group import ShotGroup
 from app.models.subject import Subject
 from app.models.task_dispatch_outbox import TaskDispatchOutbox
 from app.models.user import User
-from app.models.video_generation_job import VideoGenerationJob
+from app.models.video_generation_job import (
+    VideoGenerationIdempotencyRequest,
+    VideoGenerationJob,
+)
 from app.models.video_provider import VideoProviderConfig
 
 
@@ -53,8 +62,11 @@ class _AsyncSessionAdapter:
     def __init__(self, session: Session) -> None:
         self.session = session
         self.commit_count = 0
+        self.rollback_count = 0
+        self.executed_statements: list[object] = []
 
     async def execute(self, statement):
+        self.executed_statements.append(statement)
         return self.session.execute(statement)
 
     async def get(self, *args, **kwargs):
@@ -68,6 +80,7 @@ class _AsyncSessionAdapter:
         self.session.commit()
 
     async def rollback(self) -> None:
+        self.rollback_count += 1
         self.session.rollback()
 
     def add(self, row) -> None:
@@ -92,7 +105,9 @@ def _make_db() -> tuple[object, Session]:
         CreditLog.__table__,
         VideoProviderConfig.__table__,
         VideoGenerationJob.__table__,
+        VideoGenerationIdempotencyRequest.__table__,
         TaskDispatchOutbox.__table__,
+        MediaStorageJob.__table__,
     ):
         table.create(engine)
     raw = Session(engine, expire_on_commit=False)
@@ -343,6 +358,36 @@ def test_video_job_model_declares_reliable_state_and_constraints() -> None:
         "ck_video_jobs_attempt_positive",
     }.issubset(check_names)
 
+    assert set(VideoGenerationIdempotencyRequest.__table__.primary_key.columns.keys()) == {
+        "script_id",
+        "idempotency_key",
+    }
+    assert {
+        "script_id",
+        "idempotency_key",
+        "request_hash",
+        "job_id",
+    } <= set(VideoGenerationIdempotencyRequest.__table__.columns.keys())
+
+
+def test_video_json_merge_uses_locked_debt_state_without_resurrecting_stale_debt() -> None:
+    from app.crud.video import _merge_latest_video_json
+
+    stale_debt = {
+        "attempt_output_cleanup": {
+            "stale-attempt": {"retryable": True},
+        },
+        "provider_cancellation": {
+            "provider_task_id": "stale-provider-task",
+            "retryable": True,
+        },
+        "provider_task_id": "provider-new",
+    }
+    assert _merge_latest_video_json(
+        {"provider_task_id": "provider-current"},
+        stale_debt,
+    ) == {"provider_task_id": "provider-new"}
+
 
 def test_video_static_routes_are_registered_before_dynamic_job_route() -> None:
     from app.api.v1.video_generation import router
@@ -366,8 +411,9 @@ def test_reference_aggregation_is_fail_closed_and_keeps_image_audio_names_aligne
         aggregated = await aggregate_references(db, "sg-10")
 
         assert aggregated.reference_image_names == ["阿明"]
+        # 持久化对象引用统一使用 canonical 相对 key。
         assert [item["storage_key"] for item in aggregated.reference_images] == [
-            "/generate_images/material-1/image.png"
+            "generate_images/material-1/image.png"
         ]
         assert aggregated.reference_audio_names == ["阿明", "门响"]
         assert [item["storage_key"] for item in aggregated.reference_audios] == [
@@ -415,6 +461,15 @@ def test_create_video_job_requires_idempotency_key_and_uses_transactional_outbox
                 user_id=seeded.user.user_id,
                 idempotency_key=None,
             )
+        with pytest.raises(BadRequestError):
+            await create_video_job(
+                db,
+                script_id=seeded.script.id,
+                episode_id=seeded.episode.episode_id,
+                shot_group_id=seeded.shot_group.shot_group_id,
+                user_id=seeded.user.user_id,
+                idempotency_key="   ",
+            )
 
         job = await create_video_job(
             db,
@@ -442,7 +497,7 @@ def test_create_video_job_requires_idempotency_key_and_uses_transactional_outbox
         assert job.input_version == seeded.episode.episode_version
         assert job.input_json["shot_group_version"]["episode_version"] == seeded.episode.episode_version
 
-        with pytest.raises(ConflictError):
+        with pytest.raises(ConflictError) as exc_info:
             await create_video_job(
                 db,
                 script_id=seeded.script.id,
@@ -451,6 +506,190 @@ def test_create_video_job_requires_idempotency_key_and_uses_transactional_outbox
                 user_id=seeded.user.user_id,
                 idempotency_key="idem-1",
             )
+        assert exc_info.value.detail == "幂等键已用于不同请求载荷"
+
+    asyncio.run(scenario())
+
+
+def test_create_video_job_reuses_active_unit_across_different_idempotency_keys(monkeypatch) -> None:
+    async def scenario() -> None:
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        db = _AsyncSessionAdapter(raw)
+        enqueued: list[dict] = []
+
+        async def fake_enqueue(db, **kwargs):
+            enqueued.append(kwargs)
+            row = TaskDispatchOutbox(
+                id=f"dispatch-{len(enqueued)}",
+                task_type=kwargs["task_type"],
+                job_id=kwargs["job_id"],
+                attempt=kwargs["attempt"],
+                payload=kwargs["payload"],
+                status="pending",
+            )
+            db.add(row)
+            return row
+
+        monkeypatch.setattr("app.services.video_generation.enqueue_task", fake_enqueue)
+
+        from app.services.video_generation import create_video_job
+
+        first = await create_video_job(
+            db,
+            script_id=seeded.script.id,
+            episode_id=seeded.episode.episode_id,
+            shot_group_id=seeded.shot_group.shot_group_id,
+            user_id=seeded.user.user_id,
+            idempotency_key="active-key-1",
+        )
+        replay = await create_video_job(
+            db,
+            script_id=seeded.script.id,
+            episode_id=seeded.episode.episode_id,
+            shot_group_id=seeded.shot_group.shot_group_id,
+            user_id=seeded.user.user_id,
+            idempotency_key="active-key-2",
+        )
+
+        assert replay.job_id == first.job_id
+        assert len(raw.scalars(select(VideoGenerationJob)).all()) == 1
+        assert len(raw.scalars(select(CreditReservation)).all()) == 1
+        assert len(raw.scalars(select(TaskDispatchOutbox)).all()) == 1
+        bindings = list(
+            raw.scalars(
+                select(VideoGenerationIdempotencyRequest).order_by(
+                    VideoGenerationIdempotencyRequest.idempotency_key
+                )
+            )
+        )
+        assert [binding.idempotency_key for binding in bindings] == [
+            "active-key-1",
+            "active-key-2",
+        ]
+        assert {binding.job_id for binding in bindings} == {first.job_id}
+        assert len(enqueued) == 1
+
+        first.status = "succeeded"
+        raw.commit()
+        terminal_replay = await create_video_job(
+            db,
+            script_id=seeded.script.id,
+            episode_id=seeded.episode.episode_id,
+            shot_group_id=seeded.shot_group.shot_group_id,
+            user_id=seeded.user.user_id,
+            idempotency_key="active-key-2",
+        )
+
+        assert terminal_replay.job_id == first.job_id
+        assert len(raw.scalars(select(VideoGenerationJob)).all()) == 1
+        assert len(enqueued) == 1
+
+    asyncio.run(scenario())
+
+
+def test_manual_retry_reuses_unresolved_submission_without_new_attempt(monkeypatch) -> None:
+    async def scenario() -> None:
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        job = _add_worker_job(
+            raw,
+            seeded,
+            job_id="job-manual-retry-blocked",
+            reservation_id="reservation-manual-retry-blocked",
+        )
+        job.status = "processing"
+        job.lease_owner = "worker"
+        job.lease_token = "lease-token"
+        job.lease_until = datetime.now(UTC) + timedelta(minutes=5)
+        submission = {
+            "state": "submission_uncertain",
+            "provider_key": "modelsai",
+            "attempt": 1,
+        }
+        job.output_json = {"provider_submission": submission}
+        job.metrics = {"provider_submission": submission}
+        raw.commit()
+        enqueue = AsyncMock(side_effect=AssertionError("未决提交不得创建新 outbox"))
+        monkeypatch.setattr("app.services.video_generation.enqueue_task", enqueue)
+
+        from app.services.video_generation import create_video_job
+
+        replay = await create_video_job(
+            _AsyncSessionAdapter(raw),
+            script_id=seeded.script.id,
+            episode_id=seeded.episode.episode_id,
+            shot_group_id=seeded.shot_group.shot_group_id,
+            user_id=seeded.user.user_id,
+            idempotency_key="manual-retry-new-key",
+        )
+
+        assert replay.job_id == job.job_id
+        assert [
+            row.attempt
+            for row in raw.scalars(
+                select(VideoGenerationJob).where(
+                    VideoGenerationJob.unit_id == job.unit_id
+                )
+            ).all()
+        ] == [1]
+        enqueue.assert_not_awaited()
+
+    asyncio.run(scenario())
+
+
+def test_video_job_scopes_shot_group_lock_before_ownership_check() -> None:
+    async def scenario() -> None:
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        other_script = Script(
+            id="script-other",
+            title="其他剧本",
+            scope="personal",
+            owner_user_id=seeded.user.user_id,
+            created_by_user_id=seeded.user.user_id,
+        )
+        other_episode = Episode(
+            episode_id="episode-other",
+            script_id=other_script.id,
+            episode_no=1,
+            title="其他分集",
+        )
+        foreign_group = ShotGroup(
+            shot_group_id="sg-foreign",
+            script_id=other_script.id,
+            episode_id=other_episode.episode_id,
+            scene_no=1,
+            group_index=1,
+            group_no="G1",
+            prompt="其他镜头组",
+        )
+        raw.add_all([other_script, other_episode, foreign_group])
+        raw.commit()
+        db = _AsyncSessionAdapter(raw)
+
+        from app.services.video_generation import create_video_job
+
+        with pytest.raises(ForbiddenError):
+            await create_video_job(
+                db,
+                script_id=seeded.script.id,
+                episode_id=seeded.episode.episode_id,
+                shot_group_id=foreign_group.shot_group_id,
+                user_id=seeded.user.user_id,
+                idempotency_key="foreign-lock",
+            )
+
+        lock_statements = []
+        for statement in db.executed_statements:
+            sql = " ".join(str(statement.compile(dialect=postgresql.dialect())).split())
+            if "FROM shot_groups" in sql and "FOR UPDATE" in sql:
+                lock_statements.append(sql)
+        assert len(lock_statements) == 1
+        lock_predicate = lock_statements[0].split(" WHERE ", 1)[1].split(" FOR UPDATE", 1)[0]
+        assert "shot_groups.shot_group_id =" in lock_predicate
+        assert "shot_groups.script_id =" in lock_predicate
+        assert "shot_groups.episode_id =" in lock_predicate
 
     asyncio.run(scenario())
 
@@ -520,6 +759,88 @@ def test_create_video_job_after_terminal_retry_creates_next_immutable_attempt(mo
     asyncio.run(scenario())
 
 
+def test_stale_claim_refuses_unresolved_provider_submission() -> None:
+    from app.crud.video import claim_video_job
+
+    _, raw = _make_db()
+    seeded = _seed(raw)
+    job = _add_worker_job(
+        raw,
+        seeded,
+        job_id="job-unresolved-claim",
+        reservation_id="reservation-unresolved-claim",
+    )
+    job.status = "processing"
+    job.lease_owner = "dead-worker"
+    job.lease_token = "expired-token"
+    job.lease_until = datetime.now(UTC) - timedelta(seconds=1)
+    submission = {
+        "state": "submit_intent",
+        "provider_key": "modelsai",
+        "attempt": 1,
+    }
+    job.output_json = {"provider_submission": submission}
+    job.metrics = {"provider_submission": submission}
+    raw.commit()
+
+    async def run() -> None:
+        claim = await claim_video_job(
+            _AsyncSessionAdapter(raw),
+            job.job_id,
+            owner="replacement-worker",
+        )
+        assert claim is None
+
+    asyncio.run(run())
+    raw.expire_all()
+    saved = raw.get(VideoGenerationJob, job.job_id)
+    assert saved is not None
+    assert saved.status == "processing"
+    assert saved.lease_token == "expired-token"
+
+
+def test_stale_claim_allows_resume_when_submission_has_authoritative_task_id() -> None:
+    from app.crud.video import claim_video_job
+
+    _, raw = _make_db()
+    seeded = _seed(raw)
+    job = _add_worker_job(
+        raw,
+        seeded,
+        job_id="job-submission-with-task-id",
+        reservation_id="reservation-submission-with-task-id",
+    )
+    job.status = "processing"
+    job.lease_owner = "dead-worker"
+    job.lease_token = "expired-token"
+    job.lease_until = datetime.now(UTC) - timedelta(seconds=1)
+    submission = {
+        "state": "submit_intent",
+        "provider_key": "modelsai",
+        "attempt": 1,
+    }
+    job.output_json = {
+        "provider_submission": submission,
+        "provider_task_id": "provider-resumable",
+    }
+    job.metrics = {
+        "provider_submission": submission,
+        "provider_task_id": "provider-resumable",
+    }
+    raw.commit()
+
+    async def run() -> None:
+        claim = await claim_video_job(
+            _AsyncSessionAdapter(raw),
+            job.job_id,
+            owner="replacement-worker",
+        )
+        assert claim is not None
+        assert claim.lease_token != "expired-token"
+
+    asyncio.run(run())
+
+
 def test_first_frame_uses_natural_g2_before_g10_order() -> None:
     async def scenario() -> None:
         _, raw = _make_db()
@@ -578,7 +899,7 @@ def test_video_claim_heartbeat_finish_are_token_guarded() -> None:
     asyncio.run(scenario())
 
 
-def test_typed_provider_request_and_private_url_rejection() -> None:
+def test_typed_provider_request_and_private_url_rejection(tmp_path: Path) -> None:
     from app.providers.video_gen import VideoGenerationProgress, VideoGenerationRequest
     from app.providers.video_gen_volcengine import VolcengineVideoGenProvider
 
@@ -597,7 +918,12 @@ def test_typed_provider_request_and_private_url_rejection() -> None:
 
     provider = VolcengineVideoGenProvider(provider_key="modelsai")
     with pytest.raises(ValueError):
-        asyncio.run(provider._download("http://127.0.0.1/private.mp4"))
+        asyncio.run(
+            provider._download_to_file(
+                "http://127.0.0.1/private.mp4",
+                tmp_path / "private.mp4",
+            )
+        )
 
 
 def test_volcengine_provider_builds_async_ark_client(monkeypatch) -> None:
@@ -619,6 +945,7 @@ def test_volcengine_provider_builds_async_ark_client(monkeypatch) -> None:
     assert captured == {
         "api_key": "test-ark-key",
         "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+        "max_retries": 0,
     }
 
 
@@ -736,11 +1063,10 @@ def test_volcengine_provider_uses_ark_tasks_and_closes_client(monkeypatch) -> No
 
         client = FakeClient()
         provider = VolcengineVideoGenProvider(provider_key="modelsai")
-        monkeypatch.setattr(provider, "_build_client", lambda: client)
-        monkeypatch.setattr(provider, "_download", AsyncMock(return_value=b"video"))
+        monkeypatch.setattr(provider, "_build_client", lambda **_kwargs: client)
 
         notifications: list[tuple] = []
-        video, metadata = await provider._submit_and_poll(
+        video_url, metadata = await provider._submit_and_poll(
             "doubao-seedance-2-0-260128",
             "镜头提示词",
             ["data:image/png;base64,aW1hZ2U="],
@@ -751,7 +1077,7 @@ def test_volcengine_provider_uses_ark_tasks_and_closes_client(monkeypatch) -> No
             job_id="job-1",
         )
 
-        assert video == b"video"
+        assert video_url == "https://cdn.example.com/video.mp4"
         assert calls["create"] == {
             "model": "doubao-seedance-2-0-260128",
             "content": provider._build_content(
@@ -789,7 +1115,7 @@ def test_video_provider_factory_routes_supported_vendors() -> None:
     assert isinstance(get_video_provider("openai"), OpenAIVideoGenProvider)
 
 
-def test_openai_video_provider_sends_first_frame_and_reads_async_content(
+def test_openai_video_provider_sends_first_frame_and_uses_safe_download(
     monkeypatch,
 ) -> None:
     async def scenario() -> None:
@@ -798,18 +1124,10 @@ def test_openai_video_provider_sends_first_frame_and_reads_async_content(
 
         calls: dict = {}
 
-        class Content:
-            closed = False
-
-            async def aread(self):
-                return b"video-bytes"
-
-            async def aclose(self):
-                self.closed = True
-
-        content = Content()
-
         class Videos:
+            def __init__(self) -> None:
+                self.with_streaming_response = self
+
             async def create(self, **kwargs):
                 calls["create"] = kwargs
                 return SimpleNamespace(id="sora-task-1")
@@ -818,9 +1136,9 @@ def test_openai_video_provider_sends_first_frame_and_reads_async_content(
                 calls.setdefault("retrieve", []).append(video_id)
                 return SimpleNamespace(status="completed")
 
-            async def download_content(self, video_id):
-                calls["download"] = video_id
-                return content
+            def download_content(self, video_id):
+                calls["sdk_download"] = video_id
+                raise AssertionError("禁止 SDK download_content 绕过安全下载器")
 
         class Client:
             def __init__(self):
@@ -832,14 +1150,25 @@ def test_openai_video_provider_sends_first_frame_and_reads_async_content(
 
         class Storage:
             def __init__(self):
-                self.puts: list[tuple[str, bytes]] = []
+                self.objects: dict[str, bytes] = {}
 
             async def get(self, key):
                 assert key == "frames/first.png"
                 return b"frame-bytes"
 
-            async def put(self, key, data):
-                self.puts.append((key, data))
+            async def put_file(self, key, path):
+                self.objects[key] = Path(path).read_bytes()
+                return key
+
+            async def promote(self, source_key, final_key):
+                self.objects[final_key] = self.objects.pop(source_key)
+                return final_key
+
+            async def delete(self, key):
+                self.objects.pop(key, None)
+
+            async def exists(self, key):
+                return key in self.objects
 
         client = Client()
         storage = Storage()
@@ -847,6 +1176,15 @@ def test_openai_video_provider_sends_first_frame_and_reads_async_content(
         monkeypatch.setattr(provider, "_check_keys", lambda: None)
         monkeypatch.setattr(provider, "_build_client", lambda: client)
         monkeypatch.setattr("app.providers.storage.get_storage", lambda: storage)
+
+        async def download(video_id: str, path: str | Path, **kwargs) -> int:
+            calls["safe_download"] = video_id
+            assert callable(kwargs["cancellation_probe"])
+            await kwargs["cancellation_probe"]()
+            Path(path).write_bytes(b"video-bytes")
+            return len(b"video-bytes")
+
+        monkeypatch.setattr(provider, "_download_to_file", download)
         request = VideoGenerationRequest(
             prompt="镜头提示词",
             reference_images=[],
@@ -866,12 +1204,12 @@ def test_openai_video_provider_sends_first_frame_and_reads_async_content(
         }
         assert calls["create"]["seconds"] == "8"
         assert calls["retrieve"] == ["sora-task-1"]
-        assert calls["download"] == "sora-task-1"
-        assert storage.puts == [
-            ("generate_images/video/job-sora.mp4", b"video-bytes")
-        ]
+        assert calls["safe_download"] == "sora-task-1"
+        assert "sdk_download" not in calls
+        assert storage.objects == {
+            "generate_images/video/job-sora.mp4": b"video-bytes"
+        }
         assert result.provider_job_id == "sora-task-1"
-        assert content.closed is True
         assert client.closed is True
 
     asyncio.run(scenario())
@@ -885,10 +1223,7 @@ def test_video_providers_resume_persisted_provider_tasks(monkeypatch) -> None:
         from app.providers.video_gen_openai import OpenAIVideoGenProvider
 
         class HttpClient:
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, exc_type, exc, tb):
+            async def aclose(self) -> None:
                 return None
 
             async def post(self, *args, **kwargs):
@@ -912,10 +1247,14 @@ def test_video_providers_resume_persisted_provider_tasks(monkeypatch) -> None:
             "_poll",
             AsyncMock(return_value="https://result.aliyuncs.com/video.mp4"),
         )
-        monkeypatch.setattr(bailian, "_download", AsyncMock(return_value=b"video"))
         monkeypatch.setattr(
             bailian,
-            "_store_video",
+            "_download_to_file",
+            AsyncMock(return_value=len(b"video")),
+        )
+        monkeypatch.setattr(
+            bailian,
+            "_store_video_file",
             AsyncMock(return_value="generate_images/video/job-resume.mp4"),
         )
 
@@ -937,12 +1276,12 @@ def test_video_providers_resume_persisted_provider_tasks(monkeypatch) -> None:
         monkeypatch.setattr(openai, "_build_client", lambda: OpenAIClient())
         monkeypatch.setattr(
             openai,
-            "_poll_and_download",
-            AsyncMock(return_value=b"video"),
+            "_poll_and_download_to_file",
+            AsyncMock(return_value=len(b"video")),
         )
         monkeypatch.setattr(
             openai,
-            "_store_video",
+            "_store_video_file",
             AsyncMock(return_value="generate_images/video/job-resume.mp4"),
         )
 
@@ -952,15 +1291,27 @@ def test_video_providers_resume_persisted_provider_tasks(monkeypatch) -> None:
     asyncio.run(scenario())
 
 
-def test_video_provider_seed_includes_all_routable_vendors() -> None:
+def test_video_provider_seed_includes_all_routable_vendors(monkeypatch) -> None:
     async def scenario() -> None:
         _, raw = _make_db()
         raw.query(VideoProviderConfig).delete()
         raw.commit()
         db = _AsyncSessionAdapter(raw)
 
+        monkeypatch.setattr(
+            "app.core.config.settings",
+            SimpleNamespace(
+                seedance_model="seedance-test",
+                dashscope_video_model="wan-test",
+                openai_video_model="sora-test",
+                google_video_model="veo-google-test",
+                video_default_provider="modelsai",
+            ),
+        )
+
         from app.crud.video import ensure_provider_configs
 
+        await ensure_provider_configs(db)
         await ensure_provider_configs(db)
         await db.commit()
 
@@ -970,7 +1321,10 @@ def test_video_provider_seed_includes_all_routable_vendors() -> None:
             "modelsai",
             "bailian",
             "openai",
+            "gemini",
         }
+        gemini = next(row for row in rows if row.provider_key == "gemini")
+        assert gemini.model == "veo-google-test"
         assert sum(row.is_active for row in rows) == 1
 
     asyncio.run(scenario())
@@ -1057,12 +1411,113 @@ def test_worker_provider_timeout_releases_real_reservation_and_sanitizes_error()
         refreshed = raw.get(VideoGenerationJob, job.job_id)
         reservation = raw.get(CreditReservation, "reservation-provider-timeout")
         account = raw.get(CreditAccount, "account-1")
+        release_log = raw.scalar(
+            select(CreditLog).where(
+                CreditLog.log_type == "release",
+                CreditLog.reservation_id == reservation.id,
+            )
+        )
         assert refreshed.status == "failed"
         assert refreshed.error_type == "provider_timeout"
         assert refreshed.error_message == "provider_timeout"
         assert reservation.status == "released"
         assert account.frozen_points == 0
         assert account.balance_points == 5000
+        assert release_log is not None
+        assert release_log.source_id == job.job_id
+        assert release_log.actor_user_id == job.owner_user_id
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "provider_error",
+    [
+        "download_too_large",
+        "video_download_too_large",
+        "video_inline_too_large",
+        "reference_image_too_large",
+        "reference_audio_too_large",
+        "reference_media_too_large",
+        "reference_media_total_too_large",
+    ],
+)
+def test_worker_maps_provider_media_limit_errors_to_stable_contract(provider_error: str) -> None:
+    async def scenario() -> None:
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        job = _add_worker_job(
+            raw,
+            seeded,
+            job_id=f"job-media-limit-{provider_error}",
+            reservation_id=f"reservation-media-limit-{provider_error}",
+        )
+        db = _AsyncSessionAdapter(raw)
+
+        class Provider:
+            async def generate(self, request, on_progress=None):
+                raise RuntimeError(provider_error)
+
+        from app.workers.video_generation import run_video_generation_once
+
+        await run_video_generation_once(
+            db,
+            job.job_id,
+            owner="worker",
+            provider=Provider(),
+        )
+
+        refreshed = raw.get(VideoGenerationJob, job.job_id)
+        reservation = raw.get(CreditReservation, job.reservation_id)
+        assert refreshed.status == "failed"
+        assert refreshed.error_type == "provider_media_invalid"
+        assert refreshed.error_message == "provider_media_invalid"
+        assert refreshed.retryable is False
+        assert reservation.status == "released"
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "provider_error",
+    [
+        pytest.param(RuntimeError("ordinary provider failure"), id="provider"),
+        pytest.param(OSError("storage backend unavailable"), id="storage"),
+        pytest.param(ValueError("download_too_large"), id="wrong-exception-type"),
+        pytest.param(RuntimeError("download_too_large: extra"), id="non-exact-message"),
+    ],
+)
+def test_worker_does_not_misclassify_ordinary_provider_or_storage_errors(
+    provider_error: Exception,
+) -> None:
+    async def scenario() -> None:
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        job = _add_worker_job(
+            raw,
+            seeded,
+            job_id="job-ordinary-provider-storage-error",
+            reservation_id="reservation-ordinary-provider-storage-error",
+        )
+        db = _AsyncSessionAdapter(raw)
+
+        class Provider:
+            async def generate(self, request, on_progress=None):
+                raise provider_error
+
+        from app.workers.video_generation import run_video_generation_once
+
+        await run_video_generation_once(
+            db,
+            job.job_id,
+            owner="worker",
+            provider=Provider(),
+        )
+
+        refreshed = raw.get(VideoGenerationJob, job.job_id)
+        assert refreshed.status == "failed"
+        assert refreshed.error_type == "provider_or_storage_error"
+        assert refreshed.error_message == "provider_or_storage_error"
 
     asyncio.run(scenario())
 
@@ -1086,9 +1541,18 @@ def test_top_level_video_failure_marks_financial_cleanup_when_release_fails(monk
             "app.workers.video_generation._credits_release", failing_release
         )
 
+        from app.crud.video import claim_video_job
         from app.workers.video_generation import _mark_failed_and_release_once
 
-        await _mark_failed_and_release_once(db, job.job_id, "worker_internal_error")
+        claim = await claim_video_job(db, job.job_id, owner="worker")
+        assert claim is not None
+        await db.commit()
+        await _mark_failed_and_release_once(
+            db,
+            job.job_id,
+            claim.lease_token,
+            "worker_internal_error",
+        )
 
         refreshed = raw.get(VideoGenerationJob, job.job_id)
         reservation = raw.get(
@@ -1112,7 +1576,7 @@ def test_video_task_wrapper_never_returns_raw_internal_error(monkeypatch) -> Non
 
     marked: list[tuple[str, str]] = []
 
-    async def mark_failed(job_id: str, error_type: str) -> None:
+    async def mark_failed(job_id: str, lease_token: str, error_type: str) -> None:
         marked.append((job_id, error_type))
 
     monkeypatch.setattr(worker, "_run_video_generation_async", failing_run)
@@ -1125,7 +1589,7 @@ def test_video_task_wrapper_never_returns_raw_internal_error(monkeypatch) -> Non
         "status": "failed",
         "error": "worker_internal_error",
     }
-    assert marked == [("job-wrapper-failure", "worker_internal_error")]
+    assert marked == []
 
 
 def test_worker_frame_failure_rolls_back_settle_releases_and_deletes_video() -> None:
@@ -1247,7 +1711,39 @@ def test_cancel_terminal_wins_over_worker_success_and_releases_credit(monkeypatc
             status="starting",
             input_json={"reservation_id": reservation.id},
         )
-        raw.add_all([reservation, job])
+        account = raw.get(CreditAccount, "account-1")
+        account.frozen_points += reservation.reserved_points
+        active_outbox = TaskDispatchOutbox(
+            id="dispatch-video-cancel",
+            task_type="video.generate",
+            job_id=job.job_id,
+            attempt=job.attempt,
+            payload={"job_id": job.job_id},
+            status="running",
+            lease_owner="dispatcher",
+            lease_token="dispatch-token",
+            lease_until=datetime.now(UTC) + timedelta(minutes=1),
+        )
+        wrong_attempt = TaskDispatchOutbox(
+            id="dispatch-video-wrong-attempt",
+            task_type="video.generate",
+            job_id=job.job_id,
+            attempt=job.attempt + 1,
+            payload={"job_id": job.job_id},
+            status="published",
+            published_at=datetime.now(UTC),
+        )
+        wrong_task_type = TaskDispatchOutbox(
+            id="dispatch-video-wrong-type",
+            task_type="timeline.render",
+            job_id=job.job_id,
+            attempt=job.attempt,
+            payload={"job_id": job.job_id},
+            status="pending",
+        )
+        raw.add_all(
+            [reservation, job, active_outbox, wrong_attempt, wrong_task_type]
+        )
         raw.commit()
         db = _AsyncSessionAdapter(raw)
 
@@ -1256,13 +1752,37 @@ def test_cancel_terminal_wins_over_worker_success_and_releases_credit(monkeypatc
 
         claim = await claim_video_job(db, "job-cancel", owner="worker")
         await db.commit()
-        release = AsyncMock()
         monkeypatch.setattr("app.services.video_generation._credits_reserve", object())
-        monkeypatch.setattr("app.services.credits.release", release)
 
-        canceled = await cancel_video_job(db, script_id=seeded.script.id, job_id="job-cancel")
+        canceled = await cancel_video_job(
+            db,
+            script_id=seeded.script.id,
+            job_id="job-cancel",
+            actor_user_id=seeded.user.user_id,
+        )
+        raw.expire_all()
+        active_outbox = raw.get(TaskDispatchOutbox, "dispatch-video-cancel")
+        wrong_attempt = raw.get(TaskDispatchOutbox, "dispatch-video-wrong-attempt")
+        wrong_task_type = raw.get(TaskDispatchOutbox, "dispatch-video-wrong-type")
+        assert active_outbox is not None
+        assert wrong_attempt is not None
+        assert wrong_task_type is not None
         assert canceled.status == "canceled"
-        assert release.await_count == 1
+        assert active_outbox.status == "canceled"
+        assert active_outbox.lease_owner is None
+        assert active_outbox.lease_token is None
+        assert active_outbox.lease_until is None
+        assert wrong_attempt.status == "published"
+        assert wrong_task_type.status == "pending"
+        release_log = raw.scalar(
+            select(CreditLog).where(
+                CreditLog.log_type == "release",
+                CreditLog.reservation_id == reservation.id,
+            )
+        )
+        assert release_log is not None
+        assert release_log.source_id == job.job_id
+        assert release_log.actor_user_id == seeded.user.user_id
         assert not await finish_video_job(
             db,
             "job-cancel",
@@ -1271,6 +1791,42 @@ def test_cancel_terminal_wins_over_worker_success_and_releases_credit(monkeypatc
             output_json={"video_storage_key": "generate_images/video/job-cancel.mp4"},
         )
         assert raw.get(VideoGenerationJob, "job-cancel").status == "canceled"
+
+    asyncio.run(scenario())
+
+
+def test_cancel_route_forwards_authenticated_actor(monkeypatch) -> None:
+    async def scenario() -> None:
+        from app.api.v1 import video_generation as api
+        from app.services import video_generation as service
+
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        job = _add_worker_job(
+            raw,
+            seeded,
+            job_id="job-route-cancel",
+            reservation_id="reservation-route-cancel",
+        )
+        db = _AsyncSessionAdapter(raw)
+        allow = AsyncMock(return_value=seeded.script)
+        cancel = AsyncMock(return_value=job)
+        monkeypatch.setattr(api, "_load_and_check_script", allow)
+        monkeypatch.setattr(service, "cancel_video_job", cancel)
+
+        result = await api.cancel_video_generation_job(
+            job.job_id,
+            db=db,
+            user=seeded.user,
+        )
+
+        assert result.job_id == job.job_id
+        cancel.assert_awaited_once_with(
+            db,
+            script_id=seeded.script.id,
+            job_id=job.job_id,
+            actor_user_id=seeded.user.user_id,
+        )
 
     asyncio.run(scenario())
 
@@ -1311,7 +1867,21 @@ def test_video_financial_cleanup_reconciler_releases_and_clears_retryable(monkey
         raw.add_all([reservation, job])
         raw.commit()
         db = _AsyncSessionAdapter(raw)
-        release = AsyncMock()
+
+        async def release_reservation(
+            release_db,
+            *,
+            reservation_id: str,
+            **_kwargs,
+        ) -> None:
+            authoritative = release_db.session.get(
+                CreditReservation,
+                reservation_id,
+            )
+            assert authoritative is not None
+            authoritative.status = "released"
+
+        release = AsyncMock(side_effect=release_reservation)
         monkeypatch.setattr("app.workers.video_generation._credits_release", release)
 
         from app.workers.video_generation import reconcile_video_financial_cleanup
@@ -1320,6 +1890,7 @@ def test_video_financial_cleanup_reconciler_releases_and_clears_retryable(monkey
         refreshed = raw.get(VideoGenerationJob, "job-cleanup")
         assert refreshed.retryable is False
         release.assert_awaited_once()
+        assert release.await_args.kwargs["actor_user_id"] == job.owner_user_id
 
     asyncio.run(scenario())
 
@@ -1369,6 +1940,7 @@ def test_fail_with_stale_lease_does_not_release_credit_or_commit(monkeypatch) ->
             "job-stale",
             "stale-token",
             reservation.id,
+            actor_user_id=seeded.user.user_id,
             error_type="provider_or_storage_error",
             retryable=False,
         )
@@ -1425,7 +1997,12 @@ def test_cancel_release_failure_does_not_commit_canceled(monkeypatch) -> None:
         from app.services.video_generation import cancel_video_job
 
         with pytest.raises(RuntimeError, match="release failed"):
-            await cancel_video_job(db, script_id=seeded.script.id, job_id="job-cancel-fail")
+            await cancel_video_job(
+                db,
+                script_id=seeded.script.id,
+                job_id="job-cancel-fail",
+                actor_user_id=seeded.user.user_id,
+            )
 
         assert db.commit_count == 0
         assert raw.get(VideoGenerationJob, "job-cancel-fail").status == "processing"
@@ -1587,14 +2164,968 @@ def test_worker_serializes_multiple_progress_updates_on_one_session() -> None:
         reservation = raw.get(
             CreditReservation, "reservation-progress-serialized"
         )
+        settle_log = raw.scalar(
+            select(CreditLog).where(
+                CreditLog.log_type == "settle",
+                CreditLog.reservation_id == reservation.id,
+            )
+        )
         assert refreshed.status == "succeeded"
         assert refreshed.output_json["provider_task_id"] == "provider-serialized"
         assert reservation.status == "captured"
+        assert settle_log is not None
+        assert settle_log.source_id == job.job_id
+        assert settle_log.actor_user_id == job.owner_user_id
 
     asyncio.run(scenario())
 
 
-def test_worker_reuses_persisted_provider_task_id_on_recovery(monkeypatch) -> None:
+def test_video_commit_after_apply_preserves_authoritative_succeeded_outputs(
+    monkeypatch,
+) -> None:
+    async def scenario() -> None:
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        job = _add_worker_job(
+            raw,
+            seeded,
+            job_id="job-commit-after-apply",
+            reservation_id="reservation-commit-after-apply",
+        )
+        disconnect_raised = False
+        rollback_disconnect_raised = False
+
+        class CommitAfterApplyAdapter(_AsyncSessionAdapter):
+            async def commit(self) -> None:
+                nonlocal disconnect_raised
+                self.session.commit()
+                saved = self.session.get(VideoGenerationJob, job.job_id)
+                if saved is not None and saved.status == "succeeded" and not disconnect_raised:
+                    disconnect_raised = True
+                    raise ConnectionError("commit response lost")
+
+            async def rollback(self) -> None:
+                nonlocal rollback_disconnect_raised
+                self.session.rollback()
+                if not rollback_disconnect_raised:
+                    rollback_disconnect_raised = True
+                    raise ConnectionError("rollback response lost")
+
+        class FakeSessionFactory:
+            def __call__(self):
+                return self
+
+            async def __aenter__(self):
+                self.raw = Session(raw.get_bind(), expire_on_commit=False)
+                return _AsyncSessionAdapter(self.raw)
+
+            async def __aexit__(self, exc_type, exc, tb):
+                self.raw.close()
+
+        db = CommitAfterApplyAdapter(raw)
+        stored: dict[str, bytes] = {}
+        deleted: list[str] = []
+        output_keys: dict[str, str] = {}
+
+        class Provider:
+            async def generate(self, request, on_progress=None):
+                attempt_id = request.metadata["storage_attempt_id"]
+                video_key = f"generate_images/video/{job.job_id}-{attempt_id}.mp4"
+                stored[video_key] = b"video"
+                output_keys["video"] = video_key
+                return SimpleNamespace(
+                    video_storage_key=video_key,
+                    provider_job_id="provider-commit-after-apply",
+                    metrics={},
+                )
+
+        class Storage:
+            async def delete(self, key: str) -> None:
+                deleted.append(key)
+                stored.pop(key, None)
+
+        async def extract_last_frame(db, _unit_id, video_key: str, _lease_token: str) -> str:
+            frame_key = video_key.removesuffix(".mp4") + "-last.png"
+            stored[frame_key] = b"frame"
+            output_keys["frame"] = frame_key
+            seeded.shot_group.reference_frames = {"last_frame": frame_key}
+            await db.flush()
+            return frame_key
+
+        monkeypatch.setattr("app.workers.video_generation._credits_settle", AsyncMock())
+        monkeypatch.setattr(
+            "app.core.database.async_session_factory",
+            FakeSessionFactory(),
+        )
+
+        from app.workers.video_generation import run_video_generation_once
+
+        await run_video_generation_once(
+            db,
+            job.job_id,
+            owner="worker",
+            provider=Provider(),
+            extract_last_frame=extract_last_frame,
+            storage=Storage(),
+        )
+
+        raw.expire_all()
+        saved = raw.get(VideoGenerationJob, job.job_id)
+        shot_group = raw.get(ShotGroup, seeded.shot_group.shot_group_id)
+        assert disconnect_raised is True
+        assert rollback_disconnect_raised is True
+        assert saved is not None and saved.status == "succeeded"
+        assert saved.output_json["video_storage_key"] == output_keys["video"]
+        assert shot_group.reference_frames["last_frame"] == output_keys["frame"]
+        assert deleted == []
+        assert stored == {
+            output_keys["video"]: b"video",
+            output_keys["frame"]: b"frame",
+        }
+
+    asyncio.run(scenario())
+
+
+def test_authoritative_video_success_requires_exact_attempt_key_and_fails_closed(
+    monkeypatch,
+) -> None:
+    async def scenario() -> None:
+        from app.workers import video_generation as worker
+
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        job = _add_worker_job(
+            raw,
+            seeded,
+            job_id="job-authoritative-video-read",
+            reservation_id="reservation-authoritative-video-read",
+        )
+        attempt_key = "generate_images/video/job-authoritative-video-read-attempt.mp4"
+        job.status = "succeeded"
+        job.output_json = {"video_storage_key": attempt_key}
+        raw.commit()
+
+        class FakeSessionFactory:
+            def __call__(self):
+                return self
+
+            async def __aenter__(self):
+                self.raw = Session(raw.get_bind(), expire_on_commit=False)
+                return _AsyncSessionAdapter(self.raw)
+
+            async def __aexit__(self, exc_type, exc, tb):
+                self.raw.close()
+
+        monkeypatch.setattr(
+            "app.core.database.async_session_factory",
+            FakeSessionFactory(),
+        )
+        assert await worker._authoritative_video_attempt_succeeded(
+            job.job_id,
+            attempt_key,
+        ) is True
+        assert await worker._authoritative_video_attempt_succeeded(
+            job.job_id,
+            "generate_images/video/other-attempt.mp4",
+        ) is False
+
+        class FailingSessionFactory:
+            def __call__(self):
+                return self
+
+            async def __aenter__(self):
+                raise ConnectionError("authoritative read unavailable")
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return None
+
+        monkeypatch.setattr(
+            "app.core.database.async_session_factory",
+            FailingSessionFactory(),
+        )
+        assert await worker._authoritative_video_attempt_succeeded(
+            job.job_id,
+            attempt_key,
+        ) is None
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    (
+        "authoritative",
+        "frame_authoritative",
+        "expected_status",
+        "failure_expected",
+    ),
+    [
+        (None, None, "processing", False),
+        (False, False, "failed", True),
+        (False, True, "failed", True),
+    ],
+)
+def test_video_commit_failure_only_cleans_after_authoritative_false(
+    monkeypatch,
+    authoritative: bool | None,
+    frame_authoritative: bool | None,
+    expected_status: str,
+    failure_expected: bool,
+) -> None:
+    async def scenario() -> None:
+        from app.workers import video_generation as worker
+
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        job = _add_worker_job(
+            raw,
+            seeded,
+            job_id=f"job-authoritative-{authoritative}",
+            reservation_id=f"reservation-authoritative-{authoritative}",
+        )
+
+        class CommitBeforeApplyAdapter(_AsyncSessionAdapter):
+            def __init__(self, session: Session) -> None:
+                super().__init__(session)
+                self.commit_calls = 0
+
+            async def commit(self) -> None:
+                self.commit_calls += 1
+                if self.commit_calls == 2:
+                    raise ConnectionError("commit outcome unavailable")
+                self.session.commit()
+
+        db = CommitBeforeApplyAdapter(raw)
+        stored: dict[str, bytes] = {}
+        deleted: list[str] = []
+        output_keys: dict[str, str] = {}
+
+        class Provider:
+            async def generate(self, request, on_progress=None):
+                attempt_id = request.metadata["storage_attempt_id"]
+                video_key = f"generate_images/video/{job.job_id}-{attempt_id}.mp4"
+                stored[video_key] = b"video"
+                output_keys["video"] = video_key
+                return SimpleNamespace(
+                    video_storage_key=video_key,
+                    provider_job_id="provider-authoritative-check",
+                    metrics={},
+                )
+
+        class Storage:
+            async def delete(self, key: str) -> None:
+                deleted.append(key)
+                stored.pop(key, None)
+
+        async def extract_last_frame(db, _unit_id, video_key: str, _lease_token: str) -> str:
+            frame_key = video_key.removesuffix(".mp4") + "-last.png"
+            stored[frame_key] = b"frame"
+            output_keys["frame"] = frame_key
+            await db.flush()
+            return frame_key
+
+        authoritative_read = AsyncMock(return_value=authoritative)
+        monkeypatch.setattr(worker, "_credits_settle", AsyncMock())
+        monkeypatch.setattr(
+            worker,
+            "_authoritative_video_attempt_succeeded",
+            authoritative_read,
+            raising=False,
+        )
+        frame_authoritative_read = AsyncMock(return_value=frame_authoritative)
+        monkeypatch.setattr(
+            worker,
+            "_authoritative_last_frame_referenced",
+            frame_authoritative_read,
+            raising=False,
+        )
+
+        await worker.run_video_generation_once(
+            db,
+            job.job_id,
+            owner="worker",
+            provider=Provider(),
+            extract_last_frame=extract_last_frame,
+            storage=Storage(),
+        )
+
+        raw.expire_all()
+        refreshed = raw.get(VideoGenerationJob, job.job_id)
+        assert refreshed.status == expected_status
+        assert refreshed.error_type == (
+            "provider_or_storage_error" if failure_expected else None
+        )
+        authoritative_read.assert_awaited_once_with(job.job_id, output_keys["video"])
+        if authoritative is False:
+            frame_authoritative_read.assert_awaited_once_with(
+                seeded.shot_group.shot_group_id,
+                output_keys["frame"],
+            )
+            if frame_authoritative is True:
+                assert deleted == [output_keys["video"]]
+                assert stored == {output_keys["frame"]: b"frame"}
+            else:
+                assert deleted == [output_keys["video"], output_keys["frame"]]
+                assert stored == {}
+            assert raw.get(CreditReservation, job.reservation_id).status == "released"
+        else:
+            frame_authoritative_read.assert_not_awaited()
+            assert deleted == []
+            assert set(stored) == {output_keys["video"], output_keys["frame"]}
+            assert raw.get(CreditReservation, job.reservation_id).status == "reserved"
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("authoritative", [False, True])
+def test_persisted_attempt_cleanup_debt_is_periodically_reconciled(
+    monkeypatch,
+    authoritative: bool,
+) -> None:
+    async def scenario() -> None:
+        from app.workers import video_generation as worker
+
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        job = _add_worker_job(
+            raw,
+            seeded,
+            job_id=f"job-attempt-debt-{authoritative}",
+            reservation_id=f"reservation-attempt-debt-{authoritative}",
+        )
+        attempt_id = "0123456789abcdef"
+        video_key = f"generate_images/video/{job.job_id}-{attempt_id}.mp4"
+        frame_key = (
+            "generate_images/video/frames/"
+            f"{seeded.shot_group.shot_group_id}_{attempt_id}_last.png"
+        )
+        record = worker._attempt_cleanup_record(
+            shot_group_id=seeded.shot_group.shot_group_id,
+            storage_attempt_id=attempt_id,
+            video_storage_key=video_key,
+            last_frame_storage_key=frame_key,
+        )
+        job.status = "succeeded" if authoritative else "failed"
+        job.output_json = {
+            **({"video_storage_key": video_key} if authoritative else {}),
+            worker._ATTEMPT_CLEANUP_DEBT_KEY: {attempt_id: record},
+        }
+        raw.commit()
+        db = _AsyncSessionAdapter(raw)
+        deleted: list[str] = []
+
+        class Storage:
+            async def delete(self, key: str) -> None:
+                deleted.append(key)
+
+        monkeypatch.setattr("app.providers.storage.get_storage", lambda: Storage())
+        authoritative_read = AsyncMock(return_value=authoritative)
+        monkeypatch.setattr(
+            worker,
+            "_authoritative_video_attempt_succeeded",
+            authoritative_read,
+        )
+        frame_authoritative_read = AsyncMock(return_value=False)
+        monkeypatch.setattr(
+            worker,
+            "_authoritative_last_frame_referenced",
+            frame_authoritative_read,
+        )
+
+        assert await worker.reconcile_video_attempt_cleanup_debts(db) == 1
+
+        raw.expire_all()
+        saved = raw.get(VideoGenerationJob, job.job_id)
+        assert worker._ATTEMPT_CLEANUP_DEBT_KEY not in (saved.output_json or {})
+        if authoritative:
+            assert saved.output_json["video_storage_key"] == video_key
+            assert deleted == []
+        else:
+            assert deleted == [video_key, frame_key]
+            frame_authoritative_read.assert_awaited_once_with(
+                seeded.shot_group.shot_group_id,
+                frame_key,
+            )
+        authoritative_read.assert_awaited_once_with(job.job_id, video_key)
+
+    asyncio.run(scenario())
+
+
+def test_persisted_attempt_cleanup_debt_survives_unrecoverable_delete(
+    monkeypatch,
+) -> None:
+    async def scenario() -> None:
+        from app.workers import video_generation as worker
+
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        job = _add_worker_job(
+            raw,
+            seeded,
+            job_id="job-attempt-debt-delete-failed",
+            reservation_id="reservation-attempt-debt-delete-failed",
+        )
+        attempt_id = "fedcba9876543210"
+        video_key = f"generate_images/video/{job.job_id}-{attempt_id}.mp4"
+        frame_key = (
+            "generate_images/video/frames/"
+            f"{seeded.shot_group.shot_group_id}_{attempt_id}_last.png"
+        )
+        record = worker._attempt_cleanup_record(
+            shot_group_id=seeded.shot_group.shot_group_id,
+            storage_attempt_id=attempt_id,
+            video_storage_key=video_key,
+            last_frame_storage_key=frame_key,
+        )
+        job.status = "failed"
+        job.output_json = {
+            worker._ATTEMPT_CLEANUP_DEBT_KEY: {attempt_id: record},
+        }
+        raw.commit()
+        db = _AsyncSessionAdapter(raw)
+        monkeypatch.setattr(
+            worker,
+            "_authoritative_video_attempt_succeeded",
+            AsyncMock(return_value=False),
+        )
+        monkeypatch.setattr(
+            worker,
+            "_authoritative_last_frame_referenced",
+            AsyncMock(return_value=False),
+        )
+        delete_output = AsyncMock(return_value=False)
+        monkeypatch.setattr(worker, "_delete_generated_output", delete_output)
+
+        assert await worker.reconcile_video_attempt_cleanup_debts(db) == 0
+
+        raw.expire_all()
+        saved = raw.get(VideoGenerationJob, job.job_id)
+        assert (saved.output_json or {})[worker._ATTEMPT_CLEANUP_DEBT_KEY] == {
+            attempt_id: record,
+        }
+        assert delete_output.await_count == 2
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("publish_fails", [False, True])
+def test_attempt_cleanup_schedule_persists_real_database_debt(
+    monkeypatch,
+    publish_fails: bool,
+) -> None:
+    async def scenario() -> None:
+        from app.workers import video_generation as worker
+
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        job = _add_worker_job(
+            raw,
+            seeded,
+            job_id="job-attempt-debt-publish-failed",
+            reservation_id="reservation-attempt-debt-publish-failed",
+        )
+        attempt_id = "0011223344556677"
+        video_key = f"generate_images/video/{job.job_id}-{attempt_id}.mp4"
+        frame_key = (
+            "generate_images/video/frames/"
+            f"{seeded.shot_group.shot_group_id}_{attempt_id}_last.png"
+        )
+
+        class FakeSessionFactory:
+            def __call__(self):
+                return self
+
+            async def __aenter__(self):
+                self.raw = Session(raw.get_bind(), expire_on_commit=False)
+                return _AsyncSessionAdapter(self.raw)
+
+            async def __aexit__(self, exc_type, exc, tb):
+                self.raw.close()
+
+        monkeypatch.setattr(
+            "app.core.database.async_session_factory",
+            FakeSessionFactory(),
+        )
+        publish = Mock(
+            side_effect=(
+                ConnectionError("redis unavailable")
+                if publish_fails
+                else None
+            )
+        )
+        monkeypatch.setattr(
+            worker.reconcile_video_attempt_outputs_task,
+            "apply_async",
+            publish,
+        )
+
+        assert await worker._schedule_video_attempt_cleanup(
+            job_id=job.job_id,
+            script_id=seeded.script.id,
+            shot_group_id=seeded.shot_group.shot_group_id,
+            storage_attempt_id=attempt_id,
+            video_storage_key=video_key,
+            last_frame_storage_key=frame_key,
+        ) is True
+        publish.assert_called_once()
+
+        raw.expire_all()
+        saved = raw.get(VideoGenerationJob, job.job_id)
+        assert (saved.output_json or {})[worker._ATTEMPT_CLEANUP_DEBT_KEY] == {
+            attempt_id: {
+                "storage_attempt_id": attempt_id,
+                "shot_group_id": seeded.shot_group.shot_group_id,
+                "video_storage_key": video_key,
+                "last_frame_storage_key": frame_key,
+                "retryable": True,
+            }
+        }
+
+    asyncio.run(scenario())
+
+
+def test_attempt_cleanup_publish_failure_after_job_delete_enqueues_storage_debt(
+    monkeypatch,
+) -> None:
+    """生命周期删除先胜出时，Redis 故障也不能让已知 attempt 对象失去清理事实。"""
+
+    async def scenario() -> None:
+        from app.workers import video_generation as worker
+
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        job = _add_worker_job(
+            raw,
+            seeded,
+            job_id="job-attempt-deleted-before-debt",
+            reservation_id="reservation-attempt-deleted-before-debt",
+        )
+        script_id = seeded.script.id
+        shot_group_id = seeded.shot_group.shot_group_id
+        attempt_id = "89abcdef01234567"
+        video_key = f"generate_images/video/{job.job_id}-{attempt_id}.mp4"
+        frame_key = (
+            "generate_images/video/frames/"
+            f"{shot_group_id}_{attempt_id}_last.png"
+        )
+
+        # 模拟 episode 删除已提交：父 Script 仍在，VideoJob 与 ShotGroup 已不存在。
+        raw.delete(job)
+        raw.delete(seeded.shot_group)
+        raw.commit()
+
+        class FakeSessionFactory:
+            def __call__(self):
+                return self
+
+            async def __aenter__(self):
+                self.raw = Session(raw.get_bind(), expire_on_commit=False)
+                return _AsyncSessionAdapter(self.raw)
+
+            async def __aexit__(self, exc_type, exc, tb):
+                self.raw.close()
+
+        monkeypatch.setattr(
+            "app.core.database.async_session_factory",
+            FakeSessionFactory(),
+        )
+        monkeypatch.setattr(
+            worker.reconcile_video_attempt_outputs_task,
+            "apply_async",
+            Mock(side_effect=ConnectionError("redis unavailable")),
+        )
+
+        assert await worker._schedule_video_attempt_cleanup(
+            job_id=job.job_id,
+            script_id=script_id,
+            shot_group_id=shot_group_id,
+            storage_attempt_id=attempt_id,
+            video_storage_key=video_key,
+            last_frame_storage_key=frame_key,
+        ) is True
+
+        raw.expire_all()
+        queued = list(raw.scalars(select(MediaStorageJob)).all())
+        assert {row.source_key for row in queued} == {video_key, frame_key}
+        assert all(row.job_type == "delete" and row.status == "pending" for row in queued)
+        assert raw.get(VideoGenerationJob, job.job_id) is None
+
+    asyncio.run(scenario())
+
+
+def test_missing_job_cleanup_debt_preserves_authoritative_last_frame(
+    monkeypatch,
+) -> None:
+    async def scenario() -> None:
+        from app.workers import video_generation as worker
+
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        job = _add_worker_job(
+            raw,
+            seeded,
+            job_id="job-deleted-frame-authoritative",
+            reservation_id="reservation-deleted-frame-authoritative",
+        )
+        attempt_id = "76543210fedcba98"
+        video_key = f"generate_images/video/{job.job_id}-{attempt_id}.mp4"
+        frame_key = (
+            "generate_images/video/frames/"
+            f"{seeded.shot_group.shot_group_id}_{attempt_id}_last.png"
+        )
+        seeded.shot_group.reference_frames = {"last_frame": frame_key}
+        raw.delete(job)
+        raw.commit()
+
+        class FakeSessionFactory:
+            def __call__(self):
+                return self
+
+            async def __aenter__(self):
+                self.raw = Session(raw.get_bind(), expire_on_commit=False)
+                return _AsyncSessionAdapter(self.raw)
+
+            async def __aexit__(self, exc_type, exc, tb):
+                self.raw.close()
+
+        monkeypatch.setattr(
+            "app.core.database.async_session_factory",
+            FakeSessionFactory(),
+        )
+        monkeypatch.setattr(
+            worker.reconcile_video_attempt_outputs_task,
+            "apply_async",
+            Mock(side_effect=ConnectionError("redis unavailable")),
+        )
+
+        assert await worker._schedule_video_attempt_cleanup(
+            job_id=job.job_id,
+            script_id=seeded.script.id,
+            shot_group_id=seeded.shot_group.shot_group_id,
+            storage_attempt_id=attempt_id,
+            video_storage_key=video_key,
+            last_frame_storage_key=frame_key,
+        ) is True
+
+        raw.expire_all()
+        queued = list(raw.scalars(select(MediaStorageJob)).all())
+        assert [row.source_key for row in queued] == [video_key]
+        shot_group = raw.get(ShotGroup, seeded.shot_group.shot_group_id)
+        assert shot_group is not None
+        assert shot_group.reference_frames["last_frame"] == frame_key
+
+    asyncio.run(scenario())
+
+
+def test_provider_progress_preserves_attempt_cleanup_debt() -> None:
+    async def scenario() -> None:
+        from app.crud.video import claim_video_job
+        from app.workers import video_generation as worker
+
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        job = _add_worker_job(
+            raw,
+            seeded,
+            job_id="job-progress-preserves-attempt-debt",
+            reservation_id="reservation-progress-preserves-attempt-debt",
+        )
+        db = _AsyncSessionAdapter(raw)
+        claim = await claim_video_job(db, job.job_id, owner="worker")
+        assert claim is not None
+        await db.commit()
+        attempt_id = "8899aabbccddeeff"
+        assert worker._ATTEMPT_CLEANUP_DEBT_KEY not in (job.output_json or {})
+        with Session(raw.get_bind(), expire_on_commit=False) as debt_raw:
+            debt_db = _AsyncSessionAdapter(debt_raw)
+            assert await worker._upsert_video_attempt_cleanup_debt(
+                debt_db,
+                job_id=job.job_id,
+                shot_group_id=seeded.shot_group.shot_group_id,
+                storage_attempt_id=attempt_id,
+                video_storage_key=(
+                    f"generate_images/video/{job.job_id}-{attempt_id}.mp4"
+                ),
+                last_frame_storage_key=None,
+            )
+            await debt_db.commit()
+
+        await worker._persist_provider_progress(
+            db,
+            job.job_id,
+            claim.lease_token,
+            SimpleNamespace(
+                progress=35,
+                stage="polling",
+                message="生成中",
+                provider_task_id="provider-progress-debt",
+            ),
+        )
+
+        raw.expire_all()
+        saved = raw.get(VideoGenerationJob, job.job_id)
+        assert saved.output_json["provider_task_id"] == "provider-progress-debt"
+        assert attempt_id in saved.output_json[worker._ATTEMPT_CLEANUP_DEBT_KEY]
+
+    asyncio.run(scenario())
+
+
+def test_finish_preserves_attempt_cleanup_debt_from_independent_session() -> None:
+    async def scenario() -> None:
+        from app.crud.video import claim_video_job, finish_video_job
+        from app.workers import video_generation as worker
+
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        job = _add_worker_job(
+            raw,
+            seeded,
+            job_id="job-finish-preserves-attempt-debt",
+            reservation_id="reservation-finish-preserves-attempt-debt",
+        )
+        db = _AsyncSessionAdapter(raw)
+        claim = await claim_video_job(db, job.job_id, owner="worker")
+        assert claim is not None
+        await db.commit()
+        attempt_id = "ffeeddccbbaa9988"
+        assert worker._ATTEMPT_CLEANUP_DEBT_KEY not in (job.output_json or {})
+        with Session(raw.get_bind(), expire_on_commit=False) as debt_raw:
+            debt_db = _AsyncSessionAdapter(debt_raw)
+            assert await worker._upsert_video_attempt_cleanup_debt(
+                debt_db,
+                job_id=job.job_id,
+                shot_group_id=seeded.shot_group.shot_group_id,
+                storage_attempt_id=attempt_id,
+                video_storage_key=(
+                    f"generate_images/video/orphan-{attempt_id}.mp4"
+                ),
+                last_frame_storage_key=None,
+            )
+            await debt_db.commit()
+
+        assert await finish_video_job(
+            db,
+            job.job_id,
+            claim.lease_token,
+            "succeeded",
+            output_json={
+                "video_storage_key": (
+                    f"generate_images/video/authoritative-{attempt_id}.mp4"
+                )
+            },
+            metrics={"provider_task_id": "provider-finish-debt"},
+        )
+        await db.commit()
+
+        raw.expire_all()
+        saved = raw.get(VideoGenerationJob, job.job_id)
+        assert saved is not None
+        assert attempt_id in saved.output_json[worker._ATTEMPT_CLEANUP_DEBT_KEY]
+        assert saved.output_json["video_storage_key"].endswith(
+            f"authoritative-{attempt_id}.mp4"
+        )
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.skipif(
+    not os.getenv("MTV_TEST_POSTGRES_URL"),
+    reason="未提供 MTV_TEST_POSTGRES_URL，跳过真实 PostgreSQL 视频 JSON 并发合并测试",
+)
+@pytest.mark.parametrize("write_kind", ["progress", "finish"])
+def test_postgres_video_json_write_preserves_independent_cleanup_debt(
+    write_kind: str,
+) -> None:
+    """旧 Session 的进度/终态写入不能覆盖独立事务刚提交的恢复债务。"""
+
+    async def scenario() -> None:
+        from sqlalchemy import delete
+        from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+        from app.crud import video as video_crud
+        from app.workers import video_generation as worker
+
+        database_url = os.environ["MTV_TEST_POSTGRES_URL"]
+        if database_url.startswith("postgresql://"):
+            database_url = database_url.replace(
+                "postgresql://",
+                "postgresql+asyncpg://",
+                1,
+            )
+        engine = create_async_engine(database_url)
+        session_factory = async_sessionmaker(engine, expire_on_commit=False)
+        suffix = secrets.token_hex(6)
+        script_id = f"script-json-{suffix}"
+        episode_id = f"episode-json-{suffix}"
+        shot_group_id = f"group-json-{suffix}"
+        job_id = f"video-json-{write_kind}-{suffix}"
+        lease_token = f"lease-json-{suffix}"
+        storage_attempt_id = suffix.ljust(16, "0")[:16]
+        cancellation_record = {
+            "provider_task_id": f"provider-cancel-{suffix}",
+            "outcome": "pending",
+            "retryable": True,
+            "attempts": 0,
+        }
+
+        try:
+            async with session_factory() as seed_db:
+                seed_db.add(
+                    Script(
+                        id=script_id,
+                        title="视频 JSON 并发合并测试",
+                        scope="personal",
+                        owner_user_id=f"user-{suffix}",
+                        created_by_user_id=f"user-{suffix}",
+                    )
+                )
+                await seed_db.flush()
+                seed_db.add(
+                    Episode(
+                        episode_id=episode_id,
+                        script_id=script_id,
+                        episode_no=1,
+                        title="第一集",
+                    )
+                )
+                await seed_db.flush()
+                seed_db.add(
+                    ShotGroup(
+                        shot_group_id=shot_group_id,
+                        script_id=script_id,
+                        episode_id=episode_id,
+                        scene_no=1,
+                        group_no="G1",
+                    )
+                )
+                await seed_db.flush()
+                seed_db.add(
+                    VideoGenerationJob(
+                        job_id=job_id,
+                        script_id=script_id,
+                        episode_id=episode_id,
+                        shot_group_id=shot_group_id,
+                        scene_no=1,
+                        unit_id=f"group:{shot_group_id}",
+                        unit_runtime_key=f"{episode_id}:1:group:{shot_group_id}",
+                        provider_key="modelsai",
+                        job_type="all_reference",
+                        status="processing",
+                        progress=20,
+                        lease_owner="worker-stale-json",
+                        lease_token=lease_token,
+                        output_json={"provider_task_id": f"provider-old-{suffix}"},
+                        metrics={"provider_task_id": f"provider-old-{suffix}"},
+                        input_json={},
+                    )
+                )
+                await seed_db.commit()
+
+            async with session_factory() as stale_db:
+                stale_job = await stale_db.get(VideoGenerationJob, job_id)
+                assert stale_job is not None
+                assert worker._ATTEMPT_CLEANUP_DEBT_KEY not in (
+                    stale_job.output_json or {}
+                )
+
+                async with session_factory() as debt_db:
+                    assert await worker._upsert_video_attempt_cleanup_debt(
+                        debt_db,
+                        job_id=job_id,
+                        shot_group_id=shot_group_id,
+                        storage_attempt_id=storage_attempt_id,
+                        video_storage_key=(
+                            "generate_images/video/"
+                            f"orphan-{storage_attempt_id}.mp4"
+                        ),
+                        last_frame_storage_key=None,
+                    )
+                    debt_job = await debt_db.get(
+                        VideoGenerationJob,
+                        job_id,
+                        populate_existing=True,
+                    )
+                    assert debt_job is not None
+                    latest_output = dict(debt_job.output_json or {})
+                    latest_metrics = dict(debt_job.metrics or {})
+                    latest_output["provider_cancellation"] = dict(
+                        cancellation_record
+                    )
+                    latest_metrics["provider_cancellation"] = dict(
+                        cancellation_record
+                    )
+                    debt_job.output_json = latest_output
+                    debt_job.metrics = latest_metrics
+                    await debt_db.commit()
+
+                incoming_output = {
+                    "provider_task_id": f"provider-new-{suffix}",
+                }
+                incoming_metrics = {
+                    "provider_task_id": f"provider-new-{suffix}",
+                }
+                if write_kind == "progress":
+                    updated = await video_crud.update_video_job_progress(
+                        stale_db,
+                        job_id,
+                        progress=45,
+                        progress_stage="polling",
+                        output_json=incoming_output,
+                        metrics=incoming_metrics,
+                        lease_token=lease_token,
+                    )
+                else:
+                    incoming_output["video_storage_key"] = (
+                        "generate_images/video/"
+                        f"authoritative-{storage_attempt_id}.mp4"
+                    )
+                    updated = await video_crud.finish_video_job(
+                        stale_db,
+                        job_id,
+                        lease_token,
+                        "succeeded",
+                        output_json=incoming_output,
+                        metrics=incoming_metrics,
+                    )
+                assert updated is True
+                await stale_db.commit()
+
+            async with session_factory() as verify_db:
+                saved = await verify_db.get(VideoGenerationJob, job_id)
+                assert saved is not None
+                output_json = saved.output_json or {}
+                metrics = saved.metrics or {}
+                assert storage_attempt_id in output_json[
+                    worker._ATTEMPT_CLEANUP_DEBT_KEY
+                ]
+                assert output_json["provider_cancellation"] == cancellation_record
+                assert metrics["provider_cancellation"] == cancellation_record
+                assert output_json["provider_task_id"] == f"provider-new-{suffix}"
+                assert metrics["provider_task_id"] == f"provider-new-{suffix}"
+        finally:
+            async with session_factory() as cleanup_db:
+                await cleanup_db.execute(
+                    delete(VideoGenerationJob).where(
+                        VideoGenerationJob.job_id == job_id
+                    )
+                )
+                await cleanup_db.execute(
+                    delete(ShotGroup).where(
+                        ShotGroup.shot_group_id == shot_group_id
+                    )
+                )
+                await cleanup_db.execute(
+                    delete(Episode).where(Episode.episode_id == episode_id)
+                )
+                await cleanup_db.execute(
+                    delete(Script).where(Script.id == script_id)
+                )
+                await cleanup_db.commit()
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_worker_reuses_persisted_provider_task_id_after_stale_cleanup(monkeypatch) -> None:
     async def scenario() -> None:
         _, raw = _make_db()
         seeded = _seed(raw)
@@ -1650,11 +3181,46 @@ def test_worker_reuses_persisted_provider_task_id_on_recovery(monkeypatch) -> No
                     metrics={},
                 )
 
-        monkeypatch.setattr("app.workers.video_generation._credits_settle", AsyncMock())
+        from app.services import video_generation as video_service
+        from app.workers import video_generation as worker
 
-        from app.workers.video_generation import run_video_generation_once
+        remote_cancel = AsyncMock()
+        monkeypatch.setattr(worker, "_credits_settle", AsyncMock())
+        monkeypatch.setattr(
+            worker,
+            "_authoritative_video_attempt_succeeded",
+            AsyncMock(return_value=False),
+        )
+        monkeypatch.setattr(
+            worker,
+            "_authoritative_last_frame_referenced",
+            AsyncMock(return_value=False),
+        )
+        monkeypatch.setattr(
+            worker,
+            "_delete_lost_lease_outputs",
+            AsyncMock(return_value=True),
+        )
+        monkeypatch.setattr(
+            video_service,
+            "_best_effort_cancel_remote_video_task",
+            remote_cancel,
+        )
 
-        await run_video_generation_once(
+        assert await worker.reconcile_stale_video_jobs(db) == [job.job_id]
+        raw.expire_all()
+        recovered = raw.get(VideoGenerationJob, job.job_id)
+        assert recovered is not None
+        assert recovered.status == "starting"
+        assert (recovered.output_json or {})["provider_task_id"] == "provider-existing"
+        assert await worker.reconcile_video_attempt_cleanup_debts(db) == 1
+        raw.expire_all()
+        after_cleanup = raw.get(VideoGenerationJob, job.job_id)
+        assert after_cleanup is not None
+        assert (after_cleanup.output_json or {})["provider_task_id"] == "provider-existing"
+        assert "attempt_output_cleanup" not in (after_cleanup.output_json or {})
+
+        await worker.run_video_generation_once(
             db,
             "job-recovery",
             owner="worker",
@@ -1662,7 +3228,12 @@ def test_worker_reuses_persisted_provider_task_id_on_recovery(monkeypatch) -> No
             extract_last_frame=AsyncMock(),
         )
 
-        assert seen_metadata == [{"provider_task_id": "provider-existing"}]
+        assert len(seen_metadata) == 1
+        assert seen_metadata[0]["provider_task_id"] == "provider-existing"
+        storage_attempt_id = seen_metadata[0]["storage_attempt_id"]
+        assert len(storage_attempt_id) == 16
+        assert int(storage_attempt_id, 16) >= 0
+        remote_cancel.assert_not_awaited()
 
     asyncio.run(scenario())
 
@@ -1760,6 +3331,85 @@ def test_stale_video_reconciler_restores_dispatches_once_and_skips_active_jobs()
         assert await reconcile_stale_video_jobs(db) == []
 
     asyncio.run(scenario())
+
+
+def test_stale_video_reconciler_does_not_resubmit_unresolved_submission() -> None:
+    _, raw = _make_db()
+    seeded = _seed(raw)
+    job = _add_worker_job(
+        raw,
+        seeded,
+        job_id="job-stale-submission-uncertain",
+        reservation_id="reservation-stale-submission-uncertain",
+    )
+    job.status = "processing"
+    job.lease_owner = "dead-worker"
+    job.lease_token = "expired-token"
+    job.lease_until = datetime.now(UTC) - timedelta(minutes=1)
+    job.updated_at = datetime.now(UTC) - timedelta(hours=2)
+    submission = {
+        "state": "submission_uncertain",
+        "provider_key": "modelsai",
+        "attempt": 1,
+    }
+    job.output_json = {"provider_submission": submission}
+    job.metrics = {"provider_submission": submission}
+    raw.commit()
+
+    async def run() -> None:
+        from app.workers.video_generation import reconcile_stale_video_jobs
+
+        assert await reconcile_stale_video_jobs(_AsyncSessionAdapter(raw)) == []
+
+    asyncio.run(run())
+    raw.expire_all()
+    saved = raw.get(VideoGenerationJob, job.job_id)
+    assert saved is not None
+    assert saved.status == "processing"
+    assert saved.lease_token == "expired-token"
+
+
+def test_cancel_refuses_unresolved_submission_and_keeps_credit_frozen() -> None:
+    from app.services.video_generation import cancel_video_job
+
+    _, raw = _make_db()
+    seeded = _seed(raw)
+    job = _add_worker_job(
+        raw,
+        seeded,
+        job_id="job-cancel-submission-uncertain",
+        reservation_id="reservation-cancel-submission-uncertain",
+    )
+    job.status = "processing"
+    job.lease_owner = "worker"
+    job.lease_token = "lease-token"
+    job.lease_until = datetime.now(UTC) + timedelta(minutes=5)
+    submission = {
+        "state": "submission_uncertain",
+        "provider_key": "modelsai",
+        "attempt": 1,
+    }
+    job.output_json = {"provider_submission": submission}
+    job.metrics = {"provider_submission": submission}
+    raw.commit()
+
+    async def run() -> None:
+        with pytest.raises(ConflictError, match="提交状态未知"):
+            await cancel_video_job(
+                _AsyncSessionAdapter(raw),
+                script_id=seeded.script.id,
+                job_id=job.job_id,
+                actor_user_id=seeded.user.user_id,
+            )
+
+    asyncio.run(run())
+    raw.expire_all()
+    saved = raw.get(VideoGenerationJob, job.job_id)
+    reservation = raw.get(CreditReservation, job.reservation_id)
+    assert saved is not None
+    assert reservation is not None
+    assert saved.status == "processing"
+    assert reservation.status == "reserved"
 
 
 def test_reference_aggregation_fail_closed_on_missing_sha_and_disambiguates_typed_materials() -> None:
@@ -1860,16 +3510,257 @@ def test_batch_create_requires_idempotency_key_before_creating_any_job(monkeypat
                 user=seeded.user,
                 idempotency_key=None,
             )
+        with pytest.raises(BadRequestError):
+            await api.batch_create_video_generation_jobs(
+                VideoJobBatchCreateIn(
+                    script_id=seeded.script.id,
+                    episode_id=seeded.episode.episode_id,
+                    shot_group_ids=[seeded.shot_group.shot_group_id],
+                ),
+                db=db,
+                user=seeded.user,
+                idempotency_key="   ",
+            )
 
         create.assert_not_awaited()
 
     asyncio.run(scenario())
 
 
-def test_active_provider_initial_seed_is_committed() -> None:
+def test_batch_create_rolls_back_each_failed_item(monkeypatch) -> None:
+    async def scenario() -> None:
+        from app.api.v1 import video_generation as api
+        from app.schemas.video import VideoJobBatchCreateIn
+
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        db = _AsyncSessionAdapter(raw)
+        monkeypatch.setattr(api, "_load_and_check_script", AsyncMock(return_value=seeded.script))
+        create = AsyncMock(
+            side_effect=ForbiddenError("镜头组不属于该剧本/分集")
+        )
+        monkeypatch.setattr("app.services.video_generation.create_video_job", create)
+
+        result = await api.batch_create_video_generation_jobs(
+            VideoJobBatchCreateIn(
+                script_id=seeded.script.id,
+                episode_id=seeded.episode.episode_id,
+                shot_group_ids=["sg-foreign"],
+            ),
+            db=db,
+            user=seeded.user,
+            idempotency_key="batch-rollback",
+        )
+
+        assert result.success == []
+        assert [item.shot_group_id for item in result.failed] == ["sg-foreign"]
+        assert db.rollback_count == 1
+
+    asyncio.run(scenario())
+
+
+def test_video_batch_rejects_more_than_one_hundred_shot_groups() -> None:
+    from app.schemas.video import VideoJobBatchCreateIn
+
+    with pytest.raises(ValidationError):
+        VideoJobBatchCreateIn(
+            script_id="script-1",
+            episode_id="episode-1",
+            shot_group_ids=[f"sg-{index}" for index in range(101)],
+        )
+
+
+async def test_video_idempotency_key_http_length_contract(client, monkeypatch) -> None:
+    from app.api.v1 import video_generation as api
+    from app.core.auth import get_current_user
+
+    async def override_user():
+        return SimpleNamespace(user_id="user-1", enabled=True)
+
+    app = client._app  # type: ignore[attr-defined]
+    app.dependency_overrides[get_current_user] = override_user
+    load_script = AsyncMock(side_effect=AssertionError("超长 header 不应进入路由业务逻辑"))
+    create = AsyncMock(side_effect=AssertionError("超长 header 不应创建任务"))
+    monkeypatch.setattr(api, "_load_and_check_script", load_script)
+    monkeypatch.setattr("app.services.video_generation.create_video_job", create)
+
+    single_response = await client.post(
+        "/v3api/video-generation-jobs",
+        headers={"Idempotency-Key": "x" * 257},
+        json={
+            "script_id": "script-1",
+            "episode_id": "episode-1",
+            "shot_group_id": "sg-1",
+        },
+    )
+    batch_response = await client.post(
+        "/v3api/video-generation-jobs/batch",
+        headers={"Idempotency-Key": "x" * 257},
+        json={
+            "script_id": "script-1",
+            "episode_id": "episode-1",
+            "shot_group_ids": ["sg-1"],
+        },
+    )
+
+    assert single_response.status_code == 422
+    assert single_response.json() == {"detail": "字段校验失败"}
+    assert batch_response.status_code == 422
+    assert batch_response.json() == {"detail": "字段校验失败"}
+    load_script.assert_not_awaited()
+    create.assert_not_awaited()
+
+
+async def test_video_batch_rejects_derived_idempotency_overflow_before_creation(
+    client, monkeypatch
+) -> None:
+    from app.api.v1 import video_generation as api
+    from app.core.auth import get_current_user
+
+    async def override_user():
+        return SimpleNamespace(user_id="user-1", enabled=True)
+
+    app = client._app  # type: ignore[attr-defined]
+    app.dependency_overrides[get_current_user] = override_user
+    monkeypatch.setattr(api, "_load_and_check_script", AsyncMock(return_value=SimpleNamespace()))
+    create = AsyncMock(side_effect=AssertionError("派生键校验必须发生在首个任务创建前"))
+    monkeypatch.setattr("app.services.video_generation.create_video_job", create)
+
+    response = await client.post(
+        "/v3api/video-generation-jobs/batch",
+        headers={"Idempotency-Key": "x" * 255},
+        json={
+            "script_id": "script-1",
+            "episode_id": "episode-1",
+            "shot_group_ids": ["sg-1", "sg-2"],
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": "批量 Idempotency-Key 派生后超过 256 字符"}
+    create.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("configured_provider", "configured_model", "expected_provider", "expected_model"),
+    [
+        ("modelsai", "", "volcengine", "seedance-env-test"),
+        ("dashscope", "", "bailian", "wan-env-test"),
+        ("sora", "", "openai", "sora-env-test"),
+        ("google", "", "gemini", "veo-env-test"),
+        ("google", "explicit-video-model", "gemini", "explicit-video-model"),
+    ],
+)
+async def test_active_provider_env_mode_get_returns_effective_config_without_db(
+    client,
+    monkeypatch,
+    configured_provider: str,
+    configured_model: str,
+    expected_provider: str,
+    expected_model: str,
+) -> None:
+    from app.api.v1 import video_generation as api
+    from app.core.auth import get_current_user
+
+    async def override_user():
+        return SimpleNamespace(user_id="user-1", enabled=True, is_admin=False)
+
+    configured = SimpleNamespace(
+        video_provider_selection_mode="env",
+        video_gen_provider=configured_provider,
+        video_gen_model=configured_model,
+        seedance_model="seedance-env-test",
+        dashscope_video_model="wan-env-test",
+        openai_video_model="sora-env-test",
+        google_video_model="veo-env-test",
+    )
+    get_database_provider = AsyncMock(
+        return_value=SimpleNamespace(
+            provider_key="modelsai",
+            job_type="all_reference",
+            model="database-model",
+        )
+    )
+    monkeypatch.setattr(api, "settings", configured, raising=False)
+    monkeypatch.setattr(api.video_crud, "get_active_provider", get_database_provider)
+    app = client._app  # type: ignore[attr-defined]
+    app.dependency_overrides[get_current_user] = override_user
+
+    response = await client.get("/v3api/video-generation/active-provider")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "provider_key": expected_provider,
+        "job_type": "all_reference",
+        "model": expected_model,
+    }
+    get_database_provider.assert_not_awaited()
+
+
+async def test_active_provider_env_mode_rejects_admin_switch_without_db_mutation(
+    client, monkeypatch
+) -> None:
+    from app.api.v1 import video_generation as api
+    from app.core.auth import get_current_user
+    from app.core.database import get_db
+
+    async def override_user():
+        return SimpleNamespace(user_id="admin-1", enabled=True, is_admin=True)
+
+    commit = AsyncMock()
+
+    async def override_db():
+        yield SimpleNamespace(commit=commit)
+
+    configured = SimpleNamespace(video_provider_selection_mode="env")
+    ensure_configs = AsyncMock()
+    provider = SimpleNamespace(
+        provider_key="gemini",
+        job_type="all_reference",
+        model="veo-database-test",
+    )
+    get_provider = AsyncMock(return_value=provider)
+    get_active = AsyncMock(
+        return_value=SimpleNamespace(
+            provider_key="modelsai",
+            job_type="all_reference",
+            model="seedance-database-test",
+        )
+    )
+    set_active = AsyncMock(return_value=provider)
+    audit = AsyncMock()
+    monkeypatch.setattr(api, "settings", configured, raising=False)
+    monkeypatch.setattr(api.video_crud, "ensure_provider_configs", ensure_configs)
+    monkeypatch.setattr(api.video_crud, "get_provider_by_key", get_provider)
+    monkeypatch.setattr(api.video_crud, "get_active_provider", get_active)
+    monkeypatch.setattr(api.video_crud, "set_active_provider", set_active)
+    monkeypatch.setattr(api, "audit_log", audit)
+    app = client._app  # type: ignore[attr-defined]
+    app.dependency_overrides[get_current_user] = override_user
+    app.dependency_overrides[get_db] = override_db
+
+    response = await client.post(
+        "/v3api/video-generation/active-provider",
+        json={"provider_key": "gemini", "job_type": "all_reference"},
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": "视频供应商由环境配置锁定，无法通过 API 切换"
+    }
+    ensure_configs.assert_not_awaited()
+    get_provider.assert_not_awaited()
+    get_active.assert_not_awaited()
+    set_active.assert_not_awaited()
+    commit.assert_not_awaited()
+    audit.assert_not_awaited()
+
+
+def test_active_provider_initial_seed_is_committed(monkeypatch) -> None:
     async def scenario() -> None:
         from app.api.v1 import video_generation as api
 
+        monkeypatch.setattr(api.settings, "video_provider_selection_mode", "database")
         engine, raw = _make_db()
         seeded = _seed(raw)
         raw.query(VideoProviderConfig).delete()
@@ -1886,14 +3777,45 @@ def test_active_provider_initial_seed_is_committed() -> None:
     asyncio.run(scenario())
 
 
+def test_active_provider_switch_seeds_gemini_for_existing_database(monkeypatch) -> None:
+    async def scenario() -> None:
+        from app.api.v1 import video_generation as api
+        from app.schemas.video import ActiveProviderUpdateIn
+
+        monkeypatch.setattr(api.settings, "video_provider_selection_mode", "database")
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        db = _AsyncSessionAdapter(raw)
+        audit = AsyncMock()
+        monkeypatch.setattr(api, "audit_log", audit)
+
+        out = await api.set_active_provider(
+            body=ActiveProviderUpdateIn(provider_key="gemini"),
+            db=db,
+            user=SimpleNamespace(user_id=seeded.user.user_id, is_admin=True),
+        )
+
+        assert out.provider_key == "gemini"
+        assert out.model
+        assert raw.scalar(
+            select(VideoProviderConfig).where(
+                VideoProviderConfig.provider_key == "gemini",
+                VideoProviderConfig.is_active.is_(True),
+            )
+        ) is not None
+        audit.assert_awaited_once()
+
+    asyncio.run(scenario())
+
+
 def test_video_provider_and_job_type_constraints_are_declared() -> None:
     job_checks = {
-        constraint.name
+        constraint.name: str(constraint.sqltext)
         for constraint in VideoGenerationJob.__table__.constraints
         if isinstance(constraint, CheckConstraint)
     }
     provider_checks = {
-        constraint.name
+        constraint.name: str(constraint.sqltext)
         for constraint in VideoProviderConfig.__table__.constraints
         if isinstance(constraint, CheckConstraint)
     }
@@ -1901,6 +3823,164 @@ def test_video_provider_and_job_type_constraints_are_declared() -> None:
     assert "ck_video_jobs_job_type" in job_checks
     assert "ck_video_provider_configs_provider_key" in provider_checks
     assert "ck_video_provider_configs_job_type" in provider_checks
+    assert "'gemini'" in job_checks["ck_video_jobs_provider_key"]
+    assert "'gemini'" in provider_checks["ck_video_provider_configs_provider_key"]
+
+
+def test_active_provider_schema_accepts_canonical_gemini() -> None:
+    from app.schemas.video import ActiveProviderUpdateIn
+
+    payload = ActiveProviderUpdateIn(provider_key="gemini")
+
+    assert payload.provider_key == "gemini"
+
+
+@pytest.mark.parametrize("alias", ["google", "gemini", "veo"])
+def test_video_service_persists_gemini_aliases_as_canonical_provider(
+    monkeypatch, alias: str
+) -> None:
+    async def scenario() -> None:
+        from app.api.v1 import video_generation as api
+        from app.core.config import Settings
+        from app.services import video_generation
+
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        db = _AsyncSessionAdapter(raw)
+        configured = Settings(
+            _env_file=None,
+            video_provider_selection_mode="env",
+            video_gen_provider=alias,
+            video_gen_api_key="test-video-key",
+            google_video_model="veo-google-test",
+        )
+        monkeypatch.setattr(api, "settings", configured, raising=False)
+        monkeypatch.setattr(video_generation, "settings", configured)
+        monkeypatch.setattr(video_generation, "_credits_reserve", None)
+
+        active = await api.get_active_provider(db=db, user=seeded.user)
+        job = await video_generation.create_video_job(
+            db,
+            script_id=seeded.script.id,
+            episode_id=seeded.episode.episode_id,
+            shot_group_id=seeded.shot_group.shot_group_id,
+            user_id=seeded.user.user_id,
+            idempotency_key=f"gemini-alias-{alias}",
+        )
+
+        assert active.provider_key == job.provider_key
+        assert active.model == job.input_json["model"]
+        assert job.provider_key == "gemini"
+        assert job.input_json["model"] == "veo-google-test"
+
+    asyncio.run(scenario())
+
+
+def test_video_service_uses_database_selected_gemini_provider(monkeypatch) -> None:
+    async def scenario() -> None:
+        from app.core.config import Settings
+        from app.crud.video import set_active_provider
+        from app.services import video_generation
+
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        raw.add(
+            VideoProviderConfig(
+                id="provider-gemini",
+                provider_key="gemini",
+                job_type="all_reference",
+                model="veo-database-test",
+                is_active=False,
+            )
+        )
+        raw.commit()
+        db = _AsyncSessionAdapter(raw)
+        await set_active_provider(db, provider_key="gemini")
+        await db.commit()
+        configured = Settings(
+            _env_file=None,
+            video_provider_selection_mode="database",
+        )
+        monkeypatch.setattr(video_generation, "settings", configured)
+        monkeypatch.setattr(video_generation, "_credits_reserve", None)
+
+        job = await video_generation.create_video_job(
+            db,
+            script_id=seeded.script.id,
+            episode_id=seeded.episode.episode_id,
+            shot_group_id=seeded.shot_group.shot_group_id,
+            user_id=seeded.user.user_id,
+            idempotency_key="gemini-database-mode",
+        )
+
+        assert job.provider_key == "gemini"
+        assert job.input_json["model"] == "veo-database-test"
+
+    asyncio.run(scenario())
+
+
+def test_gemini_service_job_routes_through_google_worker_factory(monkeypatch) -> None:
+    async def scenario() -> None:
+        from app.core.config import Settings
+        from app.providers import video_gen
+        from app.providers.video_gen import VideoGenerationResult
+        from app.providers.video_gen_google import GoogleVideoGenProvider
+        from app.services import video_generation
+        from app.workers.video_generation import run_video_generation_once
+
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        db = _AsyncSessionAdapter(raw)
+        configured = Settings(
+            _env_file=None,
+            video_provider_selection_mode="env",
+            video_gen_provider="veo",
+            video_gen_api_key="test-video-key",
+            google_video_model="veo-google-test",
+        )
+        monkeypatch.setattr(video_generation, "settings", configured)
+        monkeypatch.setattr(video_generation, "_credits_reserve", None)
+
+        job = await video_generation.create_video_job(
+            db,
+            script_id=seeded.script.id,
+            episode_id=seeded.episode.episode_id,
+            shot_group_id=seeded.shot_group.shot_group_id,
+            user_id=seeded.user.user_id,
+            idempotency_key="gemini-worker-route",
+        )
+
+        factory_keys: list[str] = []
+        generated = AsyncMock(
+            return_value=VideoGenerationResult(
+                video_storage_key="generate_images/video/gemini-worker-route.mp4",
+                provider_job_id="operations/gemini-worker-route",
+            )
+        )
+        real_factory = video_gen.get_video_provider
+
+        def observed_factory(provider_key: str):
+            factory_keys.append(provider_key)
+            provider = real_factory(provider_key)
+            assert isinstance(provider, GoogleVideoGenProvider)
+            provider.generate = generated  # type: ignore[method-assign]
+            return provider
+
+        monkeypatch.setattr(video_gen, "get_video_provider", observed_factory)
+        await run_video_generation_once(
+            db,
+            job.job_id,
+            owner="gemini-route-worker",
+            extract_last_frame=AsyncMock(return_value=None),
+        )
+
+        assert factory_keys == ["gemini"]
+        generated.assert_awaited_once()
+        request = generated.await_args.args[0]
+        assert request.model == "veo-google-test"
+        assert raw.get(VideoGenerationJob, job.job_id).status == "succeeded"
+
+    asyncio.run(scenario())
 
 
 def test_financial_cleanup_has_schedulable_celery_task() -> None:
@@ -1910,6 +3990,19 @@ def test_financial_cleanup_has_schedulable_celery_task() -> None:
         "app.workers.video_generation.reconcile_video_financial_cleanup"
     )
     assert callable(worker.reconcile_video_financial_cleanup_task.delay)
+
+
+def test_remote_cancellation_cleanup_has_registered_beat_task() -> None:
+    from app.workers import video_generation as worker
+    from app.workers.celery_app import app as celery_app
+
+    task_name = "app.workers.video_generation.reconcile_video_remote_cancellations"
+    schedule = celery_app.conf.beat_schedule["video-remote-cancellation-cleanup"]
+
+    assert worker.reconcile_video_remote_cancellations_task.name == task_name
+    assert callable(worker.reconcile_video_remote_cancellations_task.delay)
+    assert schedule["task"] == task_name
+    assert schedule["schedule"] == 60.0
 
 
 def test_first_frame_reference_read_failure_is_fail_closed(monkeypatch) -> None:
@@ -1997,3 +4090,1420 @@ async def test_video_generation_http_denies_cross_user_create_list_get_cancel(cl
     assert list_response.status_code == 403
     assert get_response.status_code == 403
     assert cancel_response.status_code == 403
+
+
+def test_volcengine_cancel_calls_tasks_delete_and_closes_client(monkeypatch) -> None:
+    async def scenario() -> None:
+        from app.providers.video_gen import VideoCancellationOutcome
+        from app.providers.video_gen_volcengine import VolcengineVideoGenProvider
+
+        deleted: list[str] = []
+
+        class Tasks:
+            async def delete(self, *, task_id: str) -> None:
+                deleted.append(task_id)
+
+        class Client:
+            def __init__(self) -> None:
+                self.content_generation = SimpleNamespace(tasks=Tasks())
+                self.closed = False
+
+            async def close(self) -> None:
+                self.closed = True
+
+        client = Client()
+        provider = VolcengineVideoGenProvider(provider_key="modelsai")
+        monkeypatch.setattr(provider, "_check_keys", lambda: None)
+        monkeypatch.setattr(provider, "_build_client", lambda **_kwargs: client)
+
+        result = await provider.cancel("provider-task-known")
+
+        assert result.provider_task_id == "provider-task-known"
+        assert result.outcome is VideoCancellationOutcome.CANCELED
+        assert deleted == ["provider-task-known"]
+        assert client.closed is True
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("signal_name", ["soft", "hard"])
+def test_volcengine_cancel_propagates_time_limit_signals(
+    monkeypatch,
+    signal_name: str,
+) -> None:
+    async def scenario() -> None:
+        from billiard.exceptions import SoftTimeLimitExceeded, TimeLimitExceeded
+
+        from app.providers.video_gen_volcengine import VolcengineVideoGenProvider
+
+        signal = (
+            SoftTimeLimitExceeded()
+            if signal_name == "soft"
+            else TimeLimitExceeded()
+        )
+
+        class Tasks:
+            async def delete(self, *, task_id: str) -> None:
+                assert task_id == f"provider-task-{signal_name}-limit"
+                raise signal
+
+        class Client:
+            content_generation = SimpleNamespace(tasks=Tasks())
+
+            def __init__(self) -> None:
+                self.closed = False
+
+            async def close(self) -> None:
+                self.closed = True
+
+        client = Client()
+        provider = VolcengineVideoGenProvider(provider_key="modelsai")
+        monkeypatch.setattr(provider, "_check_keys", lambda: None)
+        monkeypatch.setattr(provider, "_build_client", lambda **_kwargs: client)
+
+        with pytest.raises(type(signal)) as exc_info:
+            await provider.cancel(f"provider-task-{signal_name}-limit")
+
+        assert exc_info.value is signal
+        assert client.closed is True
+
+    asyncio.run(scenario())
+
+
+def test_volcengine_cancel_treats_structured_not_found_as_already_canceled() -> None:
+    async def scenario() -> None:
+        import httpx
+        from volcenginesdkarkruntime._exceptions import ArkNotFoundError
+
+        from app.providers.video_gen import VideoCancellationOutcome
+        from app.providers.video_gen_volcengine import VolcengineVideoGenProvider
+
+        request = httpx.Request(
+            "DELETE",
+            "https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks/task",
+        )
+        response = httpx.Response(404, request=request)
+        error = ArkNotFoundError(
+            "opaque sdk error",
+            response=response,
+            body={"error": {"code": "opaque"}},
+            request_id="request-id",
+        )
+
+        class Tasks:
+            async def delete(self, *, task_id: str) -> None:
+                assert task_id == "provider-task-already-gone"
+                raise error
+
+        result = await VolcengineVideoGenProvider._cancel_task(
+            Tasks(),
+            "provider-task-already-gone",
+        )
+
+        assert result.provider_task_id == "provider-task-already-gone"
+        assert result.outcome is VideoCancellationOutcome.CANCELED
+        assert result.detail == "火山方舟远端任务已不存在"
+
+    asyncio.run(scenario())
+
+
+def test_volcengine_cancel_does_not_treat_other_errors_as_not_found() -> None:
+    async def scenario() -> None:
+        import httpx
+        from volcenginesdkarkruntime._exceptions import (
+            ArkAuthenticationError,
+            ArkInternalServerError,
+            ArkPermissionDeniedError,
+            ArkRateLimitError,
+        )
+
+        from app.providers.video_gen import VideoCancellationOutcome
+        from app.providers.video_gen_volcengine import VolcengineVideoGenProvider
+
+        error_cases = [
+            (401, ArkAuthenticationError),
+            (403, ArkPermissionDeniedError),
+            (429, ArkRateLimitError),
+            (500, ArkInternalServerError),
+        ]
+        errors: list[Exception] = []
+        for status_code, error_type in error_cases:
+            request = httpx.Request(
+                "DELETE",
+                "https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks/task",
+            )
+            response = httpx.Response(status_code, request=request)
+            errors.append(
+                error_type(
+                    "opaque sdk error",
+                    response=response,
+                    body=None,
+                    request_id="request-id",
+                )
+            )
+        errors.append(RuntimeError("task not found in an unstructured message"))
+
+        for error in errors:
+            class Tasks:
+                async def delete(self, *, task_id: str) -> None:
+                    assert task_id == "provider-task-error"
+                    raise error
+
+            result = await VolcengineVideoGenProvider._cancel_task(
+                Tasks(),
+                "provider-task-error",
+            )
+            assert result.outcome is VideoCancellationOutcome.FAILED
+
+    asyncio.run(scenario())
+
+
+def test_volcengine_cancel_uses_short_sdk_timeout_and_total_deadline(monkeypatch) -> None:
+    async def scenario() -> None:
+        from app.providers import video_gen_volcengine as module
+        from app.providers.video_gen import VideoCancellationOutcome
+        from app.providers.video_gen_volcengine import VolcengineVideoGenProvider
+
+        delete_started = asyncio.Event()
+        delete_stopped = asyncio.Event()
+        build_kwargs: list[dict] = []
+
+        class Tasks:
+            async def delete(self, *, task_id: str) -> None:
+                assert task_id == "provider-task-timeout"
+                delete_started.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    delete_stopped.set()
+
+        class Client:
+            def __init__(self) -> None:
+                self.content_generation = SimpleNamespace(tasks=Tasks())
+                self.closed = False
+
+            async def close(self) -> None:
+                self.closed = True
+
+        client = Client()
+        provider = VolcengineVideoGenProvider(provider_key="modelsai")
+        monkeypatch.setattr(provider, "_check_keys", lambda: None)
+
+        def build_client(**kwargs):
+            build_kwargs.append(kwargs)
+            return client
+
+        monkeypatch.setattr(provider, "_build_client", build_client)
+        monkeypatch.setattr(module, "_CANCEL_TOTAL_TIMEOUT", 0.01, raising=False)
+
+        result = await asyncio.wait_for(
+            provider.cancel("provider-task-timeout"),
+            timeout=0.2,
+        )
+
+        assert result.outcome is VideoCancellationOutcome.FAILED
+        assert result.provider_task_id == "provider-task-timeout"
+        assert result.detail and "Timeout" in result.detail
+        assert build_kwargs == [
+            {"timeout": module._CANCEL_SDK_TIMEOUT, "max_retries": 0}
+        ]
+        assert delete_started.is_set()
+        assert delete_stopped.is_set()
+        assert client.closed is True
+
+    asyncio.run(scenario())
+
+
+def test_volcengine_cancel_close_failure_does_not_override_result(monkeypatch) -> None:
+    async def scenario() -> None:
+        from app.providers.video_gen import VideoCancellationOutcome
+        from app.providers.video_gen_volcengine import VolcengineVideoGenProvider
+
+        class Tasks:
+            async def delete(self, *, task_id: str) -> None:
+                assert task_id == "provider-task-close-failure"
+
+        class Client:
+            content_generation = SimpleNamespace(tasks=Tasks())
+
+            async def close(self) -> None:
+                raise RuntimeError("close_failed")
+
+        provider = VolcengineVideoGenProvider(provider_key="modelsai")
+        monkeypatch.setattr(provider, "_check_keys", lambda: None)
+        monkeypatch.setattr(provider, "_build_client", lambda **_kwargs: Client())
+
+        result = await provider.cancel("provider-task-close-failure")
+
+        assert result.outcome is VideoCancellationOutcome.CANCELED
+
+    asyncio.run(scenario())
+
+
+def test_volcengine_cancel_hanging_close_has_own_deadline(monkeypatch) -> None:
+    async def scenario() -> None:
+        from app.providers import video_gen
+        from app.providers.video_gen import VideoCancellationOutcome
+        from app.providers.video_gen_volcengine import VolcengineVideoGenProvider
+
+        close_stopped = asyncio.Event()
+
+        class Tasks:
+            async def delete(self, *, task_id: str) -> None:
+                assert task_id == "provider-task-close-timeout"
+
+        class Client:
+            content_generation = SimpleNamespace(tasks=Tasks())
+
+            async def close(self) -> None:
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    close_stopped.set()
+
+        provider = VolcengineVideoGenProvider(provider_key="modelsai")
+        monkeypatch.setattr(provider, "_check_keys", lambda: None)
+        monkeypatch.setattr(provider, "_build_client", lambda **_kwargs: Client())
+        monkeypatch.setattr(video_gen, "_VIDEO_CLIENT_CLOSE_TIMEOUT", 0.01, raising=False)
+
+        result = await asyncio.wait_for(
+            provider.cancel("provider-task-close-timeout"),
+            timeout=0.2,
+        )
+
+        assert result.outcome is VideoCancellationOutcome.CANCELED
+        assert close_stopped.is_set()
+
+    asyncio.run(scenario())
+
+
+def test_volcengine_generation_close_that_swallows_cancellation_has_hard_deadline(
+    monkeypatch,
+) -> None:
+    async def scenario() -> None:
+        import time
+
+        from app.providers import video_gen
+        from app.providers.video_gen import VideoGenerationRemoteTerminalError
+        from app.providers.video_gen_volcengine import VolcengineVideoGenProvider
+
+        primary_error = VideoGenerationRemoteTerminalError(
+            provider_task_id="volcengine-generation-stubborn-close",
+            terminal_status="failed",
+        )
+        close_cancelled = asyncio.Event()
+        close_finished = asyncio.Event()
+        release_close = asyncio.Event()
+
+        class ContentGeneration:
+            @property
+            def tasks(self):
+                raise primary_error
+
+        class Client:
+            content_generation = ContentGeneration()
+
+            async def close(self) -> None:
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    close_cancelled.set()
+                    current = asyncio.current_task()
+                    assert current is not None
+                    while current.cancelling():
+                        current.uncancel()
+                    await release_close.wait()
+                finally:
+                    close_finished.set()
+
+        provider = VolcengineVideoGenProvider(provider_key="modelsai")
+        monkeypatch.setattr(provider, "_build_client", lambda: Client())
+        monkeypatch.setattr(video_gen, "_VIDEO_CLIENT_CLOSE_TIMEOUT", 0.01, raising=False)
+        asyncio.get_running_loop().call_later(0.15, release_close.set)
+
+        started_at = time.monotonic()
+        with pytest.raises(VideoGenerationRemoteTerminalError) as exc_info:
+            await provider._submit_and_poll(
+                "doubao-seedance-2-0-260128",
+                "镜头提示词",
+                [],
+                [],
+                None,
+                lambda *_args: None,
+            )
+        elapsed = time.monotonic() - started_at
+
+        assert exc_info.value is primary_error
+        assert close_cancelled.is_set()
+        assert elapsed < 0.08
+        assert len(video_gen._VIDEO_CLIENT_CLOSE_ORPHANS) == 1
+        await asyncio.wait_for(close_finished.wait(), timeout=0.3)
+        await asyncio.sleep(0)
+        assert video_gen._VIDEO_CLIENT_CLOSE_ORPHANS == set()
+
+    asyncio.run(scenario())
+
+
+def test_volcengine_cancel_close_that_swallows_cancellation_has_hard_deadline(
+    monkeypatch,
+) -> None:
+    async def scenario() -> None:
+        import time
+
+        from app.providers import video_gen
+        from app.providers.video_gen import VideoCancellationOutcome
+        from app.providers.video_gen_volcengine import VolcengineVideoGenProvider
+
+        close_cancelled = asyncio.Event()
+        close_finished = asyncio.Event()
+        release_close = asyncio.Event()
+
+        class Tasks:
+            async def delete(self, *, task_id: str) -> None:
+                assert task_id == "volcengine-cancel-stubborn-close"
+
+        class Client:
+            content_generation = SimpleNamespace(tasks=Tasks())
+
+            async def close(self) -> None:
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    close_cancelled.set()
+                    current = asyncio.current_task()
+                    assert current is not None
+                    while current.cancelling():
+                        current.uncancel()
+                    await release_close.wait()
+                finally:
+                    close_finished.set()
+
+        provider = VolcengineVideoGenProvider(provider_key="modelsai")
+        monkeypatch.setattr(provider, "_check_keys", lambda: None)
+        monkeypatch.setattr(provider, "_build_client", lambda **_kwargs: Client())
+        monkeypatch.setattr(video_gen, "_VIDEO_CLIENT_CLOSE_TIMEOUT", 0.01, raising=False)
+        asyncio.get_running_loop().call_later(0.15, release_close.set)
+
+        started_at = time.monotonic()
+        result = await provider.cancel("volcengine-cancel-stubborn-close")
+        elapsed = time.monotonic() - started_at
+
+        assert result.outcome is VideoCancellationOutcome.CANCELED
+        assert close_cancelled.is_set()
+        assert elapsed < 0.08
+        assert len(video_gen._VIDEO_CLIENT_CLOSE_ORPHANS) == 1
+        await asyncio.wait_for(close_finished.wait(), timeout=0.3)
+        await asyncio.sleep(0)
+        assert video_gen._VIDEO_CLIENT_CLOSE_ORPHANS == set()
+
+    asyncio.run(scenario())
+
+
+def test_volcengine_cancel_reserves_one_cross_loop_close_slot_atomically(
+    monkeypatch,
+) -> None:
+    import threading
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    from app.providers import video_gen
+    from app.providers.video_gen import VideoCancellationOutcome
+    from app.providers.video_gen_volcengine import VolcengineVideoGenProvider
+
+    concurrency = 24
+    enter_close = threading.Barrier(concurrency)
+    release_close = threading.Event()
+    counter_lock = threading.Lock()
+    close_started = 0
+    contexts_returned = 0
+
+    async def invoke(index: int) -> None:
+        nonlocal close_started, contexts_returned
+
+        class Tasks:
+            async def delete(self, *, task_id: str) -> None:
+                assert task_id == f"volcengine-concurrent-close-{index}"
+                enter_close.wait(timeout=5)
+
+        class Client:
+            content_generation = SimpleNamespace(tasks=Tasks())
+
+            async def close(self) -> None:
+                nonlocal close_started
+                with counter_lock:
+                    close_started += 1
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    current = asyncio.current_task()
+                    assert current is not None
+                    while not release_close.is_set():
+                        while current.cancelling():
+                            current.uncancel()
+                        try:
+                            await asyncio.sleep(0.005)
+                        except asyncio.CancelledError:
+                            continue
+
+        provider = VolcengineVideoGenProvider(provider_key="modelsai")
+        provider._check_keys = lambda: None  # type: ignore[method-assign]
+        provider._build_client = lambda **_kwargs: Client()  # type: ignore[method-assign]
+        result = await provider.cancel(f"volcengine-concurrent-close-{index}")
+        assert result.outcome is VideoCancellationOutcome.CANCELED
+        with counter_lock:
+            contexts_returned += 1
+
+    def run_in_thread(index: int) -> None:
+        asyncio.run(invoke(index))
+
+    monkeypatch.setattr(video_gen, "_VIDEO_CLIENT_CLOSE_TIMEOUT", 0.02, raising=False)
+    try:
+        with ThreadPoolExecutor(max_workers=concurrency) as executor:
+            futures = [executor.submit(run_in_thread, index) for index in range(concurrency)]
+            try:
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline:
+                    with counter_lock:
+                        if close_started == concurrency or contexts_returned >= concurrency - 1:
+                            break
+                    time.sleep(0.005)
+                with counter_lock:
+                    assert close_started == 1
+                deadline = time.monotonic() + 0.5
+                while (
+                    not video_gen._VIDEO_CLIENT_CLOSE_ORPHANS
+                    and time.monotonic() < deadline
+                ):
+                    time.sleep(0.005)
+                assert len(video_gen._VIDEO_CLIENT_CLOSE_ORPHANS) == 1
+            finally:
+                release_close.set()
+            for future in futures:
+                future.result(timeout=2)
+    finally:
+        release_close.set()
+
+    deadline = time.monotonic() + 1
+    while video_gen._VIDEO_CLIENT_CLOSE_ORPHANS and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert video_gen._VIDEO_CLIENT_CLOSE_ORPHANS == set()
+
+    closed: list[bool] = []
+
+    class ProbeTasks:
+        async def delete(self, *, task_id: str) -> None:
+            assert task_id == "volcengine-sync-close-probe"
+
+    class ProbeClient:
+        content_generation = SimpleNamespace(tasks=ProbeTasks())
+
+        def close(self) -> None:
+            closed.append(True)
+
+    async def run_probe() -> None:
+        provider = VolcengineVideoGenProvider(provider_key="modelsai")
+        provider._check_keys = lambda: None  # type: ignore[method-assign]
+        provider._build_client = lambda **_kwargs: ProbeClient()  # type: ignore[method-assign]
+        result = await provider.cancel("volcengine-sync-close-probe")
+        assert result.outcome is VideoCancellationOutcome.CANCELED
+
+    asyncio.run(run_probe())
+    assert closed == [True]
+
+
+def test_volcengine_submit_tasks_lookup_and_close_preserve_original_error(monkeypatch) -> None:
+    async def scenario() -> None:
+        from app.providers.video_gen_volcengine import VolcengineVideoGenProvider
+
+        class ContentGeneration:
+            @property
+            def tasks(self):
+                raise RuntimeError("tasks_lookup_failed")
+
+        class Client:
+            content_generation = ContentGeneration()
+
+            def __init__(self) -> None:
+                self.closed = False
+
+            async def close(self) -> None:
+                self.closed = True
+                raise RuntimeError("close_failed")
+
+        client = Client()
+        provider = VolcengineVideoGenProvider(provider_key="modelsai")
+        monkeypatch.setattr(provider, "_build_client", lambda: client)
+
+        with pytest.raises(RuntimeError, match="tasks_lookup_failed"):
+            await provider._submit_and_poll(
+                "doubao-seedance-2-0-260128",
+                "镜头提示词",
+                [],
+                [],
+                None,
+                lambda *_args: None,
+            )
+
+        assert client.closed is True
+
+    asyncio.run(scenario())
+
+
+def test_volcengine_checks_cancellation_before_downloading(monkeypatch) -> None:
+    async def scenario() -> None:
+        from app.providers.video_gen import (
+            VideoCancellationOutcome,
+            VideoCancellationResult,
+            VideoGenerationCancelled,
+            VideoGenerationRequest,
+        )
+        from app.providers.video_gen_volcengine import VolcengineVideoGenProvider
+
+        provider = VolcengineVideoGenProvider(provider_key="modelsai")
+        monkeypatch.setattr(provider, "_check_keys", lambda: None)
+        monkeypatch.setattr(provider, "_preflight_reference_sizes", AsyncMock())
+        monkeypatch.setattr(
+            provider,
+            "_submit_and_poll",
+            AsyncMock(
+                return_value=(
+                    "https://ark-content-generation-cn-beijing.tos-cn-beijing.volces.com/video.mp4",
+                    {"task_id": "provider-task-download", "volcengine_status": "succeeded"},
+                )
+            ),
+        )
+        download = AsyncMock(side_effect=AssertionError("取消后不得开始下载"))
+        monkeypatch.setattr(provider, "_download_to_file", download)
+        monkeypatch.setattr(
+            provider,
+            "cancel",
+            AsyncMock(
+                return_value=VideoCancellationResult(
+                    provider_task_id="provider-task-download",
+                    outcome=VideoCancellationOutcome.CANCELED,
+                )
+            ),
+        )
+        request = VideoGenerationRequest(
+            prompt="镜头提示词",
+            reference_images=[],
+            reference_image_names=[],
+            reference_audios=[],
+            reference_audio_names=[],
+            model="doubao-seedance-2-0-260128",
+            job_id="job-download-cancel",
+            metadata={"provider_task_id": "provider-task-download"},
+            cancel_requested=AsyncMock(return_value=True),
+        )
+
+        with pytest.raises(VideoGenerationCancelled):
+            await provider.generate(request)
+
+        download.assert_not_awaited()
+        provider.cancel.assert_awaited_once_with("provider-task-download")
+
+    asyncio.run(scenario())
+
+
+def test_volcengine_cancels_between_submit_and_first_poll(monkeypatch) -> None:
+    async def scenario() -> None:
+        from app.providers.video_gen import (
+            VideoCancellationOutcome,
+            VideoGenerationCancelled,
+        )
+        from app.providers.video_gen_volcengine import VolcengineVideoGenProvider
+
+        calls: dict[str, list[str]] = {"get": [], "delete": []}
+
+        class Tasks:
+            async def create(self, **_kwargs):
+                return SimpleNamespace(id="provider-task-race")
+
+            async def get(self, *, task_id: str):
+                calls["get"].append(task_id)
+                raise AssertionError("本地已取消时不得进入首次轮询")
+
+            async def delete(self, *, task_id: str) -> None:
+                calls["delete"].append(task_id)
+
+        class Client:
+            def __init__(self) -> None:
+                self.content_generation = SimpleNamespace(tasks=Tasks())
+                self.closed = False
+
+            async def close(self) -> None:
+                self.closed = True
+
+        client = Client()
+        provider = VolcengineVideoGenProvider(provider_key="modelsai")
+        monkeypatch.setattr(provider, "_build_client", lambda: client)
+        cancel_requested = AsyncMock(side_effect=[False, True])
+
+        with pytest.raises(VideoGenerationCancelled) as caught:
+            await provider._submit_and_poll(
+                "doubao-seedance-2-0-260128",
+                "镜头提示词",
+                [],
+                [],
+                None,
+                lambda *_args: None,
+                job_id="job-race",
+                cancel_requested=cancel_requested,
+            )
+
+        assert cancel_requested.await_count == 2
+        assert caught.value.result.outcome is VideoCancellationOutcome.CANCELED
+        assert caught.value.result.provider_task_id == "provider-task-race"
+        assert calls == {"get": [], "delete": ["provider-task-race"]}
+        assert client.closed is True
+
+    asyncio.run(scenario())
+
+
+def test_volcengine_does_not_submit_when_cancellation_is_already_visible(
+    monkeypatch,
+) -> None:
+    async def scenario() -> None:
+        from app.providers.video_gen import (
+            VideoCancellationOutcome,
+            VideoGenerationCancelled,
+        )
+        from app.providers.video_gen_volcengine import VolcengineVideoGenProvider
+
+        calls = {"create": 0, "delete": 0}
+
+        class Tasks:
+            async def create(self, **_kwargs):
+                calls["create"] += 1
+                return SimpleNamespace(id="must-not-exist")
+
+            async def delete(self, *, task_id: str) -> None:
+                calls["delete"] += 1
+
+        class Client:
+            def __init__(self) -> None:
+                self.content_generation = SimpleNamespace(tasks=Tasks())
+                self.closed = False
+
+            async def close(self) -> None:
+                self.closed = True
+
+        client = Client()
+        provider = VolcengineVideoGenProvider(provider_key="modelsai")
+        monkeypatch.setattr(provider, "_build_client", lambda: client)
+
+        with pytest.raises(VideoGenerationCancelled) as caught:
+            await provider._submit_and_poll(
+                "doubao-seedance-2-0-260128",
+                "镜头提示词",
+                [],
+                [],
+                None,
+                lambda *_args: None,
+                job_id="job-canceled-before-submit",
+                cancel_requested=AsyncMock(return_value=True),
+            )
+
+        assert caught.value.result.outcome is VideoCancellationOutcome.CANCELED
+        assert caught.value.result.provider_task_id == ""
+        assert calls == {"create": 0, "delete": 0}
+        assert client.closed is True
+
+    asyncio.run(scenario())
+
+
+def test_other_video_providers_declare_remote_cancel_as_unsupported() -> None:
+    async def scenario() -> None:
+        from app.providers.video_gen import VideoCancellationOutcome
+        from app.providers.video_gen_bailian import BailianVideoGenProvider
+        from app.providers.video_gen_google import GoogleVideoGenProvider
+        from app.providers.video_gen_openai import OpenAIVideoGenProvider
+
+        providers = [
+            BailianVideoGenProvider(),
+            OpenAIVideoGenProvider(),
+            GoogleVideoGenProvider(),
+        ]
+        for provider in providers:
+            result = await provider.cancel("provider-task-unsupported")
+            assert result.provider_task_id == "provider-task-unsupported"
+            assert result.outcome is VideoCancellationOutcome.UNSUPPORTED
+            assert result.detail
+
+    asyncio.run(scenario())
+
+
+def test_cancel_video_job_best_effort_cancels_known_provider_task(monkeypatch) -> None:
+    async def scenario() -> None:
+        from app.providers.video_gen import (
+            VideoCancellationOutcome,
+            VideoCancellationResult,
+        )
+        from app.services import video_generation as service
+
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        job = _add_worker_job(
+            raw,
+            seeded,
+            job_id="job-provider-cancel",
+            reservation_id="reservation-provider-cancel",
+        )
+        job.output_json = {"provider_task_id": "provider-task-known"}
+        raw.commit()
+        db = _AsyncSessionAdapter(raw)
+        cancel = AsyncMock(
+            return_value=VideoCancellationResult(
+                provider_task_id="provider-task-known",
+                outcome=VideoCancellationOutcome.CANCELED,
+            )
+        )
+        provider = SimpleNamespace(cancel=cancel)
+        monkeypatch.setattr(service, "get_video_provider", lambda _key: provider, raising=False)
+        monkeypatch.setattr(service, "_credits_reserve", object())
+
+        result = await service.cancel_video_job(
+            db,
+            script_id=seeded.script.id,
+            job_id=job.job_id,
+            actor_user_id=seeded.user.user_id,
+        )
+
+        assert result.status == "canceled"
+        cancel.assert_awaited_once_with("provider-task-known")
+        cancellation = (result.output_json or {})["provider_cancellation"]
+        assert cancellation["outcome"] == "canceled"
+        assert cancellation["retryable"] is False
+
+    asyncio.run(scenario())
+
+
+def test_cancel_video_job_persists_failed_remote_cancellation_debt(monkeypatch) -> None:
+    async def scenario() -> None:
+        from app.providers.video_gen import (
+            VideoCancellationOutcome,
+            VideoCancellationResult,
+        )
+        from app.services import video_generation as service
+
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        job = _add_worker_job(
+            raw,
+            seeded,
+            job_id="job-provider-cancel-failed",
+            reservation_id="reservation-provider-cancel-failed",
+        )
+        job.output_json = {"provider_task_id": "provider-task-direct-failed"}
+        raw.commit()
+        db = _AsyncSessionAdapter(raw)
+        cancel = AsyncMock(
+            return_value=VideoCancellationResult(
+                provider_task_id="provider-task-direct-failed",
+                outcome=VideoCancellationOutcome.FAILED,
+                detail="Bearer direct-secret " + "z" * 1000,
+            )
+        )
+        monkeypatch.setattr(
+            service,
+            "get_video_provider",
+            lambda _key: SimpleNamespace(cancel=cancel),
+            raising=False,
+        )
+        monkeypatch.setattr(service, "_credits_reserve", object())
+        release = AsyncMock()
+        cancel_outbox = AsyncMock()
+        monkeypatch.setattr("app.services.credits.release", release)
+        monkeypatch.setattr(service, "cancel_outbox_task", cancel_outbox)
+
+        result = await service.cancel_video_job(
+            db,
+            script_id=seeded.script.id,
+            job_id=job.job_id,
+            actor_user_id=seeded.user.user_id,
+        )
+
+        debt = (result.output_json or {})["provider_cancellation"]
+        assert result.status == "canceled"
+        assert result.retryable is False
+        assert debt["provider_task_id"] == "provider-task-direct-failed"
+        assert debt["outcome"] == "failed"
+        assert debt["retryable"] is True
+        assert debt["attempts"] == 1
+        assert "direct-secret" not in debt["detail"]
+        assert len(debt["detail"]) <= 512
+        release.assert_awaited_once()
+        cancel_outbox.assert_awaited_once_with(
+            db,
+            task_type="video.generate",
+            job_id=job.job_id,
+            attempt=job.attempt,
+        )
+
+    asyncio.run(scenario())
+
+
+def test_cancel_video_job_commits_pending_debt_before_remote_call(monkeypatch) -> None:
+    async def scenario() -> None:
+        from app.services import video_generation as service
+
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        job = _add_worker_job(
+            raw,
+            seeded,
+            job_id="job-provider-cancel-interrupted",
+            reservation_id="reservation-provider-cancel-interrupted",
+        )
+        job.output_json = {"provider_task_id": "provider-task-interrupted"}
+        raw.commit()
+        db = _AsyncSessionAdapter(raw)
+        monkeypatch.setattr(service, "_credits_reserve", object())
+        monkeypatch.setattr(
+            service,
+            "_best_effort_cancel_remote_video_task",
+            AsyncMock(side_effect=asyncio.CancelledError),
+        )
+
+        with pytest.raises(asyncio.CancelledError):
+            await service.cancel_video_job(
+                db,
+                script_id=seeded.script.id,
+                job_id=job.job_id,
+                actor_user_id=seeded.user.user_id,
+            )
+
+        raw.expire_all()
+        saved = raw.get(VideoGenerationJob, job.job_id)
+        debt = (saved.output_json or {})["provider_cancellation"]
+        assert saved.status == "canceled"
+        assert debt == {
+            "provider_task_id": "provider-task-interrupted",
+            "outcome": "pending",
+            "detail": None,
+            "retryable": True,
+            "attempts": 0,
+        }
+
+    asyncio.run(scenario())
+
+
+def test_worker_treats_local_cancellation_as_terminal_without_artifacts(
+    monkeypatch,
+) -> None:
+    async def scenario() -> None:
+        from app.providers.video_gen import (
+            VideoCancellationOutcome,
+            VideoCancellationResult,
+            VideoGenerationCancelled,
+        )
+        from app.workers import video_generation as worker
+
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        job = _add_worker_job(
+            raw,
+            seeded,
+            job_id="job-worker-cancel",
+            reservation_id="reservation-worker-cancel",
+        )
+        db = _AsyncSessionAdapter(raw)
+        probe_calls = 0
+        failed = AsyncMock()
+        settled = AsyncMock()
+        extract_last_frame = AsyncMock()
+
+        async def canceled(job_id: str) -> bool:
+            nonlocal probe_calls
+            probe_calls += 1
+            assert job_id == job.job_id
+            saved = raw.get(VideoGenerationJob, job_id)
+            saved.status = "canceled"
+            saved.progress_stage = "canceled"
+            saved.lease_owner = None
+            saved.lease_token = None
+            saved.lease_until = None
+            raw.commit()
+            return True
+
+        class Provider:
+            closed = False
+
+            async def generate(self, request, _on_progress=None):
+                try:
+                    assert request.cancel_requested is not None
+                    if await request.cancel_requested():
+                        raise VideoGenerationCancelled(
+                            VideoCancellationResult(
+                                provider_task_id="provider-task-race",
+                                outcome=VideoCancellationOutcome.CANCELED,
+                            )
+                        )
+                    raise AssertionError("取消探针返回 true 后不得生成产物")
+                finally:
+                    self.closed = True
+
+        provider = Provider()
+        monkeypatch.setattr(worker, "_is_video_job_canceled", canceled, raising=False)
+        monkeypatch.setattr(worker, "_mark_failed_and_release_once", failed)
+        monkeypatch.setattr(worker, "_credits_settle", settled)
+
+        await worker.run_video_generation_once(
+            db,
+            job.job_id,
+            owner="worker",
+            provider=provider,
+            extract_last_frame=extract_last_frame,
+        )
+
+        saved = raw.get(VideoGenerationJob, job.job_id)
+        assert saved.status == "canceled"
+        assert not (saved.output_json or {}).get("video_storage_key")
+        cancellation = (saved.output_json or {})["provider_cancellation"]
+        assert (saved.output_json or {})["provider_task_id"] == "provider-task-race"
+        assert cancellation == {
+            "provider_task_id": "provider-task-race",
+            "outcome": "canceled",
+            "detail": None,
+            "retryable": False,
+            "attempts": 1,
+        }
+        assert probe_calls == 1
+        assert provider.closed is True
+        failed.assert_not_awaited()
+        settled.assert_not_awaited()
+        extract_last_frame.assert_not_awaited()
+
+    asyncio.run(scenario())
+
+
+def test_worker_persists_sanitized_retryable_remote_cancellation_debt(monkeypatch) -> None:
+    async def scenario() -> None:
+        from app.providers.video_gen import (
+            VideoCancellationOutcome,
+            VideoCancellationResult,
+            VideoGenerationCancelled,
+        )
+        from app.workers import video_generation as worker
+
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        job = _add_worker_job(
+            raw,
+            seeded,
+            job_id="job-worker-cancel-failed",
+            reservation_id="reservation-worker-cancel-failed",
+        )
+        db = _AsyncSessionAdapter(raw)
+
+        class Provider:
+            async def generate(self, request, _on_progress=None):
+                saved = raw.get(VideoGenerationJob, request.job_id)
+                saved.status = "canceled"
+                saved.progress_stage = "canceled"
+                saved.lease_owner = None
+                saved.lease_token = None
+                saved.lease_until = None
+                raw.commit()
+                raise VideoGenerationCancelled(
+                    VideoCancellationResult(
+                        provider_task_id="provider-task-debt",
+                        outcome=VideoCancellationOutcome.FAILED,
+                        detail=(
+                            "Bearer secret-token https://private.example/video?token=secret "
+                            + "x" * 1000
+                        ),
+                    )
+                )
+
+        release = AsyncMock()
+        settle = AsyncMock()
+        monkeypatch.setattr(worker, "_credits_release", release)
+        monkeypatch.setattr(worker, "_credits_settle", settle)
+
+        await worker.run_video_generation_once(
+            db,
+            job.job_id,
+            owner="worker",
+            provider=Provider(),
+            extract_last_frame=AsyncMock(),
+        )
+
+        saved = raw.get(VideoGenerationJob, job.job_id)
+        debt = (saved.output_json or {})["provider_cancellation"]
+        assert saved.status == "canceled"
+        assert saved.retryable is False
+        assert debt["outcome"] == "failed"
+        assert debt["retryable"] is True
+        assert debt["attempts"] == 1
+        assert len(debt["detail"]) <= 512
+        assert "secret-token" not in debt["detail"]
+        assert "private.example" not in debt["detail"]
+        assert "token=secret" not in debt["detail"]
+        release.assert_not_awaited()
+        settle.assert_not_awaited()
+
+    asyncio.run(scenario())
+
+
+def test_remote_cancellation_reconcile_clears_debt_and_does_not_repeat_delete(
+    monkeypatch,
+) -> None:
+    async def scenario() -> None:
+        from app.providers.video_gen import (
+            VideoCancellationOutcome,
+            VideoCancellationResult,
+        )
+        from app.workers import video_generation as worker
+
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        job = _add_worker_job(
+            raw,
+            seeded,
+            job_id="job-cancel-debt-success",
+            reservation_id="reservation-cancel-debt-success",
+        )
+        job.status = "canceled"
+        job.output_json = {
+            "provider_task_id": "provider-task-debt-success",
+            "provider_cancellation": {
+                "provider_task_id": "provider-task-debt-success",
+                "outcome": "failed",
+                "detail": "TimeoutError",
+                "retryable": True,
+                "attempts": 1,
+            },
+        }
+        raw.commit()
+        db = _AsyncSessionAdapter(raw)
+        cancel = AsyncMock(
+            return_value=VideoCancellationResult(
+                provider_task_id="provider-task-debt-success",
+                outcome=VideoCancellationOutcome.CANCELED,
+            )
+        )
+        monkeypatch.setattr(
+            worker,
+            "get_video_provider",
+            lambda _provider_key: SimpleNamespace(cancel=cancel),
+            raising=False,
+        )
+        release = AsyncMock()
+        monkeypatch.setattr(worker, "_credits_release", release)
+
+        assert await worker.reconcile_video_remote_cancellations(db) == 1
+        assert await worker.reconcile_video_remote_cancellations(db) == 0
+
+        saved = raw.get(VideoGenerationJob, job.job_id)
+        debt = (saved.output_json or {})["provider_cancellation"]
+        assert saved.status == "canceled"
+        assert saved.retryable is False
+        assert debt["outcome"] == "canceled"
+        assert debt["retryable"] is False
+        assert debt["attempts"] == 2
+        cancel.assert_awaited_once_with("provider-task-debt-success")
+        release.assert_not_awaited()
+
+    asyncio.run(scenario())
+
+
+def test_remote_cancellation_reconcile_uses_bounded_default_batch() -> None:
+    import inspect
+
+    from app.workers import video_generation as worker
+
+    reconcile_limit = inspect.signature(
+        worker.reconcile_video_remote_cancellations
+    ).parameters["limit"]
+    task_limit = inspect.signature(
+        worker.reconcile_video_remote_cancellations_task.run
+    ).parameters["limit"]
+
+    assert reconcile_limit.default == 10
+    assert task_limit.default == 10
+
+
+def test_remote_cancellation_reconcile_locks_and_commits_one_debt_at_a_time(
+    monkeypatch,
+) -> None:
+    async def scenario() -> None:
+        from app.providers.video_gen import (
+            VideoCancellationOutcome,
+            VideoCancellationResult,
+        )
+        from app.workers import video_generation as worker
+
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        first = _add_worker_job(
+            raw,
+            seeded,
+            job_id="job-cancel-debt-batch-1",
+            reservation_id="reservation-cancel-debt-batch-1",
+            unit_id="group:sg-10",
+        )
+        second = _add_worker_job(
+            raw,
+            seeded,
+            job_id="job-cancel-debt-batch-2",
+            reservation_id="reservation-cancel-debt-batch-2",
+            unit_id="group:sg-2",
+        )
+        for index, job in enumerate((first, second), start=1):
+            task_id = f"provider-task-batch-{index}"
+            job.status = "canceled"
+            job.output_json = {
+                "provider_task_id": task_id,
+                "provider_cancellation": {
+                    "provider_task_id": task_id,
+                    "outcome": "failed",
+                    "detail": "TimeoutError",
+                    "retryable": True,
+                    "attempts": 1,
+                },
+            }
+        raw.commit()
+        db = _AsyncSessionAdapter(raw)
+
+        async def cancel(task_id: str) -> VideoCancellationResult:
+            return VideoCancellationResult(
+                provider_task_id=task_id,
+                outcome=VideoCancellationOutcome.CANCELED,
+            )
+
+        monkeypatch.setattr(
+            worker,
+            "get_video_provider",
+            lambda _provider_key: SimpleNamespace(cancel=AsyncMock(side_effect=cancel)),
+            raising=False,
+        )
+
+        assert await worker.reconcile_video_remote_cancellations(db) == 2
+        assert db.commit_count == 2
+
+        select_sql = [
+            " ".join(str(statement.compile(dialect=postgresql.dialect())).split())
+            for statement in db.executed_statements
+            if getattr(statement, "is_select", False)
+        ]
+        assert "FOR UPDATE" not in select_sql[0]
+        locked_sql = [
+            sql
+            for sql in select_sql[1:]
+            if "FOR UPDATE SKIP LOCKED" in sql
+            and "video_generation_jobs.status =" in sql
+        ]
+        assert len(locked_sql) == 2
+        update_sql = [
+            " ".join(str(statement.compile(dialect=postgresql.dialect())).split())
+            for statement in db.executed_statements
+            if getattr(statement, "is_update", False)
+        ]
+        versioned_updates = [
+            sql
+            for sql in update_sql
+            if "UPDATE video_generation_jobs" in sql
+            and "video_generation_jobs.version =" in sql
+        ]
+        assert len(versioned_updates) == 2
+
+    asyncio.run(scenario())
+
+
+def test_remote_cancellation_reconcile_keeps_failed_debt_and_increments_attempts(
+    monkeypatch,
+) -> None:
+    async def scenario() -> None:
+        from app.providers.video_gen import (
+            VideoCancellationOutcome,
+            VideoCancellationResult,
+        )
+        from app.workers import video_generation as worker
+
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        job = _add_worker_job(
+            raw,
+            seeded,
+            job_id="job-cancel-debt-failed",
+            reservation_id="reservation-cancel-debt-failed",
+        )
+        job.status = "canceled"
+        job.output_json = {
+            "provider_task_id": "provider-task-debt-failed",
+            "provider_cancellation": {
+                "provider_task_id": "provider-task-debt-failed",
+                "outcome": "failed",
+                "detail": "TimeoutError",
+                "retryable": True,
+                "attempts": 2,
+            },
+        }
+        raw.commit()
+        db = _AsyncSessionAdapter(raw)
+        cancel = AsyncMock(
+            return_value=VideoCancellationResult(
+                provider_task_id="provider-task-debt-failed",
+                outcome=VideoCancellationOutcome.FAILED,
+                detail="Bearer another-secret " + "y" * 1000,
+            )
+        )
+        monkeypatch.setattr(
+            worker,
+            "get_video_provider",
+            lambda _provider_key: SimpleNamespace(cancel=cancel),
+            raising=False,
+        )
+
+        assert await worker.reconcile_video_remote_cancellations(db) == 0
+
+        saved = raw.get(VideoGenerationJob, job.job_id)
+        debt = (saved.output_json or {})["provider_cancellation"]
+        assert saved.status == "canceled"
+        assert debt["outcome"] == "failed"
+        assert debt["retryable"] is True
+        assert debt["attempts"] == 3
+        assert "another-secret" not in debt["detail"]
+        assert len(debt["detail"]) <= 512
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("debt_outcome", ["pending", "failed"])
+def test_remote_cancellation_reconcile_clears_debt_on_real_volcengine_not_found(
+    monkeypatch,
+    debt_outcome: str,
+) -> None:
+    async def scenario() -> None:
+        import httpx
+        from volcenginesdkarkruntime._exceptions import ArkNotFoundError
+
+        from app.providers.video_gen_volcengine import VolcengineVideoGenProvider
+        from app.workers import video_generation as worker
+
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        job = _add_worker_job(
+            raw,
+            seeded,
+            job_id=f"job-real-404-{debt_outcome}",
+            reservation_id=f"reservation-real-404-{debt_outcome}",
+        )
+        provider_task_id = f"provider-task-real-404-{debt_outcome}"
+        job.status = "canceled"
+        job.output_json = {
+            "provider_task_id": provider_task_id,
+            "provider_cancellation": {
+                "provider_task_id": provider_task_id,
+                "outcome": debt_outcome,
+                "detail": None,
+                "retryable": True,
+                "attempts": 0 if debt_outcome == "pending" else 1,
+            },
+        }
+        raw.commit()
+        db = _AsyncSessionAdapter(raw)
+        delete_calls: list[str] = []
+
+        request = httpx.Request(
+            "DELETE",
+            "https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks/task",
+        )
+        response = httpx.Response(404, request=request)
+        not_found = ArkNotFoundError(
+            "opaque sdk error",
+            response=response,
+            body={"error": {"code": "opaque"}},
+            request_id="request-id",
+        )
+
+        class Tasks:
+            async def delete(self, *, task_id: str) -> None:
+                delete_calls.append(task_id)
+                raise not_found
+
+        class Client:
+            content_generation = SimpleNamespace(tasks=Tasks())
+
+            async def close(self) -> None:
+                return None
+
+        provider = VolcengineVideoGenProvider(provider_key="modelsai")
+        monkeypatch.setattr(provider, "_check_keys", lambda: None)
+        monkeypatch.setattr(provider, "_build_client", lambda **_kwargs: Client())
+        monkeypatch.setattr(
+            worker,
+            "get_video_provider",
+            lambda _provider_key: provider,
+            raising=False,
+        )
+
+        assert await worker.reconcile_video_remote_cancellations(db) == 1
+        assert await worker.reconcile_video_remote_cancellations(db) == 0
+
+        raw.expire_all()
+        saved = raw.get(VideoGenerationJob, job.job_id)
+        debt = (saved.output_json or {})["provider_cancellation"]
+        assert saved.status == "canceled"
+        assert saved.retryable is False
+        assert debt["outcome"] == "canceled"
+        assert debt["retryable"] is False
+        assert delete_calls == [provider_task_id]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("confirmed_outcome", ["canceled", "unsupported"])
+def test_confirmed_remote_cancellation_is_not_downgraded_by_late_failure(
+    confirmed_outcome: str,
+) -> None:
+    async def scenario() -> None:
+        from app.providers.video_gen import (
+            VideoCancellationOutcome,
+            VideoCancellationResult,
+        )
+        from app.services.video_remote_cancellation import (
+            persist_provider_cancellation_result,
+        )
+
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        job = _add_worker_job(
+            raw,
+            seeded,
+            job_id=f"job-confirmed-{confirmed_outcome}",
+            reservation_id=f"reservation-confirmed-{confirmed_outcome}",
+        )
+        job.status = "canceled"
+        job.output_json = {
+            "provider_task_id": "provider-task-confirmed",
+            "provider_cancellation": {
+                "provider_task_id": "provider-task-confirmed",
+                "outcome": confirmed_outcome,
+                "detail": None,
+                "retryable": False,
+                "attempts": 1,
+            },
+        }
+        raw.commit()
+        db = _AsyncSessionAdapter(raw)
+
+        assert await persist_provider_cancellation_result(
+            db,
+            job.job_id,
+            VideoCancellationResult(
+                provider_task_id="provider-task-confirmed",
+                outcome=VideoCancellationOutcome.FAILED,
+                detail="late_duplicate_delete_failed",
+            ),
+        )
+        await db.commit()
+
+        saved = raw.get(VideoGenerationJob, job.job_id)
+        record = (saved.output_json or {})["provider_cancellation"]
+        assert record["outcome"] == confirmed_outcome
+        assert record["retryable"] is False
+        assert record["attempts"] == 2
+
+    asyncio.run(scenario())

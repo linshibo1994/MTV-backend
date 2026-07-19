@@ -19,8 +19,8 @@ DAG 结构（08 文档 §2.2）：
   - 两个叶子均 ready → finalizer 按实际消耗 settle；失败不得留下 done job。
   - superseded 链路 → skipped 与 release 在同一事务提交。
 
-async + Celery 混用方案（PLAN 风险 11）：task 内用单次 asyncio.run 执行
-async 包装函数 _run_stage_async，减少事件循环创建开销与中间状态不一致窗口。
+async + Celery 混用方案（PLAN 风险 11）：所有同步任务入口提交到 worker 进程级
+持久事件循环，避免 AsyncEngine 池内连接跨事件循环复用。
 """
 
 import asyncio
@@ -28,6 +28,7 @@ import inspect
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from sqlalchemy import or_, select, update
 from sqlalchemy.orm import noload
@@ -37,9 +38,13 @@ from app.core.database import async_session_factory
 from app.core.ids import new_id
 from app.core.job_state import PipelineFailure
 from app.crud.script import replace_parent_subjects, replace_subjects
+from app.models.episode import Episode
 from app.models.pipeline_job import PipelineJob
+from app.models.script import Script
 from app.services.credits import release as credits_release
 from app.services.credits import settle as credits_settle
+from app.services.pipeline.orchestrator import acquire_pipeline_advisory_lock
+from app.workers.async_runtime import run_worker_async
 from app.workers.celery_app import app as celery_app
 
 logger = logging.getLogger(__name__)
@@ -181,6 +186,26 @@ async def _call_mark_stage(
     return await _mark_stage(db, script_id, episode_id, stage, status, input_version)
 
 
+def _pipeline_claim_conditions(
+    run_id: str,
+    stage: str,
+    dispatch_id: str | None,
+    now: datetime,
+) -> list[Any]:
+    conditions = [PipelineJob.run_id == run_id, PipelineJob.stage == stage]
+    if dispatch_id is not None:
+        conditions.append(PipelineJob.dispatch_id == dispatch_id)
+    conditions.append(
+        or_(
+            PipelineJob.status.in_(["pending", "retry"]),
+            (PipelineJob.status == "running")
+            & (PipelineJob.lease_until.is_not(None))
+            & (PipelineJob.lease_until <= now),
+        )
+    )
+    return conditions
+
+
 def pipeline_claim_query(
     run_id: str,
     stage: str,
@@ -188,25 +213,62 @@ def pipeline_claim_query(
     now: datetime,
 ):
     """构造 PG 行锁领取查询；SQLite 会保留同一确定性选择路径。"""
-    conditions = [PipelineJob.run_id == run_id, PipelineJob.stage == stage]
-    if dispatch_id is not None:
-        conditions.append(PipelineJob.dispatch_id == dispatch_id)
     return (
         select(PipelineJob)
         .where(
-            *conditions,
-            or_(
-                PipelineJob.status.in_(["pending", "retry"]),
-                (PipelineJob.status == "running")
-                & (PipelineJob.lease_until.is_not(None))
-                & (PipelineJob.lease_until <= now),
-            ),
+            *_pipeline_claim_conditions(run_id, stage, dispatch_id, now),
         )
         .options(noload(PipelineJob.script))
         .order_by(PipelineJob.attempt.desc())
         .limit(1)
         .with_for_update(skip_locked=True)
     )
+
+
+def pipeline_claim_parent_query(
+    run_id: str,
+    stage: str,
+    dispatch_id: str | None,
+    now: datetime,
+):
+    """领取前只读父标识；真正状态与 attempt 仍在父锁后复检。"""
+    return (
+        select(PipelineJob.script_id, PipelineJob.episode_id)
+        .where(*_pipeline_claim_conditions(run_id, stage, dispatch_id, now))
+        .order_by(PipelineJob.attempt.desc())
+        .limit(1)
+    )
+
+
+async def _lock_pipeline_retry_parents(
+    db,
+    script_id: str,
+    episode_id: str | None,
+) -> bool:
+    """按 Script -> advisory -> Episode 取得父锁，与所有创建入口同序。"""
+    locked_script_id = (
+        await db.execute(
+            select(Script.id)
+            .where(Script.id == script_id)
+            .with_for_update(read=True, key_share=True)
+        )
+    ).scalar_one_or_none()
+    if locked_script_id is None:
+        return False
+    await acquire_pipeline_advisory_lock(db, script_id)
+    if episode_id is None:
+        return True
+    locked_episode_id = (
+        await db.execute(
+            select(Episode.episode_id)
+            .where(
+                Episode.episode_id == episode_id,
+                Episode.script_id == script_id,
+            )
+            .with_for_update(read=True, key_share=True)
+        )
+    ).scalar_one_or_none()
+    return locked_episode_id is not None
 
 
 async def claim_pipeline_job(
@@ -221,10 +283,26 @@ async def claim_pipeline_job(
     """锁定一个可领取 attempt；过期 lease 重领不创建或修改 attempt。"""
     now = datetime.now(UTC)
     token = new_id()
+    parent_snapshot = (
+        await db.execute(
+            pipeline_claim_parent_query(run_id, stage, dispatch_id, now)
+        )
+    ).one_or_none()
+    if parent_snapshot is None or not await _lock_pipeline_retry_parents(
+        db,
+        parent_snapshot.script_id,
+        parent_snapshot.episode_id,
+    ):
+        return None
     candidate = (
         await db.execute(pipeline_claim_query(run_id, stage, dispatch_id, now))
     ).scalar_one_or_none()
     if candidate is None:
+        return None
+    if (
+        candidate.script_id != parent_snapshot.script_id
+        or candidate.episode_id != parent_snapshot.episode_id
+    ):
         return None
     if (
         candidate.status == "running"
@@ -241,7 +319,7 @@ async def claim_pipeline_job(
         if candidate.attempt >= _MAX_ATTEMPTS:
             await db.flush()
             return None
-        candidate = await create_pipeline_retry_attempt(db, candidate)
+        candidate = await _insert_pipeline_retry_attempt(db, candidate)
     result = await db.execute(
         update(PipelineJob)
         .where(
@@ -277,8 +355,7 @@ async def claim_pipeline_job(
     )
 
 
-async def create_pipeline_retry_attempt(db, source) -> PipelineJob:
-    """复制新 attempt；source 对应的旧行保持终态和错误历史不变。"""
+async def _insert_pipeline_retry_attempt(db, source) -> PipelineJob:
     retry = PipelineJob(
         id=new_id(),
         script_id=source.script_id,
@@ -294,6 +371,29 @@ async def create_pipeline_retry_attempt(db, source) -> PipelineJob:
     db.add(retry)
     await db.flush()
     return retry
+
+
+async def create_pipeline_retry_attempt(db, source) -> PipelineJob:
+    """按父先锁序复制新 attempt；旧行保持终态和错误历史不变。"""
+    if not await _lock_pipeline_retry_parents(
+        db,
+        source.script_id,
+        source.episode_id,
+    ):
+        raise PipelineStageBusy("流水线父资源已删除")
+    source_id = getattr(source, "job_id", None) or source.id
+    locked_source = (
+        await db.execute(
+            select(PipelineJob)
+            .where(PipelineJob.id == source_id)
+            .options(noload(PipelineJob.script))
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if locked_source is None:
+        raise PipelineStageBusy("流水线原始 attempt 已删除")
+    return await _insert_pipeline_retry_attempt(db, locked_source)
 
 
 async def get_pipeline_job_status(db, run_id: str, stage: str) -> str | None:
@@ -555,7 +655,7 @@ async def finalize_pipeline_jobs(
 
 
 # --------------------------------------------------------------------------- #
-# 阶段执行主体（单次 asyncio.run 内完成）
+# 阶段执行主体（在 worker 持久事件循环内完成）
 # --------------------------------------------------------------------------- #
 async def _heartbeat_loop(job_id: str, lease_token: str, stop: asyncio.Event) -> None:
     """阶段运行期间周期续租；停止事件可立即结束等待。"""
@@ -742,13 +842,19 @@ async def _run_stage_async(
                 and failure.retryable
                 and claim.attempt < _MAX_ATTEMPTS
             )
+            if will_retry and not await _lock_pipeline_retry_parents(
+                db,
+                claim.script_id,
+                claim.episode_id,
+            ):
+                will_retry = False
             job_status = "failed"
             finished = await finish_pipeline_job(
                 db, claim.job_id, claim.lease_token, job_status, failure
             )
             if finished:
                 if will_retry:
-                    await create_pipeline_retry_attempt(db, claim)
+                    await _insert_pipeline_retry_attempt(db, claim)
                     await _reset_owned_running_stage(
                         db, script_id, stage, input_version
                     )
@@ -861,8 +967,8 @@ def _run_stage(
     retry_exhausted: bool = False,
     input_client_save_seq: int | None = None,
 ) -> str | dict:
-    """同步入口：在单次 asyncio.run 中执行 async 主体。"""
-    return asyncio.run(
+    """同步入口：在 worker 持久事件循环中执行 async 主体。"""
+    return run_worker_async(
         _run_stage_async(
             stage,
             script_id,
@@ -1058,7 +1164,7 @@ def finalize_task(
     run_id: str,
 ) -> str:
     """chord 唯一回调；只有两个叶子任务均成功返回后才执行。"""
-    return asyncio.run(
+    return run_worker_async(
         _finalize_pipeline_async(
             script_id,
             episode_id,

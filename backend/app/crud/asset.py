@@ -14,7 +14,9 @@ from app.core.errors import BadRequestError, ConflictError, ForbiddenError, NotF
 from app.core.ids import new_id
 from app.models.asset_entry import AssetEntry
 from app.models.episode import Episode
+from app.models.generation_job import GenerationJob
 from app.models.materials import Materials
+from app.models.media_upload import MediaUpload
 from app.models.parent_subject import ParentSubject
 from app.models.script import Script
 from app.models.subject import Subject
@@ -29,6 +31,15 @@ from app.schemas.asset import (
     subject_type_label,
 )
 from app.services.cover import generate_svg_cover
+from app.services.storage_references import (
+    StorageReferenceExclusions,
+    acquire_storage_reference_barrier,
+    collect_storage_keys,
+    decide_storage_key_deletes,
+    enqueue_storage_deletes,
+    normalize_storage_keys,
+)
+from app.services.task_dispatch import cancel_outbox_task
 
 # =====================================================================
 # Script 辅助
@@ -473,10 +484,124 @@ async def resolve_subject_suggestion(
     return suggestion
 
 
-async def delete_subject(db: AsyncSession, subject: Subject) -> None:
+async def delete_subject(
+    db: AsyncSession,
+    subject: Subject,
+    *,
+    protected_storage_keys: set[str] | None = None,
+    parent_delete_prepared: bool = False,
+) -> None:
     """按即时外键顺序删除主体、资产和父主体关联。"""
+    await acquire_storage_reference_barrier(db)
     entries_q = select(AssetEntry).where(AssetEntry.subject_id == subject.id)
     entries = list((await db.execute(entries_q)).scalars().all())
+
+    generation_jobs: list[GenerationJob] = []
+    if not parent_delete_prepared:
+        generation_jobs = list(
+            (
+                await db.execute(
+                    select(GenerationJob)
+                    .where(GenerationJob.subject_id == subject.id)
+                    .order_by(GenerationJob.job_id.asc())
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).scalars().all()
+        )
+        active_count = sum(
+            job.status in {"starting", "processing"} for job in generation_jobs
+        )
+        if active_count:
+            raise ConflictError(
+                f"仍有 {active_count} 个活动图片生成任务，"
+                "请先取消或等待任务进入终态后再删除"
+            )
+        financial_debt_count = sum(
+            job.status == "failed"
+            and job.error_type == "financial_cleanup"
+            and job.retryable is True
+            for job in generation_jobs
+        )
+        if financial_debt_count:
+            raise ConflictError(
+                f"仍有 {financial_debt_count} 个图片生成任务存在可重试的财务清理债务，"
+                "请等待后台清理完成后再删除"
+            )
+        for job in generation_jobs:
+            await cancel_outbox_task(
+                db,
+                task_type="generation.generate_images",
+                job_id=job.job_id,
+                attempt=job.attempt,
+            )
+
+    if not parent_delete_prepared:
+        uploads = list(
+            (
+                await db.execute(
+                    select(MediaUpload)
+                    .where(MediaUpload.subject_id == subject.id)
+                    .order_by(MediaUpload.id.asc())
+                    .with_for_update()
+                )
+            ).scalars().all()
+        )
+        candidate_keys: set[str] = set()
+        asset_ids_by_key: dict[str, str] = {}
+        upload_ids_by_key: dict[str, str] = {}
+        for entry in entries:
+            collect_storage_keys(entry.storage_key, candidate_keys)
+            asset_ids_by_key[entry.storage_key] = entry.id
+        for job in generation_jobs:
+            collect_storage_keys(job.output_json, candidate_keys)
+            collect_storage_keys(job.metrics, candidate_keys)
+        for upload in uploads:
+            collect_storage_keys(upload.temp_storage_key, candidate_keys)
+            collect_storage_keys(upload.final_storage_key, candidate_keys)
+            upload_ids_by_key[upload.temp_storage_key] = upload.id
+            upload_ids_by_key[upload.final_storage_key] = upload.id
+
+        exclusions = StorageReferenceExclusions(
+            asset_entry_ids={entry.id for entry in entries},
+            media_upload_ids={upload.id for upload in uploads},
+            generation_job_ids={job.job_id for job in generation_jobs},
+        )
+        decision = await decide_storage_key_deletes(
+            db,
+            candidate_keys,
+            exclusions=exclusions,
+        )
+        protected_keys = set(decision.protected_keys)
+        protected_keys.update(
+            normalize_storage_keys(protected_storage_keys or set())
+        )
+        deletion_keys = set(decision.candidate_keys - protected_keys)
+        now = datetime.now(UTC)
+        for upload in uploads:
+            final_key = next(
+                iter(normalize_storage_keys({upload.final_storage_key})),
+                "",
+            )
+            temp_key = next(
+                iter(normalize_storage_keys({upload.temp_storage_key})),
+                "",
+            )
+            if final_key in protected_keys:
+                if upload.status == "staging":
+                    deletion_keys.discard(temp_key)
+                continue
+            upload.status = "deleted"
+            upload.completed_at = now
+
+        await enqueue_storage_deletes(
+            db,
+            deletion_keys,
+            exclusions=exclusions,
+            asset_ids_by_key=asset_ids_by_key,
+            upload_ids_by_key=upload_ids_by_key,
+            protected_storage_keys=protected_keys,
+        )
 
     # Subject.image_entry_id 和 AssetEntry.superseded_by_id 都会阻断条目删除。
     # parent_id 指向 ParentSubject，不是 Subject 自引用，不能误清理其他主体。
@@ -502,6 +627,10 @@ async def delete_subject(db: AsyncSession, subject: Subject) -> None:
 
     for entry in entries:
         await db.delete(entry)
+    await db.flush()
+
+    for job in generation_jobs:
+        await db.delete(job)
     await db.flush()
 
     if parent is not None:

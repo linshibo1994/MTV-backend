@@ -23,6 +23,7 @@ from app.core.auth import get_current_user
 from app.core.database import get_db
 from app.core.permissions import Action, check_timeline_access, check_timeline_script_access
 from app.crud import timeline as timeline_crud
+from app.models.timeline_render_job import TIMELINE_IDEMPOTENCY_KEY_MAX_LENGTH
 from app.models.user import User
 from app.schemas.timeline import (
     RenderJobOut,
@@ -230,7 +231,11 @@ async def remove_arrangement(
 )
 async def render_timeline(
     payload: RenderRequestIn,
-    idempotency_key: str | None = Header(None, alias="Idempotency-Key"),
+    idempotency_key: str | None = Header(
+        None,
+        alias="Idempotency-Key",
+        max_length=TIMELINE_IDEMPOTENCY_KEY_MAX_LENGTH,
+    ),
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> RenderJobOut:

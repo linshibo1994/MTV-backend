@@ -16,11 +16,13 @@
 权限校验由 API 层在调用前完成（check_script_access）。
 """
 
+import asyncio
 import hashlib
 import json
 import logging
 from typing import TYPE_CHECKING, Any, cast
 
+from billiard.exceptions import SoftTimeLimitExceeded, TimeLimitExceeded
 from sqlalchemy import select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
@@ -28,17 +30,33 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import noload
 
 from app.core.config import settings
+from app.core.errors import BadRequestError, ConflictError, ForbiddenError
 from app.crud import video as video_crud
 from app.models.episode import Episode
+from app.models.script import Script
 from app.models.shot_group import ShotGroup
-from app.providers.registry import ProviderConfigurationError, normalize_provider
+from app.models.video_generation_job import VIDEO_IDEMPOTENCY_KEY_MAX_LENGTH
+from app.providers.registry import require_capability
+from app.providers.video_gen import (
+    VideoCancellationOutcome,
+    VideoCancellationResult,
+    get_video_provider,
+)
 from app.services.reference_aggregator import aggregate_references
-from app.services.task_dispatch import enqueue_task
+from app.services.task_dispatch import cancel_outbox_task, enqueue_task
+from app.services.video_remote_cancellation import (
+    merge_pending_provider_cancellation,
+    merge_video_task_checkpoint_lease_authority,
+    persist_locked_provider_cancellation_result,
+    persist_provider_cancellation_result,
+    provider_submission_is_unresolved,
+)
 
 if TYPE_CHECKING:
     from app.models.video_generation_job import VideoGenerationJob
 
 logger = logging.getLogger(__name__)
+_IDEMPOTENCY_CONFLICT_DETAIL = "幂等键已用于不同请求载荷"
 
 # 跨模块依赖（T2 积分服务可能未就绪，统一从 PLAN 路径 import）
 try:
@@ -80,19 +98,10 @@ async def create_video_job(
     """
     from fastapi import HTTPException, status
 
-    from app.core.errors import BadRequestError, ConflictError, ForbiddenError
-
-    if (
-        settings.video_provider_selection_mode == "env"
-        and normalize_provider(settings.video_gen_provider) == "gemini"
-    ):
-        raise ProviderConfigurationError(
-            "Gemini Veo Provider 已实现，但当前数据库约束尚未启用 provider_key=gemini；"
-            "需先执行经确认的 Alembic 迁移"
-        )
-
-    if not idempotency_key:
+    if not idempotency_key or not idempotency_key.strip():
         raise BadRequestError("Idempotency-Key 必填")
+    if len(idempotency_key) > VIDEO_IDEMPOTENCY_KEY_MAX_LENGTH:
+        raise BadRequestError("Idempotency-Key 过长")
     unit_id = f"group:{shot_group_id}"
     request_hash = _request_hash(
         {
@@ -103,30 +112,90 @@ async def create_video_job(
     )
 
     # 1. 幂等去重（doc 08 §4.2）
-    existing = await _find_idempotent_job(db, script_id, idempotency_key)
-    if existing is not None:
-        if existing.request_hash != request_hash:
-            raise ConflictError("幂等键已用于不同请求载荷")
-        logger.info("视频生成任务幂等复用 job_id=%s unit_id=%s", existing.job_id, unit_id)
-        return existing
+    existing_before_lock = await _resolve_idempotent_job(
+        db, script_id, idempotency_key, request_hash
+    )
 
-    # 2. 取 shot_group 并校验归属
+    # 2. 固定创建锁序为 Script -> Episode -> ShotGroup，与父资源删除保持一致。
+    # SQLAlchemy 需同时设置 read/key_share，PostgreSQL 才会生成 FOR KEY SHARE。
+    script_result = await db.execute(
+        select(Script.id)
+        .where(Script.id == script_id)
+        .with_for_update(read=True, key_share=True)
+    )
+    locked_script_id = script_result.scalar_one_or_none()
+    episode_result = await db.execute(
+        select(Episode)
+        .where(
+            Episode.episode_id == episode_id,
+            Episode.script_id == script_id,
+        )
+        .options(noload(Episode.script), noload(Episode.scenes))
+        .with_for_update(read=True, key_share=True)
+    )
+    episode = episode_result.scalar_one_or_none()
+
+    # 首次命中只用于保留幂等冲突优先级；父锁后必须重查，避免返回正被级联删除的旧任务。
+    if existing_before_lock is not None:
+        existing = await _resolve_idempotent_job(
+            db, script_id, idempotency_key, request_hash
+        )
+        if existing is not None:
+            logger.info(
+                "视频生成任务幂等复用 job_id=%s unit_id=%s",
+                existing.job_id,
+                unit_id,
+            )
+            return existing
+
+    # 父行锁之后再独占生成单元；不存在/跨资源错误仍以镜头组归属为先。
     sg_result = await db.execute(
-        select(ShotGroup).where(ShotGroup.shot_group_id == shot_group_id)
+        select(ShotGroup)
+        .where(
+            ShotGroup.shot_group_id == shot_group_id,
+            ShotGroup.script_id == script_id,
+            ShotGroup.episode_id == episode_id,
+        )
+        .with_for_update()
     )
     shot_group = sg_result.scalar_one_or_none()
     if shot_group is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="镜头组不存在")
-    if shot_group.script_id != script_id or shot_group.episode_id != episode_id:
+        ownership = (
+            await db.execute(
+                select(ShotGroup.script_id, ShotGroup.episode_id).where(
+                    ShotGroup.shot_group_id == shot_group_id
+                )
+            )
+        ).one_or_none()
+        if ownership is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="镜头组不存在")
         raise ForbiddenError("镜头组不属于该剧本/分集")
-    episode_result = await db.execute(
-        select(Episode)
-        .where(Episode.episode_id == episode_id)
-        .options(noload(Episode.script), noload(Episode.scenes))
-    )
-    episode = episode_result.scalar_one_or_none()
-    if episode is None or episode.script_id != script_id:
+    if locked_script_id is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="镜头组不存在")
+    if episode is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="分集不存在")
+
+    # 等待镜头组锁期间，另一个事务可能已建立同 key 映射，锁后必须重新读取。
+    existing = await _resolve_idempotent_job(
+        db, script_id, idempotency_key, request_hash
+    )
+    if existing is not None:
+        return existing
+
+    active_job = await video_crud.find_active_job_by_unit(db, unit_id)
+    if active_job is not None:
+        logger.info(
+            "视频生成任务活动单元复用 job_id=%s unit_id=%s",
+            active_job.job_id,
+            unit_id,
+        )
+        return await _bind_existing_job(
+            db,
+            script_id=script_id,
+            idempotency_key=idempotency_key,
+            request_hash=request_hash,
+            job=active_job,
+        )
 
     # 3. 汇聚参考图 + 参考音频
     aggregated = await aggregate_references(db, shot_group_id)
@@ -139,10 +208,18 @@ async def create_video_job(
 
     # 5. 取激活供应商配置，缺失兜底
     provider_cfg = await video_crud.get_active_provider(db, "all_reference")
+    provider_key: str
     if settings.video_provider_selection_mode == "env":
         # env 模式下部署级环境变量是权威配置，不再被数据库历史 active 行覆盖。
-        provider_key = settings.video_gen_provider
-        model = settings.video_gen_model or settings.seedance_model
+        canonical_provider = require_capability(settings.video_gen_provider, "video")
+        fallback_models = {
+            "volcengine": settings.seedance_model,
+            "bailian": settings.dashscope_video_model,
+            "openai": settings.openai_video_model,
+            "gemini": settings.google_video_model,
+        }
+        provider_key = canonical_provider
+        model = settings.video_gen_model or fallback_models[canonical_provider]
     elif provider_cfg is None:
         provider_key = settings.video_default_provider
         model = settings.video_gen_model or settings.seedance_model
@@ -200,6 +277,13 @@ async def create_video_job(
             reservation_id=None,
             input_json=input_json,
         )
+        await video_crud.bind_idempotency_request(
+            db,
+            script_id=script_id,
+            idempotency_key=idempotency_key,
+            request_hash=request_hash,
+            job_id=job.job_id,
+        )
 
         # 7. 积分 reserve（source_id=job_id 幂等；冻结量=price_video_gen_frozen）
         reservation_id: str | None = None
@@ -234,10 +318,12 @@ async def create_video_job(
         await db.commit()
     except IntegrityError as exc:
         await db.rollback()
-        existing = await _find_idempotent_job(db, script_id, idempotency_key)
-        if existing is not None and existing.request_hash == request_hash:
+        existing = await _resolve_idempotent_job(
+            db, script_id, idempotency_key, request_hash
+        )
+        if existing is not None:
             return existing
-        raise ConflictError("视频生成任务幂等冲突") from exc
+        raise ConflictError(_IDEMPOTENCY_CONFLICT_DETAIL) from exc
     except Exception:
         await db.rollback()
         raise
@@ -250,15 +336,16 @@ async def cancel_video_job(
     *,
     script_id: str,
     job_id: str,
+    actor_user_id: str,
 ) -> "VideoGenerationJob":
-    """取消视频生成任务 — 仅 starting/processing 可取消，置 canceled 并释放冻结积分。
+    """取消视频生成任务 — starting/processing 转 canceled，重复 canceled 幂等返回。
 
     doc04 §1.19 / doc08 §2.5：canceled 为终态。
     权限校验由 API 层在调用前完成（check_script_access require_write=True）。
 
     Raises:
         HTTPException 404: 任务不存在。
-        ConflictError 409: 任务已终态，不可取消。
+        ConflictError 409: 任务处于 canceled 之外的终态，不可取消。
     """
     from fastapi import HTTPException, status
 
@@ -268,6 +355,8 @@ async def cancel_video_job(
     result = await db.execute(
         select(VideoGenerationJob)
         .where(VideoGenerationJob.job_id == job_id)
+        .options(noload(VideoGenerationJob.script))
+        .execution_options(populate_existing=True)
         .with_for_update()
     )
     job = result.scalar_one_or_none()
@@ -275,8 +364,29 @@ async def cancel_video_job(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="视频生成任务不存在")
     if job.script_id != script_id:
         raise ConflictError("任务不属于该剧本")
+    if job.status == "canceled":
+        return job
     if job.status not in ("starting", "processing"):
         raise ConflictError(f"任务当前状态 {job.status}，不可取消")
+    if provider_submission_is_unresolved(job.output_json, job.metrics):
+        raise ConflictError("远端提交状态未知，任务需保持冻结并等待人工核对")
+    provider_task_id = str(
+        (job.output_json or {}).get("provider_task_id")
+        or (job.metrics or {}).get("provider_task_id")
+        or ""
+    )
+    provider_key = job.provider_key
+    canceled_output, canceled_metrics = merge_video_task_checkpoint_lease_authority(
+        job.output_json,
+        job.metrics,
+        job.lease_token,
+    )
+    if provider_task_id:
+        canceled_output, canceled_metrics = merge_pending_provider_cancellation(
+            canceled_output,
+            canceled_metrics,
+            provider_task_id,
+        )
 
     # 释放冻结积分（按 source_type='generation_job' 反查 reservation）
     if _credits_reserve is not None:
@@ -288,11 +398,18 @@ async def cancel_video_job(
                 db,
                 reservation_id=reservation_id,
                 reason=f"视频任务取消 job_id={job_id}",
+                actor_user_id=actor_user_id,
                 commit=False,
             )
         else:
             logger.warning("取消任务未找到预扣预约，跳过 release job_id=%s", job_id)
 
+    await cancel_outbox_task(
+        db,
+        task_type="video.generate",
+        job_id=job.job_id,
+        attempt=job.attempt,
+    )
     now = __import__("datetime").datetime.now(__import__("datetime").UTC)
     result = cast(
         CursorResult[Any],
@@ -312,6 +429,8 @@ async def cancel_video_job(
                 lease_owner=None,
                 lease_token=None,
                 lease_until=None,
+                output_json=canceled_output,
+                metrics=canceled_metrics,
                 version=VideoGenerationJob.version + 1,
             )
         ),
@@ -319,13 +438,300 @@ async def cancel_video_job(
     if result.rowcount != 1:
         await db.rollback()
         raise ConflictError("任务状态已变化，请刷新后重试")
-    await db.commit()
+    try:
+        await db.commit()
+    except Exception:
+        await _best_effort_cancel_rollback(db, job_id=job_id, stage="local_cancel_commit")
+        authoritative = await _load_authoritative_canceled_job(
+            script_id=script_id,
+            job_id=job_id,
+        )
+        if authoritative is None:
+            raise
+        logger.warning(
+            "视频本地取消提交结果未知，已由独立会话确认终态 job_id=%s",
+            job_id,
+        )
+        # 无法证明本次请求拥有远端取消执行权，保留同事务写入的 pending debt，
+        # 交给 reconciler 唯一接管，避免并发请求重复调用 Provider。
+        return authoritative
+
+    # 先提交本地终态，使 worker 的取消探针可见；远端取消失败不得回滚本地取消。
+    if provider_task_id:
+        cancellation_result = await _best_effort_cancel_remote_video_task(
+            provider_key,
+            provider_task_id,
+        )
+        primary_persisted = False
+        primary_error_type: str | None = None
+        try:
+            persisted = await persist_provider_cancellation_result(
+                db,
+                job_id,
+                cancellation_result,
+            )
+            if persisted:
+                await db.commit()
+                primary_persisted = True
+            else:
+                await _best_effort_cancel_rollback(
+                    db,
+                    job_id=job_id,
+                    stage="remote_cancel_result_cas",
+                )
+        except Exception as exc:  # noqa: BLE001 - 本地 canceled 已是权威成功
+            primary_error_type = type(exc).__name__
+            await _best_effort_cancel_rollback(
+                db,
+                job_id=job_id,
+                stage="remote_cancel_result_commit",
+            )
+        if not primary_persisted:
+            authoritative = await _persist_cancellation_result_independently(
+                script_id=script_id,
+                job_id=job_id,
+                result=cancellation_result,
+            )
+            if authoritative is not None:
+                logger.warning(
+                    "远端视频取消结果已由独立事务确认 job_id=%s task_id=%s",
+                    job_id,
+                    provider_task_id,
+                )
+                return authoritative
+            canceled = await _load_authoritative_canceled_job(
+                script_id=script_id,
+                job_id=job_id,
+            )
+            logger.warning(
+                "远端视频取消结果无法通过主事务或独立事务确认，保留 pending debt；"
+                "reconciler 后续可能再次调用 Provider，依赖 Provider cancel 幂等 "
+                "job_id=%s task_id=%s primary_error=%s",
+                job_id,
+                provider_task_id,
+                primary_error_type or "cas_not_applied",
+            )
+            return canceled or job
 
     # 重新读取返回最新状态
     r2 = await db.execute(
         select(VideoGenerationJob).where(VideoGenerationJob.job_id == job_id)
     )
     return r2.scalar_one()  # type: ignore[return-value]
+
+
+async def _best_effort_cancel_rollback(
+    db: AsyncSession,
+    *,
+    job_id: str,
+    stage: str,
+) -> None:
+    """提交结果未知时尽力结束原事务，回滚异常不得覆盖原始事实。"""
+    try:
+        await db.rollback()
+    except Exception as exc:  # noqa: BLE001 - 随后使用独立会话判权
+        logger.warning(
+            "视频取消事务回滚失败 job_id=%s stage=%s error=%s",
+            job_id,
+            stage,
+            type(exc).__name__,
+        )
+
+
+async def _load_authoritative_canceled_job(
+    *,
+    script_id: str,
+    job_id: str,
+) -> "VideoGenerationJob | None":
+    """使用独立会话读取 canceled 权威终态，原会话可能已不可继续使用。"""
+    from app.core.database import async_session_factory
+    from app.models.video_generation_job import VideoGenerationJob
+
+    try:
+        async with async_session_factory() as authority_db:
+            job = (
+                await authority_db.execute(
+                    select(VideoGenerationJob)
+                    .where(VideoGenerationJob.job_id == job_id)
+                    .options(noload(VideoGenerationJob.script))
+                    .execution_options(populate_existing=True)
+                )
+            ).scalar_one_or_none()
+    except Exception as exc:  # noqa: BLE001 - 未能证明成功时调用方 fail closed
+        logger.warning(
+            "视频取消权威终态读取失败 job_id=%s error=%s",
+            job_id,
+            type(exc).__name__,
+        )
+        return None
+    if job is None or job.script_id != script_id or job.status != "canceled":
+        return None
+    return job
+
+
+def _cancellation_result_is_persisted(
+    job: "VideoGenerationJob",
+    result: VideoCancellationResult,
+) -> bool:
+    """判断数据库是否已有同等或更强的远端取消事实。"""
+    record = (job.output_json or {}).get("provider_cancellation")
+    if not isinstance(record, dict):
+        return False
+    if str(record.get("provider_task_id") or "") != result.provider_task_id:
+        return False
+    outcome = str(record.get("outcome") or "")
+    retryable = record.get("retryable")
+    if outcome == VideoCancellationOutcome.CANCELED.value:
+        return retryable is False
+    if outcome == VideoCancellationOutcome.UNSUPPORTED.value:
+        return (
+            result.outcome
+            in (VideoCancellationOutcome.UNSUPPORTED, VideoCancellationOutcome.FAILED)
+            and retryable is False
+        )
+    return (
+        outcome == VideoCancellationOutcome.FAILED.value
+        and result.outcome is VideoCancellationOutcome.FAILED
+        and retryable is True
+    )
+
+
+async def _load_authoritative_cancellation_result(
+    *,
+    script_id: str,
+    job_id: str,
+    result: VideoCancellationResult,
+) -> "VideoGenerationJob | None":
+    job = await _load_authoritative_canceled_job(
+        script_id=script_id,
+        job_id=job_id,
+    )
+    if job is None or not _cancellation_result_is_persisted(job, result):
+        return None
+    return job
+
+
+async def _persist_cancellation_result_independently(
+    *,
+    script_id: str,
+    job_id: str,
+    result: VideoCancellationResult,
+) -> "VideoGenerationJob | None":
+    """用独立事务补写已取得的 Provider 结果，不再次访问 Provider。"""
+    from app.core.database import async_session_factory
+    from app.models.video_generation_job import VideoGenerationJob
+
+    for attempt in range(1, 3):
+        current: VideoGenerationJob | None = None
+        try:
+            async with async_session_factory() as repair_db:
+                current = (
+                    await repair_db.execute(
+                        select(VideoGenerationJob)
+                        .where(
+                            VideoGenerationJob.job_id == job_id,
+                            VideoGenerationJob.status == "canceled",
+                        )
+                        .options(noload(VideoGenerationJob.script))
+                        .execution_options(populate_existing=True)
+                        .with_for_update()
+                    )
+                ).scalar_one_or_none()
+                if current is None or current.script_id != script_id:
+                    await _best_effort_cancel_rollback(
+                        repair_db,
+                        job_id=job_id,
+                        stage="independent_cancel_result_missing",
+                    )
+                    return None
+                if _cancellation_result_is_persisted(current, result):
+                    return current
+                persisted = await persist_locked_provider_cancellation_result(
+                    repair_db,
+                    current,
+                    result,
+                )
+                if not persisted:
+                    await _best_effort_cancel_rollback(
+                        repair_db,
+                        job_id=job_id,
+                        stage="independent_cancel_result_cas",
+                    )
+                else:
+                    try:
+                        await repair_db.commit()
+                    except Exception as exc:  # noqa: BLE001 - 提交结果需独立判权
+                        logger.warning(
+                            "独立保存远端取消结果提交未知 job_id=%s attempt=%s error=%s",
+                            job_id,
+                            attempt,
+                            type(exc).__name__,
+                        )
+                        await _best_effort_cancel_rollback(
+                            repair_db,
+                            job_id=job_id,
+                            stage="independent_cancel_result_commit",
+                        )
+                    else:
+                        authoritative = await _load_authoritative_cancellation_result(
+                            script_id=script_id,
+                            job_id=job_id,
+                            result=result,
+                        )
+                        return authoritative or current
+        except Exception as exc:  # noqa: BLE001 - 下一独立事务仍可补写同一结果
+            logger.warning(
+                "独立保存远端取消结果失败 job_id=%s attempt=%s error=%s",
+                job_id,
+                attempt,
+                type(exc).__name__,
+            )
+
+        authoritative = await _load_authoritative_cancellation_result(
+            script_id=script_id,
+            job_id=job_id,
+            result=result,
+        )
+        if authoritative is not None:
+            return authoritative
+    return None
+
+
+async def _best_effort_cancel_remote_video_task(
+    provider_key: str,
+    provider_task_id: str,
+) -> VideoCancellationResult:
+    try:
+        result = await get_video_provider(provider_key).cancel(provider_task_id)
+    except (asyncio.CancelledError, SoftTimeLimitExceeded, TimeLimitExceeded):
+        raise
+    except Exception as exc:  # noqa: BLE001 - 本地 canceled 终态不能被远端异常覆盖
+        logger.warning(
+            "远端视频任务取消调用失败 provider=%s task_id=%s error=%s",
+            provider_key,
+            provider_task_id,
+            type(exc).__name__,
+        )
+        return VideoCancellationResult(
+            provider_task_id=provider_task_id,
+            outcome=VideoCancellationOutcome.FAILED,
+            detail=f"远端取消调用失败: {type(exc).__name__}",
+        )
+    if result.outcome is VideoCancellationOutcome.CANCELED:
+        logger.info(
+            "远端视频任务已请求取消 provider=%s task_id=%s",
+            provider_key,
+            provider_task_id,
+        )
+        return result
+    logger.warning(
+        "远端视频任务未确认取消 provider=%s task_id=%s outcome=%s detail_present=%s",
+        provider_key,
+        provider_task_id,
+        result.outcome.value,
+        result.detail is not None,
+    )
+    return result
 
 
 async def _lookup_reservation_for_cancel(db: AsyncSession, job_id: str) -> str | None:
@@ -342,19 +748,56 @@ async def _lookup_reservation_for_cancel(db: AsyncSession, job_id: str) -> str |
     return result.scalar_one_or_none()
 
 
-async def _find_idempotent_job(
-    db: AsyncSession, script_id: str, idempotency_key: str
-):
-    """幂等去重：优先按 Idempotency-Key 查历史 job，否则按 unit_id 查活动任务。
+async def _resolve_idempotent_job(
+    db: AsyncSession,
+    script_id: str,
+    idempotency_key: str,
+    request_hash: str,
+) -> "VideoGenerationJob | None":
+    """从权威映射读取幂等结果，并统一校验请求载荷。
 
     doc 08 §4.2：同一幂等键重复创建任务，不产生重复作业或重复冻结。
 
     幂等键查询加 script_id 过滤，防止跨剧本 IDOR：用户 B 使用与用户 A 相同的
     幂等键命中 A 的任务（doc06 §8 权限边界 — 任务归属剧本维度隔离）。
     """
-    return await video_crud.find_job_by_idempotency(
+    binding = await video_crud.find_idempotency_binding(
         db, script_id=script_id, idempotency_key=idempotency_key
     )
+    if binding is None:
+        return None
+    if binding.request_hash != request_hash:
+        raise ConflictError(_IDEMPOTENCY_CONFLICT_DETAIL)
+    return binding.job
+
+
+async def _bind_existing_job(
+    db: AsyncSession,
+    *,
+    script_id: str,
+    idempotency_key: str,
+    request_hash: str,
+    job: "VideoGenerationJob",
+) -> "VideoGenerationJob":
+    """为活动任务持久化别名 key；唯一冲突时返回权威赢家。"""
+    try:
+        await video_crud.bind_idempotency_request(
+            db,
+            script_id=script_id,
+            idempotency_key=idempotency_key,
+            request_hash=request_hash,
+            job_id=job.job_id,
+        )
+        await db.commit()
+        return job
+    except IntegrityError as exc:
+        await db.rollback()
+        winner = await _resolve_idempotent_job(
+            db, script_id, idempotency_key, request_hash
+        )
+        if winner is not None:
+            return winner
+        raise ConflictError(_IDEMPOTENCY_CONFLICT_DETAIL) from exc
 
 
 async def _resolve_first_frame(db: AsyncSession, shot_group: ShotGroup) -> str | None:

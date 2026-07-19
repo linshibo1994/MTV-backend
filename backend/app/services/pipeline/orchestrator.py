@@ -10,6 +10,7 @@ DAG: split → extract → merge → { enrich ‖ parents }
 """
 
 from datetime import UTC, datetime
+from typing import Any
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -35,6 +36,38 @@ from app.services.task_dispatch import enqueue_task
 PIPELINE_DAG_TASK_TYPE = "pipeline.dag"
 
 
+def _database_dialect_name(db: Any) -> str | None:
+    """从真实会话或同步测试 adapter/proxy 解析结构化 dialect。"""
+    candidates = (db, getattr(db, "session", None), getattr(db, "sync_session", None))
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        bind = getattr(candidate, "bind", None)
+        if bind is None:
+            get_bind = getattr(candidate, "get_bind", None)
+            if callable(get_bind):
+                bind = get_bind()
+        dialect_name = getattr(getattr(bind, "dialect", None), "name", None)
+        if isinstance(dialect_name, str):
+            return dialect_name
+    return None
+
+
+async def acquire_pipeline_advisory_lock(db: Any, script_id: str) -> bool:
+    """仅 PostgreSQL 取得同剧本流水线事务锁；其他数据库安全跳过。"""
+    if _database_dialect_name(db) != "postgresql":
+        return False
+    await db.execute(
+        select(
+            func.pg_advisory_xact_lock(
+                func.hashtext("pipeline_trigger"),
+                func.hashtext(script_id),
+            )
+        )
+    )
+    return True
+
+
 async def _is_running(db: AsyncSession, script_id: str) -> bool:
     """任一阶段处于 running 视为流水线运行中。"""
     from app.models.pipeline_stage import PipelineStage
@@ -46,6 +79,39 @@ async def _is_running(db: AsyncSession, script_id: str) -> bool:
         )
     )
     return result.scalar_one_or_none() is not None
+
+
+async def _lock_pipeline_parents(
+    db: AsyncSession,
+    script_id: str,
+    episode_id: str,
+) -> tuple[Script, Episode]:
+    """按 Script -> advisory -> Episode 锁定，与所有创建入口保持同序。"""
+    script = (
+        await db.execute(
+            select(Script)
+            .where(Script.id == script_id)
+            .with_for_update(read=True, key_share=True)
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if script is None:
+        raise ConflictError("剧本不存在")
+    await acquire_pipeline_advisory_lock(db, script_id)
+    episode = (
+        await db.execute(
+            select(Episode)
+            .where(
+                Episode.episode_id == episode_id,
+                Episode.script_id == script_id,
+            )
+            .with_for_update(read=True, key_share=True)
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if episode is None:
+        raise ConflictError("分集不存在")
+    return script, episode
 
 
 def build_pipeline_outbox_payload(
@@ -167,14 +233,7 @@ async def trigger_pipeline(
     #    不触发幂等拒绝）并投递两条 Celery chain，流水线并发跑同一剧本。此处用事务级咨询锁
     #    （pg_advisory_xact_lock，commit/rollback 后自动释放）将 check→reset→reserve→commit
     #    串行化：第二个调用阻塞至第一个提交（split=running）后回检即被拒绝（08§2.2）。
-    await db.execute(
-        select(
-            func.pg_advisory_xact_lock(
-                func.hashtext("pipeline_trigger"),
-                func.hashtext(script_id),
-            )
-        )
-    )
+    script, episode = await _lock_pipeline_parents(db, script_id, episode_id)
     await _supersede_active_pipeline_runs(db, script_id)
 
     for stage in STAGE_ORDER:
@@ -187,10 +246,9 @@ async def trigger_pipeline(
         row.error = None
         await db.flush()
 
-    # 读取触发分集版本，作为本链路 input_version（绑定输入版本）
-    episode = await db.get(Episode, episode_id)
-    input_version = (episode.episode_version if episode else 1) or 1
-    input_client_save_seq = (episode.client_save_seq if episode else 0) or 0
+    # 使用父锁后的权威分集版本绑定本轮输入。
+    input_version = episode.episode_version or 1
+    input_client_save_seq = episode.client_save_seq or 0
 
     # split 阶段 detail 写入 input_version —— worker 据此判定旧链路是否被取代
     await set_stage(
@@ -206,9 +264,6 @@ async def trigger_pipeline(
 
     # 2. 预扣积分：按剧本所有者账户 reserve（commit=False，与 split 阶段写入合并为单事务，
     #    避免 reserve 内部 commit 后任务拿不到 reservation_id 的孤立冻结）
-    script = await db.get(Script, script_id)
-    if script is None:
-        raise ConflictError("剧本不存在")
     account = (
         await db.execute(
             select(CreditAccount).where(

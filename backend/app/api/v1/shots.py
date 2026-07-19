@@ -39,7 +39,7 @@ from app.crud.storyboard import (
 from app.models.credit import CreditAccount
 from app.models.episode import Episode
 from app.models.script import Script
-from app.models.storyboard_job import StoryboardJob
+from app.models.storyboard_job import STORYBOARD_IDEMPOTENCY_KEY_MAX_LENGTH, StoryboardJob
 from app.models.task_dispatch_outbox import TaskDispatchOutbox
 from app.models.user import User
 from app.schemas.shot import (
@@ -198,7 +198,11 @@ async def generate_storyboard(
     script_id: str,
     episode_id: str,
     episode_version: int,
-    idempotency_key: str = Header(..., alias="Idempotency-Key"),
+    idempotency_key: str = Header(
+        ...,
+        alias="Idempotency-Key",
+        max_length=STORYBOARD_IDEMPOTENCY_KEY_MAX_LENGTH,
+    ),
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> GenerateStoryboardResponse:
@@ -461,7 +465,11 @@ async def retry_storyboard_job(
     script_id: str,
     episode_id: str,
     job_id: str,
-    idempotency_key: str = Header(..., alias="Idempotency-Key"),
+    idempotency_key: str = Header(
+        ...,
+        alias="Idempotency-Key",
+        max_length=STORYBOARD_IDEMPOTENCY_KEY_MAX_LENGTH,
+    ),
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> GenerateStoryboardResponse:

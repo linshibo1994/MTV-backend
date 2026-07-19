@@ -14,6 +14,8 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.core.ids import new_id
 from app.models.base import Base, TimestampMixin
 
+STORYBOARD_IDEMPOTENCY_KEY_MAX_LENGTH = 128
+
 
 class StoryboardJob(TimestampMixin, Base):
     """分镜生成任务 — LLM-5 异步生成的状态机载体。
@@ -61,7 +63,9 @@ class StoryboardJob(TimestampMixin, Base):
     input_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     input_client_save_seq: Mapped[int | None] = mapped_column(Integer, nullable=True)
     attempt: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
-    idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    idempotency_key: Mapped[str] = mapped_column(
+        String(STORYBOARD_IDEMPOTENCY_KEY_MAX_LENGTH), nullable=False, index=True
+    )
     request_hash: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     lease_owner: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
     lease_token: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)

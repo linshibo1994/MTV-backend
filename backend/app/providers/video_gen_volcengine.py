@@ -22,13 +22,33 @@ data URL，避免要求私有对象存储暴露公网地址。
 import asyncio
 import base64
 import logging
+import re
 import time
+from inspect import isawaitable
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from typing import Any
+from urllib.parse import urlsplit
+
+from billiard.exceptions import SoftTimeLimitExceeded, TimeLimitExceeded
 
 from app.core.config import settings
 from app.providers.video_gen import (
+    CancellationProbe,
+    SubmissionStateCallback,
+    TaskCreatedCallback,
+    VideoCancellationOutcome,
+    VideoCancellationResult,
     VideoGenerationProgress,
+    VideoGenerationRemoteTerminalError,
     VideoGenerationRequest,
     VideoGenerationResult,
+    await_video_task_checkpoint,
+    execute_video_submission,
+    managed_video_client,
+    raise_if_video_cancel_requested,
+    raise_if_video_cancel_requested_before_submit,
+    raise_video_submission_uncertain,
 )
 
 logger = logging.getLogger(__name__)
@@ -37,6 +57,13 @@ logger = logging.getLogger(__name__)
 _POLL_INTERVAL = 5.0
 # 轮询超时（秒），约 10 分钟
 _POLL_TIMEOUT = 600
+_CANCEL_SDK_TIMEOUT = 5.0
+_CANCEL_TOTAL_TIMEOUT = 8.0
+_MAX_TOTAL_REFERENCE_BYTES = 200 * 1024 * 1024
+_ARK_CONTENT_DOWNLOAD_HOST = re.compile(
+    r"ark-content-generation-(?P<region>[a-z0-9]+(?:-[a-z0-9]+)*)\."
+    r"tos-(?P=region)\.volces\.com"
+)
 
 
 class VolcengineVideoGenProvider:
@@ -55,6 +82,87 @@ class VolcengineVideoGenProvider:
     @property
     def provider_key(self) -> str:
         return self._provider_key
+
+    async def cancel(self, provider_task_id: str) -> VideoCancellationResult:
+        """通过 Ark tasks.delete 尽力取消远端内容生成任务。"""
+        if not provider_task_id:
+            return VideoCancellationResult(
+                provider_task_id=provider_task_id,
+                outcome=VideoCancellationOutcome.FAILED,
+                detail="缺少火山方舟远端任务 ID",
+            )
+        result: VideoCancellationResult | None = None
+        try:
+            self._check_keys()
+            client = self._build_client(
+                timeout=_CANCEL_SDK_TIMEOUT,
+                max_retries=0,
+            )
+            async with managed_video_client(
+                client,
+                lambda: self._close_client_safely(client),
+                provider_key=self.provider_key,
+            ):
+                result = await self._cancel_task(
+                    client.content_generation.tasks,
+                    provider_task_id,
+                )
+            return result
+        except (asyncio.CancelledError, SoftTimeLimitExceeded, TimeLimitExceeded):
+            raise
+        except Exception as exc:  # noqa: BLE001 - 取消是尽力操作，不能覆盖本地终态
+            if result is not None:
+                logger.warning(
+                    "关闭火山方舟取消客户端失败 task_id=%s error=%s",
+                    provider_task_id,
+                    type(exc).__name__,
+                )
+                return result
+            logger.warning(
+                "取消火山方舟视频任务失败 task_id=%s error=%s",
+                provider_task_id,
+                type(exc).__name__,
+            )
+            return VideoCancellationResult(
+                provider_task_id=provider_task_id,
+                outcome=VideoCancellationOutcome.FAILED,
+                detail=f"火山方舟远端取消失败: {type(exc).__name__}",
+            )
+
+    @staticmethod
+    async def _cancel_task(tasks, provider_task_id: str) -> VideoCancellationResult:
+        try:
+            await asyncio.wait_for(
+                tasks.delete(task_id=provider_task_id),
+                timeout=_CANCEL_TOTAL_TIMEOUT,
+            )
+        except (asyncio.CancelledError, SoftTimeLimitExceeded, TimeLimitExceeded):
+            raise
+        except Exception as exc:  # noqa: BLE001 - 返回显式失败供调用方降级
+            if _is_ark_task_not_found(exc):
+                logger.info(
+                    "火山方舟视频任务已不存在 task_id=%s",
+                    provider_task_id,
+                )
+                return VideoCancellationResult(
+                    provider_task_id=provider_task_id,
+                    outcome=VideoCancellationOutcome.CANCELED,
+                    detail="火山方舟远端任务已不存在",
+                )
+            logger.warning(
+                "火山方舟 tasks.delete 失败 task_id=%s error=%s",
+                provider_task_id,
+                type(exc).__name__,
+            )
+            return VideoCancellationResult(
+                provider_task_id=provider_task_id,
+                outcome=VideoCancellationOutcome.FAILED,
+                detail=f"火山方舟 tasks.delete 失败: {type(exc).__name__}",
+            )
+        return VideoCancellationResult(
+            provider_task_id=provider_task_id,
+            outcome=VideoCancellationOutcome.CANCELED,
+        )
 
     def _resolve_ark_api_key(self) -> str:
         """解析 Ark API Key：显式 VIDEO_GEN_API_KEY 优先，否则回退 VOLCENGINE_API_KEY。"""
@@ -85,7 +193,12 @@ class VolcengineVideoGenProvider:
                 "无法调用豆包 Seedance 视频生成"
             )
 
-    def _build_client(self):
+    def _build_client(
+        self,
+        *,
+        timeout: float | None = None,
+        max_retries: int = 0,
+    ):
         """构造火山方舟异步客户端。"""
         try:
             from volcenginesdkarkruntime import AsyncArk
@@ -94,10 +207,28 @@ class VolcengineVideoGenProvider:
                 "缺少 volcenginesdkarkruntime，无法调用豆包 Seedance 视频生成"
             ) from exc
 
+        client_kwargs: dict[str, Any] = {
+            "api_key": self._resolve_ark_api_key(),
+            "base_url": self._resolve_ark_base_url(),
+            # Ark 视频 submit 无稳定幂等 token，网络失败交由 durable intent 判权。
+            "max_retries": max_retries,
+        }
+        if timeout is not None:
+            client_kwargs["timeout"] = timeout
         return AsyncArk(
-            api_key=self._resolve_ark_api_key(),
-            base_url=self._resolve_ark_base_url(),
+            **client_kwargs,
         )
+
+    @staticmethod
+    async def _close_client(client) -> None:
+        """兼容 Ark SDK 同步与异步 close，由统一生命周期负责超时和隔离。"""
+        close_result = client.close()
+        if isawaitable(close_result):
+            await close_result
+
+    async def _close_client_safely(self, client) -> None:
+        """保留旧扩展入口；安全边界仍由外层 managed_video_client 统一提供。"""
+        await self._close_client(client)
 
     async def generate_all_reference(
         self,
@@ -152,6 +283,12 @@ class VolcengineVideoGenProvider:
             job_id: 调用方视频任务 ID，用于拼 storage_key 便于追溯（缺失回退 task_id）。
             on_progress: 回调 (stage:str, message:str, progress:int)。
         """
+        existing_task_id = str(request.metadata.get("provider_task_id") or "")
+        if existing_task_id:
+            await await_video_task_checkpoint(
+                request.on_task_created,
+                existing_task_id,
+            )
         self._check_keys()
         use_model = request.model or settings.seedance_model
 
@@ -176,25 +313,76 @@ class VolcengineVideoGenProvider:
 
         # 提交阶段
         _notify("submitting", "正在提交视频生成任务", 10)
+        if not existing_task_id:
+            await raise_if_video_cancel_requested_before_submit(
+                request.cancel_requested
+            )
+            await self._preflight_reference_sizes(
+                request.reference_images,
+                request.reference_audios,
+                request.first_frame,
+            )
 
-        # Ark 的 content 字段接收 URL；这里使用 data URL 承载私有存储中的媒体。
-        image_urls = await self._encode_storage_refs(request.reference_images, "image/png")
-        audio_urls = await self._encode_storage_refs(request.reference_audios, "audio/mpeg")
-        first_frame_url: str | None = None
-        if request.first_frame:
-            first_frame_url = await self._encode_single(request.first_frame)
+            # Ark 的 content 字段接收 URL；这里使用 data URL 承载私有存储中的媒体。
+            reference_budget = [0]
+            image_urls = await self._encode_storage_refs(
+                request.reference_images,
+                "image/png",
+                budget=reference_budget,
+            )
+            audio_urls = await self._encode_storage_refs(
+                request.reference_audios,
+                "audio/mpeg",
+                budget=reference_budget,
+            )
+            first_frame_url: str | None = None
+            if request.first_frame:
+                first_frame_url = await self._encode_single(
+                    request.first_frame,
+                    budget=reference_budget,
+                )
+        else:
+            image_urls = []
+            audio_urls = []
+            first_frame_url = None
 
         # ===== volcengine SDK 调用 =====
-        video_bytes, task_meta = await self._submit_and_poll(
+        video_url, task_meta = await self._submit_and_poll(
             use_model, request.prompt, image_urls, audio_urls, first_frame_url, _notify,
             duration_seconds=request.duration_seconds,
             job_id=request.job_id,
-            provider_task_id=request.metadata.get("provider_task_id"),
+            provider_task_id=existing_task_id or None,
+            cancel_requested=request.cancel_requested,
+            on_task_created=(None if existing_task_id else request.on_task_created),
+            before_submit=request.before_submit,
+            on_submission_uncertain=request.on_submission_uncertain,
         )
 
-        # 存入对象存储
-        _notify("storing", "正在存储视频", 95)
-        storage_key = await self._store_video(video_bytes, task_meta)
+        with TemporaryDirectory(prefix="mtv-volcengine-video-") as temp_dir:
+            video_path = Path(temp_dir) / "video.mp4"
+            task_id = str(task_meta.get("task_id") or "")
+
+            async def _check_download_cancellation() -> None:
+                await raise_if_video_cancel_requested(
+                    request.cancel_requested,
+                    task_id,
+                    self.cancel,
+                )
+
+            await _check_download_cancellation()
+            _notify("downloading", "正在下载生成视频", 90, task_meta.get("task_id"))
+            await self._download_to_file(
+                video_url,
+                video_path,
+                cancellation_probe=_check_download_cancellation,
+            )
+            await _check_download_cancellation()
+            _notify("storing", "正在存储视频", 95)
+            storage_key = await self._store_video_file(
+                video_path,
+                task_meta,
+                request.metadata,
+            )
 
         _notify("succeeded", "视频生成完成", 100)
         return VideoGenerationResult(
@@ -207,42 +395,108 @@ class VolcengineVideoGenProvider:
             },
         )
 
-    async def _encode_storage_refs(self, refs: list[dict], default_mime: str) -> list[str]:
+    async def _encode_storage_refs(
+        self,
+        refs: list[dict],
+        default_mime: str,
+        *,
+        budget: list[int] | None = None,
+    ) -> list[str]:
         """批量读取参考媒体并编码为 data URL；任一项缺失时关闭失败。"""
         from app.providers.storage import get_storage
+        from app.providers.streaming_io import read_storage_bytes_limited
 
         if not refs:
             return []
         storage = get_storage()
         encoded: list[str] = []
+        active_budget = budget if budget is not None else [0]
+        too_large_error = (
+            "reference_audio_too_large"
+            if default_mime.startswith("audio/")
+            else "reference_image_too_large"
+        )
         for ref in refs:
             key = ref.get("storage_key") if isinstance(ref, dict) else None
             if not key:
                 continue
-            try:
-                data = await storage.get(key)
-            except Exception as exc:  # noqa: BLE001
-                raise RuntimeError("reference_read_failed") from exc
-            if not data:
-                raise RuntimeError("reference_read_failed")
+            data = await read_storage_bytes_limited(
+                storage,
+                key,
+                too_large_error=too_large_error,
+            )
+            self._consume_reference_budget(active_budget, len(data))
             mime_type = str(ref.get("mime_type") or default_mime).split(";", 1)[0].strip()
             if "/" not in mime_type:
                 mime_type = default_mime
             encoded.append(self._as_data_url(data, mime_type))
         return encoded
 
-    async def _encode_single(self, storage_key: str) -> str:
+    async def _encode_single(
+        self,
+        storage_key: str,
+        *,
+        budget: list[int] | None = None,
+    ) -> str:
         """读取单个首帧并编码为图片 data URL。"""
         from app.providers.storage import get_storage
+        from app.providers.streaming_io import read_storage_bytes_limited
 
-        try:
-            data = await storage.get(storage_key) if (storage := get_storage()) else b""
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("读取首帧参考失败 storage_key=%s", storage_key, exc_info=True)
-            raise RuntimeError("reference_read_failed") from exc
-        if not data:
-            raise RuntimeError("reference_read_failed")
+        data = await read_storage_bytes_limited(
+            get_storage(),
+            storage_key,
+            too_large_error="reference_image_too_large",
+        )
+        self._consume_reference_budget(budget if budget is not None else [0], len(data))
         return self._as_data_url(data, "image/png")
+
+    async def _preflight_reference_sizes(
+        self,
+        reference_images: list[dict],
+        reference_audios: list[dict],
+        first_frame: str | None,
+    ) -> None:
+        """在读取任一多模态输入前校验单项与聚合体积。"""
+        from app.providers.storage import get_storage
+        from app.providers.streaming_io import MAX_REFERENCE_MEDIA_BYTES
+
+        storage = get_storage()
+        get_size = getattr(storage, "get_size", None)
+        if not callable(get_size):
+            return
+        media: list[tuple[str, str]] = []
+        media.extend(
+            (str(ref["storage_key"]), "reference_image_too_large")
+            for ref in reference_images
+            if isinstance(ref, dict) and ref.get("storage_key")
+        )
+        media.extend(
+            (str(ref["storage_key"]), "reference_audio_too_large")
+            for ref in reference_audios
+            if isinstance(ref, dict) and ref.get("storage_key")
+        )
+        if first_frame:
+            media.append((first_frame, "reference_image_too_large"))
+
+        total = 0
+        for storage_key, too_large_error in media:
+            try:
+                size = int(await get_size(storage_key))
+            except Exception as exc:  # noqa: BLE001
+                raise RuntimeError("reference_read_failed") from exc
+            if size <= 0:
+                raise RuntimeError("reference_read_failed")
+            if size > MAX_REFERENCE_MEDIA_BYTES:
+                raise RuntimeError(too_large_error)
+            total += size
+            if total > _MAX_TOTAL_REFERENCE_BYTES:
+                raise RuntimeError("reference_media_total_too_large")
+
+    @staticmethod
+    def _consume_reference_budget(budget: list[int], size: int) -> None:
+        budget[0] += size
+        if budget[0] > _MAX_TOTAL_REFERENCE_BYTES:
+            raise RuntimeError("reference_media_total_too_large")
 
     @staticmethod
     def _as_data_url(data: bytes, mime_type: str) -> str:
@@ -295,13 +549,26 @@ class VolcengineVideoGenProvider:
         duration_seconds: int | None = None,
         job_id: str | None = None,
         provider_task_id: str | None = None,
-    ) -> tuple[bytes, dict]:
-        """通过 Ark 提交视频任务并轮询至完成。"""
+        cancel_requested: CancellationProbe | None = None,
+        on_task_created: TaskCreatedCallback | None = None,
+        before_submit: SubmissionStateCallback | None = None,
+        on_submission_uncertain: SubmissionStateCallback | None = None,
+    ) -> tuple[str, dict]:
+        """通过 Ark 提交视频任务并轮询至完成，返回下载 URL 与任务元数据。"""
         client = self._build_client()
-        tasks = client.content_generation.tasks
-        try:
+        async with managed_video_client(
+            client,
+            lambda: self._close_client_safely(client),
+            provider_key=self.provider_key,
+        ):
+            tasks = client.content_generation.tasks
             task_id = provider_task_id
-            if not task_id:
+            if task_id:
+                await await_video_task_checkpoint(on_task_created, task_id)
+            else:
+                await raise_if_video_cancel_requested_before_submit(
+                    cancel_requested
+                )
                 create_kwargs: dict = {
                     "model": model,
                     "content": self._build_content(
@@ -312,10 +579,23 @@ class VolcengineVideoGenProvider:
                 }
                 if duration_seconds and duration_seconds > 0:
                     create_kwargs["duration"] = duration_seconds
-                submit_resp = await tasks.create(**create_kwargs)
+                async def _submit_video():
+                    return await tasks.create(**create_kwargs)
+
+                submit_resp = await execute_video_submission(
+                    _submit_video,
+                    before_submit=before_submit,
+                    on_submission_uncertain=on_submission_uncertain,
+                )
                 task_id = self._extract_task_id(submit_resp)
                 if not task_id:
-                    raise RuntimeError("volcengine 视频生成提交失败，未返回 task_id")
+                    await raise_video_submission_uncertain(on_submission_uncertain)
+                await await_video_task_checkpoint(on_task_created, task_id)
+                await raise_if_video_cancel_requested(
+                    cancel_requested,
+                    task_id,
+                    lambda remote_id: self._cancel_task(tasks, remote_id),
+                )
                 _notify("submitted", "视频生成任务已提交", 15, task_id)
 
             _notify("polling", "视频生成中，轮询任务状态", 20, task_id)
@@ -324,9 +604,19 @@ class VolcengineVideoGenProvider:
             last_progress = 20
             result_resp = None
             while True:
+                await raise_if_video_cancel_requested(
+                    cancel_requested,
+                    task_id,
+                    lambda remote_id: self._cancel_task(tasks, remote_id),
+                )
                 result_resp = await tasks.get(task_id=task_id)
+                await raise_if_video_cancel_requested(
+                    cancel_requested,
+                    task_id,
+                    lambda remote_id: self._cancel_task(tasks, remote_id),
+                )
                 status = self._extract_status(result_resp)
-                if status in {"failed", "succeeded", "cancelled"}:
+                if status in {"failed", "error", "succeeded", "cancelled", "canceled"}:
                     break
                 if time.monotonic() > deadline:
                     raise RuntimeError(f"volcengine 视频生成轮询超时 task_id={task_id}")
@@ -338,9 +628,9 @@ class VolcengineVideoGenProvider:
 
             status = self._extract_status(result_resp)
             if status != "succeeded":
-                error = self._extract_error(result_resp)
-                raise RuntimeError(
-                    f"volcengine 视频生成失败 task_id={task_id} status={status} error={error}"
+                raise VideoGenerationRemoteTerminalError(
+                    provider_task_id=task_id,
+                    terminal_status=status,
                 )
 
             video_url = self._extract_video_url(result_resp)
@@ -349,17 +639,13 @@ class VolcengineVideoGenProvider:
                     f"volcengine 视频生成完成但未返回 video_url task_id={task_id}"
                 )
 
-            _notify("downloading", "正在下载生成视频", 90, task_id)
-            video_bytes = await self._download(video_url)
-            return video_bytes, {
+            return video_url, {
                 "task_id": task_id,
                 "volcengine_status": status,
                 "video_url": video_url,
                 "last_frame_url": self._extract_last_frame_url(result_resp),
                 "job_id": job_id,
             }
-        finally:
-            await client.close()
 
     @staticmethod
     def _extract_task_id(resp) -> str:
@@ -438,24 +724,96 @@ class VolcengineVideoGenProvider:
             return str(error.get("message") or error.get("code") or "unknown")
         return str(getattr(error, "message", None) or getattr(error, "code", None) or error or "unknown")
 
-    async def _download(self, url: str) -> bytes:
-        """下载视频 URL 字节流，逐跳 SSRF 校验 + 流式大小限制。"""
-        from app.providers._url_safety import safe_download_bytes
+    async def _download_to_file(
+        self,
+        url: str,
+        path: str | Path,
+        *,
+        cancellation_probe=None,
+    ) -> int:
+        """逐跳校验视频 URL，并把响应流写入临时文件。"""
+        from app.providers._url_safety import MAX_PROVIDER_VIDEO_BYTES, safe_download_to_file
 
-        return await safe_download_bytes(url, max_bytes=1024 * 1024 * 1024)
+        return await safe_download_to_file(
+            url,
+            path,
+            max_bytes=MAX_PROVIDER_VIDEO_BYTES,
+            timeout=120.0,
+            url_validator=self._validate_download_host,
+            cancellation_probe=cancellation_probe,
+        )
 
-    async def _store_video(self, video_bytes: bytes, task_meta: dict) -> str:
-        """将视频字节存入对象存储，返回 storage_key。
+    def _validate_download_host(self, url: str) -> None:
+        """仅允许 Ark API 主机或区域一致的官方内容桶通过 HTTPS 443 下载。"""
+        try:
+            parsed = urlsplit(url)
+            hostname = (parsed.hostname or "").lower()
+            port = parsed.port or 443
+        except ValueError as exc:
+            raise RuntimeError("provider_download_url_invalid") from exc
+
+        try:
+            configured = urlsplit(self._resolve_ark_base_url())
+            configured_host = (configured.hostname or "").lower()
+            configured_port = configured.port or 443
+        except ValueError:
+            configured_host = ""
+            configured_port = 0
+
+        configured_origin = (
+            configured.scheme.lower() == "https"
+            and configured_port == 443
+            and hostname == configured_host
+        )
+        official_content_origin = _ARK_CONTENT_DOWNLOAD_HOST.fullmatch(hostname) is not None
+        if (
+            parsed.scheme.lower() != "https"
+            or not hostname
+            or port != 443
+            or parsed.username is not None
+            or parsed.password is not None
+            or not (configured_origin or official_content_origin)
+        ):
+            raise RuntimeError("provider_download_url_invalid")
+
+    async def _store_video_file(
+        self,
+        path: str | Path,
+        task_meta: dict,
+        metadata: dict,
+    ) -> str:
+        """将临时视频文件原子提升为本次尝试的正式对象。
 
         走 app.providers.storage 抽象（T10 实现），storage_key 形如
         generate_images/video/<job_or_task>.mp4。
         """
-        # 延迟 import，storage provider 未就绪时不阻塞模块加载
         from app.providers.storage import get_storage
+        from app.providers.streaming_io import atomic_put_file, storage_attempt_suffix
 
         storage = get_storage()
-        # 用 task_meta 中的标识拼 key；job_id 由调用方经 task_meta 传入更佳
         ident = task_meta.get("job_id") or task_meta.get("task_id") or "unknown"
-        storage_key = f"generate_images/video/{ident}.mp4"
-        await storage.put(storage_key, video_bytes)
-        return storage_key
+        attempt_suffix = storage_attempt_suffix(metadata)
+        suffix = f"-{attempt_suffix}" if attempt_suffix else ""
+        storage_key = f"generate_images/video/{ident}{suffix}.mp4"
+        return await atomic_put_file(
+            storage,
+            storage_key,
+            path,
+            attempt_id=attempt_suffix or "legacy",
+            preserve_existing_final=not attempt_suffix,
+        )
+
+
+def _is_ark_task_not_found(exc: Exception) -> bool:
+    """仅把 SDK 的结构化 HTTP 404 识别为幂等取消成功。"""
+    try:
+        from volcenginesdkarkruntime._exceptions import ArkAPIStatusError
+    except ImportError:  # pragma: no cover - SDK 缺失时不会产生 Ark 状态异常
+        return False
+    if not isinstance(exc, ArkAPIStatusError):
+        return False
+    response = getattr(exc, "response", None)
+    return (
+        getattr(exc, "status_code", None) == 404
+        and getattr(response, "status_code", None) == 404
+    )

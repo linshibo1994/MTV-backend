@@ -1,6 +1,6 @@
 """ShotGroup（镜头组）ORM 模型。"""
 
-from sqlalchemy import CheckConstraint, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import CheckConstraint, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -75,3 +75,17 @@ class ShotGroup(TimestampMixin, Base):
         kwargs.setdefault("materials", {"character": [], "background": [], "prop": [], "other": []})
         kwargs.setdefault("audio_elements", {"characters": [], "sounds": []})
         super().__init__(**kwargs)
+
+
+Index(
+    "ix_shot_groups_reference_frames_first_frame",
+    ShotGroup.reference_frames["first_frame"].as_string(),
+)
+Index(
+    "ix_shot_groups_reference_frames_last_frame",
+    ShotGroup.reference_frames["last_frame"].as_string(),
+)
+Index(
+    "ix_shot_groups_reference_frames_reference_frame",
+    ShotGroup.reference_frames["reference_frame"].as_string(),
+)

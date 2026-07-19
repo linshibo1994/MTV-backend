@@ -278,6 +278,31 @@ async def test_team_script_creation_uses_active_org_not_primary_org():
     assert added_scripts and added_scripts[0].org_id == "orgB"
 
 
+async def test_team_script_creation_flushes_script_before_owner_member():
+    user = _user(active_org_id="orgB")
+    db = _db()
+    events: list[str] = []
+
+    db.add = MagicMock(
+        side_effect=lambda row: events.append(f"add:{type(row).__name__}")
+    )
+    db.flush = AsyncMock(side_effect=lambda: events.append("flush"))
+    db.commit = AsyncMock(side_effect=lambda: events.append("commit"))
+    db.refresh = AsyncMock(
+        side_effect=lambda row: events.append(f"refresh:{type(row).__name__}")
+    )
+
+    await create_script(db, "team script", "team", user)
+
+    assert events == [
+        "add:Script",
+        "flush",
+        "add:ProjectMember",
+        "commit",
+        "refresh:Script",
+    ]
+
+
 async def test_team_script_creation_without_active_org_fails_closed():
     user = _user(active_org_id=None)
     db = _db()

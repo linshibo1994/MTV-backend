@@ -5,10 +5,12 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Sequence
+from typing import cast
 from uuid import UUID, uuid5
 
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import noload
 
 from app.core.errors import ConflictError, ForbiddenError, InsufficientCreditsError, NotFoundError
 from app.core.ids import new_id
@@ -25,12 +27,18 @@ from app.services.pipeline import STAGE_ORDER, get_stage, set_stage
 from app.services.pipeline.orchestrator import (
     PIPELINE_DAG_TASK_TYPE,
     _estimate_cost,
+    acquire_pipeline_advisory_lock,
     build_pipeline_outbox_payload,
 )
 from app.services.task_dispatch import enqueue_task
 
 _RUN_ID_NAMESPACE = UUID("681d22d7-73fc-43bf-9706-b496b4e9d85c")
 _ACTIVE_STATUSES = ("pending", "retry", "running", "ready")
+_PIPELINE_LEAF_STAGES = frozenset({"enrich", "parents"})
+_PIPELINE_NONLEAF_STATUSES = frozenset(
+    {"pending", "running", "done", "failed", "skipped"}
+)
+_PIPELINE_LEAF_STATUSES = _PIPELINE_NONLEAF_STATUSES | {"ready"}
 
 
 def _request_fingerprint(body: PipelineRunCreateIn) -> str:
@@ -51,16 +59,104 @@ def _run_id_for_request(
     return str(uuid5(_RUN_ID_NAMESPACE, scoped_key))
 
 
-async def _acquire_script_lock(db: AsyncSession, script_id: str) -> None:
-    """串行化同一剧本的检查与创建，避免并发产生两个活动 run。"""
-    await db.execute(
-        select(
-            func.pg_advisory_xact_lock(
-                func.hashtext("pipeline_trigger"),
-                func.hashtext(script_id),
-            )
+def _pipeline_job_history_is_valid(
+    jobs: Sequence[PipelineJob],
+    *,
+    script_id: str,
+    episode_id: str,
+    run_id: str,
+    dispatch_id: str,
+    baseline_attempt: int,
+    input_version: int,
+    input_client_save_seq: int,
+) -> bool:
+    """校验同一 run 的 attempt 历史与 worker 可达的 DAG 状态。"""
+    attempts_by_stage: dict[str, dict[int, PipelineJob]] = {
+        stage: {} for stage in STAGE_ORDER
+    }
+    for job in jobs:
+        stage_attempts = attempts_by_stage.get(job.stage)
+        if (
+            stage_attempts is None
+            or job.script_id != script_id
+            or job.episode_id != episode_id
+            or job.run_id != run_id
+            or job.dispatch_id != dispatch_id
+            or job.input_version != input_version
+            or job.input_client_save_seq != input_client_save_seq
+            or type(job.attempt) is not int
+            or job.attempt < baseline_attempt
+            or job.attempt in stage_attempts
+        ):
+            return False
+        stage_attempts[job.attempt] = job
+
+    latest: dict[str, PipelineJob] = {}
+    has_execution_evidence: dict[str, bool] = {}
+    for stage, stage_attempts in attempts_by_stage.items():
+        if not stage_attempts:
+            return False
+        if (
+            min(stage_attempts) != baseline_attempt
+            or len(stage_attempts) != max(stage_attempts) - baseline_attempt + 1
+        ):
+            return False
+
+        ordered_attempts = sorted(stage_attempts)
+        for attempt in ordered_attempts[:-1]:
+            historical = stage_attempts[attempt]
+            if historical.status != "failed" or historical.retryable is not True:
+                return False
+        current = stage_attempts[ordered_attempts[-1]]
+        allowed_statuses = (
+            _PIPELINE_LEAF_STATUSES
+            if stage in _PIPELINE_LEAF_STAGES
+            else _PIPELINE_NONLEAF_STATUSES
         )
+        if current.status not in allowed_statuses:
+            return False
+        latest[stage] = current
+        has_execution_evidence[stage] = (
+            stage_attempts[baseline_attempt].status != "pending"
+            or ordered_attempts[-1] > baseline_attempt
+        )
+
+    split_status = latest["split"].status
+    extract_status = latest["extract"].status
+    merge_status = latest["merge"].status
+    if has_execution_evidence["extract"] and split_status != "done":
+        return False
+    if has_execution_evidence["merge"] and (
+        split_status != "done" or extract_status != "done"
+    ):
+        return False
+    prerequisites_done = (
+        split_status == "done"
+        and extract_status == "done"
+        and merge_status == "done"
     )
+    for leaf in _PIPELINE_LEAF_STAGES:
+        if has_execution_evidence[leaf] and not prerequisites_done:
+            return False
+
+    leaf_done = {stage for stage in _PIPELINE_LEAF_STAGES if latest[stage].status == "done"}
+    if leaf_done and leaf_done != _PIPELINE_LEAF_STAGES:
+        return False
+    return True
+
+
+async def _acquire_script_lock(db: AsyncSession, script_id: str) -> None:
+    """先锁定真实父行，再串行化同一剧本的人工 run 创建。"""
+    locked_script_id = (
+        await db.execute(
+            select(Script.id)
+            .where(Script.id == script_id)
+            .with_for_update(read=True, key_share=True)
+        )
+    ).scalar_one_or_none()
+    if locked_script_id is None:
+        raise NotFoundError("剧本不存在")
+    await acquire_pipeline_advisory_lock(db, script_id)
 
 
 async def _load_idempotent_result(
@@ -68,38 +164,120 @@ async def _load_idempotent_result(
     *,
     run_id: str,
     request_fingerprint: str,
+    script_id: str,
+    episode_id: str,
+    body: PipelineRunCreateIn,
+    requested_by_user_id: str,
+    idempotency_key_hash: str,
 ) -> PipelineRunOut | None:
-    result = await db.execute(
-        select(TaskDispatchOutbox).where(
+    jobs_result = await db.execute(
+        select(PipelineJob)
+        .where(PipelineJob.run_id == run_id)
+        .order_by(PipelineJob.stage.asc(), PipelineJob.attempt.asc(), PipelineJob.id.asc())
+        .options(noload(PipelineJob.script))
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    jobs = list(jobs_result.scalars().all())
+    outbox_result = await db.execute(
+        select(TaskDispatchOutbox)
+        .where(
             TaskDispatchOutbox.task_type == PIPELINE_DAG_TASK_TYPE,
             TaskDispatchOutbox.job_id == run_id,
         )
+        .order_by(TaskDispatchOutbox.attempt.asc(), TaskDispatchOutbox.id.asc())
+        .with_for_update()
+        .execution_options(populate_existing=True)
     )
-    outbox = result.scalar_one_or_none()
-    if outbox is None:
+    outboxes = list(outbox_result.scalars().all())
+    if not outboxes and not jobs:
         return None
-    payload = outbox.payload or {}
+    if len(outboxes) != 1 or not jobs:
+        raise ConflictError("Idempotency-Key 对应的流水线运行已失效，请使用新键重试")
+    outbox = outboxes[0]
+    payload = outbox.payload
+    if not isinstance(payload, dict):
+        raise ConflictError("Idempotency-Key 对应的流水线运行已失效，请使用新键重试")
     if payload.get("request_fingerprint") != request_fingerprint:
         raise ConflictError("Idempotency-Key 已用于不同的流水线请求")
-    jobs_result = await db.execute(
-        select(PipelineJob).where(PipelineJob.run_id == run_id)
+
+    pipeline_attempt = payload.get("pipeline_attempt")
+    input_version = payload.get("input_version")
+    input_client_save_seq = payload.get("input_client_save_seq")
+    estimated = payload.get("estimated")
+    reservation_id = payload.get("reservation_id")
+    scalar_payload_is_valid = (
+        type(pipeline_attempt) is int
+        and pipeline_attempt > 0
+        and type(input_version) is int
+        and input_version > 0
+        and type(input_client_save_seq) is int
+        and input_client_save_seq >= 0
+        and type(estimated) is int
+        and estimated > 0
+        and isinstance(reservation_id, str)
+        and bool(reservation_id)
     )
-    status = _derive_run_status(list(jobs_result.scalars().all()))
-    return PipelineRunOut(
-        script_id=payload["script_id"],
-        episode_id=payload["episode_id"],
+    expected_pipeline_attempt_is_valid = (
+        pipeline_attempt == 1
+        if body.mode is PipelineRunMode.MANUAL_REEXTRACT
+        else type(pipeline_attempt) is int and pipeline_attempt > 0
+    )
+    validated_attempt = cast(int, pipeline_attempt)
+    validated_input_version = cast(int, input_version)
+    validated_input_client_save_seq = cast(int, input_client_save_seq)
+    job_history_is_valid = scalar_payload_is_valid and _pipeline_job_history_is_valid(
+        jobs,
+        script_id=script_id,
+        episode_id=episode_id,
         run_id=run_id,
         dispatch_id=outbox.id,
-        reservation_id=payload["reservation_id"],
-        mode=PipelineRunMode(payload["mode"]),
-        retry_of_run_id=payload.get("retry_of_run_id"),
-        attempt=int(payload["pipeline_attempt"]),
-        input_version=int(payload["input_version"]),
-        input_client_save_seq=int(payload["input_client_save_seq"]),
-        estimated=int(payload["estimated"]),
-        status=status,
-        idempotent_replay=True,
+        baseline_attempt=validated_attempt,
+        input_version=validated_input_version,
+        input_client_save_seq=validated_input_client_save_seq,
     )
+    if (
+        not scalar_payload_is_valid
+        or not expected_pipeline_attempt_is_valid
+        or outbox.status not in {"pending", "retry", "running", "published"}
+        or outbox.attempt != body.episode_version
+        or payload.get("script_id") != script_id
+        or payload.get("episode_id") != episode_id
+        or payload.get("run_id") != run_id
+        or payload.get("dispatch_id") != outbox.id
+        or payload.get("mode") != body.mode.value
+        or payload.get("retry_of_run_id") != body.failed_run_id
+        or payload.get("requested_by_user_id") != requested_by_user_id
+        or payload.get("idempotency_key_hash") != idempotency_key_hash
+        or input_version != body.episode_version
+        or input_client_save_seq != body.client_save_seq
+        or not job_history_is_valid
+    ):
+        raise ConflictError("Idempotency-Key 对应的流水线运行已失效，请使用新键重试")
+    validated_estimated = cast(int, estimated)
+    validated_reservation_id = cast(str, reservation_id)
+    status = _derive_run_status(jobs)
+    try:
+        replay = PipelineRunOut(
+            script_id=script_id,
+            episode_id=episode_id,
+            run_id=run_id,
+            dispatch_id=outbox.id,
+            reservation_id=validated_reservation_id,
+            mode=body.mode,
+            retry_of_run_id=body.failed_run_id,
+            attempt=validated_attempt,
+            input_version=body.episode_version,
+            input_client_save_seq=body.client_save_seq,
+            estimated=validated_estimated,
+            status=status,
+            idempotent_replay=True,
+        )
+    except (KeyError, TypeError, ValueError):
+        raise ConflictError(
+            "Idempotency-Key 对应的流水线运行已失效，请使用新键重试"
+        ) from None
+    return replay
 
 
 def _derive_run_status(jobs: Sequence[PipelineJob]) -> str:
@@ -124,12 +302,14 @@ def _derive_run_status(jobs: Sequence[PipelineJob]) -> str:
 async def _reload_episode(
     db: AsyncSession, *, script_id: str, episode_id: str
 ) -> Episode:
-    episode = await db.get(
-        Episode,
-        episode_id,
-        populate_existing=True,
-        with_for_update=True,
-    )
+    episode = (
+        await db.execute(
+            select(Episode)
+            .where(Episode.episode_id == episode_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
     if episode is None:
         raise NotFoundError("分集不存在")
     if episode.script_id != script_id:
@@ -182,7 +362,27 @@ async def _load_retry_source(
 def _validate_retry_source(
     jobs: Sequence[PipelineJob], *, input_version: int, input_client_save_seq: int
 ) -> int:
-    """只检查各阶段最新 attempt；历史失败行始终保持不可变。"""
+    """验证完整 worker 历史后，返回新 run 的统一 baseline attempt。"""
+    if not jobs or any(type(job.attempt) is not int for job in jobs):
+        raise ConflictError("失败流水线历史已失效，不能显式重试")
+    first = jobs[0]
+    first_episode_id = first.episode_id
+    first_input_client_save_seq = first.input_client_save_seq
+    if first_episode_id is None or first_input_client_save_seq is None:
+        raise ConflictError("失败流水线历史已失效，不能显式重试")
+    baseline_attempt = min(job.attempt for job in jobs)
+    if not _pipeline_job_history_is_valid(
+        jobs,
+        script_id=first.script_id,
+        episode_id=first_episode_id,
+        run_id=first.run_id,
+        dispatch_id=first.dispatch_id,
+        baseline_attempt=baseline_attempt,
+        input_version=first.input_version,
+        input_client_save_seq=first_input_client_save_seq,
+    ):
+        raise ConflictError("失败流水线历史已失效，不能显式重试")
+
     latest: dict[str, PipelineJob] = {}
     for job in jobs:
         current = latest.get(job.stage)
@@ -193,10 +393,10 @@ def _validate_retry_source(
         raise ConflictError("指定流水线不是失败终态，不能显式重试")
     if any(job.retryable is not True for job in failed):
         raise ConflictError("指定流水线包含不可重试失败")
-    source_inputs = {
-        (job.input_version, job.input_client_save_seq) for job in latest.values()
-    }
-    if source_inputs != {(input_version, input_client_save_seq)}:
+    if (first.input_version, first_input_client_save_seq) != (
+        input_version,
+        input_client_save_seq,
+    ):
         raise ConflictError("失败流水线输入版本已过期，请手动重新提取")
     return max(job.attempt for job in jobs) + 1
 
@@ -259,20 +459,25 @@ async def create_pipeline_run(
     )
     try:
         await _acquire_script_lock(db, script.id)
-        replay = await _load_idempotent_result(
-            db,
-            run_id=run_id,
-            request_fingerprint=fingerprint,
-        )
-        if replay is not None:
-            await db.commit()
-            return replay
-
         episode = await _reload_episode(
             db,
             script_id=script.id,
             episode_id=episode_id,
         )
+        replay = await _load_idempotent_result(
+            db,
+            run_id=run_id,
+            request_fingerprint=fingerprint,
+            script_id=script.id,
+            episode_id=episode_id,
+            body=body,
+            requested_by_user_id=actor.user_id,
+            idempotency_key_hash=_idempotency_hash(idempotency_key),
+        )
+        if replay is not None:
+            await db.commit()
+            return replay
+
         if (
             episode.episode_version != body.episode_version
             or episode.client_save_seq != body.client_save_seq

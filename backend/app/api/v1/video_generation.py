@@ -16,12 +16,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import noload
 
 from app.core.auth import get_current_user
+from app.core.config import settings
 from app.core.database import get_db
-from app.core.errors import BadRequestError, ForbiddenError
+from app.core.errors import BadRequestError, ConflictError, ForbiddenError
 from app.crud import video as video_crud
 from app.models.script import Script
 from app.models.shot_group import ShotGroup
 from app.models.user import User
+from app.models.video_generation_job import VIDEO_IDEMPOTENCY_KEY_MAX_LENGTH
+from app.providers.registry import require_capability
 from app.schemas.video import (
     ActiveProviderOut,
     ActiveProviderUpdateIn,
@@ -35,6 +38,31 @@ from app.schemas.video import (
 from app.services.audit import best_effort_log as audit_log
 
 router = APIRouter()
+
+
+def _derive_batch_idempotency_keys(prefix: str, count: int) -> list[str]:
+    keys = [f"{prefix}:{idx}" for idx in range(count)]
+    if any(len(key) > VIDEO_IDEMPOTENCY_KEY_MAX_LENGTH for key in keys):
+        raise BadRequestError(
+            f"批量 Idempotency-Key 派生后超过 {VIDEO_IDEMPOTENCY_KEY_MAX_LENGTH} 字符"
+        )
+    return keys
+
+
+def _effective_env_video_provider() -> ActiveProviderOut:
+    """返回环境配置实际用于创建视频任务的规范化 Provider 与模型。"""
+    provider_key = require_capability(settings.video_gen_provider, "video")
+    fallback_models = {
+        "volcengine": settings.seedance_model,
+        "bailian": settings.dashscope_video_model,
+        "openai": settings.openai_video_model,
+        "gemini": settings.google_video_model,
+    }
+    return ActiveProviderOut(
+        provider_key=provider_key,
+        job_type="all_reference",
+        model=settings.video_gen_model or fallback_models[provider_key],
+    )
 
 
 async def _load_and_check_script(
@@ -80,6 +108,7 @@ async def create_video_generation_job(
     idempotency_key: str | None = Header(
         None,
         alias="Idempotency-Key",
+        max_length=VIDEO_IDEMPOTENCY_KEY_MAX_LENGTH,
         description="幂等键；同一键重复创建返回已存在任务而非新建（doc 08 §4.2）",
     ),
 ) -> VideoJobOut:
@@ -180,7 +209,12 @@ async def cancel_video_generation_job(
 
     from app.services.video_generation import cancel_video_job
 
-    cancelled = await cancel_video_job(db, script_id=job.script_id, job_id=job_id)
+    cancelled = await cancel_video_job(
+        db,
+        script_id=job.script_id,
+        job_id=job_id,
+        actor_user_id=user.user_id,
+    )
     return VideoJobOut.model_validate(cancelled)
 
 
@@ -232,7 +266,9 @@ async def batch_create_video_generation_jobs(
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
     idempotency_key: str | None = Header(
-        None, alias="Idempotency-Key",
+        None,
+        alias="Idempotency-Key",
+        max_length=VIDEO_IDEMPOTENCY_KEY_MAX_LENGTH,
         description="幂等键前缀，批量任务按 <prefix>:<idx> 派生",
     ),
 ) -> VideoJobBatchOut:
@@ -245,15 +281,17 @@ async def batch_create_video_generation_jobs(
     资源级授权：按 body.script_id 校验剧本写权限（统一校验一次）。
     """
     await _load_and_check_script(db, user, body.script_id, require_write=True)
-    if not idempotency_key:
+    if not idempotency_key or not idempotency_key.strip():
         raise BadRequestError("Idempotency-Key 必填")
+    derived_keys = _derive_batch_idempotency_keys(
+        idempotency_key, len(body.shot_group_ids)
+    )
 
     from app.services.video_generation import create_video_job
 
     success: list[VideoJobOut] = []
     failed: list[VideoJobFailedItem] = []
-    for idx, sg_id in enumerate(body.shot_group_ids):
-        key = f"{idempotency_key}:{idx}" if idempotency_key else None
+    for sg_id, key in zip(body.shot_group_ids, derived_keys, strict=True):
         try:
             job = await create_video_job(
                 db,
@@ -265,6 +303,7 @@ async def batch_create_video_generation_jobs(
             )
             success.append(VideoJobOut.model_validate(job))
         except HTTPException as exc:
+            await db.rollback()
             # 单个失败：记入 failed 列表但不中断批量
             failed.append(VideoJobFailedItem(
                 shot_group_id=sg_id,
@@ -284,12 +323,13 @@ async def get_active_provider(
 ) -> ActiveProviderOut:
     """取当前激活的视频供应商 + 模型 {provider_key, job_type, model}。
 
-    无激活配置时返回默认（settings.video_default_provider + seedance_model）。
+    env 模式返回任务创建实际采用的环境配置；database 模式返回数据库激活配置。
     """
+    if settings.video_provider_selection_mode == "env":
+        return _effective_env_video_provider()
+
     cfg = await video_crud.get_active_provider(db, "all_reference", commit_on_seed=True)
     if cfg is None:
-        from app.core.config import settings
-
         return ActiveProviderOut(
             provider_key=settings.video_default_provider,
             job_type="all_reference",
@@ -310,12 +350,15 @@ async def set_active_provider(
 ) -> ActiveProviderOut:
     """切换激活视频供应商 — 仅管理员可操作。
 
-    支持豆包别名 jianyu/modelsai、阿里百炼 bailian 与 OpenAI Sora。
+    支持豆包别名 jianyu/modelsai、阿里百炼 bailian、OpenAI Sora 与 Gemini Veo。
     """
     if not user.is_admin:
         raise ForbiddenError("仅管理员可切换视频供应商")
+    if settings.video_provider_selection_mode == "env":
+        raise ConflictError("视频供应商由环境配置锁定，无法通过 API 切换")
 
-    # 目标配置须存在
+    # 存量数据库可能已有旧供应商配置但缺少后续新增项，切换前幂等补齐。
+    await video_crud.ensure_provider_configs(db)
     existing = await video_crud.get_provider_by_key(db, body.provider_key, body.job_type)
     if existing is None:
         from fastapi import HTTPException

@@ -774,6 +774,7 @@ async def reconcile_stale_render_jobs(
             noload(TimelineRenderJob.episode),
             noload(TimelineRenderJob.owner),
         )
+        .with_for_update(skip_locked=True)
     )
     recovered = 0
     for job in list(result.scalars().all()):

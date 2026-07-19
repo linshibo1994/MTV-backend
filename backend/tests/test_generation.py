@@ -871,6 +871,34 @@ def test_generation_claim_heartbeat_finish_and_cancel_use_token_cas(monkeypatch)
                 ),
             ]
         )
+        cancel_outbox = TaskDispatchOutbox(
+            id="dispatch-generation-cancel",
+            task_type="generation.generate_images",
+            job_id="job-pending",
+            attempt=1,
+            payload={"job_id": "job-pending"},
+            status="running",
+            lease_owner="dispatcher",
+            lease_token="dispatch-token",
+            lease_until=now + timedelta(minutes=1),
+        )
+        wrong_attempt = TaskDispatchOutbox(
+            id="dispatch-generation-wrong-attempt",
+            task_type="generation.generate_images",
+            job_id="job-pending",
+            attempt=2,
+            payload={"job_id": "job-pending"},
+            status="retry",
+        )
+        wrong_task_type = TaskDispatchOutbox(
+            id="dispatch-generation-wrong-type",
+            task_type="timeline.render",
+            job_id="job-pending",
+            attempt=1,
+            payload={"job_id": "job-pending"},
+            status="pending",
+        )
+        raw.add_all([cancel_outbox, wrong_attempt, wrong_task_type])
         raw.commit()
 
         pending = await generation_worker.claim_generation_job(db, "job-pending", "worker-a")
@@ -894,6 +922,20 @@ def test_generation_claim_heartbeat_finish_and_cancel_use_token_cas(monkeypatch)
         assert await generation_worker.cancel_generation_job(
             db, "job-pending", actor_user_id="user-1"
         )
+        await db.commit()
+        raw.expire_all()
+        cancel_outbox = raw.get(TaskDispatchOutbox, "dispatch-generation-cancel")
+        wrong_attempt = raw.get(TaskDispatchOutbox, "dispatch-generation-wrong-attempt")
+        wrong_task_type = raw.get(TaskDispatchOutbox, "dispatch-generation-wrong-type")
+        assert cancel_outbox is not None
+        assert wrong_attempt is not None
+        assert wrong_task_type is not None
+        assert cancel_outbox.status == "canceled"
+        assert cancel_outbox.lease_owner is None
+        assert cancel_outbox.lease_token is None
+        assert cancel_outbox.lease_until is None
+        assert wrong_attempt.status == "retry"
+        assert wrong_task_type.status == "pending"
         assert not await generation_worker.finish_generation_job(
             db,
             pending.job_id,
@@ -1059,6 +1101,7 @@ def test_generation_job_output_sanitizes_public_metrics_and_errors() -> None:
 
     out = generation_api._to_out(job)
 
+    assert out.subject_id == "subject-1"
     assert out.input_json == {
         "prompt": "公开 prompt",
         "resolved_prompts": {"final": _twelve_sections()},
@@ -1081,6 +1124,81 @@ def test_generation_job_output_sanitizes_public_metrics_and_errors() -> None:
         error_message="Authorization=secret-token /private/provider/path",
     )
     assert generation_api._to_out(failed).error_message == "生成失败，请稍后重试"
+
+
+def test_generation_create_batch_and_poll_share_public_subject_mapping(monkeypatch) -> None:
+    async def scenario() -> None:
+        def job(job_id: str, subject_id: str) -> GenerationJob:
+            return GenerationJob(
+                job_id=job_id,
+                owner_user_id="user-1",
+                material_id="material-1",
+                script_id="script-1",
+                subject_id=subject_id,
+                idempotency_key=f"key-{job_id}",
+                request_hash=f"hash-{job_id}",
+                input_version=7,
+                attempt=1,
+                job_type="generate_images",
+                status="starting",
+                progress=0,
+                input_json={
+                    "prompt": f"公开 prompt {subject_id}",
+                    "resolved_prompts": {"final": _twelve_sections()},
+                    "subject_id": subject_id,
+                    "reservation_id": f"reservation-{job_id}",
+                },
+            )
+
+        single_job = job("job-single-public", "subject-single")
+        batch_job = job("job-batch-public", "subject-batch")
+
+        async def create_one(*args, **kwargs):
+            return single_job
+
+        async def create_batch(*args, **kwargs):
+            return [batch_job], [], []
+
+        async def get_one(*args, **kwargs):
+            return single_job
+
+        async def verify_access(*args, **kwargs) -> None:
+            return None
+
+        monkeypatch.setattr(generation_api, "create_generation_job", create_one)
+        monkeypatch.setattr(generation_api, "create_batch_generation_jobs", create_batch)
+        monkeypatch.setattr(generation_api, "get_job", get_one)
+        monkeypatch.setattr(generation_api, "_verify_job_access", verify_access)
+
+        actor = SimpleNamespace(user_id="user-1")
+        db = SimpleNamespace()
+        created = await generation_api.create_job_endpoint(
+            CreateJobIn(material_id="material-1", subject_id="subject-single"),
+            "single-key",
+            db=db,
+            user=actor,
+        )
+        batch = await generation_api.create_batch_jobs_endpoint(
+            BatchCreateJobIn(material_id="material-1", subject_ids=["subject-batch"]),
+            "batch-key",
+            db=db,
+            user=actor,
+        )
+        polled = await generation_api.get_job_endpoint(
+            "job-single-public",
+            db=db,
+            user=actor,
+        )
+
+        assert created.subject_id == "subject-single"
+        assert batch.created[0].subject_id == "subject-batch"
+        assert polled.subject_id == "subject-single"
+        for output in (created, batch.created[0], polled):
+            assert output.input_json is not None
+            assert "subject_id" not in output.input_json
+            assert "reservation_id" not in output.input_json
+
+    asyncio.run(scenario())
 
 
 def test_provider_result_validation_accepts_partial_and_rejects_invalid_counts_and_ssrf_url():

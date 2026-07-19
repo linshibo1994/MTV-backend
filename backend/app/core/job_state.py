@@ -6,6 +6,10 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from secrets import token_urlsafe
 
+TASK_HARD_TIME_LIMIT_SECONDS = 900
+TASK_SOFT_TIME_LIMIT_SECONDS = 810
+MEDIA_STORAGE_JOB_LEASE_SECONDS = TASK_HARD_TIME_LIMIT_SECONDS + 60
+
 _SAFE_FAILURES: dict[str, tuple[str, bool]] = {
     "provider_contract_error": ("供应商响应不符合约定", False),
     "provider_timeout": ("上游服务超时", True),

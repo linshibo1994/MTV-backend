@@ -9,6 +9,8 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.core.ids import new_id
 from app.models.base import Base, TimestampMixin
 
+TIMELINE_IDEMPOTENCY_KEY_MAX_LENGTH = 256
+
 
 class TimelineRenderJob(TimestampMixin, Base):
     """时间线合成任务状态权威来源。
@@ -39,7 +41,9 @@ class TimelineRenderJob(TimestampMixin, Base):
     owner_user_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("users.user_id"), nullable=False, index=True
     )
-    idempotency_key: Mapped[str] = mapped_column(String(256), nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(
+        String(TIMELINE_IDEMPOTENCY_KEY_MAX_LENGTH), nullable=False
+    )
     request_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     input_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     attempt: Mapped[int] = mapped_column(Integer, nullable=False, default=1)

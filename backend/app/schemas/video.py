@@ -65,13 +65,15 @@ class VideoJobBatchCreateIn(BaseModel):
 
     script_id: str
     episode_id: str
-    shot_group_ids: list[str] = Field(..., min_length=1, description="镜头组 ID 列表")
+    shot_group_ids: list[str] = Field(
+        ..., min_length=1, max_length=100, description="镜头组 ID 列表"
+    )
 
 
 class ActiveProviderUpdateIn(BaseModel):
     """切换视频供应商（管理员）入参。"""
 
-    provider_key: Literal["jianyu", "modelsai", "bailian", "openai"] = Field(
+    provider_key: Literal["jianyu", "modelsai", "bailian", "openai", "gemini"] = Field(
         ..., description="供应商 key"
     )
     job_type: str = Field(default="all_reference", description="任务类型，默认 all_reference")

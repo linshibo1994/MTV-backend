@@ -12,7 +12,7 @@ generate_images_task(job_id) 流程：
 9. 失败：清理已落盘图片、credits.release 释放冻结、回退 subject.review_status、写 error_message，不重试
 
 说明：
-- Celery 任务体内通过 asyncio.run 执行异步主体，复用 async DB session 与 async provider。
+- Celery 任务体内通过 worker 持久事件循环执行异步主体，复用 async DB session 与 async provider。
 - 存储统一经 app.providers.storage.get_storage() 抽象（与 video_generation/timeline_render 一致），
   支持 local / s3 两种 driver，S3 模式下生成图正确写入对象存储、media 代理经同一 provider 读取。
 - 积分 actual 按实际成功张数差异化结算：actual = settings.price_image_gen *
@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from io import BytesIO
@@ -53,6 +54,8 @@ from app.providers.storage import get_storage
 from app.services.credits import release as credits_release
 from app.services.credits import settle as credits_settle
 from app.services.media_storage_jobs import enqueue_delete
+from app.services.task_dispatch import cancel_outbox_task
+from app.workers.async_runtime import run_worker_async
 from app.workers.celery_app import celery_app
 
 logger = logging.getLogger(__name__)
@@ -258,6 +261,12 @@ async def cancel_generation_job(db, job_id: str, *, actor_user_id: str) -> bool:
             actor_user_id=actor_user_id,
             commit=False,
         )
+    await cancel_outbox_task(
+        db,
+        task_type="generation.generate_images",
+        job_id=job.job_id,
+        attempt=job.attempt,
+    )
     job.status = "canceled"
     job.canceled_at = datetime.now(UTC)
     job.finished_at = job.canceled_at
@@ -793,49 +802,147 @@ async def run_generation_once(
         )
 
 
-async def reconcile_generation_jobs(db, *, limit: int = 100) -> int:
-    """执行失败后处于 financial_cleanup 的任务，供后续 beat 接线。"""
-    rows = list(
+async def _load_authoritative_generation_reservation(
+    db: Any,
+    job_id: str,
+) -> CreditReservation | None:
+    """按不可变 source 映射锁定积分预约，载荷中的 reservation_id 仅作冗余。"""
+
+    return (
+        await db.execute(
+            select(CreditReservation)
+            .where(
+                CreditReservation.source_type == "generation_job",
+                CreditReservation.source_id == job_id,
+            )
+            .execution_options(populate_existing=True)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+
+
+async def _reconcile_one_generation_financial_cleanup(db: Any, job_id: str) -> bool:
+    job = (
+        await db.execute(
+            select(GenerationJob)
+            .where(
+                GenerationJob.job_id == job_id,
+                GenerationJob.status == "failed",
+                GenerationJob.error_type == "financial_cleanup",
+                GenerationJob.retryable.is_(True),
+            )
+            .options(noload(GenerationJob.material))
+            .execution_options(populate_existing=True)
+            .with_for_update(skip_locked=True)
+        )
+    ).scalar_one_or_none()
+    if job is None:
+        await db.rollback()
+        return False
+
+    reservation = await _load_authoritative_generation_reservation(db, job.job_id)
+    if reservation is not None and reservation.status == "reserved":
+        if credits_release is None:
+            await db.rollback()
+            return False
+        cleanup = (job.metrics or {}).get("financial_cleanup") or {}
+        action = cleanup.get("action") or "release"
+        await credits_release(
+            db,
+            reservation_id=reservation.id,
+            reason=f"generation financial cleanup: {action}",
+            actor_user_id=job.owner_user_id,
+            commit=False,
+        )
+        await db.flush()
+        reservation = await _load_authoritative_generation_reservation(db, job.job_id)
+        if reservation is not None and reservation.status == "reserved":
+            await db.rollback()
+            return False
+
+    job.retryable = False
+    await db.commit()
+    return True
+
+
+async def _run_generation_financial_cleanup_candidate(
+    db: Any,
+    job_id: str,
+) -> tuple[bool, bool]:
+    """返回（是否恢复、当前会话是否仍可安全复用）。"""
+
+    try:
+        return await _reconcile_one_generation_financial_cleanup(db, job_id), True
+    except Exception as exc:  # noqa: BLE001 - 单任务失败不得污染后续事务
+        logger.warning(
+            "图片财务清理失败 job_id=%s error_type=%s",
+            job_id,
+            exc.__class__.__name__,
+        )
+        try:
+            await db.rollback()
+            return False, True
+        except Exception as rollback_exc:  # noqa: BLE001 - 当前会话已不可复用
+            logger.warning(
+                "图片财务清理回滚失败 job_id=%s error_type=%s",
+                job_id,
+                rollback_exc.__class__.__name__,
+            )
+            return False, False
+
+
+async def reconcile_generation_jobs(
+    db: Any,
+    *,
+    limit: int = 100,
+    session_factory: Callable[[], Any] | None = None,
+) -> int:
+    """逐任务隔离地补偿失败图片任务的积分释放。"""
+
+    candidate_ids = list(
         (
             await db.execute(
-                select(GenerationJob)
+                select(GenerationJob.job_id)
                 .where(
                     GenerationJob.status == "failed",
                     GenerationJob.error_type == "financial_cleanup",
                     GenerationJob.retryable.is_(True),
                 )
+                .order_by(GenerationJob.created_at.asc(), GenerationJob.job_id.asc())
                 .limit(limit)
+                .with_for_update(skip_locked=True)
             )
         )
         .scalars()
         .all()
     )
+    await db.rollback()
     recovered = 0
-    for job in rows:
-        try:
-            cleanup = (job.metrics or {}).get("financial_cleanup") or {}
-            action = cleanup.get("action") or "release"
-            reservation_id = cleanup.get("reservation_id") or (job.input_json or {}).get("reservation_id")
-            if not reservation_id:
-                job.retryable = False
-                await db.commit()
-                recovered += 1
-                continue
-            if job.status != "failed" or job.error_type != "financial_cleanup":
-                await db.rollback()
-                continue
-            await credits_release(
+    for job_id in candidate_ids:
+        if session_factory is None:
+            resolved, healthy = await _run_generation_financial_cleanup_candidate(
                 db,
-                reservation_id=reservation_id,
-                reason=f"generation financial cleanup: {action}",
-                commit=False,
+                job_id,
             )
-            job.retryable = False
-            await db.commit()
-            recovered += 1
-        except Exception:
-            logger.exception("generation financial cleanup reconcile failed")
-            await db.rollback()
+            recovered += int(resolved)
+            if not healthy:
+                break
+            continue
+
+        resolved = False
+        try:
+            async with session_factory() as task_db:
+                resolved, _ = await _run_generation_financial_cleanup_candidate(
+                    task_db,
+                    job_id,
+                )
+        except Exception as exc:  # noqa: BLE001 - 关闭失败也必须隔离到当前任务
+            logger.warning(
+                "关闭图片财务清理会话失败 job_id=%s error_type=%s",
+                job_id,
+                exc.__class__.__name__,
+            )
+        recovered += int(resolved)
     return recovered
 
 
@@ -1051,7 +1158,7 @@ async def _run_generation(job_id: str) -> None:
     max_retries=0,
 )
 def generate_images_task(self, job_id: str) -> None:
-    """文生图 Celery 任务入口 — 在独立事件循环中执行异步主体。"""
+    """文生图 Celery 任务入口 — 在 worker 持久事件循环中执行异步主体。"""
     async def _run() -> None:
         async with async_session_factory() as db:
             await run_generation_once(
@@ -1060,7 +1167,7 @@ def generate_images_task(self, job_id: str) -> None:
                 owner="celery:generation.generate_images",
             )
 
-    asyncio.run(_run())
+    run_worker_async(_run())
 
 
 @celery_app.task(
@@ -1071,9 +1178,12 @@ def generate_images_task(self, job_id: str) -> None:
 def reconcile_generation_financial_cleanup_task(self) -> int:
     async def _run() -> int:
         async with async_session_factory() as db:
-            return await reconcile_generation_jobs(db)
+            return await reconcile_generation_jobs(
+                db,
+                session_factory=async_session_factory,
+            )
 
-    return asyncio.run(_run())
+    return run_worker_async(_run())
 
 
 @celery_app.task(
@@ -1086,4 +1196,4 @@ def reconcile_generation_stale_task(self) -> int:
         async with async_session_factory() as db:
             return await reconcile_stale_generation_jobs(db)
 
-    return asyncio.run(_run())
+    return run_worker_async(_run())

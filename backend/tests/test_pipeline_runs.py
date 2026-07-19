@@ -53,6 +53,7 @@ def _job(**overrides) -> SimpleNamespace:
         "script_id": "script-1",
         "episode_id": "episode-1",
         "run_id": "failed-run",
+        "dispatch_id": "dispatch-1",
         "stage": "extract",
         "status": "failed",
         "attempt": 2,
@@ -66,6 +67,26 @@ def _job(**overrides) -> SimpleNamespace:
     return SimpleNamespace(**values)
 
 
+def _valid_history(
+    *,
+    run_id: str = "failed-run",
+    baseline_attempt: int = 2,
+) -> list[SimpleNamespace]:
+    return [
+        _job(
+            id=f"{stage}-{baseline_attempt}",
+            run_id=run_id,
+            stage=stage,
+            status="done",
+            attempt=baseline_attempt,
+            retryable=None,
+            error_type=None,
+            error_message=None,
+        )
+        for stage in STAGE_ORDER
+    ]
+
+
 def test_retry_schema_requires_failed_run_and_manual_forbids_it() -> None:
     with pytest.raises(ValidationError, match="failed_run_id"):
         _body(mode=PipelineRunMode.RETRY_FAILED)
@@ -74,9 +95,19 @@ def test_retry_schema_requires_failed_run_and_manual_forbids_it() -> None:
 
 
 def test_retry_validation_rejects_nonretryable_and_stale_input() -> None:
+    jobs = _valid_history()
+    jobs[3].status = "failed"
+    jobs[3].retryable = False
+    jobs[4].status = "ready"
     with pytest.raises(ConflictError, match="不可重试"):
         pipeline_runs_service._validate_retry_source(
-            [_job(retryable=False)], input_version=4, input_client_save_seq=9
+            jobs, input_version=4, input_client_save_seq=9
+        )
+
+    jobs[3].retryable = True
+    with pytest.raises(ConflictError, match="输入版本已过期"):
+        pipeline_runs_service._validate_retry_source(
+            jobs, input_version=5, input_client_save_seq=10
         )
 
 
@@ -91,6 +122,268 @@ def test_replay_status_uses_latest_attempts() -> None:
     assert pipeline_runs_service._derive_run_status(jobs) == "failed"
 
 
+@pytest.mark.parametrize(
+    "invalid_history",
+    [
+        "missing-baseline",
+        "below-baseline",
+        "duplicate-attempt",
+        "attempt-gap",
+        "scope-mismatch",
+    ],
+)
+def test_replay_job_history_rejects_invalid_retry_sequences(
+    invalid_history: str,
+) -> None:
+    def history_job(stage: str, attempt: int, **overrides) -> SimpleNamespace:
+        values = {
+            "id": f"{stage}-{attempt}",
+            "script_id": "script-1",
+            "episode_id": "episode-1",
+            "run_id": "run-1",
+            "stage": stage,
+            "dispatch_id": "dispatch-1",
+            "status": "done",
+            "attempt": attempt,
+            "input_version": 4,
+            "input_client_save_seq": 9,
+        }
+        values.update(overrides)
+        return SimpleNamespace(**values)
+
+    jobs = [history_job(stage, 2) for stage in STAGE_ORDER]
+    assert pipeline_runs_service._pipeline_job_history_is_valid(
+        jobs,
+        script_id="script-1",
+        episode_id="episode-1",
+        run_id="run-1",
+        dispatch_id="dispatch-1",
+        baseline_attempt=2,
+        input_version=4,
+        input_client_save_seq=9,
+    )
+
+    retry_stage = STAGE_ORDER[0]
+    if invalid_history == "missing-baseline":
+        jobs[0].attempt = 3
+    elif invalid_history == "below-baseline":
+        jobs.append(history_job(retry_stage, 1))
+    elif invalid_history == "duplicate-attempt":
+        jobs.append(history_job(retry_stage, 2, id="duplicate"))
+    elif invalid_history == "attempt-gap":
+        jobs.append(history_job(retry_stage, 4))
+    else:
+        jobs.append(history_job(retry_stage, 3, dispatch_id="other-dispatch"))
+
+    assert not pipeline_runs_service._pipeline_job_history_is_valid(
+        jobs,
+        script_id="script-1",
+        episode_id="episode-1",
+        run_id="run-1",
+        dispatch_id="dispatch-1",
+        baseline_attempt=2,
+        input_version=4,
+        input_client_save_seq=9,
+    )
+
+
+@pytest.mark.parametrize(
+    "invalid_history",
+    [
+        "unknown-stage",
+        "missing-stage",
+        "done-before-retry",
+        "nonretryable-before-retry",
+        "unknown-status",
+        "nonleaf-ready",
+        "extract-before-split",
+        "merge-before-extract",
+        "leaf-before-merge",
+        "single-leaf-done",
+    ],
+)
+def test_pipeline_history_rejects_impossible_worker_state(
+    invalid_history: str,
+) -> None:
+    jobs = _valid_history(run_id="run-1")
+
+    if invalid_history == "unknown-stage":
+        jobs.append(_job(id="unknown-2", run_id="run-1", stage="unknown"))
+    elif invalid_history == "missing-stage":
+        jobs = [job for job in jobs if job.stage != "parents"]
+    elif invalid_history in {"done-before-retry", "nonretryable-before-retry"}:
+        source = next(job for job in jobs if job.stage == "enrich")
+        source.status = "done" if invalid_history == "done-before-retry" else "failed"
+        source.retryable = invalid_history == "done-before-retry"
+        jobs.append(
+            _job(
+                id="enrich-3",
+                run_id="run-1",
+                stage="enrich",
+                status="running",
+                attempt=3,
+                retryable=None,
+                error_type=None,
+                error_message=None,
+            )
+        )
+        next(job for job in jobs if job.stage == "parents").status = "ready"
+    elif invalid_history == "unknown-status":
+        jobs[0].status = "retry"
+    elif invalid_history == "nonleaf-ready":
+        jobs[1].status = "ready"
+    elif invalid_history == "extract-before-split":
+        jobs[0].status = "pending"
+        jobs[1].status = "running"
+        for job in jobs[2:]:
+            job.status = "pending"
+    elif invalid_history == "merge-before-extract":
+        jobs[1].status = "pending"
+        jobs[2].status = "failed"
+        jobs[2].retryable = True
+        for job in jobs[3:]:
+            job.status = "pending"
+    elif invalid_history == "leaf-before-merge":
+        jobs[2].status = "pending"
+        jobs[3].status = "running"
+        jobs[4].status = "pending"
+    else:
+        jobs[4].status = "ready"
+
+    assert not pipeline_runs_service._pipeline_job_history_is_valid(
+        jobs,
+        script_id="script-1",
+        episode_id="episode-1",
+        run_id="run-1",
+        dispatch_id="dispatch-1",
+        baseline_attempt=2,
+        input_version=4,
+        input_client_save_seq=9,
+    )
+
+
+def test_retry_source_reuses_authoritative_history_validation() -> None:
+    jobs = _valid_history()
+    enrich = next(job for job in jobs if job.stage == "enrich")
+    parents = next(job for job in jobs if job.stage == "parents")
+    enrich.status = "failed"
+    enrich.retryable = True
+    parents.status = "ready"
+
+    assert (
+        pipeline_runs_service._validate_retry_source(
+            jobs,
+            input_version=4,
+            input_client_save_seq=9,
+        )
+        == 3
+    )
+
+    enrich.status = "done"
+    jobs.append(
+        _job(
+            id="enrich-3",
+            stage="enrich",
+            status="failed",
+            attempt=3,
+            retryable=True,
+        )
+    )
+    with pytest.raises(ConflictError, match="历史已失效"):
+        pipeline_runs_service._validate_retry_source(
+            jobs,
+            input_version=4,
+            input_client_save_seq=9,
+        )
+
+
+def test_pipeline_history_requires_prerequisites_for_any_execution_evidence() -> None:
+    invalid = _valid_history()
+    for job in invalid:
+        job.status = "pending"
+        job.retryable = None
+    split = next(job for job in invalid if job.stage == "split")
+    extract = next(job for job in invalid if job.stage == "extract")
+    split.status = "failed"
+    split.retryable = True
+    extract.status = "failed"
+    extract.retryable = True
+    invalid.append(
+        _job(
+            id="extract-3",
+            stage="extract",
+            status="pending",
+            attempt=3,
+            retryable=None,
+            error_type=None,
+            error_message=None,
+        )
+    )
+
+    assert not pipeline_runs_service._pipeline_job_history_is_valid(
+        invalid,
+        script_id="script-1",
+        episode_id="episode-1",
+        run_id="failed-run",
+        dispatch_id="dispatch-1",
+        baseline_attempt=2,
+        input_version=4,
+        input_client_save_seq=9,
+    )
+    with pytest.raises(ConflictError, match="历史已失效"):
+        pipeline_runs_service._validate_retry_source(
+            invalid,
+            input_version=4,
+            input_client_save_seq=9,
+        )
+
+    waiting = _valid_history(run_id="waiting-run")
+    for job in waiting:
+        job.status = "pending"
+        job.retryable = None
+    assert pipeline_runs_service._pipeline_job_history_is_valid(
+        waiting,
+        script_id="script-1",
+        episode_id="episode-1",
+        run_id="waiting-run",
+        dispatch_id="dispatch-1",
+        baseline_attempt=2,
+        input_version=4,
+        input_client_save_seq=9,
+    )
+
+    legal_retry = _valid_history(run_id="retry-run")
+    for job in legal_retry:
+        job.status = "pending"
+        job.retryable = None
+    next(job for job in legal_retry if job.stage == "split").status = "done"
+    extract = next(job for job in legal_retry if job.stage == "extract")
+    extract.status = "failed"
+    extract.retryable = True
+    legal_retry.append(
+        _job(
+            id="extract-retry-3",
+            run_id="retry-run",
+            stage="extract",
+            status="pending",
+            attempt=3,
+            retryable=None,
+            error_type=None,
+            error_message=None,
+        )
+    )
+    assert pipeline_runs_service._pipeline_job_history_is_valid(
+        legal_retry,
+        script_id="script-1",
+        episode_id="episode-1",
+        run_id="retry-run",
+        dispatch_id="dispatch-1",
+        baseline_attempt=2,
+        input_version=4,
+        input_client_save_seq=9,
+    )
+
+
 async def test_active_detection_ignores_failed_pending_leftovers_but_not_running() -> None:
     failed = _job(stage="split", status="failed", attempt=1)
     leftover = _job(stage="extract", status="pending", attempt=1)
@@ -102,10 +395,6 @@ async def test_active_detection_ignores_failed_pending_leftovers_but_not_running
         return_value=_RowsResult([failed, leftover, sibling_running])
     )
     assert await pipeline_runs_service._find_active_run(db, "script-1") == "failed-run"
-    with pytest.raises(ConflictError, match="输入版本已过期"):
-        pipeline_runs_service._validate_retry_source(
-            [_job()], input_version=5, input_client_save_seq=10
-        )
 
 
 async def test_route_requires_run_ai_and_blocks_cross_resource(monkeypatch) -> None:
@@ -169,7 +458,9 @@ async def test_route_propagates_viewer_denial_before_creating_run(monkeypatch) -
     create.assert_not_awaited()
 
 
-async def test_idempotent_replay_returns_before_active_run_check(monkeypatch) -> None:
+async def test_idempotent_replay_reloads_episode_before_active_run_check(
+    monkeypatch,
+) -> None:
     db = _Session()
     expected = PipelineRunOut(
         script_id="script-1",
@@ -186,12 +477,13 @@ async def test_idempotent_replay_returns_before_active_run_check(monkeypatch) ->
         idempotent_replay=True,
     )
     reload_episode = AsyncMock()
+    load_idempotent_result = AsyncMock(return_value=expected)
     audit = AsyncMock()
     monkeypatch.setattr(pipeline_runs_service, "_acquire_script_lock", AsyncMock())
     monkeypatch.setattr(
         pipeline_runs_service,
         "_load_idempotent_result",
-        AsyncMock(return_value=expected),
+        load_idempotent_result,
     )
     monkeypatch.setattr(pipeline_runs_service, "_reload_episode", reload_episode)
     monkeypatch.setattr(pipeline_runs_service, "audit_log", audit)
@@ -206,7 +498,13 @@ async def test_idempotent_replay_returns_before_active_run_check(monkeypatch) ->
     )
 
     assert actual == expected
-    reload_episode.assert_not_awaited()
+    reload_episode.assert_awaited_once_with(
+        db,
+        script_id="script-1",
+        episode_id="episode-1",
+    )
+    assert load_idempotent_result.await_args.kwargs["script_id"] == "script-1"
+    assert load_idempotent_result.await_args.kwargs["episode_id"] == "episode-1"
     audit.assert_not_awaited()
     db.commit.assert_awaited_once()
 
@@ -261,8 +559,11 @@ async def test_retry_creates_new_run_attempt_reservation_outbox_without_mutating
     monkeypatch,
 ) -> None:
     db = _Session()
-    source = _job()
-    old_snapshot = vars(source).copy()
+    source_jobs = _valid_history()
+    source_jobs[3].status = "failed"
+    source_jobs[3].retryable = True
+    source_jobs[4].status = "ready"
+    old_snapshots = [vars(source).copy() for source in source_jobs]
     episode = SimpleNamespace(
         episode_id="episode-1",
         script_id="script-1",
@@ -287,7 +588,9 @@ async def test_retry_creates_new_run_attempt_reservation_outbox_without_mutating
         pipeline_runs_service, "_find_active_run", AsyncMock(return_value=None)
     )
     monkeypatch.setattr(
-        pipeline_runs_service, "_load_retry_source", AsyncMock(return_value=[source])
+        pipeline_runs_service,
+        "_load_retry_source",
+        AsyncMock(return_value=source_jobs),
     )
     monkeypatch.setattr(
         pipeline_runs_service,
@@ -314,7 +617,7 @@ async def test_retry_creates_new_run_attempt_reservation_outbox_without_mutating
     assert result.run_id != "failed-run"
     assert result.retry_of_run_id == "failed-run"
     assert result.attempt == 3
-    assert vars(source) == old_snapshot
+    assert [vars(source) for source in source_jobs] == old_snapshots
     new_jobs = [row for row in db.added if isinstance(row, PipelineJob)]
     assert {row.stage for row in new_jobs} == set(STAGE_ORDER)
     assert {row.attempt for row in new_jobs} == {3}

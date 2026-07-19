@@ -1,5 +1,7 @@
 import asyncio
 import importlib
+import os
+import secrets
 import sys
 from datetime import UTC, datetime, timedelta
 from types import ModuleType, SimpleNamespace
@@ -7,29 +9,37 @@ from unittest.mock import AsyncMock
 
 import pytest
 from pydantic import ValidationError
-from sqlalchemy import UniqueConstraint, create_engine, select, update
+from sqlalchemy import UniqueConstraint, create_engine, delete, select, text, update
 from sqlalchemy.dialects import postgresql, sqlite
 from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import Session
 
 from app.api.v1 import scripts as scripts_api
-from app.core.errors import ConflictError
+from app.core.errors import ConflictError, NotFoundError
 from app.core.job_state import (
     PipelineFailure,
     StageSnapshot,
     is_current_input_version,
     reset_stage,
 )
+from app.crud import script as script_crud
 from app.crud.script import replace_subjects
 from app.models.base import Base
+from app.models.credit import CreditAccount
+from app.models.credit_log import CreditLog
+from app.models.credit_reservation import CreditReservation
 from app.models.episode import Episode
 from app.models.pipeline_job import PipelineJob
+from app.models.pipeline_stage import PipelineStage
 from app.models.scene import Scene
 from app.models.script import Script
 from app.models.shot import Shot
 from app.models.shot_group import ShotGroup
 from app.models.subject import Subject
+from app.models.task_dispatch_outbox import TaskDispatchOutbox
+from app.models.user import User
 from app.schemas import pipeline_contracts
 from app.schemas.pipeline_contracts import (
     EnrichOutput,
@@ -39,9 +49,12 @@ from app.schemas.pipeline_contracts import (
     SplitOutput,
     should_enrich_subject,
 )
+from app.schemas.pipeline_runs import PipelineRunCreateIn, PipelineRunMode
 from app.schemas.script import EpisodeCreateIn
 from app.services import generation as generation_service
+from app.services import pipeline_runs as pipeline_runs_service
 from app.services.pipeline import (
+    STAGE_ORDER,
     enrich,
     extract,
     input_episode_is_current,
@@ -86,6 +99,54 @@ class _TriggerSessionAdapter(_AsyncSessionAdapter):
         if "pg_advisory_xact_lock" in str(statement):
             return self.session.execute(select(1))
         return await super().execute(statement)
+
+
+class _RecordingTriggerSessionAdapter(_TriggerSessionAdapter):
+    def __init__(self, session: Session) -> None:
+        super().__init__(session)
+        self.statements: list[object] = []
+        self.bind = SimpleNamespace(dialect=SimpleNamespace(name="postgresql"))
+
+    async def execute(self, statement):
+        self.statements.append(statement)
+        return await super().execute(statement)
+
+
+def _postgres_sql(statements: list[object]) -> list[str]:
+    return [
+        " ".join(
+            str(statement.compile(dialect=postgresql.dialect())).upper().split()
+        )
+        for statement in statements
+    ]
+
+
+def _create_pipeline_job_test_tables(engine) -> None:
+    Script.__table__.create(engine)
+    Episode.__table__.create(engine)
+    PipelineJob.__table__.create(engine)
+
+
+def _seed_pipeline_job_parents(session: Session) -> None:
+    session.add(
+        Script(
+            id="script-1",
+            title="流水线测试剧本",
+            scope="personal",
+            owner_user_id="user-1",
+            created_by_user_id="user-1",
+        )
+    )
+    session.flush()
+    session.add(
+        Episode(
+            episode_id="episode-1",
+            script_id="script-1",
+            episode_no=1,
+            title="第一集",
+        )
+    )
+    session.flush()
 
 
 class FakeProvider:
@@ -702,13 +763,11 @@ def test_trigger_pipeline_supersedes_running_run_and_schedules_latest_input(
             def __init__(self) -> None:
                 self.added: list[object] = []
                 self.commits = 0
-                self.exec_calls = 0
 
             async def execute(self, statement):
-                self.exec_calls += 1
                 account = SimpleNamespace(id="account-1")
                 return SimpleNamespace(
-                    scalar_one_or_none=lambda: account if self.exec_calls > 1 else None,
+                    scalar_one_or_none=lambda: account,
                     scalar=lambda: 0,
                 )
 
@@ -729,6 +788,13 @@ def test_trigger_pipeline_supersedes_running_run_and_schedules_latest_input(
                 self.commits += 1
 
         db = _TriggerDb()
+        lock_parents = AsyncMock(
+            return_value=(
+                SimpleNamespace(owner_user_id="user-1"),
+                SimpleNamespace(episode_version=4, client_save_seq=10),
+            )
+        )
+        monkeypatch.setattr(orchestrator, "_lock_pipeline_parents", lock_parents)
         monkeypatch.setattr(orchestrator, "_supersede_active_pipeline_runs", AsyncMock(return_value=1))
         monkeypatch.setattr(orchestrator, "_is_running", AsyncMock(return_value=True))
         monkeypatch.setattr(orchestrator, "_estimate_cost", AsyncMock(return_value=12))
@@ -750,12 +816,559 @@ def test_trigger_pipeline_supersedes_running_run_and_schedules_latest_input(
         assert {job.stage for job in jobs} == set(orchestrator.STAGE_ORDER)
         assert {job.input_version for job in jobs} == {4}
         assert {job.input_client_save_seq for job in jobs} == {10}
+        lock_parents.assert_awaited_once_with(db, "script-1", "episode-1")
         orchestrator._supersede_active_pipeline_runs.assert_awaited_once()
         orchestrator.reserve.assert_awaited_once()
         orchestrator.enqueue_task.assert_awaited_once()
         assert db.commits == 1
 
     asyncio.run(scenario())
+
+
+def test_manual_pipeline_locks_script_before_advisory_lock() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    _create_pipeline_job_test_tables(engine)
+    with Session(engine, expire_on_commit=False) as raw:
+        _seed_pipeline_job_parents(raw)
+        raw.commit()
+        db = _RecordingTriggerSessionAdapter(raw)
+
+        asyncio.run(pipeline_runs_service._acquire_script_lock(db, "script-1"))
+
+        sql = _postgres_sql(db.statements)
+        script_lock = next(
+            index
+            for index, statement in enumerate(sql)
+            if "FROM SCRIPTS" in statement and "FOR KEY SHARE" in statement
+        )
+        advisory_lock = next(
+            index
+            for index, statement in enumerate(sql)
+            if "PG_ADVISORY_XACT_LOCK" in statement
+        )
+        assert script_lock < advisory_lock
+
+
+def test_manual_pipeline_replay_requires_live_episode_jobs_and_dispatch() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine, expire_on_commit=False) as raw:
+        _seed_pipeline_job_parents(raw)
+        body = PipelineRunCreateIn(
+            mode=PipelineRunMode.MANUAL_REEXTRACT,
+            episode_version=1,
+            client_save_seq=0,
+        )
+        idempotency_key = "manual-replay"
+        run_id = pipeline_runs_service._run_id_for_request(
+            script_id="script-1",
+            episode_id="episode-1",
+            actor_user_id="user-1",
+            idempotency_key=idempotency_key,
+        )
+        dispatch = TaskDispatchOutbox(
+            id="dispatch-manual-replay",
+            task_type=orchestrator.PIPELINE_DAG_TASK_TYPE,
+            job_id=run_id,
+            attempt=1,
+            payload={
+                "script_id": "script-1",
+                "episode_id": "episode-1",
+                "run_id": run_id,
+                "dispatch_id": "dispatch-manual-replay",
+                "reservation_id": "reservation-manual-replay",
+                "mode": body.mode.value,
+                "retry_of_run_id": None,
+                "pipeline_attempt": 1,
+                "input_version": 1,
+                "input_client_save_seq": 0,
+                "estimated": 1,
+                "requested_by_user_id": "user-1",
+                "idempotency_key_hash": pipeline_runs_service._idempotency_hash(
+                    idempotency_key
+                ),
+                "request_fingerprint": pipeline_runs_service._request_fingerprint(body),
+            },
+            status="pending",
+        )
+        raw.add(dispatch)
+        raw.add_all(
+            [
+                PipelineJob(
+                    id=f"job-manual-replay-{stage}",
+                    script_id="script-1",
+                    episode_id="episode-1",
+                    stage=stage,
+                    dispatch_id=dispatch.id,
+                    run_id=run_id,
+                    status="pending",
+                    input_version=1,
+                    input_client_save_seq=0,
+                    attempt=1,
+                )
+                for stage in STAGE_ORDER
+            ]
+        )
+        raw.commit()
+        db = _RecordingTriggerSessionAdapter(raw)
+        actor = SimpleNamespace(user_id="user-1", username="alice")
+
+        replay = asyncio.run(
+            pipeline_runs_service.create_pipeline_run(
+                db,
+                script=SimpleNamespace(
+                    id="script-1",
+                    owner_user_id="user-1",
+                ),
+                episode_id="episode-1",
+                actor=actor,
+                body=body,
+                idempotency_key=idempotency_key,
+            )
+        )
+
+        assert replay.idempotent_replay is True
+        sql = _postgres_sql(db.statements)
+        script_lock = next(
+            index
+            for index, statement in enumerate(sql)
+            if "FROM SCRIPTS" in statement and "FOR KEY SHARE" in statement
+        )
+        advisory_lock = next(
+            index
+            for index, statement in enumerate(sql)
+            if "PG_ADVISORY_XACT_LOCK" in statement
+        )
+        episode_lock = next(
+            index
+            for index, statement in enumerate(sql)
+            if "FROM EPISODES" in statement and "FOR UPDATE" in statement
+        )
+        pipeline_job_lock = next(
+            index
+            for index, statement in enumerate(sql)
+            if "FROM PIPELINE_JOBS" in statement and "FOR UPDATE" in statement
+        )
+        assert script_lock < advisory_lock < episode_lock < pipeline_job_lock
+
+        raw.execute(delete(PipelineJob).where(PipelineJob.run_id == run_id))
+        dispatch.status = "canceled"
+        raw.commit()
+
+        with pytest.raises(ConflictError, match="流水线运行已失效"):
+            asyncio.run(
+                pipeline_runs_service.create_pipeline_run(
+                    db,
+                    script=SimpleNamespace(
+                        id="script-1",
+                        owner_user_id="user-1",
+                    ),
+                    episode_id="episode-1",
+                    actor=actor,
+                    body=body,
+                    idempotency_key=idempotency_key,
+                )
+            )
+
+        raw.execute(delete(Episode).where(Episode.episode_id == "episode-1"))
+        raw.commit()
+
+        with pytest.raises(NotFoundError, match="分集不存在"):
+            asyncio.run(
+                pipeline_runs_service.create_pipeline_run(
+                    db,
+                    script=SimpleNamespace(
+                        id="script-1",
+                        owner_user_id="user-1",
+                    ),
+                    episode_id="episode-1",
+                    actor=actor,
+                    body=body,
+                    idempotency_key=idempotency_key,
+                )
+            )
+
+
+@pytest.mark.parametrize(
+    ("latest_retry_status", "expected_run_status"),
+    [
+        pytest.param("running", "running", id="running"),
+        pytest.param("done", "done", id="done"),
+        pytest.param("failed", "failed", id="failed"),
+    ],
+)
+def test_manual_pipeline_replay_accepts_worker_retry_history(
+    latest_retry_status: str,
+    expected_run_status: str,
+) -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine, expire_on_commit=False) as raw:
+        _seed_pipeline_job_parents(raw)
+        body = PipelineRunCreateIn(
+            mode=PipelineRunMode.MANUAL_REEXTRACT,
+            episode_version=1,
+            client_save_seq=0,
+        )
+        idempotency_key = f"manual-replay-worker-retry-{latest_retry_status}"
+        run_id = pipeline_runs_service._run_id_for_request(
+            script_id="script-1",
+            episode_id="episode-1",
+            actor_user_id="user-1",
+            idempotency_key=idempotency_key,
+        )
+        dispatch = TaskDispatchOutbox(
+            id=f"dispatch-manual-replay-worker-retry-{latest_retry_status}",
+            task_type=orchestrator.PIPELINE_DAG_TASK_TYPE,
+            job_id=run_id,
+            attempt=1,
+            payload={
+                "script_id": "script-1",
+                "episode_id": "episode-1",
+                "run_id": run_id,
+                "dispatch_id": (
+                    f"dispatch-manual-replay-worker-retry-{latest_retry_status}"
+                ),
+                "reservation_id": "reservation-manual-replay-worker-retry",
+                "mode": body.mode.value,
+                "retry_of_run_id": None,
+                "pipeline_attempt": 1,
+                "input_version": 1,
+                "input_client_save_seq": 0,
+                "estimated": 1,
+                "requested_by_user_id": "user-1",
+                "idempotency_key_hash": pipeline_runs_service._idempotency_hash(
+                    idempotency_key
+                ),
+                "request_fingerprint": pipeline_runs_service._request_fingerprint(body),
+            },
+            status="pending",
+        )
+        # worker 只能在已完成前三阶段后重试叶子；另一个叶子会停在 ready，
+        # finalizer 成功时再将两个叶子原子推进为 done。
+        retry_stage = "enrich"
+        raw.add(dispatch)
+        raw.add_all(
+            [
+                PipelineJob(
+                    id=f"job-manual-replay-worker-retry-{stage}-attempt-1",
+                    script_id="script-1",
+                    episode_id="episode-1",
+                    stage=stage,
+                    dispatch_id=dispatch.id,
+                    run_id=run_id,
+                    status=(
+                        "failed"
+                        if stage == retry_stage
+                        else (
+                            "done"
+                            if stage != "parents" or latest_retry_status == "done"
+                            else "ready"
+                        )
+                    ),
+                    input_version=1,
+                    input_client_save_seq=0,
+                    attempt=1,
+                    retryable=True if stage == retry_stage else None,
+                )
+                for stage in STAGE_ORDER
+            ]
+        )
+        raw.add(
+            PipelineJob(
+                id="job-manual-replay-worker-retry-enrich-attempt-2",
+                script_id="script-1",
+                episode_id="episode-1",
+                stage=retry_stage,
+                dispatch_id=dispatch.id,
+                run_id=run_id,
+                status=latest_retry_status,
+                input_version=1,
+                input_client_save_seq=0,
+                attempt=2,
+            )
+        )
+        raw.commit()
+
+        replay = asyncio.run(
+            pipeline_runs_service.create_pipeline_run(
+                _RecordingTriggerSessionAdapter(raw),
+                script=SimpleNamespace(
+                    id="script-1",
+                    owner_user_id="user-1",
+                ),
+                episode_id="episode-1",
+                actor=SimpleNamespace(user_id="user-1", username="alice"),
+                body=body,
+                idempotency_key=idempotency_key,
+            )
+        )
+
+        assert replay.idempotent_replay is True
+        assert replay.attempt == 1
+        assert replay.status == expected_run_status
+
+
+@pytest.mark.parametrize(
+    ("payload_updates", "outbox_attempt"),
+    [
+        pytest.param({"mode": "retry_failed"}, 1, id="mode"),
+        pytest.param(
+            {"retry_of_run_id": "unrelated-retry-run"},
+            1,
+            id="retry-of-run",
+        ),
+        pytest.param({"pipeline_attempt": 99}, 1, id="pipeline-attempt"),
+        pytest.param(
+            {"requested_by_user_id": "unrelated-user"},
+            1,
+            id="requested-by-user",
+        ),
+        pytest.param(
+            {"idempotency_key_hash": "0" * 64},
+            1,
+            id="idempotency-key-hash",
+        ),
+        pytest.param({}, 99, id="outbox-attempt"),
+    ],
+)
+def test_manual_pipeline_replay_rejects_cross_field_tampering(
+    payload_updates: dict,
+    outbox_attempt: int,
+) -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine, expire_on_commit=False) as raw:
+        _seed_pipeline_job_parents(raw)
+        body = PipelineRunCreateIn(
+            mode=PipelineRunMode.MANUAL_REEXTRACT,
+            episode_version=1,
+            client_save_seq=0,
+        )
+        idempotency_key = "manual-replay-tamper"
+        run_id = pipeline_runs_service._run_id_for_request(
+            script_id="script-1",
+            episode_id="episode-1",
+            actor_user_id="user-1",
+            idempotency_key=idempotency_key,
+        )
+        payload = {
+            "script_id": "script-1",
+            "episode_id": "episode-1",
+            "run_id": run_id,
+            "dispatch_id": "dispatch-manual-replay-tamper",
+            "reservation_id": "reservation-manual-replay-tamper",
+            "mode": body.mode.value,
+            "retry_of_run_id": None,
+            "pipeline_attempt": 1,
+            "input_version": 1,
+            "input_client_save_seq": 0,
+            "estimated": 1,
+            "requested_by_user_id": "user-1",
+            "idempotency_key_hash": pipeline_runs_service._idempotency_hash(
+                idempotency_key
+            ),
+            "request_fingerprint": pipeline_runs_service._request_fingerprint(body),
+        }
+        payload.update(payload_updates)
+        dispatch = TaskDispatchOutbox(
+            id="dispatch-manual-replay-tamper",
+            task_type=orchestrator.PIPELINE_DAG_TASK_TYPE,
+            job_id=run_id,
+            attempt=outbox_attempt,
+            payload=payload,
+            status="pending",
+        )
+        raw.add(dispatch)
+        raw.add_all(
+            [
+                PipelineJob(
+                    id=f"job-manual-replay-tamper-{stage}",
+                    script_id="script-1",
+                    episode_id="episode-1",
+                    stage=stage,
+                    dispatch_id=dispatch.id,
+                    run_id=run_id,
+                    status="pending",
+                    input_version=1,
+                    input_client_save_seq=0,
+                    attempt=1,
+                )
+                for stage in STAGE_ORDER
+            ]
+        )
+        raw.commit()
+
+        assert payload["request_fingerprint"] == pipeline_runs_service._request_fingerprint(
+            body
+        )
+        with pytest.raises(ConflictError, match="流水线运行已失效"):
+            asyncio.run(
+                pipeline_runs_service.create_pipeline_run(
+                    _RecordingTriggerSessionAdapter(raw),
+                    script=SimpleNamespace(
+                        id="script-1",
+                        owner_user_id="user-1",
+                    ),
+                    episode_id="episode-1",
+                    actor=SimpleNamespace(user_id="user-1", username="alice"),
+                    body=body,
+                    idempotency_key=idempotency_key,
+                )
+            )
+
+
+@pytest.mark.parametrize("path", ["manual", "save", "orchestrator", "worker_retry"])
+def test_pipeline_parent_lock_paths_run_on_real_sqlite_without_postgres_function(
+    path: str,
+) -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine, expire_on_commit=False) as raw:
+        _seed_pipeline_job_parents(raw)
+        raw.commit()
+        db = _AsyncSessionAdapter(raw)
+
+        if path == "manual":
+            asyncio.run(pipeline_runs_service._acquire_script_lock(db, "script-1"))
+        elif path == "save":
+            asyncio.run(
+                script_crud.save_episode(
+                    db,
+                    "script-1",
+                    "episode-1",
+                    "更新正文",
+                    1,
+                    0,
+                    commit=False,
+                )
+            )
+        elif path == "orchestrator":
+            script, episode = asyncio.run(
+                orchestrator._lock_pipeline_parents(db, "script-1", "episode-1")
+            )
+            assert script.id == "script-1"
+            assert episode.episode_id == "episode-1"
+        else:
+            assert asyncio.run(
+                pipeline_worker._lock_pipeline_retry_parents(
+                    db,
+                    "script-1",
+                    "episode-1",
+                )
+            )
+
+
+def test_worker_retry_parent_lock_uses_script_advisory_episode_order_through_proxy() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    _create_pipeline_job_test_tables(engine)
+    with Session(engine, expire_on_commit=False) as raw:
+        _seed_pipeline_job_parents(raw)
+        raw.commit()
+        db = _RecordingTriggerSessionAdapter(raw)
+
+        class Proxy:
+            def __getattr__(self, name: str):
+                return getattr(db, name)
+
+        assert asyncio.run(
+            pipeline_worker._lock_pipeline_retry_parents(
+                Proxy(),
+                "script-1",
+                "episode-1",
+            )
+        )
+
+        sql = _postgres_sql(db.statements)
+        script_lock = next(
+            index
+            for index, statement in enumerate(sql)
+            if "FROM SCRIPTS" in statement and "FOR KEY SHARE" in statement
+        )
+        advisory_lock = next(
+            index
+            for index, statement in enumerate(sql)
+            if "PG_ADVISORY_XACT_LOCK" in statement
+        )
+        episode_lock = next(
+            index
+            for index, statement in enumerate(sql)
+            if "FROM EPISODES" in statement and "FOR KEY SHARE" in statement
+        )
+        assert script_lock < advisory_lock < episode_lock
+
+
+def test_automatic_save_locks_script_and_advisory_before_episode_update() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine, expire_on_commit=False) as raw:
+        _seed_pipeline_job_parents(raw)
+        raw.commit()
+        db = _RecordingTriggerSessionAdapter(raw)
+
+        asyncio.run(
+            script_crud.save_episode(
+                db,
+                "script-1",
+                "episode-1",
+                "更新正文",
+                1,
+                0,
+                commit=False,
+            )
+        )
+
+        sql = _postgres_sql(db.statements)
+        script_lock = next(
+            index
+            for index, statement in enumerate(sql)
+            if "FROM SCRIPTS" in statement and "FOR KEY SHARE" in statement
+        )
+        advisory_locks = [
+            index
+            for index, statement in enumerate(sql)
+            if "PG_ADVISORY_XACT_LOCK" in statement
+        ]
+        episode_update = next(
+            index
+            for index, statement in enumerate(sql)
+            if statement.startswith("UPDATE EPISODES")
+        )
+        assert advisory_locks
+        assert script_lock < advisory_locks[0] < episode_update
+
+
+def test_orchestrator_locks_script_and_advisory_before_episode() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine, expire_on_commit=False) as raw:
+        _seed_pipeline_job_parents(raw)
+        raw.commit()
+        db = _RecordingTriggerSessionAdapter(raw)
+
+        script, episode = asyncio.run(
+            orchestrator._lock_pipeline_parents(db, "script-1", "episode-1")
+        )
+
+        assert script.id == "script-1"
+        assert episode.episode_id == "episode-1"
+        sql = _postgres_sql(db.statements)
+        script_lock = next(
+            index
+            for index, statement in enumerate(sql)
+            if "FROM SCRIPTS" in statement and "FOR KEY SHARE" in statement
+        )
+        advisory_lock = next(
+            index
+            for index, statement in enumerate(sql)
+            if "PG_ADVISORY_XACT_LOCK" in statement
+        )
+        episode_lock = next(
+            index
+            for index, statement in enumerate(sql)
+            if "FROM EPISODES" in statement and "FOR KEY SHARE" in statement
+        )
+        assert script_lock < advisory_lock < episode_lock
 
 
 def test_episode_create_rejects_zero_and_negative_episode_numbers() -> None:
@@ -1975,6 +2588,7 @@ def test_worker_retryable_failure_requeues_without_releasing_reservation(monkeyp
     )
     finish = AsyncMock(return_value=True)
     release = AsyncMock()
+    parent_lock = AsyncMock(return_value=True)
 
     async def unavailable_service(*args, **kwargs):
         raise TimeoutError("provider timeout")
@@ -1983,6 +2597,11 @@ def test_worker_retryable_failure_requeues_without_releasing_reservation(monkeyp
     monkeypatch.setattr(pipeline_worker, "finish_pipeline_job", finish)
     monkeypatch.setattr(pipeline_worker, "heartbeat_pipeline_job", AsyncMock(return_value=True))
     monkeypatch.setattr(pipeline_worker, "_release_pipeline", release)
+    monkeypatch.setattr(
+        pipeline_worker,
+        "_lock_pipeline_retry_parents",
+        parent_lock,
+    )
     monkeypatch.setattr(pipeline_worker, "_resolve_service", lambda name: unavailable_service)
 
     class SessionContext:
@@ -2014,6 +2633,7 @@ def test_worker_retryable_failure_requeues_without_releasing_reservation(monkeyp
         assert len(retries) == 1
         assert retries[0].attempt == 2
         assert retries[0].status == "pending"
+        parent_lock.assert_awaited_once_with(db, "script-1", "episode-1")
         release.assert_not_awaited()
 
     asyncio.run(scenario())
@@ -2245,10 +2865,11 @@ def test_old_lease_token_rolls_back_service_business_writes(monkeypatch) -> None
 def test_worker_claim_heartbeat_and_finish_use_database_cas() -> None:
     async def scenario() -> None:
         engine = create_engine("sqlite+pysqlite:///:memory:")
-        PipelineJob.__table__.create(engine)
+        _create_pipeline_job_test_tables(engine)
         now = datetime.now(UTC)
         with Session(engine, expire_on_commit=False) as raw_session:
-            db = _AsyncSessionAdapter(raw_session)
+            _seed_pipeline_job_parents(raw_session)
+            db = _RecordingTriggerSessionAdapter(raw_session)
             rows = [
                 PipelineJob(
                     id="job-pending",
@@ -2298,10 +2919,35 @@ def test_worker_claim_heartbeat_and_finish_use_database_cas() -> None:
             retry = await pipeline_worker.claim_pipeline_job(
                 db, "run-1", "extract", "worker-1", dispatch_id="dispatch-1"
             )
+            reclaim_statement_offset = len(db.statements)
             reclaimed = await pipeline_worker.claim_pipeline_job(
                 db, "run-1", "merge", "worker-2", dispatch_id="dispatch-1"
             )
             assert pending and retry and reclaimed
+            reclaim_sql = _postgres_sql(db.statements[reclaim_statement_offset:])
+            script_lock = next(
+                index
+                for index, statement in enumerate(reclaim_sql)
+                if "FROM SCRIPTS" in statement and "FOR KEY SHARE" in statement
+            )
+            advisory_lock = next(
+                index
+                for index, statement in enumerate(reclaim_sql)
+                if "PG_ADVISORY_XACT_LOCK" in statement
+            )
+            episode_lock = next(
+                index
+                for index, statement in enumerate(reclaim_sql)
+                if "FROM EPISODES" in statement and "FOR KEY SHARE" in statement
+            )
+            candidate_lock = next(
+                index
+                for index, statement in enumerate(reclaim_sql)
+                if "FROM PIPELINE_JOBS" in statement
+                and "FOR UPDATE SKIP LOCKED" in statement
+            )
+            assert script_lock < advisory_lock < episode_lock < candidate_lock
+
             def job_value(job_id: str, column):
                 return raw_session.execute(
                     select(column).where(PipelineJob.id == job_id)
@@ -2367,10 +3013,11 @@ def test_pipeline_claim_query_uses_skip_locked_only_on_postgresql() -> None:
 def test_explicit_celery_retry_creates_new_immutable_attempt() -> None:
     async def scenario() -> None:
         engine = create_engine("sqlite+pysqlite:///:memory:")
-        PipelineJob.__table__.create(engine)
+        _create_pipeline_job_test_tables(engine)
         original_finished_at = datetime.now(UTC) - timedelta(minutes=1)
         with Session(engine, expire_on_commit=False) as raw_session:
-            db = _AsyncSessionAdapter(raw_session)
+            _seed_pipeline_job_parents(raw_session)
+            db = _RecordingTriggerSessionAdapter(raw_session)
             original = PipelineJob(
                 id="job-attempt-1",
                 script_id="script-1",
@@ -2400,7 +3047,30 @@ def test_explicit_celery_retry_creates_new_immutable_attempt() -> None:
             assert original.status == "failed"
             assert original.attempt == 1
             assert original.error_type == "provider_timeout"
-            assert original.finished_at == original_finished_at
+            assert original.finished_at is not None
+            assert original.finished_at.replace(tzinfo=UTC) == original_finished_at
+            sql = _postgres_sql(db.statements)
+            script_lock = next(
+                index
+                for index, statement in enumerate(sql)
+                if "FROM SCRIPTS" in statement and "FOR KEY SHARE" in statement
+            )
+            advisory_lock = next(
+                index
+                for index, statement in enumerate(sql)
+                if "PG_ADVISORY_XACT_LOCK" in statement
+            )
+            episode_lock = next(
+                index
+                for index, statement in enumerate(sql)
+                if "FROM EPISODES" in statement and "FOR KEY SHARE" in statement
+            )
+            source_lock = next(
+                index
+                for index, statement in enumerate(sql)
+                if "FROM PIPELINE_JOBS" in statement and "FOR UPDATE" in statement
+            )
+            assert script_lock < advisory_lock < episode_lock < source_lock
             attempts = list(
                 raw_session.execute(
                     select(PipelineJob.attempt)
@@ -3352,11 +4022,12 @@ def test_pipeline_claim_is_exclusive_across_two_sqlite_sessions_and_expires_to_n
 ) -> None:
     async def scenario() -> None:
         engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'pipeline-claim.db'}")
-        PipelineJob.__table__.create(engine)
+        _create_pipeline_job_test_tables(engine)
         with (
             Session(engine, expire_on_commit=False) as first_raw,
             Session(engine, expire_on_commit=False) as second_raw,
         ):
+            _seed_pipeline_job_parents(first_raw)
             first = _AsyncSessionAdapter(first_raw)
             second = _AsyncSessionAdapter(second_raw)
             first.add(
@@ -3413,3 +4084,708 @@ def test_pipeline_claim_is_exclusive_across_two_sqlite_sessions_and_expires_to_n
             assert original_status == "failed"
 
     asyncio.run(scenario())
+
+
+@pytest.mark.skipif(
+    not os.getenv("MTV_TEST_POSTGRES_URL"),
+    reason="未提供 MTV_TEST_POSTGRES_URL，跳过真实 PostgreSQL 流水线重试删除竞态测试",
+)
+def test_postgres_pipeline_retry_uses_parent_first_lock_order_and_fails_closed() -> None:
+    async def scenario() -> None:
+        database_url = os.environ["MTV_TEST_POSTGRES_URL"]
+        if database_url.startswith("postgresql://"):
+            database_url = database_url.replace(
+                "postgresql://", "postgresql+asyncpg://", 1
+            )
+        engine = create_async_engine(database_url)
+        session_factory = async_sessionmaker(engine, expire_on_commit=False)
+        suffix = secrets.token_hex(6)
+        user_id = f"user-pipeline-retry-{suffix}"
+        script_id = f"script-pipeline-retry-{suffix}"
+        episode_id = f"episode-pipeline-retry-{suffix}"
+        run_id = f"run-pipeline-retry-{suffix}"
+        job_id = f"job-pipeline-retry-{suffix}"
+
+        try:
+            async with session_factory() as setup:
+                setup.add(
+                    User(
+                        user_id=user_id,
+                        username=f"pipeline-retry-{suffix}",
+                        password_hash="hash",
+                        enabled=True,
+                    )
+                )
+                setup.add(
+                    Script(
+                        id=script_id,
+                        title="流水线重试删除锁序测试",
+                        scope="personal",
+                        owner_user_id=user_id,
+                        created_by_user_id=user_id,
+                    )
+                )
+                await setup.flush()
+                setup.add(
+                    Episode(
+                        episode_id=episode_id,
+                        script_id=script_id,
+                        episode_no=1,
+                        title="第一集",
+                    )
+                )
+                await setup.flush()
+                setup.add(
+                    PipelineJob(
+                        id=job_id,
+                        script_id=script_id,
+                        episode_id=episode_id,
+                        stage="merge",
+                        dispatch_id=f"dispatch-{suffix}",
+                        run_id=run_id,
+                        status="running",
+                        input_version=1,
+                        attempt=1,
+                        lease_owner="stale-worker",
+                        lease_token="stale-token",
+                        lease_until=datetime.now(UTC) - timedelta(seconds=1),
+                    )
+                )
+                await setup.commit()
+
+            async with (
+                session_factory() as deleting,
+                session_factory() as retrying,
+                session_factory() as observer,
+            ):
+                retry_task = None
+                try:
+                    await deleting.execute(text("SET LOCAL lock_timeout = '5s'"))
+                    await retrying.execute(text("SET LOCAL lock_timeout = '5s'"))
+                    await script_crud.get_script_for_update(deleting, script_id)
+                    await script_crud.get_episode_for_update(
+                        deleting,
+                        script_id,
+                        episode_id,
+                    )
+                    retry_pid = int(
+                        (await retrying.execute(text("SELECT pg_backend_pid()"))).scalar_one()
+                    )
+                    retry_task = asyncio.create_task(
+                        pipeline_worker.claim_pipeline_job(
+                            retrying,
+                            run_id,
+                            "merge",
+                            "retry-worker",
+                            dispatch_id=f"dispatch-{suffix}",
+                        )
+                    )
+
+                    deadline = asyncio.get_running_loop().time() + 5
+                    while True:
+                        wait_event_type = (
+                            await observer.execute(
+                                text(
+                                    "SELECT wait_event_type FROM pg_stat_activity "
+                                    "WHERE pid = :pid"
+                                ),
+                                {"pid": retry_pid},
+                            )
+                        ).scalar_one_or_none()
+                        if wait_event_type == "Lock":
+                            break
+                        if asyncio.get_running_loop().time() >= deadline:
+                            raise AssertionError("retry 事务未进入预期父行锁等待")
+                        await asyncio.sleep(0.02)
+
+                    await script_crud.delete_episode(
+                        deleting,
+                        script_id,
+                        episode_id,
+                        commit=False,
+                    )
+                    await deleting.commit()
+                    claim = await asyncio.wait_for(retry_task, timeout=5)
+                    assert claim is None
+                    await retrying.rollback()
+                finally:
+                    if retry_task is not None and not retry_task.done():
+                        retry_task.cancel()
+                        await asyncio.gather(retry_task, return_exceptions=True)
+                    await deleting.rollback()
+                    await retrying.rollback()
+                    await observer.rollback()
+
+            async with session_factory() as verification:
+                assert await verification.get(Episode, episode_id) is None
+                remaining_jobs = int(
+                    (
+                        await verification.execute(
+                            select(PipelineJob.id).where(
+                                PipelineJob.script_id == script_id
+                            )
+                        )
+                    ).scalars().first()
+                    is not None
+                )
+                assert remaining_jobs == 0
+        finally:
+            async with session_factory() as cleanup:
+                await cleanup.execute(
+                    delete(PipelineJob).where(PipelineJob.script_id == script_id)
+                )
+                await cleanup.execute(
+                    delete(Episode).where(Episode.script_id == script_id)
+                )
+                await cleanup.execute(delete(Script).where(Script.id == script_id))
+                await cleanup.execute(delete(User).where(User.user_id == user_id))
+                await cleanup.commit()
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.skipif(
+    not os.getenv("MTV_TEST_POSTGRES_URL"),
+    reason="未提供 MTV_TEST_POSTGRES_URL，跳过人工流水线幂等重放删除竞态测试",
+)
+def test_postgres_manual_replay_returns_not_found_after_episode_delete() -> None:
+    async def scenario() -> None:
+        database_url = os.environ["MTV_TEST_POSTGRES_URL"]
+        if database_url.startswith("postgresql://"):
+            database_url = database_url.replace(
+                "postgresql://", "postgresql+asyncpg://", 1
+            )
+        engine = create_async_engine(database_url)
+        session_factory = async_sessionmaker(engine, expire_on_commit=False)
+        suffix = secrets.token_hex(6)
+        user_id = f"u-pr-{suffix}"
+        script_id = f"s-pr-{suffix}"
+        episode_id = f"e-pr-{suffix}"
+        dispatch_id = f"d-pr-{suffix}"
+        idempotency_key = f"manual-replay-{suffix}"
+        body = PipelineRunCreateIn(
+            mode=PipelineRunMode.MANUAL_REEXTRACT,
+            episode_version=1,
+            client_save_seq=0,
+        )
+        run_id = pipeline_runs_service._run_id_for_request(
+            script_id=script_id,
+            episode_id=episode_id,
+            actor_user_id=user_id,
+            idempotency_key=idempotency_key,
+        )
+
+        try:
+            async with session_factory() as setup:
+                setup.add(
+                    User(
+                        user_id=user_id,
+                        username=f"pipeline-replay-{suffix}",
+                        password_hash="hash",
+                        enabled=True,
+                    )
+                )
+                setup.add(
+                    Script(
+                        id=script_id,
+                        title="人工流水线幂等重放删除竞态",
+                        scope="personal",
+                        owner_user_id=user_id,
+                        created_by_user_id=user_id,
+                    )
+                )
+                await setup.flush()
+                setup.add(
+                    Episode(
+                        episode_id=episode_id,
+                        script_id=script_id,
+                        episode_no=1,
+                        title="第一集",
+                    )
+                )
+                await setup.flush()
+                setup.add(
+                    TaskDispatchOutbox(
+                        id=dispatch_id,
+                        task_type=orchestrator.PIPELINE_DAG_TASK_TYPE,
+                        job_id=run_id,
+                        attempt=1,
+                        payload={
+                            "script_id": script_id,
+                            "episode_id": episode_id,
+                            "run_id": run_id,
+                            "dispatch_id": dispatch_id,
+                            "reservation_id": f"reservation-{suffix}",
+                            "mode": body.mode.value,
+                            "retry_of_run_id": None,
+                            "pipeline_attempt": 1,
+                            "input_version": 1,
+                            "input_client_save_seq": 0,
+                            "estimated": 1,
+                            "requested_by_user_id": user_id,
+                            "idempotency_key_hash": (
+                                pipeline_runs_service._idempotency_hash(
+                                    idempotency_key
+                                )
+                            ),
+                            "request_fingerprint": (
+                                pipeline_runs_service._request_fingerprint(body)
+                            ),
+                        },
+                        status="pending",
+                    )
+                )
+                setup.add_all(
+                    [
+                        PipelineJob(
+                            id=f"j-pr-{stage}-{suffix}",
+                            script_id=script_id,
+                            episode_id=episode_id,
+                            stage=stage,
+                            dispatch_id=dispatch_id,
+                            run_id=run_id,
+                            status="done",
+                            input_version=1,
+                            input_client_save_seq=0,
+                            attempt=1,
+                        )
+                        for stage in STAGE_ORDER
+                    ]
+                )
+                await setup.commit()
+
+            async with (
+                session_factory() as deleting,
+                session_factory() as replaying,
+                session_factory() as observer,
+            ):
+                replay_task = None
+                try:
+                    await deleting.execute(text("SET LOCAL lock_timeout = '5s'"))
+                    await replaying.execute(text("SET LOCAL lock_timeout = '5s'"))
+                    await script_crud.get_script_for_update(deleting, script_id)
+                    replay_pid = int(
+                        (await replaying.execute(text("SELECT pg_backend_pid()"))).scalar_one()
+                    )
+                    replay_task = asyncio.create_task(
+                        pipeline_runs_service.create_pipeline_run(
+                            replaying,
+                            script=SimpleNamespace(
+                                id=script_id,
+                                owner_user_id=user_id,
+                            ),
+                            episode_id=episode_id,
+                            actor=SimpleNamespace(
+                                user_id=user_id,
+                                username=f"pipeline-replay-{suffix}",
+                            ),
+                            body=body,
+                            idempotency_key=idempotency_key,
+                        )
+                    )
+
+                    deadline = asyncio.get_running_loop().time() + 5
+                    while True:
+                        wait_event_type = (
+                            await observer.execute(
+                                text(
+                                    "SELECT wait_event_type FROM pg_stat_activity "
+                                    "WHERE pid = :pid"
+                                ),
+                                {"pid": replay_pid},
+                            )
+                        ).scalar_one_or_none()
+                        if wait_event_type == "Lock":
+                            break
+                        if asyncio.get_running_loop().time() >= deadline:
+                            raise AssertionError("幂等重放事务未进入预期父行锁等待")
+                        await asyncio.sleep(0.02)
+
+                    await script_crud.delete_episode(
+                        deleting,
+                        script_id,
+                        episode_id,
+                        commit=False,
+                    )
+                    await deleting.commit()
+                    replay_result = (
+                        await asyncio.wait_for(
+                            asyncio.gather(replay_task, return_exceptions=True),
+                            timeout=5,
+                        )
+                    )[0]
+                    assert isinstance(replay_result, NotFoundError), repr(replay_result)
+                    assert replay_result.detail == "分集不存在"
+                finally:
+                    if replay_task is not None and not replay_task.done():
+                        replay_task.cancel()
+                        await asyncio.gather(replay_task, return_exceptions=True)
+                    await deleting.rollback()
+                    await replaying.rollback()
+                    await observer.rollback()
+
+            async with session_factory() as verification:
+                assert await verification.get(Episode, episode_id) is None
+                assert not (
+                    await verification.execute(
+                        select(PipelineJob.id).where(PipelineJob.run_id == run_id)
+                    )
+                ).scalars().all()
+                dispatch = await verification.get(TaskDispatchOutbox, dispatch_id)
+                assert dispatch is not None and dispatch.status == "canceled"
+        finally:
+            async with session_factory() as cleanup:
+                await cleanup.execute(
+                    delete(PipelineJob).where(PipelineJob.run_id == run_id)
+                )
+                await cleanup.execute(
+                    delete(TaskDispatchOutbox).where(
+                        TaskDispatchOutbox.id == dispatch_id
+                    )
+                )
+                await cleanup.execute(
+                    delete(Episode).where(Episode.script_id == script_id)
+                )
+                await cleanup.execute(delete(Script).where(Script.id == script_id))
+                await cleanup.execute(delete(User).where(User.user_id == user_id))
+                await cleanup.commit()
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+class _ParentLockRaceSession:
+    """在父锁或旧实现的首次 flush 前暂停，用事件精确编排锁竞争。"""
+
+    def __init__(
+        self,
+        session,
+        *,
+        reached: asyncio.Event,
+        proceed: asyncio.Event,
+        pause_script_lock: bool = False,
+        pause_episode_lock: bool = False,
+        pause_first_flush: bool = False,
+    ) -> None:
+        self._session = session
+        self._reached = reached
+        self._proceed = proceed
+        self._pause_script_lock = pause_script_lock
+        self._pause_episode_lock = pause_episode_lock
+        self._pause_first_flush = pause_first_flush
+        self._paused = False
+
+    def __getattr__(self, name: str):
+        return getattr(self._session, name)
+
+    async def _pause_once(self) -> None:
+        if self._paused:
+            return
+        self._paused = True
+        self._reached.set()
+        await self._proceed.wait()
+
+    @staticmethod
+    def _lock_sql(statement) -> str:
+        try:
+            return " ".join(
+                str(statement.compile(dialect=postgresql.dialect())).upper().split()
+            )
+        except Exception:
+            return ""
+
+    async def execute(self, statement, *args, **kwargs):
+        sql = self._lock_sql(statement)
+        is_lock = " FOR " in sql
+        if (
+            self._pause_script_lock
+            and is_lock
+            and " FROM SCRIPTS " in f" {sql} "
+        ) or (
+            self._pause_episode_lock
+            and is_lock
+            and " FROM EPISODES " in f" {sql} "
+        ):
+            await self._pause_once()
+        return await self._session.execute(statement, *args, **kwargs)
+
+    async def flush(self, *args, **kwargs) -> None:
+        if self._pause_first_flush:
+            await self._pause_once()
+        await self._session.flush(*args, **kwargs)
+
+
+async def _run_postgres_pipeline_create_delete_race(
+    kind: str,
+    monkeypatch,
+) -> None:
+    database_url = os.environ["MTV_TEST_POSTGRES_URL"]
+    if database_url.startswith("postgresql://"):
+        database_url = database_url.replace(
+            "postgresql://", "postgresql+asyncpg://", 1
+        )
+    engine = create_async_engine(database_url)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    suffix = secrets.token_hex(6)
+    owner_id = f"owner-pipeline-race-{suffix}"
+    script_id = f"script-pipeline-race-{suffix}"
+    episode_id = f"episode-pipeline-race-{suffix}"
+    account_id = f"account-pipeline-race-{suffix}"
+
+    monkeypatch.setattr(
+        pipeline_runs_service,
+        "_estimate_cost",
+        AsyncMock(return_value=1),
+    )
+    monkeypatch.setattr(pipeline_runs_service, "audit_log", AsyncMock())
+    monkeypatch.setattr(
+        orchestrator,
+        "_estimate_cost",
+        AsyncMock(return_value=1),
+    )
+
+    try:
+        async with session_factory() as setup:
+            setup.add(
+                Script(
+                    id=script_id,
+                    title=f"流水线父锁竞态-{kind}",
+                    scope="personal",
+                    owner_user_id=owner_id,
+                    created_by_user_id=owner_id,
+                )
+            )
+            await setup.flush()
+            setup.add_all(
+                [
+                    Episode(
+                        episode_id=episode_id,
+                        script_id=script_id,
+                        episode_no=1,
+                        title="第一集",
+                        script_text="原始正文",
+                    ),
+                    CreditAccount(
+                        id=account_id,
+                        owner_type="user",
+                        owner_id=owner_id,
+                        balance_points=100,
+                        frozen_points=0,
+                        status="active",
+                    ),
+                    *[
+                        PipelineStage(
+                            script_id=script_id,
+                            stage=stage,
+                            status="pending",
+                        )
+                        for stage in STAGE_ORDER
+                    ],
+                ]
+            )
+            await setup.commit()
+
+        async with (
+            session_factory() as deleting,
+            session_factory() as creating,
+        ):
+            creator_reached = asyncio.Event()
+            creator_proceed = asyncio.Event()
+            deleter_reached = asyncio.Event()
+            deleter_proceed = asyncio.Event()
+            creator_db = _ParentLockRaceSession(
+                creating,
+                reached=creator_reached,
+                proceed=creator_proceed,
+                pause_script_lock=True,
+                pause_first_flush=True,
+            )
+            deleter_db = _ParentLockRaceSession(
+                deleting,
+                reached=deleter_reached,
+                proceed=deleter_proceed,
+                pause_episode_lock=True,
+            )
+            create_task = None
+            delete_task = None
+            try:
+                await deleting.execute(text("SET LOCAL lock_timeout = '5s'"))
+                await creating.execute(text("SET LOCAL lock_timeout = '5s'"))
+                await script_crud.get_script_for_update(deleting, script_id)
+
+                async def create_pipeline():
+                    if kind == "manual":
+                        return await pipeline_runs_service.create_pipeline_run(
+                            creator_db,
+                            script=SimpleNamespace(
+                                id=script_id,
+                                owner_user_id=owner_id,
+                            ),
+                            episode_id=episode_id,
+                            actor=SimpleNamespace(
+                                user_id=owner_id,
+                                username=f"owner-{suffix}",
+                            ),
+                            body=PipelineRunCreateIn(
+                                mode=PipelineRunMode.MANUAL_REEXTRACT,
+                                episode_version=1,
+                                client_save_seq=0,
+                            ),
+                            idempotency_key=f"manual-{suffix}",
+                        )
+                    try:
+                        await script_crud.save_episode(
+                            creator_db,
+                            script_id,
+                            episode_id,
+                            "更新正文",
+                            1,
+                            0,
+                            commit=False,
+                        )
+                        return await orchestrator.trigger_pipeline(
+                            creator_db,
+                            script_id,
+                            episode_id,
+                        )
+                    except Exception:
+                        await creator_db.rollback()
+                        raise
+
+                async def delete_episode() -> str:
+                    try:
+                        await script_crud.delete_episode(
+                            deleter_db,
+                            script_id,
+                            episode_id,
+                            commit=False,
+                        )
+                        await deleter_db.commit()
+                        return "deleted"
+                    except Exception:
+                        await deleter_db.rollback()
+                        raise
+
+                create_task = asyncio.create_task(create_pipeline())
+                await asyncio.wait_for(creator_reached.wait(), timeout=5)
+                delete_task = asyncio.create_task(delete_episode())
+                await asyncio.wait_for(deleter_reached.wait(), timeout=5)
+                creator_proceed.set()
+                deleter_proceed.set()
+                delete_result, create_result = await asyncio.wait_for(
+                    asyncio.gather(
+                        delete_task,
+                        create_task,
+                        return_exceptions=True,
+                    ),
+                    timeout=10,
+                )
+
+                assert delete_result == "deleted", repr(delete_result)
+                assert isinstance(
+                    create_result,
+                    (NotFoundError, script_crud.NotFoundError),
+                ), repr(create_result)
+                assert create_result.detail == "分集不存在"
+            finally:
+                creator_proceed.set()
+                deleter_proceed.set()
+                for task in (create_task, delete_task):
+                    if task is not None and not task.done():
+                        task.cancel()
+                await asyncio.gather(
+                    *(task for task in (create_task, delete_task) if task is not None),
+                    return_exceptions=True,
+                )
+                await deleting.rollback()
+                await creating.rollback()
+
+        async with session_factory() as verification:
+            assert await verification.get(Script, script_id) is not None
+            assert await verification.get(Episode, episode_id) is None
+            assert not (
+                await verification.execute(
+                    select(PipelineJob.id).where(PipelineJob.script_id == script_id)
+                )
+            ).scalars().all()
+            assert not (
+                await verification.execute(
+                    select(TaskDispatchOutbox.id).where(
+                        TaskDispatchOutbox.payload["script_id"].as_string()
+                        == script_id
+                    )
+                )
+            ).scalars().all()
+            assert not (
+                await verification.execute(
+                    select(CreditReservation.id).where(
+                        CreditReservation.account_id == account_id,
+                        CreditReservation.source_type == "pipeline",
+                    )
+                )
+            ).scalars().all()
+            assert not (
+                await verification.execute(
+                    select(CreditLog.id).where(CreditLog.account_id == account_id)
+                )
+            ).scalars().all()
+            account = await verification.get(CreditAccount, account_id)
+            assert account is not None
+            assert account.frozen_points == 0
+            stage_statuses = (
+                await verification.execute(
+                    select(PipelineStage.status).where(
+                        PipelineStage.script_id == script_id
+                    )
+                )
+            ).scalars().all()
+            assert stage_statuses == ["pending"] * len(STAGE_ORDER)
+    finally:
+        async with session_factory() as cleanup:
+            await cleanup.execute(
+                delete(PipelineJob).where(PipelineJob.script_id == script_id)
+            )
+            await cleanup.execute(
+                delete(TaskDispatchOutbox).where(
+                    TaskDispatchOutbox.payload["script_id"].as_string() == script_id
+                )
+            )
+            await cleanup.execute(
+                delete(PipelineStage).where(PipelineStage.script_id == script_id)
+            )
+            await cleanup.execute(
+                delete(CreditLog).where(CreditLog.account_id == account_id)
+            )
+            await cleanup.execute(
+                delete(CreditReservation).where(
+                    CreditReservation.account_id == account_id
+                )
+            )
+            await cleanup.execute(
+                delete(Episode).where(Episode.script_id == script_id)
+            )
+            await cleanup.execute(delete(Script).where(Script.id == script_id))
+            await cleanup.execute(
+                delete(CreditAccount).where(CreditAccount.id == account_id)
+            )
+            await cleanup.commit()
+        await engine.dispose()
+
+
+@pytest.mark.skipif(
+    not os.getenv("MTV_TEST_POSTGRES_URL"),
+    reason="未提供 MTV_TEST_POSTGRES_URL，跳过人工流水线父锁竞态测试",
+)
+def test_postgres_manual_pipeline_run_uses_parent_first_lock_order(
+    monkeypatch,
+) -> None:
+    asyncio.run(_run_postgres_pipeline_create_delete_race("manual", monkeypatch))
+
+
+@pytest.mark.skipif(
+    not os.getenv("MTV_TEST_POSTGRES_URL"),
+    reason="未提供 MTV_TEST_POSTGRES_URL，跳过自动流水线父锁竞态测试",
+)
+def test_postgres_save_trigger_uses_parent_first_lock_order(monkeypatch) -> None:
+    asyncio.run(_run_postgres_pipeline_create_delete_race("automatic", monkeypatch))

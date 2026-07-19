@@ -4,6 +4,7 @@ import pytest
 from fastapi import HTTPException, Request
 from httpx import ASGITransport, AsyncClient, Response
 from pydantic import ValidationError
+from sqlalchemy import create_engine
 from starlette.middleware.sessions import SessionMiddleware
 
 from app.core.config import Settings
@@ -12,6 +13,13 @@ PRODUCTION_ENVIRONMENTS = ["prod", "production"]
 TRUSTED_ORIGIN = "https://trusted.example"
 UNTRUSTED_ORIGIN = "https://untrusted.example"
 STRONG_SESSION_SECRET = "MTV_9qL2-vR7!cX4@pN8#sK5$wH1%zF6&dB3"
+
+
+def test_default_sync_database_driver_is_installed() -> None:
+    configured = Settings(_env_file=None)
+
+    engine = create_engine(configured.database_sync_url)
+    engine.dispose()
 
 
 @pytest.mark.parametrize("app_env", PRODUCTION_ENVIRONMENTS)

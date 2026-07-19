@@ -16,11 +16,13 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from sqlalchemy import select
+from sqlalchemy.orm import noload
 
 from app.core.config import settings
 from app.core.database import async_session_factory
@@ -33,11 +35,13 @@ from app.crud.storyboard import (
     heartbeat_job,
     update_job,
 )
+from app.models.credit_reservation import CreditReservation
 from app.models.episode import Episode
 from app.models.storyboard_job import StoryboardJob
 from app.models.task_dispatch_outbox import TaskDispatchOutbox
 from app.services import storyboard as storyboard_service
 from app.services.task_dispatch import enqueue_task
+from app.workers.async_runtime import run_worker_async
 
 logger = logging.getLogger(__name__)
 STORYBOARD_OUTBOX_TASK_TYPE = "storyboard.generate"
@@ -379,29 +383,140 @@ async def reconcile_storyboard_dispatches(
     return recovered
 
 
-async def reconcile_storyboard_financial_cleanup(db, *, limit: int = 100) -> int:
-    """幂等执行 release 失败后的财务补偿。"""
-    result = await db.execute(
-        select(StoryboardJob)
-        .where(StoryboardJob.financial_cleanup_status == "pending")
-        .order_by(StoryboardJob.created_at.asc())
-        .limit(limit)
-    )
-    jobs = list(result.scalars().all())
-    cleaned = 0
-    for job in jobs:
-        reservation_id = _job_reservation_id(job)
-        if release is not None and reservation_id:
-            await release(
-                db,
-                reservation_id,
-                "分镜失败补偿释放积分",
-                actor_user_id=job.triggered_by_user_id,
-                commit=False,
+async def _load_authoritative_storyboard_reservation(
+    db: Any,
+    job_id: str,
+) -> CreditReservation | None:
+    """按不可变 source 映射锁定积分预约，兼容任务载荷丢失。"""
+
+    return (
+        await db.execute(
+            select(CreditReservation)
+            .where(
+                CreditReservation.source_type == "storyboard",
+                CreditReservation.source_id == job_id,
             )
-        job.financial_cleanup_status = "done"
-        job.financial_cleanup_error = None
-        cleaned += 1
+            .execution_options(populate_existing=True)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+
+
+async def _reconcile_one_storyboard_financial_cleanup(db: Any, job_id: str) -> bool:
+    job = (
+        await db.execute(
+            select(StoryboardJob)
+            .where(
+                StoryboardJob.job_id == job_id,
+                StoryboardJob.financial_cleanup_status == "pending",
+            )
+            .options(noload(StoryboardJob.script))
+            .execution_options(populate_existing=True)
+            .with_for_update(skip_locked=True)
+        )
+    ).scalar_one_or_none()
+    if job is None:
+        await db.rollback()
+        return False
+
+    reservation = await _load_authoritative_storyboard_reservation(db, job.job_id)
+    if reservation is not None and reservation.status == "reserved":
+        if release is None:
+            await db.rollback()
+            return False
+        await release(
+            db,
+            reservation.id,
+            "分镜失败补偿释放积分",
+            actor_user_id=job.triggered_by_user_id,
+            commit=False,
+        )
+        await db.flush()
+        reservation = await _load_authoritative_storyboard_reservation(db, job.job_id)
+        if reservation is not None and reservation.status == "reserved":
+            await db.rollback()
+            return False
+
+    job.financial_cleanup_status = "done"
+    job.financial_cleanup_error = None
+    await db.commit()
+    return True
+
+
+async def _run_storyboard_financial_cleanup_candidate(
+    db: Any,
+    job_id: str,
+) -> tuple[bool, bool]:
+    """返回（是否恢复、当前会话是否仍可安全复用）。"""
+
+    try:
+        return await _reconcile_one_storyboard_financial_cleanup(db, job_id), True
+    except Exception as exc:  # noqa: BLE001 - 单任务失败不得污染后续事务
+        logger.warning(
+            "分镜财务清理失败 job_id=%s error_type=%s",
+            job_id,
+            exc.__class__.__name__,
+        )
+        try:
+            await db.rollback()
+            return False, True
+        except Exception as rollback_exc:  # noqa: BLE001 - 当前会话已不可复用
+            logger.warning(
+                "分镜财务清理回滚失败 job_id=%s error_type=%s",
+                job_id,
+                rollback_exc.__class__.__name__,
+            )
+            return False, False
+
+
+async def reconcile_storyboard_financial_cleanup(
+    db: Any,
+    *,
+    limit: int = 100,
+    session_factory: Callable[[], Any] | None = None,
+) -> int:
+    """逐任务隔离地补偿分镜失败后的积分释放。"""
+
+    candidate_ids = list(
+        (
+            await db.execute(
+                select(StoryboardJob.job_id)
+                .where(StoryboardJob.financial_cleanup_status == "pending")
+                .order_by(StoryboardJob.created_at.asc(), StoryboardJob.job_id.asc())
+                .limit(limit)
+                .with_for_update(skip_locked=True)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    await db.rollback()
+    cleaned = 0
+    for job_id in candidate_ids:
+        if session_factory is None:
+            resolved, healthy = await _run_storyboard_financial_cleanup_candidate(
+                db,
+                job_id,
+            )
+            cleaned += int(resolved)
+            if not healthy:
+                break
+            continue
+
+        resolved = False
+        try:
+            async with session_factory() as task_db:
+                resolved, _ = await _run_storyboard_financial_cleanup_candidate(
+                    task_db,
+                    job_id,
+                )
+        except Exception as exc:  # noqa: BLE001 - 关闭失败也必须隔离到当前任务
+            logger.warning(
+                "关闭分镜财务清理会话失败 job_id=%s error_type=%s",
+                job_id,
+                exc.__class__.__name__,
+            )
+        cleaned += int(resolved)
     return cleaned
 
 
@@ -424,7 +539,7 @@ def _generate_storyboard_task(
     job_id: str,
 ) -> dict:
     """Celery task 同步入口, 包装异步执行。"""
-    return asyncio.run(_run_storyboard_job_by_id(job_id))
+    return run_worker_async(_run_storyboard_job_by_id(job_id))
 
 
 def build_storyboard_canvas(payload: dict, storyboard_task) -> object:
@@ -482,7 +597,7 @@ if celery_app is not None:
                 await db.commit()
                 return recovered
 
-        return asyncio.run(_run())
+        return run_worker_async(_run())
 
     @celery_app.task(
         name="app.workers.storyboard.reconcile_storyboard_financial_cleanup",
@@ -492,11 +607,12 @@ if celery_app is not None:
     def reconcile_storyboard_financial_cleanup_task(self) -> int:
         async def _run() -> int:
             async with async_session_factory() as db:
-                cleaned = await reconcile_storyboard_financial_cleanup(db)
-                await db.commit()
-                return cleaned
+                return await reconcile_storyboard_financial_cleanup(
+                    db,
+                    session_factory=async_session_factory,
+                )
 
-        return asyncio.run(_run())
+        return run_worker_async(_run())
 else:
     # fallback: 直接返回同步函数 (开发环境无 Celery 时可直调)
     def generate_storyboard_task(
@@ -522,9 +638,10 @@ else:
 
     async def reconcile_storyboard_financial_cleanup_task() -> int:
         async with async_session_factory() as db:
-            cleaned = await reconcile_storyboard_financial_cleanup(db)
-            await db.commit()
-            return cleaned
+            return await reconcile_storyboard_financial_cleanup(
+                db,
+                session_factory=async_session_factory,
+            )
 
 
 __all__ = [

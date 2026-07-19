@@ -2,9 +2,11 @@
 
 import asyncio
 import sys
+from datetime import UTC, datetime, timedelta
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi import FastAPI
@@ -19,19 +21,25 @@ from starlette.datastructures import UploadFile
 from app.core.errors import ConflictError
 from app.crud import asset as asset_crud
 from app.models.asset_entry import AssetEntry
+from app.models.audit_event import AuditEvent
 from app.models.base import Base
 from app.models.canvas_edge import CanvasEdge
 from app.models.canvas_node import CanvasNode
+from app.models.credit import CreditAccount
+from app.models.credit_log import CreditLog
+from app.models.credit_reservation import CreditReservation
 from app.models.episode import Episode
 from app.models.generation_job import GenerationJob
 from app.models.materials import Materials
 from app.models.media_storage_job import MediaStorageJob
+from app.models.media_upload import MediaUpload
 from app.models.parent_subject import ParentSubject
 from app.models.scene import Scene
 from app.models.script import Script
 from app.models.shot import Shot
 from app.models.shot_group import ShotGroup
 from app.models.subject import Subject
+from app.models.task_dispatch_outbox import TaskDispatchOutbox
 from app.models.timeline_render_job import TimelineRenderJob
 from app.models.user import User
 from app.models.video_generation_job import VideoGenerationJob
@@ -73,6 +81,48 @@ class _AsyncSessionAdapter:
         self.session.add(row)
 
 
+class _MemoryStorage:
+    """覆盖上传完整性校验契约的内存存储替身。"""
+
+    def __init__(self) -> None:
+        self.objects: dict[str, bytes] = {}
+        self.put_keys: list[str] = []
+        self.promotions: list[tuple[str, str]] = []
+        self.delete_keys: list[str] = []
+
+    async def put(self, key: str, data: bytes) -> str:
+        self.put_keys.append(key)
+        self.objects[key] = data
+        return key
+
+    async def put_file(self, key: str, path: str) -> str:
+        return await self.put(key, Path(path).read_bytes())
+
+    async def promote(self, source_key: str, final_key: str) -> str:
+        self.promotions.append((source_key, final_key))
+        self.objects[final_key] = self.objects.pop(source_key)
+        return final_key
+
+    async def promote_if_absent(self, source_key: str, final_key: str) -> bool:
+        if final_key in self.objects:
+            return False
+        await self.promote(source_key, final_key)
+        return True
+
+    async def delete(self, key: str) -> None:
+        self.delete_keys.append(key)
+        self.objects.pop(key, None)
+
+    async def exists(self, key: str) -> bool:
+        return key in self.objects
+
+    async def get_size(self, key: str) -> int:
+        return len(self.objects[key])
+
+    async def iter_chunks(self, key: str, **_kwargs):
+        yield self.objects[key]
+
+
 def _asset_tables(engine) -> None:
     Base.metadata.create_all(
         engine,
@@ -86,6 +136,7 @@ def _asset_tables(engine) -> None:
             AssetEntry.__table__,
             GenerationJob.__table__,
             MediaStorageJob.__table__,
+            MediaUpload.__table__,
             Materials.__table__,
             CanvasNode.__table__,
             CanvasEdge.__table__,
@@ -116,6 +167,87 @@ def _subject(*, review_status: str = "pending") -> Subject:
         description="主角描述",
         review_status=review_status,
     )
+
+
+def _seed_subject_delete_generation_graph(
+    raw: Session,
+    *,
+    status: str = "succeeded",
+    error_type: str | None = None,
+    retryable: bool = False,
+) -> tuple[User, GenerationJob]:
+    user = User(
+        user_id="user-1",
+        username="subject-delete-owner",
+        password_hash="unused",
+    )
+    account = CreditAccount(
+        id="account-subject-delete",
+        owner_type="user",
+        owner_id=user.user_id,
+        balance_points=99,
+        frozen_points=0,
+        status="active",
+    )
+    raw.add_all(
+        [
+            user,
+            _script(),
+            Materials(id="material-1", name="剧本", script_id="script-1"),
+            _subject(review_status="approved"),
+            account,
+        ]
+    )
+    raw.flush()
+    job = GenerationJob(
+        job_id="job-subject-delete",
+        material_id="material-1",
+        script_id="script-1",
+        subject_id="subject-1",
+        owner_user_id=user.user_id,
+        idempotency_key="subject-delete-generation",
+        request_hash="a" * 64,
+        input_version=1,
+        attempt=1,
+        job_type="generate_images",
+        status=status,
+        progress=100 if status == "succeeded" else 0,
+        error_type=error_type,
+        retryable=retryable,
+        input_json={},
+    )
+    reservation = CreditReservation(
+        id="reservation-subject-delete",
+        account_id=account.id,
+        source_type="generation_job",
+        source_id=job.job_id,
+        reserved_points=1,
+        actual_points=1,
+        status="captured",
+    )
+    log = CreditLog(
+        id="log-subject-delete",
+        account_id=account.id,
+        reservation_id=reservation.id,
+        source_type="generation_job",
+        source_id=job.job_id,
+        log_type="settle",
+        points_delta=-1,
+        frozen_delta=-1,
+        balance_after=99,
+        frozen_after=0,
+    )
+    dispatch = TaskDispatchOutbox(
+        id="dispatch-subject-delete",
+        task_type="generation.generate_images",
+        job_id=job.job_id,
+        attempt=job.attempt,
+        payload={"job_id": job.job_id},
+        status="pending",
+    )
+    raw.add_all([job, reservation, log, dispatch])
+    raw.commit()
+    return user, job
 
 
 class _Result:
@@ -533,8 +665,33 @@ def test_upload_image_uses_candidate_crud_and_moves_media_subject_pending(monkey
         from app.api.v1 import media
 
         class _Storage:
-            async def put(self, _key: str, _data: bytes) -> None:
-                return None
+            def __init__(self) -> None:
+                self.objects: dict[str, bytes] = {}
+
+            async def put(self, key: str, data: bytes) -> None:
+                self.objects[key] = data
+
+            async def promote(self, source_key: str, final_key: str) -> str:
+                self.objects[final_key] = self.objects.pop(source_key)
+                return final_key
+
+            async def promote_if_absent(self, source_key: str, final_key: str) -> bool:
+                if final_key in self.objects:
+                    return False
+                await self.promote(source_key, final_key)
+                return True
+
+            async def delete(self, key: str) -> None:
+                self.objects.pop(key, None)
+
+            async def exists(self, key: str) -> bool:
+                return key in self.objects
+
+            async def get_size(self, key: str) -> int:
+                return len(self.objects[key])
+
+            async def iter_chunks(self, key: str, **_kwargs):
+                yield self.objects[key]
 
         async def _allow(*_args, **_kwargs) -> None:
             return None
@@ -809,6 +966,467 @@ def test_delete_approved_subject_respects_foreign_key_order_and_parent_count():
     asyncio.run(scenario())
 
 
+def test_delete_subject_api_removes_terminal_generation_and_preserves_financial_history(
+    monkeypatch,
+) -> None:
+    async def scenario() -> None:
+        from app.api.v1 import asset_library
+
+        async def _allow(*_args, **_kwargs) -> None:
+            return None
+
+        engine = create_engine("sqlite+pysqlite:///:memory:")
+
+        @event.listens_for(engine, "connect")
+        def _enable_foreign_keys(connection, _record) -> None:
+            connection.execute("PRAGMA foreign_keys=ON")
+
+        Base.metadata.create_all(engine)
+        with Session(engine, expire_on_commit=False) as raw:
+            user, job = _seed_subject_delete_generation_graph(raw)
+            db = _AsyncSessionAdapter(raw)
+            app = FastAPI()
+            app.include_router(asset_library.router)
+
+            async def _db_override():
+                yield db
+
+            app.dependency_overrides[asset_library.get_db] = _db_override
+            app.dependency_overrides[asset_library.get_current_user] = lambda: user
+            monkeypatch.setattr(asset_library, "check_script_access", _allow)
+
+            async with AsyncClient(
+                transport=ASGITransport(app=app, raise_app_exceptions=False),
+                base_url="http://test",
+            ) as client:
+                response = await client.delete(
+                    "/scripts/script-1/asset-library/subjects/subject-1"
+                )
+
+            assert response.status_code == 200, response.text
+            assert raw.get(Subject, "subject-1") is None
+            assert raw.get(GenerationJob, job.job_id) is None
+            dispatch = raw.get(TaskDispatchOutbox, "dispatch-subject-delete")
+            assert dispatch is not None and dispatch.status == "canceled"
+            assert raw.get(CreditReservation, "reservation-subject-delete") is not None
+            assert raw.get(CreditLog, "log-subject-delete") is not None
+            audit = raw.scalar(
+                select(AuditEvent).where(
+                    AuditEvent.action == "subject_delete",
+                    AuditEvent.resource_id == "subject-1",
+                )
+            )
+            assert audit is not None
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("status", "error_type", "retryable"),
+    [
+        pytest.param("starting", None, False, id="active"),
+        pytest.param("failed", "financial_cleanup", True, id="financial-debt"),
+    ],
+)
+def test_delete_subject_api_rejects_blocking_generation_without_partial_changes(
+    monkeypatch,
+    status: str,
+    error_type: str | None,
+    retryable: bool,
+) -> None:
+    async def scenario() -> None:
+        from app.api.v1 import asset_library
+
+        async def _allow(*_args, **_kwargs) -> None:
+            return None
+
+        engine = create_engine("sqlite+pysqlite:///:memory:")
+
+        @event.listens_for(engine, "connect")
+        def _enable_foreign_keys(connection, _record) -> None:
+            connection.execute("PRAGMA foreign_keys=ON")
+
+        Base.metadata.create_all(engine)
+        with Session(engine, expire_on_commit=False) as raw:
+            user, job = _seed_subject_delete_generation_graph(
+                raw,
+                status=status,
+                error_type=error_type,
+                retryable=retryable,
+            )
+            db = _AsyncSessionAdapter(raw)
+            app = FastAPI()
+            app.include_router(asset_library.router)
+
+            async def _db_override():
+                yield db
+
+            app.dependency_overrides[asset_library.get_db] = _db_override
+            app.dependency_overrides[asset_library.get_current_user] = lambda: user
+            monkeypatch.setattr(asset_library, "check_script_access", _allow)
+
+            async with AsyncClient(
+                transport=ASGITransport(app=app, raise_app_exceptions=False),
+                base_url="http://test",
+            ) as client:
+                response = await client.delete(
+                    "/scripts/script-1/asset-library/subjects/subject-1"
+                )
+
+            assert response.status_code == 409, response.text
+            assert raw.get(Subject, "subject-1") is not None
+            assert raw.get(GenerationJob, job.job_id) is not None
+            dispatch = raw.get(TaskDispatchOutbox, "dispatch-subject-delete")
+            assert dispatch is not None and dispatch.status == "pending"
+            assert raw.scalar(
+                select(AuditEvent.id).where(AuditEvent.action == "subject_delete")
+            ) is None
+
+    asyncio.run(scenario())
+
+
+def test_delete_subject_api_rolls_back_when_strict_audit_fails(monkeypatch) -> None:
+    async def scenario() -> None:
+        from app.api.v1 import asset_library
+
+        async def _allow(*_args, **_kwargs) -> None:
+            return None
+
+        async def _fail_audit(*_args, **_kwargs) -> None:
+            raise RuntimeError("audit unavailable")
+
+        engine = create_engine("sqlite+pysqlite:///:memory:")
+
+        @event.listens_for(engine, "connect")
+        def _enable_foreign_keys(connection, _record) -> None:
+            connection.execute("PRAGMA foreign_keys=ON")
+
+        Base.metadata.create_all(engine)
+        with Session(engine, expire_on_commit=False) as raw:
+            user, job = _seed_subject_delete_generation_graph(raw)
+            db = _AsyncSessionAdapter(raw)
+            app = FastAPI()
+            app.include_router(asset_library.router)
+
+            async def _db_override():
+                yield db
+
+            app.dependency_overrides[asset_library.get_db] = _db_override
+            app.dependency_overrides[asset_library.get_current_user] = lambda: user
+            monkeypatch.setattr(asset_library, "check_script_access", _allow)
+            audit = AsyncMock(side_effect=_fail_audit)
+            monkeypatch.setattr(asset_library, "strict_audit_log", audit)
+
+            async with AsyncClient(
+                transport=ASGITransport(app=app, raise_app_exceptions=False),
+                base_url="http://test",
+            ) as client:
+                response = await client.delete(
+                    "/scripts/script-1/asset-library/subjects/subject-1"
+                )
+
+            assert response.status_code == 500
+            audit.assert_awaited_once()
+            assert raw.get(Subject, "subject-1") is not None
+            assert raw.get(GenerationJob, job.job_id) is not None
+            dispatch = raw.get(TaskDispatchOutbox, "dispatch-subject-delete")
+            assert dispatch is not None and dispatch.status == "pending"
+            assert raw.get(CreditReservation, "reservation-subject-delete") is not None
+            assert raw.get(CreditLog, "log-subject-delete") is not None
+
+    asyncio.run(scenario())
+
+
+def test_delete_subject_api_preserves_generation_referenced_upload_and_cleans_orphan(
+    monkeypatch,
+):
+    async def scenario() -> None:
+        from app.api.v1 import asset_library
+        from app.services import media_storage_jobs
+
+        async def _allow(*_args, **_kwargs) -> None:
+            return None
+
+        async def _ignore_audit(*_args, **_kwargs) -> None:
+            return None
+
+        engine = create_engine("sqlite+pysqlite:///:memory:")
+
+        @event.listens_for(engine, "connect")
+        def _enable_foreign_keys(connection, _record) -> None:
+            connection.execute("PRAGMA foreign_keys=ON")
+
+        Base.metadata.create_all(engine)
+        with Session(engine, expire_on_commit=False) as raw:
+            user = User(
+                user_id="user-1",
+                username="subject-delete-owner",
+                password_hash="unused",
+            )
+            retained_subject = Subject(
+                id="subject-retained",
+                script_id="script-retained",
+                type="character",
+                name="保留主体",
+                review_status="approved",
+            )
+            retained_script = Script(
+                id="script-retained",
+                title="保留剧本",
+                scope="personal",
+                owner_user_id=user.user_id,
+                created_by_user_id=user.user_id,
+            )
+            retained_episode = Episode(
+                episode_id="episode-retained",
+                script_id=retained_script.id,
+                episode_no=1,
+                title="保留分集",
+            )
+            retained_material = Materials(
+                id="material-retained",
+                name="保留画布",
+                script_id=retained_script.id,
+            )
+            raw.add_all(
+                [
+                    user,
+                    _script(),
+                    retained_script,
+                    Materials(id="material-1", name="剧本", script_id="script-1"),
+                    retained_material,
+                    retained_episode,
+                    _subject(review_status="approved"),
+                    retained_subject,
+                ]
+            )
+            raw.commit()
+
+            shared_final = "upload_images/material-1/shared.png"
+            shared_temp = "upload_images/_tmp/material-1/shared.png"
+            ready_final = "upload_images/material-1/ready-shared.png"
+            ready_temp = "upload_images/_tmp/material-1/ready-shared.png"
+            orphan_final = "upload_images/material-1/orphan.png"
+            orphan_temp = "upload_images/_tmp/material-1/orphan.png"
+            shared_asset = AssetEntry(
+                id="asset-shared",
+                script_id="script-1",
+                subject_id="subject-1",
+                kind="image",
+                storage_key=f"/{shared_final}",
+                mime_type="image/png",
+                size_bytes=6,
+                source="upload_images",
+            )
+            orphan_asset = AssetEntry(
+                id="asset-orphan",
+                script_id="script-1",
+                subject_id="subject-1",
+                kind="image",
+                storage_key=f"/{orphan_final}",
+                mime_type="image/png",
+                size_bytes=6,
+                source="upload_images",
+            )
+            ready_asset = AssetEntry(
+                id="asset-ready-shared",
+                script_id="script-1",
+                subject_id="subject-1",
+                kind="image",
+                storage_key=f"/{ready_final}",
+                mime_type="image/png",
+                size_bytes=6,
+                source="upload_images",
+            )
+            raw.add_all([shared_asset, ready_asset, orphan_asset])
+            raw.flush()
+
+            shared_upload = MediaUpload(
+                id="upload-shared",
+                script_id="script-1",
+                material_id="material-1",
+                subject_id="subject-1",
+                asset_id=shared_asset.id,
+                temp_storage_key=shared_temp,
+                final_storage_key=shared_final,
+                original_filename="shared.png",
+                mime_type="image/png",
+                size_bytes=6,
+                sha256="a" * 64,
+                status="staging",
+            )
+            orphan_upload = MediaUpload(
+                id="upload-orphan",
+                script_id="script-1",
+                material_id="material-1",
+                subject_id="subject-1",
+                asset_id=orphan_asset.id,
+                temp_storage_key=orphan_temp,
+                final_storage_key=orphan_final,
+                original_filename="orphan.png",
+                mime_type="image/png",
+                size_bytes=6,
+                sha256="b" * 64,
+                status="staging",
+            )
+            ready_upload = MediaUpload(
+                id="upload-ready-shared",
+                script_id="script-1",
+                material_id="material-1",
+                subject_id="subject-1",
+                asset_id=ready_asset.id,
+                temp_storage_key=ready_temp,
+                final_storage_key=ready_final,
+                original_filename="ready-shared.png",
+                mime_type="image/png",
+                size_bytes=6,
+                sha256="d" * 64,
+                status="ready",
+            )
+            shared_promote = MediaStorageJob(
+                id="promote-shared",
+                idempotency_key="upload-promote:upload-shared",
+                job_type="promote",
+                source_key=shared_temp,
+                final_key=shared_final,
+                upload_id=shared_upload.id,
+                status="pending",
+            )
+            orphan_promote = MediaStorageJob(
+                id="promote-orphan",
+                idempotency_key="upload-promote:upload-orphan",
+                job_type="promote",
+                source_key=orphan_temp,
+                final_key=orphan_final,
+                upload_id=orphan_upload.id,
+                status="pending",
+            )
+            ready_promote = MediaStorageJob(
+                id="promote-ready-shared",
+                idempotency_key="upload-promote:upload-ready-shared",
+                job_type="promote",
+                source_key=ready_temp,
+                final_key=ready_final,
+                upload_id=ready_upload.id,
+                status="succeeded",
+                completed_at=datetime.now(UTC),
+            )
+            retained_job = GenerationJob(
+                job_id="generation-retained",
+                material_id=retained_material.id,
+                script_id=retained_script.id,
+                subject_id=retained_subject.id,
+                owner_user_id=user.user_id,
+                idempotency_key="generation-retained",
+                request_hash="c" * 64,
+                input_version=1,
+                attempt=1,
+                job_type="generate_images",
+                status="succeeded",
+                progress=100,
+                episode_id=retained_episode.episode_id,
+                output_json=None,
+                metrics={"retained_storage": {"storage_key": ready_final}},
+            )
+            retained_timeline = TimelineRenderJob(
+                job_id="timeline-retained",
+                script_id=retained_script.id,
+                episode_id=retained_episode.episode_id,
+                owner_user_id=user.user_id,
+                idempotency_key="timeline-retained",
+                request_hash="e" * 64,
+                input_json={"source": {"storage_key": f"/{shared_final}"}},
+                output_storage_key="render_outputs/script-retained/output.mp4",
+                status="succeeded",
+            )
+            raw.add_all(
+                [
+                    shared_upload,
+                    ready_upload,
+                    orphan_upload,
+                    retained_job,
+                    retained_timeline,
+                ]
+            )
+            raw.flush()
+            raw.add_all([shared_promote, ready_promote, orphan_promote])
+            raw.commit()
+
+            db = _AsyncSessionAdapter(raw)
+            app = FastAPI()
+            app.include_router(asset_library.router)
+
+            async def _db_override():
+                yield db
+
+            app.dependency_overrides[asset_library.get_db] = _db_override
+            app.dependency_overrides[asset_library.get_current_user] = lambda: user
+            monkeypatch.setattr(asset_library, "check_script_access", _allow)
+            monkeypatch.setattr(asset_library, "audit_log", _ignore_audit)
+
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                response = await client.delete(
+                    "/scripts/script-1/asset-library/subjects/subject-1"
+                )
+
+            assert response.status_code == 200
+            raw.refresh(shared_upload)
+            raw.refresh(ready_upload)
+            raw.refresh(orphan_upload)
+            raw.refresh(shared_promote)
+            raw.refresh(ready_promote)
+            raw.refresh(orphan_promote)
+            assert raw.get(Subject, "subject-1") is None
+            assert raw.get(GenerationJob, retained_job.job_id) is not None
+            assert raw.get(TimelineRenderJob, retained_timeline.job_id) is not None
+            assert shared_upload.status == "staging"
+            assert shared_upload.subject_id is None
+            assert shared_upload.asset_id is None
+            assert shared_promote.status == "pending"
+            assert ready_upload.status == "ready"
+            assert ready_upload.subject_id is None
+            assert ready_upload.asset_id is None
+            assert ready_promote.status == "succeeded"
+            assert orphan_upload.status == "deleted"
+            assert orphan_promote.status == "canceled"
+
+            delete_keys = set(
+                raw.scalars(
+                    select(MediaStorageJob.source_key).where(
+                        MediaStorageJob.job_type == "delete"
+                    )
+                ).all()
+            )
+            assert delete_keys == {ready_temp, orphan_temp, orphan_final}
+            assert {shared_temp, shared_final}.isdisjoint(delete_keys)
+            assert ready_final not in delete_keys
+
+            claim = await media_storage_jobs.claim_job(
+                db,
+                shared_promote.id,
+                owner="late-shared-promote",
+            )
+            assert claim is not None
+            await db.commit()
+            asset_id = await media_storage_jobs.finalize_upload_ready(db, claim)
+            assert asset_id is None
+            assert await media_storage_jobs.mark_succeeded(
+                db,
+                claim.id,
+                claim.lease_token,
+                asset_id=asset_id,
+            )
+            await db.commit()
+            raw.refresh(shared_upload)
+            raw.refresh(shared_promote)
+            assert shared_upload.status == "ready"
+            assert shared_promote.status == "succeeded"
+
+    asyncio.run(scenario())
+
+
 def test_get_subject_for_update_refreshes_stale_identity_map(tmp_path):
     """锁定读取必须强制拿数据库新值，不能复用当前 Session 的旧 identity map。"""
 
@@ -933,11 +1551,33 @@ def test_video_upload_does_not_create_an_image_candidate(monkeypatch):
         from app.api.v1 import media
 
         class _Storage:
-            async def put(self, _key: str, _data: bytes) -> None:
-                return None
+            def __init__(self) -> None:
+                self.objects: dict[str, bytes] = {}
 
-            async def delete(self, _key: str) -> None:
-                return None
+            async def put(self, key: str, data: bytes) -> None:
+                self.objects[key] = data
+
+            async def promote(self, source_key: str, final_key: str) -> str:
+                self.objects[final_key] = self.objects.pop(source_key)
+                return final_key
+
+            async def promote_if_absent(self, source_key: str, final_key: str) -> bool:
+                if final_key in self.objects:
+                    return False
+                await self.promote(source_key, final_key)
+                return True
+
+            async def delete(self, key: str) -> None:
+                self.objects.pop(key, None)
+
+            async def exists(self, key: str) -> bool:
+                return key in self.objects
+
+            async def get_size(self, key: str) -> int:
+                return len(self.objects[key])
+
+            async def iter_chunks(self, key: str, **_kwargs):
+                yield self.objects[key]
 
         async def _allow(*_args, **_kwargs) -> None:
             return None
@@ -964,27 +1604,12 @@ def test_upload_writes_temp_key_and_persists_promote_job_for_subjectless_upload(
     async def scenario() -> None:
         from app.api.v1 import media
 
-        class _Storage:
-            def __init__(self) -> None:
-                self.put_keys: list[str] = []
-                self.promotions: list[tuple[str, str]] = []
-
-            async def put(self, key: str, _data: bytes) -> None:
-                self.put_keys.append(key)
-
-            async def promote(self, source_key: str, final_key: str) -> str:
-                self.promotions.append((source_key, final_key))
-                return final_key
-
-            async def delete(self, _key: str) -> None:
-                return None
-
         async def _allow(*_args, **_kwargs) -> None:
             return None
 
         engine = create_engine("sqlite+pysqlite:///:memory:")
         _asset_tables(engine)
-        storage = _Storage()
+        storage = _MemoryStorage()
         with Session(engine, expire_on_commit=False) as raw:
             raw.add_all([_script(), Materials(id="material-1", name="剧本", script_id="script-1")])
             raw.commit()
@@ -996,15 +1621,19 @@ def test_upload_writes_temp_key_and_persists_promote_job_for_subjectless_upload(
                 None, _AsyncSessionAdapter(raw), SimpleNamespace(),
             )
 
-            jobs = raw.scalars(select(MediaStorageJob)).all()
-            assert len(jobs) == 1
-            assert jobs[0].job_type == "promote"
-            assert jobs[0].asset_id is None
-            assert jobs[0].status == "succeeded"
-            assert storage.put_keys == [jobs[0].source_key]
+            cleanup = raw.scalar(
+                select(MediaStorageJob).where(MediaStorageJob.job_type == "delete")
+            )
+            promote = raw.scalar(
+                select(MediaStorageJob).where(MediaStorageJob.job_type == "promote")
+            )
+            assert cleanup is not None and cleanup.status == "canceled"
+            assert promote is not None and promote.status == "succeeded"
+            assert promote.asset_id is None
+            assert storage.put_keys == [promote.source_key]
             assert storage.put_keys[0].startswith("upload_images/_tmp/material-1/")
-            assert storage.promotions == [(jobs[0].source_key, jobs[0].final_key)]
-            assert result["storage_key"] == f"/{jobs[0].final_key}"
+            assert storage.promotions == [(promote.source_key, promote.final_key)]
+            assert result["storage_key"] == f"/{promote.final_key}"
             assert not (Path(str(media.settings.storage_root)) / "upload-cleanup-intents.jsonl").exists()
 
     from pathlib import Path
@@ -1012,26 +1641,22 @@ def test_upload_writes_temp_key_and_persists_promote_job_for_subjectless_upload(
     asyncio.run(scenario())
 
 
-def test_upload_persists_promote_intent_before_streaming_object(monkeypatch):
+def test_upload_streams_temp_before_persisting_promote_intent(monkeypatch):
     async def scenario() -> None:
         from app.api.v1 import media
 
-        class _Storage:
+        class _Storage(_MemoryStorage):
             def __init__(self) -> None:
+                super().__init__()
                 self.events: list[tuple[str, int]] = []
 
-            async def put_file(self, key: str, path: str) -> None:
+            async def put_file(self, key: str, path: str) -> str:
                 self.events.append((key, raw.query(MediaStorageJob).count()))
                 assert Path(path).exists()
+                return await _MemoryStorage.put(self, key, Path(path).read_bytes())
 
             async def put(self, _key: str, _data: bytes) -> None:
                 raise AssertionError("上传不得通过 bytes put 复制整对象")
-
-            async def promote(self, source_key: str, final_key: str) -> str:
-                return final_key
-
-            async def delete(self, _key: str) -> None:
-                return None
 
         async def _allow(*_args, **_kwargs) -> None:
             return None
@@ -1051,27 +1676,24 @@ def test_upload_persists_promote_intent_before_streaming_object(monkeypatch):
                 None, _AsyncSessionAdapter(raw), SimpleNamespace(),
             )
 
-            job = raw.scalar(select(MediaStorageJob))
+            job = raw.scalar(
+                select(MediaStorageJob).where(MediaStorageJob.job_type == "promote")
+            )
+            assert job is not None
             assert storage.events == [(job.source_key, 1)]
             assert result["storage_key"] == f"/{job.final_key}"
 
     asyncio.run(scenario())
 
 
-def test_upload_put_failure_records_recoverable_delete_job(monkeypatch):
+def test_upload_temp_write_failure_activates_durable_cleanup(monkeypatch):
     async def scenario() -> None:
         from app.api.v1 import media
 
-        class _Storage:
-            def __init__(self) -> None:
-                self.put_keys: list[str] = []
-
-            async def put(self, key: str, _data: bytes) -> None:
+        class _Storage(_MemoryStorage):
+            async def put(self, key: str, _data: bytes) -> str:
                 self.put_keys.append(key)
                 raise RuntimeError("secret put failure")
-
-            async def delete(self, _key: str) -> None:
-                return None
 
         async def _allow(*_args, **_kwargs) -> None:
             return None
@@ -1080,7 +1702,11 @@ def test_upload_put_failure_records_recoverable_delete_job(monkeypatch):
         _asset_tables(engine)
         storage = _Storage()
         with Session(engine, expire_on_commit=False) as raw:
-            raw.add_all([_script(), Materials(id="material-1", name="剧本", script_id="script-1")])
+            raw.add_all([
+                _script(),
+                Materials(id="material-1", name="剧本", script_id="script-1"),
+                _subject(review_status="not_designed"),
+            ])
             raw.commit()
             monkeypatch.setattr(media, "get_storage", lambda: storage)
             monkeypatch.setattr(media, "check_script_access", _allow)
@@ -1088,15 +1714,20 @@ def test_upload_put_failure_records_recoverable_delete_job(monkeypatch):
             with pytest.raises(RuntimeError, match="secret put failure"):
                 await media.upload_image(
                     "material-1", "reference.png", UploadFile(BytesIO(b"png"), filename="reference.png"),
-                    None, _AsyncSessionAdapter(raw), SimpleNamespace(),
+                    "subject-1", _AsyncSessionAdapter(raw), SimpleNamespace(),
                 )
 
-            jobs = raw.scalars(select(MediaStorageJob)).all()
-            assert len(jobs) == 1
-            assert jobs[0].job_type == "delete"
-            assert jobs[0].source_key == storage.put_keys[0]
-            assert jobs[0].status == "pending"
-            assert jobs[0].last_error_message is None
+            upload = raw.scalar(select(MediaUpload))
+            cleanup = raw.scalar(
+                select(MediaStorageJob).where(MediaStorageJob.job_type == "delete")
+            )
+            assert storage.delete_keys == []
+            assert upload is not None and upload.status == "failed"
+            assert upload.last_error_type == "RuntimeError"
+            assert cleanup is not None and cleanup.status == "pending"
+            assert abs((cleanup.available_at - upload.completed_at).total_seconds()) < 1
+            assert raw.scalar(select(AssetEntry)) is None
+            assert raw.get(Subject, "subject-1").review_status == "not_designed"
 
     asyncio.run(scenario())
 
@@ -1105,19 +1736,10 @@ def test_upload_promote_failure_leaves_retry_job_for_worker_recovery(monkeypatch
     async def scenario() -> None:
         from app.api.v1 import media
 
-        class _Storage:
-            def __init__(self) -> None:
-                self.promotions: list[tuple[str, str]] = []
-
-            async def put(self, _key: str, _data: bytes) -> None:
-                return None
-
+        class _Storage(_MemoryStorage):
             async def promote(self, source_key: str, final_key: str) -> str:
                 self.promotions.append((source_key, final_key))
                 raise RuntimeError("secret promote failure")
-
-            async def delete(self, _key: str) -> None:
-                return None
 
         async def _allow(*_args, **_kwargs) -> None:
             return None
@@ -1137,13 +1759,126 @@ def test_upload_promote_failure_leaves_retry_job_for_worker_recovery(monkeypatch
                     None, _AsyncSessionAdapter(raw), SimpleNamespace(),
                 )
 
-            job = raw.scalar(select(MediaStorageJob))
+            job = raw.scalar(
+                select(MediaStorageJob).where(MediaStorageJob.job_type == "promote")
+            )
+            assert job is not None
             assert job.status == "retry"
             assert job.job_type == "promote"
             assert job.attempt == 1
             assert job.last_error_type == "RuntimeError"
             assert job.last_error_message == "媒体存储任务执行失败"
             assert "secret" not in job.last_error_message
+
+    asyncio.run(scenario())
+
+
+def test_upload_promote_missing_source_marks_intent_failed(monkeypatch):
+    async def scenario() -> None:
+        from app.api.v1 import media
+        from app.providers.storage import StorageObjectNotFoundError
+
+        class _Storage(_MemoryStorage):
+            async def promote(self, source_key: str, _final_key: str) -> str:
+                raise StorageObjectNotFoundError(source_key)
+
+        async def _allow(*_args, **_kwargs) -> None:
+            return None
+
+        engine = create_engine("sqlite+pysqlite:///:memory:")
+        _asset_tables(engine)
+        with Session(engine, expire_on_commit=False) as raw:
+            raw.add_all([_script(), Materials(id="material-1", name="剧本", script_id="script-1")])
+            raw.commit()
+            monkeypatch.setattr(media, "get_storage", _Storage)
+            monkeypatch.setattr(media, "check_script_access", _allow)
+            monkeypatch.setattr(media, "_detect_mime", lambda *_args: "video/mp4")
+
+            with pytest.raises(StorageObjectNotFoundError):
+                await media.upload_image(
+                    "material-1",
+                    "clip.mp4",
+                    UploadFile(BytesIO(b"mp4"), filename="clip.mp4"),
+                    None,
+                    _AsyncSessionAdapter(raw),
+                    SimpleNamespace(),
+                )
+
+            job = raw.scalar(
+                select(MediaStorageJob).where(MediaStorageJob.job_type == "promote")
+            )
+            assert job is not None
+            assert job.status == "failed"
+            assert job.last_error_type == "StorageObjectNotFoundError"
+
+    asyncio.run(scenario())
+
+
+def test_upload_commit_then_interruption_is_recovered_by_worker(monkeypatch):
+    async def scenario() -> None:
+        from app.api.v1 import media
+        from app.workers import media_storage as media_worker
+
+        async def _allow(*_args, **_kwargs) -> None:
+            return None
+
+        async def _interrupt_after_commit(
+            _db,
+            _storage,
+            job_id: str,
+            *,
+            claim=None,
+            **_kwargs,
+        ) -> None:
+            assert claim is not None
+            assert claim.id == job_id
+            assert claim.status == "running"
+            persisted = raw.get(MediaStorageJob, job_id)
+            assert persisted is not None
+            assert persisted.status == "running"
+            assert persisted.attempt == 1
+            assert persisted.lease_token == claim.lease_token
+            raise RuntimeError("simulated process interruption")
+
+        engine = create_engine("sqlite+pysqlite:///:memory:")
+        _asset_tables(engine)
+        storage = _MemoryStorage()
+        with Session(engine, expire_on_commit=False) as raw:
+            raw.add_all([_script(), Materials(id="material-1", name="剧本", script_id="script-1")])
+            raw.commit()
+            db = _AsyncSessionAdapter(raw)
+            monkeypatch.setattr(media, "get_storage", lambda: storage)
+            monkeypatch.setattr(media, "check_script_access", _allow)
+            monkeypatch.setattr(media, "_detect_mime", lambda *_args: "video/mp4")
+            monkeypatch.setattr(media, "_run_promote_job", _interrupt_after_commit)
+
+            with pytest.raises(RuntimeError, match="simulated process interruption"):
+                await media.upload_image(
+                    "material-1",
+                    "clip.mp4",
+                    UploadFile(BytesIO(b"mp4"), filename="clip.mp4"),
+                    None,
+                    db,
+                    SimpleNamespace(),
+                )
+
+            job = raw.scalar(
+                select(MediaStorageJob).where(MediaStorageJob.job_type == "promote")
+            )
+            assert job is not None
+            assert job.status == "running"
+            assert job.attempt == 1
+            assert job.source_key in storage.objects
+            assert job.final_key not in storage.objects
+
+            job.lease_until = datetime.now(UTC).replace(tzinfo=None) - timedelta(seconds=1)
+            raw.commit()
+            assert await media_worker.process_one(db, storage, owner="worker-a") == job.id
+            raw.refresh(job)
+            assert job.status == "succeeded"
+            assert job.attempt == 2
+            assert job.source_key not in storage.objects
+            assert storage.objects[job.final_key] == b"mp4"
 
     asyncio.run(scenario())
 
@@ -1158,15 +1893,17 @@ def test_media_storage_worker_consumes_promote_and_delete_jobs_idempotently():
                 self.promotions: list[tuple[str, str]] = []
                 self.deletes: list[str] = []
 
-            async def promote(self, source_key: str, final_key: str) -> str:
+            async def promote_if_absent(
+                self, source_key: str, final_key: str
+            ) -> bool:
                 self.promotions.append((source_key, final_key))
-                return final_key
+                return True
 
             async def delete(self, key: str) -> None:
                 self.deletes.append(key)
 
         engine = create_engine("sqlite+pysqlite:///:memory:")
-        _asset_tables(engine)
+        Base.metadata.create_all(engine)
         storage = _Storage()
         with Session(engine, expire_on_commit=False) as raw:
             db = _AsyncSessionAdapter(raw)
@@ -1191,6 +1928,84 @@ def test_media_storage_worker_consumes_promote_and_delete_jobs_idempotently():
             assert storage.promotions == [("upload_images/_tmp/material-1/tmp.png", "upload_images/material-1/final.png")]
             assert storage.deletes == ["upload_images/_tmp/material-1/orphan.png"]
             assert {row.status for row in raw.scalars(select(MediaStorageJob)).all()} == {"succeeded"}
+
+    asyncio.run(scenario())
+
+
+def test_media_storage_worker_marks_missing_promote_source_failed():
+    async def scenario() -> None:
+        from app.providers.storage import StorageObjectNotFoundError
+        from app.services import media_storage_jobs
+        from app.workers import media_storage as media_worker
+
+        class _Storage:
+            async def promote_if_absent(
+                self, source_key: str, _final_key: str
+            ) -> bool:
+                raise StorageObjectNotFoundError(source_key)
+
+            async def delete(self, _key: str) -> None:
+                return None
+
+        engine = create_engine("sqlite+pysqlite:///:memory:")
+        _asset_tables(engine)
+        with Session(engine, expire_on_commit=False) as raw:
+            db = _AsyncSessionAdapter(raw)
+            job = await media_storage_jobs.enqueue_promote(
+                db,
+                idempotency_key="promote:missing",
+                source_key="upload_images/_tmp/material-1/missing.png",
+                final_key="upload_images/material-1/final.png",
+            )
+            raw.commit()
+
+            with pytest.raises(StorageObjectNotFoundError):
+                await media_worker.process_one(db, _Storage(), owner="worker-a")
+
+            raw.refresh(job)
+            assert job.status == "failed"
+            assert job.attempt == 1
+            assert job.last_error_type == "StorageObjectNotFoundError"
+            assert await media_worker.process_one(db, _Storage(), owner="worker-a") is None
+
+    asyncio.run(scenario())
+
+
+def test_media_storage_worker_retries_transient_promote_with_backoff():
+    async def scenario() -> None:
+        from app.services import media_storage_jobs
+        from app.workers import media_storage as media_worker
+
+        class _Storage:
+            async def promote_if_absent(
+                self, _source_key: str, _final_key: str
+            ) -> bool:
+                raise TimeoutError("temporary storage timeout")
+
+            async def delete(self, _key: str) -> None:
+                return None
+
+        engine = create_engine("sqlite+pysqlite:///:memory:")
+        _asset_tables(engine)
+        with Session(engine, expire_on_commit=False) as raw:
+            db = _AsyncSessionAdapter(raw)
+            job = await media_storage_jobs.enqueue_promote(
+                db,
+                idempotency_key="promote:timeout",
+                source_key="upload_images/_tmp/material-1/timeout.png",
+                final_key="upload_images/material-1/final.png",
+            )
+            raw.commit()
+
+            with pytest.raises(TimeoutError, match="temporary storage timeout"):
+                await media_worker.process_one(db, _Storage(), owner="worker-a")
+
+            raw.refresh(job)
+            assert job.status == "retry"
+            assert job.attempt == 1
+            assert job.available_at > job.created_at
+            assert job.last_error_type == "TimeoutError"
+            assert await media_worker.process_one(db, _Storage(), owner="worker-a") is None
 
     asyncio.run(scenario())
 
@@ -1242,20 +2057,10 @@ def test_material_image_http_distinguishes_missing_from_cross_script_asset(monke
     asyncio.run(scenario())
 
 
-def test_upload_database_failure_compensates_written_object(monkeypatch):
+def test_upload_asset_database_failure_keeps_retryable_promote(monkeypatch):
     async def scenario() -> None:
         from app.api.v1 import media
-
-        class _Storage:
-            def __init__(self) -> None:
-                self.put_keys: list[str] = []
-                self.deleted_keys: list[str] = []
-
-            async def put(self, key: str, _data: bytes) -> None:
-                self.put_keys.append(key)
-
-            async def delete(self, key: str) -> None:
-                self.deleted_keys.append(key)
+        from app.crud import asset as asset_crud_module
 
         async def _allow(*_args, **_kwargs) -> None:
             return None
@@ -1265,20 +2070,27 @@ def test_upload_database_failure_compensates_written_object(monkeypatch):
 
         engine = create_engine("sqlite+pysqlite:///:memory:")
         _asset_tables(engine)
-        storage = _Storage()
+        storage = _MemoryStorage()
         with Session(engine, expire_on_commit=False) as raw:
             raw.add_all([_script(), Materials(id="material-1", name="剧本", script_id="script-1"), _subject()])
             raw.commit()
             monkeypatch.setattr(media, "get_storage", lambda: storage)
             monkeypatch.setattr(media, "check_script_access", _allow)
             monkeypatch.setattr(media, "_detect_mime", lambda *_args: "image/png")
-            monkeypatch.setattr(media, "add_candidate", _db_failure)
+            monkeypatch.setattr(asset_crud_module, "add_candidate", _db_failure)
             with pytest.raises(RuntimeError, match="数据库写入失败"):
                 await media.upload_image(
                     "material-1", "reference.png", UploadFile(BytesIO(b"png"), filename="reference.png"),
                     "subject-1", _AsyncSessionAdapter(raw), SimpleNamespace(),
                 )
-            assert storage.deleted_keys == storage.put_keys
+            upload = raw.scalar(select(MediaUpload))
+            promote = raw.scalar(
+                select(MediaStorageJob).where(MediaStorageJob.job_type == "promote")
+            )
+            assert upload is not None and upload.status == "staging"
+            assert promote is not None and promote.status == "retry"
+            assert promote.final_key in storage.objects
+            assert storage.delete_keys == []
             assert raw.scalar(select(AssetEntry.id)) is None
 
     asyncio.run(scenario())
@@ -1368,19 +2180,10 @@ def test_audio_video_probe_tool_missing_fails_closed(monkeypatch, tmp_path):
     assert media._detect_mime(str(sample), "voice.mp3") == "application/octet-stream"
 
 
-def test_upload_cleanup_delete_failure_records_recoverable_job(monkeypatch, tmp_path):
+def test_upload_asset_database_failure_keeps_durable_intent(monkeypatch, tmp_path):
     async def scenario() -> None:
         from app.api.v1 import media
-
-        class _Storage:
-            def __init__(self) -> None:
-                self.put_keys: list[str] = []
-
-            async def put(self, key: str, _data: bytes) -> None:
-                self.put_keys.append(key)
-
-            async def delete(self, _key: str) -> None:
-                raise RuntimeError("delete failed")
+        from app.crud import asset as asset_crud_module
 
         async def _allow(*_args, **_kwargs) -> None:
             return None
@@ -1390,7 +2193,7 @@ def test_upload_cleanup_delete_failure_records_recoverable_job(monkeypatch, tmp_
 
         engine = create_engine("sqlite+pysqlite:///:memory:")
         _asset_tables(engine)
-        storage = _Storage()
+        storage = _MemoryStorage()
         with Session(engine, expire_on_commit=False) as raw:
             raw.add_all([_script(), Materials(id="material-1", name="剧本", script_id="script-1"), _subject()])
             raw.commit()
@@ -1398,15 +2201,76 @@ def test_upload_cleanup_delete_failure_records_recoverable_job(monkeypatch, tmp_
             monkeypatch.setattr(media, "get_storage", lambda: storage)
             monkeypatch.setattr(media, "check_script_access", _allow)
             monkeypatch.setattr(media, "_detect_mime", lambda *_args: "image/png")
-            monkeypatch.setattr(media, "add_candidate", _db_failure)
+            monkeypatch.setattr(asset_crud_module, "add_candidate", _db_failure)
             with pytest.raises(RuntimeError, match="数据库写入失败"):
                 await media.upload_image(
                     "material-1", "reference.png", UploadFile(BytesIO(b"png"), filename="reference.png"),
                     "subject-1", _AsyncSessionAdapter(raw), SimpleNamespace(),
                 )
 
+            assert len(storage.put_keys) == 1
+            assert storage.delete_keys == []
+            cleanup = raw.scalar(
+                select(MediaStorageJob).where(MediaStorageJob.job_type == "delete")
+            )
+            promote = raw.scalar(
+                select(MediaStorageJob).where(MediaStorageJob.job_type == "promote")
+            )
+            assert cleanup is not None and cleanup.status == "canceled"
+            assert promote is not None and promote.status == "retry"
+            assert raw.scalar(select(AssetEntry)) is None
+
+    asyncio.run(scenario())
+
+
+def test_upload_initial_commit_failure_performs_no_storage_io(monkeypatch):
+    async def scenario() -> None:
+        from app.api.v1 import media
+
+        class _CommitFailingSession(_AsyncSessionAdapter):
+            def __init__(self, session: Session) -> None:
+                super().__init__(session)
+                self.commit_calls = 0
+
+            async def commit(self) -> None:
+                self.commit_calls += 1
+                raise RuntimeError("数据库提交失败")
+
+        async def _allow(*_args, **_kwargs) -> None:
+            return None
+
+        engine = create_engine("sqlite+pysqlite:///:memory:")
+        _asset_tables(engine)
+        storage = _MemoryStorage()
+        with Session(engine, expire_on_commit=False) as raw:
+            raw.add_all([
+                _script(),
+                Materials(id="material-1", name="剧本", script_id="script-1"),
+                _subject(review_status="not_designed"),
+            ])
+            raw.commit()
+            db = _CommitFailingSession(raw)
+            monkeypatch.setattr(media, "get_storage", lambda: storage)
+            monkeypatch.setattr(media, "check_script_access", _allow)
+            monkeypatch.setattr(media, "_detect_mime", lambda *_args: "image/png")
+
+            with pytest.raises(RuntimeError, match="数据库提交失败"):
+                await media.upload_image(
+                    "material-1",
+                    "reference.png",
+                    UploadFile(BytesIO(b"png"), filename="reference.png"),
+                    "subject-1",
+                    db,
+                    SimpleNamespace(),
+                )
+
+            assert db.commit_calls == 1
             assert storage.put_keys == []
+            assert storage.delete_keys == []
+            assert storage.objects == {}
             assert raw.scalar(select(MediaStorageJob)) is None
+            assert raw.scalar(select(AssetEntry)) is None
+            assert raw.get(Subject, "subject-1").review_status == "not_designed"
 
     asyncio.run(scenario())
 
@@ -2111,7 +2975,9 @@ def test_media_authorizes_video_job_output_and_frame_by_exact_stored_key(monkeyp
                     group_no="G1",
                     unit_id="group:group-1",
                     reference_frames={
-                        "last_frame": "/generate_images/video/frames/group-1_last.png"
+                        "first_frame": "generate_images/video/frames/group-1_first.png",
+                        "last_frame": "/generate_images/video/frames/group-1_last.png",
+                        "reference_frame": "generate_images/video/frames/group-1_reference.png",
                     },
                 ),
                 VideoGenerationJob(
@@ -2126,7 +2992,9 @@ def test_media_authorizes_video_job_output_and_frame_by_exact_stored_key(monkeyp
                     status="succeeded",
                     progress=100,
                     scene_no=1,
-                    output_json={"video_storage_key": "generate_images/video/video-job-1.mp4"},
+                    output_json={
+                        "video_storage_key": "/generate_images/video/video-job-1.mp4"
+                    },
                 ),
             ])
             raw.commit()
@@ -2137,11 +3005,16 @@ def test_media_authorizes_video_job_output_and_frame_by_exact_stored_key(monkeyp
                 "generate_images/video/video-job-1.mp4",
                 SimpleNamespace(),
             )
-            await media._authorize_by_storage_key(
-                _AsyncSessionAdapter(raw),
+            for frame_key in (
+                "generate_images/video/frames/group-1_first.png",
                 "generate_images/video/frames/group-1_last.png",
-                SimpleNamespace(),
-            )
+                "generate_images/video/frames/group-1_reference.png",
+            ):
+                await media._authorize_by_storage_key(
+                    _AsyncSessionAdapter(raw),
+                    frame_key,
+                    SimpleNamespace(),
+                )
 
     asyncio.run(scenario())
 

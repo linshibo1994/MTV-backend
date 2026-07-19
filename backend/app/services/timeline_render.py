@@ -19,7 +19,7 @@ from app.models.user import User
 from app.models.video_generation_job import VideoGenerationJob
 from app.services.credits import release as credits_release
 from app.services.credits import reserve as credits_reserve
-from app.services.task_dispatch import enqueue_task
+from app.services.task_dispatch import cancel_outbox_task, enqueue_task
 
 _TIMELINE_RENDER_RESERVED_POINTS = 1
 
@@ -271,7 +271,19 @@ async def cancel_render(
                     },
                 },
             )
+            await cancel_outbox_task(
+                db,
+                task_type="timeline.render",
+                job_id=relocked.job_id,
+                attempt=relocked.attempt,
+            )
             return timeline_crud.render_job_to_status(relocked)
+    await cancel_outbox_task(
+        db,
+        task_type="timeline.render",
+        job_id=locked.job_id,
+        attempt=locked.attempt,
+    )
     await timeline_crud.mark_locked_render_job_terminal(
         db,
         locked,

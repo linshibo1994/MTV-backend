@@ -19,6 +19,7 @@ from app.models.task_dispatch_outbox import TaskDispatchOutbox
 from app.services.credits import release as credits_release
 
 Publisher = Callable[[str, dict], object | Awaitable[object]]
+_ACTIVE_DISPATCH_STATUSES = ("pending", "retry", "running")
 
 
 def backoff_seconds(publish_attempts: int) -> int:
@@ -82,6 +83,35 @@ async def enqueue_task(
         )
         row = result.scalar_one()
     return row
+
+
+async def cancel_outbox_task(
+    db: AsyncSession,
+    *,
+    task_type: str,
+    job_id: str,
+    attempt: int | None = None,
+) -> int:
+    """在调用方事务内取消指定任务的活动投递，不自行提交。"""
+
+    criteria = [
+        TaskDispatchOutbox.task_type == task_type,
+        TaskDispatchOutbox.job_id == job_id,
+        TaskDispatchOutbox.status.in_(_ACTIVE_DISPATCH_STATUSES),
+    ]
+    if attempt is not None:
+        criteria.append(TaskDispatchOutbox.attempt == attempt)
+    result = await db.execute(
+        select(TaskDispatchOutbox).where(*criteria).with_for_update()
+    )
+    rows = list(result.scalars().all())
+    for row in rows:
+        row.status = "canceled"
+        row.lease_owner = None
+        row.lease_token = None
+        row.lease_until = None
+    await db.flush()
+    return len(rows)
 
 
 async def _claim_next(

@@ -94,6 +94,7 @@ def _to_out(job: GenerationJob) -> GenerationJobOut:
         job_id=job.job_id,
         material_id=job.material_id,
         script_id=job.script_id,
+        subject_id=job.subject_id,
         episode_id=job.episode_id,
         scene_no=job.scene_no,
         job_type=job.job_type,

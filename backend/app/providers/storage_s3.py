@@ -16,7 +16,7 @@ from botocore.client import BaseClient  # noqa: F401
 from botocore.exceptions import ClientError
 
 from app.core.config import settings
-from app.providers.storage import validate_key_prefix
+from app.providers.storage import StorageObjectNotFoundError, validate_key_prefix
 
 
 class S3StorageProvider:
@@ -64,13 +64,56 @@ class S3StorageProvider:
         await asyncio.to_thread(self._copy_then_delete, source, final)
         return final
 
+    async def promote_if_absent(self, source_key: str, final_key: str) -> bool:
+        source = validate_key_prefix(source_key)
+        final = validate_key_prefix(final_key)
+        return await asyncio.to_thread(self._put_if_absent_then_delete, source, final)
+
     def _copy_then_delete(self, source: str, final: str) -> None:
-        self._client.copy_object(
-            Bucket=self._bucket,
-            Key=final,
-            CopySource={"Bucket": self._bucket, "Key": source},
-        )
+        try:
+            self._client.copy_object(
+                Bucket=self._bucket,
+                Key=final,
+                CopySource={"Bucket": self._bucket, "Key": source},
+            )
+        except ClientError as exc:
+            if not self._is_not_found_error(exc):
+                raise
+            # copy/delete 已完成但任务状态提交前崩溃时，重放视为成功。
+            if self._head_object(final):
+                return
+            raise StorageObjectNotFoundError(source) from exc
         self._client.delete_object(Bucket=self._bucket, Key=source)
+
+    def _put_if_absent_then_delete(self, source: str, final: str) -> bool:
+        """以目标条件写原子发布；不支持条件写的兼容端必须直接失败。"""
+        try:
+            response = self._client.get_object(Bucket=self._bucket, Key=source)
+        except ClientError as exc:
+            if not self._is_not_found_error(exc):
+                raise
+            if self._head_object(final):
+                return False
+            raise StorageObjectNotFoundError(source) from exc
+
+        body = response["Body"]
+        try:
+            try:
+                self._client.put_object(
+                    Bucket=self._bucket,
+                    Key=final,
+                    Body=body,
+                    ContentLength=int(response["ContentLength"]),
+                    IfNoneMatch="*",
+                )
+            except ClientError as exc:
+                if self._is_precondition_failed(exc):
+                    return False
+                raise
+        finally:
+            body.close()
+        self._client.delete_object(Bucket=self._bucket, Key=source)
+        return True
 
     async def get(self, key: str) -> bytes:
         rel = validate_key_prefix(key)
@@ -99,13 +142,21 @@ class S3StorageProvider:
             self._client.head_object(Bucket=self._bucket, Key=key)
             return True
         except ClientError as exc:
-            status = (
-                exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
-            )
-            code = exc.response.get("Error", {}).get("Code")
-            if status == 404 or code in ("404", "NoSuchKey"):
+            if self._is_not_found_error(exc):
                 return False
             raise  # 其他 ClientError（5xx/凭证/网络）原样上抛
+
+    @staticmethod
+    def _is_not_found_error(exc: ClientError) -> bool:
+        status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+        code = exc.response.get("Error", {}).get("Code")
+        return status == 404 or code in ("404", "NoSuchKey", "NotFound")
+
+    @staticmethod
+    def _is_precondition_failed(exc: ClientError) -> bool:
+        status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+        code = exc.response.get("Error", {}).get("Code")
+        return status == 412 or code in ("412", "PreconditionFailed")
 
     async def get_size(self, key: str) -> int:
         rel = validate_key_prefix(key)

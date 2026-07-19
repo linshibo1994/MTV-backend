@@ -17,6 +17,7 @@ storage_key 两类前缀 (经 validate_key_prefix 白名单校验):
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -26,19 +27,20 @@ from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, Header, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
-from sqlalchemy import select
+from sqlalchemy import JSON, literal, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth import get_current_user
 from app.core.config import settings
 from app.core.database import get_db
-from app.core.errors import ForbiddenError, NotFoundError
+from app.core.errors import ConflictError, ForbiddenError, NotFoundError
 from app.core.ids import new_id
+from app.core.job_state import MEDIA_STORAGE_JOB_LEASE_SECONDS
 from app.core.permissions import Action, check_script_access
-from app.crud.asset import add_candidate
 from app.models.asset_entry import AssetEntry
 from app.models.generation_job import GenerationJob
 from app.models.materials import Materials
+from app.models.media_upload import MediaUpload
 from app.models.script import Script
 from app.models.shot_group import ShotGroup
 from app.models.timeline_render_job import TimelineRenderJob
@@ -53,6 +55,8 @@ from app.services import media_storage_jobs
 
 router = APIRouter(tags=["媒体代理"])
 logger = logging.getLogger(__name__)
+_PROMOTE_OUTCOME_WAIT_SECONDS = 5.0
+_PROMOTE_OUTCOME_POLL_SECONDS = 0.05
 
 # 允许上传的真实 MIME 白名单。
 _ALLOWED_UPLOAD_MIME_TYPES: set[str] = (
@@ -106,6 +110,27 @@ _MIME_EXTENSION: dict[str, str] = {
     "video/webm": ".webm",
     "video/quicktime": ".mov",
 }
+
+_VIDEO_STORAGE_KEY_JSON_INDEX = literal(
+    "video_storage_key",
+    type_=JSON.JSONStrIndexType(),
+    literal_execute=True,
+)
+_FIRST_FRAME_JSON_INDEX = literal(
+    "first_frame",
+    type_=JSON.JSONStrIndexType(),
+    literal_execute=True,
+)
+_LAST_FRAME_JSON_INDEX = literal(
+    "last_frame",
+    type_=JSON.JSONStrIndexType(),
+    literal_execute=True,
+)
+_REFERENCE_FRAME_JSON_INDEX = literal(
+    "reference_frame",
+    type_=JSON.JSONStrIndexType(),
+    literal_execute=True,
+)
 
 
 def _probe_video_with_ffprobe(path: str) -> bool | None:
@@ -281,18 +306,6 @@ async def _record_delete_job(db: AsyncSession, storage_key: str, asset_id: str |
     await db.commit()
 
 
-async def _promote_storage(storage, source_key: str, final_key: str) -> str:
-    promote = getattr(storage, "promote", None)
-    if promote is not None:
-        return await promote(source_key, final_key)
-    if not hasattr(storage, "get"):
-        return final_key
-    data = await storage.get(source_key)
-    await storage.put(final_key, data)
-    await storage.delete(source_key)
-    return final_key
-
-
 async def _put_temp_object(storage, key: str, path: str) -> str:
     put_file = getattr(storage, "put_file", None)
     if put_file is not None:
@@ -303,6 +316,13 @@ async def _put_temp_object(storage, key: str, path: str) -> str:
     with open(path, "rb") as file_obj:
         data = await asyncio.to_thread(file_obj.read)
     return await storage.put(key, data)
+
+
+async def _rollback_upload_best_effort(db: AsyncSession) -> None:
+    try:
+        await db.rollback()
+    except Exception:
+        logger.exception("upload_db_rollback_failed")
 
 
 def _safe_download_filename(storage_key: str) -> str:
@@ -320,21 +340,95 @@ def _content_disposition(storage_key: str) -> str:
 
 
 async def _run_promote_job(
-    db: AsyncSession, storage, job_id: str, *, owner: str = "upload-request"
-) -> None:
-    claim = await media_storage_jobs.claim_job(db, job_id, owner=owner, lease_seconds=300)
+    db: AsyncSession,
+    storage,
+    job_id: str,
+    *,
+    owner: str = "upload-request",
+    claim: media_storage_jobs.MediaStorageJobClaim | None = None,
+) -> str | None:
     if claim is None:
-        return
+        claim = await media_storage_jobs.claim_job(
+            db,
+            job_id,
+            owner=owner,
+            lease_seconds=MEDIA_STORAGE_JOB_LEASE_SECONDS,
+        )
+        if claim is None:
+            # claim 查询可能因 SKIP LOCKED 未命中，先结束只读事务再轮询权威提交态。
+            await _rollback_upload_best_effort(db)
+            return await _wait_for_promote_outcome(db, job_id)
+        try:
+            # 直接调用的恢复路径也必须先持久化 claim，再进入存储 I/O。
+            await db.commit()
+        except Exception:
+            await _rollback_upload_best_effort(db)
+            raise
+    elif claim.id != job_id:
+        raise ValueError("媒体存储 claim 与任务不一致")
+    if claim.status in {"failed", "effect_failed"}:
+        return await _wait_for_promote_outcome(db, job_id)
     try:
         if claim.job_type != "promote" or not claim.final_key:
             raise RuntimeError("invalid media storage job")
-        await _promote_storage(storage, claim.source_key, claim.final_key)
-        await media_storage_jobs.mark_succeeded(db, claim.id, claim.lease_token)
+        await media_storage_jobs.promote_with_integrity(storage, claim)
+        asset_id = await media_storage_jobs.finalize_upload_ready(db, claim)
+        marked = await media_storage_jobs.mark_succeeded(
+            db,
+            claim.id,
+            claim.lease_token,
+            asset_id=asset_id,
+        )
+        if not marked:
+            raise ConflictError("媒体存储任务 lease 已失效")
         await db.commit()
     except Exception as exc:
-        await media_storage_jobs.mark_retry(db, claim.id, claim.lease_token, exc)
-        await db.commit()
+        await _rollback_upload_best_effort(db)
+        try:
+            await media_storage_jobs.mark_execution_error(db, claim, exc)
+            await db.commit()
+        except Exception:
+            await _rollback_upload_best_effort(db)
+            logger.exception(
+                "upload_promote_error_state_persist_failed job_id=%s",
+                claim.id,
+            )
+        authoritative = False
+        try:
+            authoritative = await media_storage_jobs.is_authoritative_claim_succeeded(db, claim)
+        except Exception:
+            await _rollback_upload_best_effort(db)
+            logger.exception("upload_promote_authoritative_success_read_failed job_id=%s", claim.id)
+        if authoritative:
+            return await _wait_for_promote_outcome(db, job_id)
         raise
+    return await _wait_for_promote_outcome(db, job_id)
+
+
+async def _wait_for_promote_outcome(db: AsyncSession, job_id: str) -> str | None:
+    """竞争领取时有界等待；只有 job succeeded 且 upload ready 才返回成功。"""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _PROMOTE_OUTCOME_WAIT_SECONDS
+    while True:
+        state = await media_storage_jobs.load_upload_promote_state(db, job_id)
+        if state is None:
+            raise ConflictError("媒体上传晋升任务不存在")
+        if state.job_status == "succeeded" and state.upload_status == "ready":
+            if await media_storage_jobs.is_authoritative_job_succeeded(db, job_id):
+                return state.asset_id
+            raise ConflictError("媒体上传晋升成功状态不一致")
+        if state.job_status in {"failed", "canceled"} or state.upload_status in {
+            None,
+            "failed",
+            "deleted",
+        }:
+            raise ConflictError("媒体上传晋升未成功，请重新上传")
+        if state.job_status not in {"pending", "retry", "running"}:
+            raise ConflictError("媒体上传晋升状态不一致")
+        if loop.time() >= deadline:
+            raise ConflictError("媒体上传晋升正在处理中，请稍后重试")
+        await _rollback_upload_best_effort(db)
+        await asyncio.sleep(_PROMOTE_OUTCOME_POLL_SECONDS)
 
 
 def _parse_range(range_header: str | None, total: int) -> tuple[int, int] | None:
@@ -406,18 +500,46 @@ async def _authorize_script(
 async def _authorize_video_media_key(
     db: AsyncSession, rel: str, user: User, require_write: bool
 ) -> None:
-    """授权 video worker 产物和末帧 key，必须精确绑定 DB 记录。"""
-    video_jobs = list((await db.execute(select(VideoGenerationJob))).scalars().all())
-    for job in video_jobs:
-        if _key_matches(job.output_json, rel):
-            await _authorize_script(db, job.script_id, user, require_write)
-            return
+    """授权 video worker 产物和参考帧 key，必须精确绑定 DB 记录。"""
+    stored_keys = (rel, f"/{rel}")
+    script_id = (
+        await db.execute(
+            select(VideoGenerationJob.script_id)
+            .where(
+                VideoGenerationJob.output_json[_VIDEO_STORAGE_KEY_JSON_INDEX]
+                .as_string()
+                .in_(stored_keys)
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if script_id is not None:
+        await _authorize_script(db, script_id, user, require_write)
+        return
 
-    shot_groups = list((await db.execute(select(ShotGroup))).scalars().all())
-    for group in shot_groups:
-        if _key_matches(group.reference_frames, rel):
-            await _authorize_script(db, group.script_id, user, require_write)
-            return
+    reference_frames = ShotGroup.reference_frames
+    script_id = (
+        await db.execute(
+            select(ShotGroup.script_id)
+            .where(
+                or_(
+                    reference_frames[_FIRST_FRAME_JSON_INDEX]
+                    .as_string()
+                    .in_(stored_keys),
+                    reference_frames[_LAST_FRAME_JSON_INDEX]
+                    .as_string()
+                    .in_(stored_keys),
+                    reference_frames[_REFERENCE_FRAME_JSON_INDEX]
+                    .as_string()
+                    .in_(stored_keys),
+                )
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if script_id is not None:
+        await _authorize_script(db, script_id, user, require_write)
+        return
 
     raise NotFoundError("媒体资源不存在")
 
@@ -462,10 +584,28 @@ async def _authorize_generation_image_key(
 async def _authorize_upload_media_key(
     db: AsyncSession, rel: str, user: User, require_write: bool
 ) -> None:
+    upload = (
+        await db.execute(
+            select(MediaUpload).where(
+                MediaUpload.final_storage_key == rel,
+            ).limit(1)
+        )
+    ).scalars().first()
+    if upload is not None:
+        if upload.status != "ready":
+            raise NotFoundError("媒体资源不存在")
+        script_id = getattr(upload, "owner_script_id", None) or upload.script_id
+        if script_id is None:
+            raise NotFoundError("媒体资源不存在")
+        await _authorize_script(db, script_id, user, require_write)
+        return
+
+    # 兼容迁移前无法安全回填归属的旧 AssetEntry。
     entry = (
         await db.execute(
             select(AssetEntry).where(
                 (AssetEntry.storage_key == f"/{rel}") | (AssetEntry.storage_key == rel),
+                AssetEntry.status != "deleted",
             ).limit(1)
         )
     ).scalars().first()
@@ -563,11 +703,19 @@ async def get_media(
     ext = os.path.splitext(key)[1].lower()
     media_type = _EXT_MIME.get(ext, "application/octet-stream")
 
-    # 优先复用存储侧已探测的真实 MIME（AssetEntry.mime_type）
+    # 优先复用上传时探测的真实 MIME；迁移前数据回退 AssetEntry。
     # storage_key 在 DB 中可能带前导 "/"，做两端兼容匹配；
     # 历史数据或重复上传可能使同 storage_key 存在多条记录，用 .first() 避免
     # scalar_one_or_none 命中多行时抛 MultipleResultsError → 500
     norm_key = key.lstrip("/")
+    upload_mime = (
+        await db.execute(
+            select(MediaUpload.mime_type).where(
+                MediaUpload.final_storage_key == norm_key,
+                MediaUpload.status == "ready",
+            ).limit(1)
+        )
+    ).scalar_one_or_none()
     entry = (
         (
             await db.execute(
@@ -578,7 +726,9 @@ async def get_media(
             )
         ).scalars().first()
     )
-    if entry is not None and entry.mime_type:
+    if upload_mime:
+        media_type = upload_mime
+    elif entry is not None and entry.mime_type:
         media_type = entry.mime_type
 
     range_span = _parse_range(request_range, total)
@@ -698,61 +848,56 @@ async def upload_image(
         sha = sha256.hexdigest()
         size_bytes = total_read
 
-        asset_id: str | None = None
-        entry: AssetEntry | None = None
-        # 仅图片/音频进入候选审核；视频只作为上传媒体保留，不得污染图片审核队列。
-        if subject is not None and (mime.startswith("image/") or mime.startswith("audio/")):
-            kind = "audio" if mime.startswith("audio/") else "image"
-            entry = await add_candidate(
+        upload_id = new_id()
+        try:
+            await media_storage_jobs.create_upload_staging(
                 db,
+                upload_id=upload_id,
                 script_id=script.id,
-                subject_id=subject.id,
-                kind=kind,
-                storage_key=f"/{final_storage_key}",
+                material_id=material.id,
+                subject_id=subject.id if subject is not None else None,
+                temp_storage_key=temp_storage_key,
+                final_storage_key=final_storage_key,
+                original_filename=filename,
                 mime_type=mime,
                 size_bytes=size_bytes,
-                source="upload_images",
                 sha256=sha,
-                subject=subject,
             )
-            asset_id = entry.id
-
-        promote_job = await media_storage_jobs.enqueue_promote(
-            db,
-            idempotency_key=f"promote:{final_storage_key}",
-            source_key=temp_storage_key,
-            final_key=final_storage_key,
-            asset_id=asset_id,
-        )
-        await db.commit()
+            await db.commit()
+        except Exception:
+            await _rollback_upload_best_effort(db)
+            raise
 
         try:
             await _put_temp_object(storage, temp_storage_key, tmp.name)
-        except Exception:
-            await db.rollback()
-            if entry is not None:
-                entry.set_status("deleted")
-            promote_job.job_type = "delete"
-            promote_job.idempotency_key = f"delete:{temp_storage_key}"
-            promote_job.final_key = None
-            promote_job.asset_id = asset_id
-            promote_job.status = "pending"
-            promote_job.attempt = 0
-            promote_job.lease_owner = None
-            promote_job.lease_token = None
-            promote_job.lease_until = None
-            promote_job.last_error_type = None
-            promote_job.last_error_message = None
+            promote_job = await media_storage_jobs.activate_upload_promote(db, upload_id)
+            promote_claim = await media_storage_jobs.claim_job(
+                db,
+                promote_job.id,
+                owner="upload-request",
+                lease_seconds=MEDIA_STORAGE_JOB_LEASE_SECONDS,
+            )
+            if promote_claim is None:
+                raise ConflictError("媒体上传晋升任务领取失败")
             await db.commit()
+        except Exception as exc:
+            await _rollback_upload_best_effort(db)
             try:
-                await storage.delete(temp_storage_key)
+                await media_storage_jobs.make_upload_cleanup_due(db, upload_id, exc)
+                await db.commit()
             except Exception:
-                logger.exception("upload_temp_delete_failed")
+                await _rollback_upload_best_effort(db)
+                logger.exception("upload_cleanup_activation_failed upload_id=%s", upload_id)
             raise
     finally:
         tmp.close()
 
-    await _run_promote_job(db, storage, promote_job.id)
+    asset_id = await _run_promote_job(
+        db,
+        storage,
+        promote_job.id,
+        claim=promote_claim,
+    )
 
     return {
         "storage_key": f"/{final_storage_key}",
@@ -760,4 +905,5 @@ async def upload_image(
         "size_bytes": size_bytes,
         "sha256": sha,
         "asset_id": asset_id,
+        "upload_id": upload_id,
     }

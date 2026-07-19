@@ -7,7 +7,9 @@ from sqlalchemy import (
     CheckConstraint,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
+    PrimaryKeyConstraint,
     String,
     UniqueConstraint,
 )
@@ -17,9 +19,11 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.core.ids import new_id
 from app.models.base import Base, TimestampMixin
 
+VIDEO_IDEMPOTENCY_KEY_MAX_LENGTH = 256
+
 
 class VideoGenerationJob(TimestampMixin, Base):
-    """视频生成任务 — 多参考图图生视频，provider_key 路由 jianyu/modelsai。"""
+    """视频生成任务 — 多参考图图生视频，provider_key 由数据库或 env 选择规范供应商。"""
 
     __tablename__ = "video_generation_jobs"
     __table_args__ = (
@@ -36,7 +40,8 @@ class VideoGenerationJob(TimestampMixin, Base):
         CheckConstraint("progress >= 0 AND progress <= 100", name="ck_video_jobs_progress_range"),
         CheckConstraint("attempt > 0", name="ck_video_jobs_attempt_positive"),
         CheckConstraint(
-            "provider_key IN ('jianyu', 'modelsai', 'volcengine', 'doubao', 'bailian', 'openai')",
+            "provider_key IN "
+            "('jianyu', 'modelsai', 'volcengine', 'doubao', 'bailian', 'openai', 'gemini')",
             name="ck_video_jobs_provider_key",
         ),
         CheckConstraint("job_type IN ('all_reference')", name="ck_video_jobs_job_type"),
@@ -55,7 +60,9 @@ class VideoGenerationJob(TimestampMixin, Base):
         String(36), ForeignKey("shot_groups.shot_group_id"), nullable=False, index=True
     )
     owner_user_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
-    idempotency_key: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    idempotency_key: Mapped[str | None] = mapped_column(
+        String(VIDEO_IDEMPOTENCY_KEY_MAX_LENGTH), nullable=True
+    )
     request_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     input_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     attempt: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
@@ -66,7 +73,7 @@ class VideoGenerationJob(TimestampMixin, Base):
     unit_id: Mapped[str] = mapped_column(String(64), nullable=False)
     unit_runtime_key: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
 
-    # jianyu | modelsai
+    # jianyu | modelsai | bailian | openai | gemini
     provider_key: Mapped[str] = mapped_column(String(32), nullable=False)
     # all_reference（可扩展）
     job_type: Mapped[str] = mapped_column(String(32), nullable=False)
@@ -97,3 +104,48 @@ class VideoGenerationJob(TimestampMixin, Base):
     canceled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     script = relationship("Script", lazy="noload")
+
+
+class VideoGenerationIdempotencyRequest(TimestampMixin, Base):
+    """视频生成幂等请求事实，同一任务可绑定多个请求键。"""
+
+    __tablename__ = "video_generation_idempotency_requests"
+    __table_args__ = (
+        PrimaryKeyConstraint(
+            "script_id",
+            "idempotency_key",
+            name="pk_video_generation_idempotency_requests",
+        ),
+        CheckConstraint(
+            "trim(idempotency_key) <> ''",
+            name="ck_video_generation_idempotency_requests_key_not_blank",
+        ),
+    )
+
+    script_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey(
+            "scripts.id", name="fk_video_idem_request_script", ondelete="CASCADE"
+        ),
+        nullable=False,
+    )
+    idempotency_key: Mapped[str] = mapped_column(
+        String(VIDEO_IDEMPOTENCY_KEY_MAX_LENGTH), nullable=False
+    )
+    request_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    job_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey(
+            "video_generation_jobs.job_id",
+            name="fk_video_idem_request_job",
+            ondelete="CASCADE",
+        ),
+        nullable=False,
+        index=True,
+    )
+
+
+Index(
+    "ix_video_generation_jobs_output_video_storage_key",
+    VideoGenerationJob.output_json["video_storage_key"].as_string(),
+)

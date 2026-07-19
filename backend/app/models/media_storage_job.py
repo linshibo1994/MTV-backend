@@ -2,7 +2,7 @@
 
 from datetime import datetime
 
-from sqlalchemy import DateTime, Integer, String, UniqueConstraint, func
+from sqlalchemy import DateTime, ForeignKey, Integer, String, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.ids import new_id
@@ -23,9 +23,15 @@ class MediaStorageJob(TimestampMixin, Base):
     source_key: Mapped[str] = mapped_column(String(512), nullable=False)
     final_key: Mapped[str | None] = mapped_column(String(512), nullable=True)
     asset_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
-    # pending/running/retry/succeeded/failed/canceled
+    upload_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("media_uploads.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    expected_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    expected_size_bytes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # pending/running/retry/deleting/succeeded/failed/effect_failed/canceled
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending", index=True)
     attempt: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=8)
     available_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now(), index=True
     )

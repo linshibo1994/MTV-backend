@@ -29,6 +29,30 @@ ALLOWED_KEY_PREFIXES: tuple[str, ...] = (
 _storage_singleton: StorageProvider | None = None
 
 
+class StorageObjectNotFoundError(FileNotFoundError):
+    """promote 的源对象与目标对象均不存在，任务无法通过重试恢复。"""
+
+    def __init__(self, storage_key: str) -> None:
+        self.storage_key = normalize_key(storage_key)
+        super().__init__("存储源对象不存在")
+
+
+class StorageObjectIntegrityError(RuntimeError):
+    """对象存在但内容摘要或大小不符合任务的持久化预期。"""
+
+    def __init__(self, storage_key: str) -> None:
+        self.storage_key = normalize_key(storage_key)
+        super().__init__("存储对象完整性校验失败")
+
+
+class StorageObjectConflictError(RuntimeError):
+    """目标 key 已被与当前任务无关的对象占用。"""
+
+    def __init__(self, storage_key: str) -> None:
+        self.storage_key = normalize_key(storage_key)
+        super().__init__("存储目标对象冲突")
+
+
 @runtime_checkable
 class StorageProvider(Protocol):
     """对象存储提供者协议。"""
@@ -42,7 +66,11 @@ class StorageProvider(Protocol):
         ...
 
     async def promote(self, source_key: str, final_key: str) -> str:
-        """将临时对象晋升为正式对象，返回最终 storage_key。"""
+        """将临时对象晋升为正式对象；两端均不存在时抛出 StorageObjectNotFoundError。"""
+        ...
+
+    async def promote_if_absent(self, source_key: str, final_key: str) -> bool:
+        """原子地发布目标且绝不覆盖；本次发布返回 True，目标已存在返回 False。"""
         ...
 
     async def get(self, key: str) -> bytes:

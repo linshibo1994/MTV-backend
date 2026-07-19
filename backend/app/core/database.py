@@ -5,6 +5,7 @@ from collections.abc import AsyncGenerator
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.core.config import settings
+from app.models.storage_reference_guard import StorageReferenceGuardedSession
 
 engine = create_async_engine(
     settings.database_url,
@@ -17,6 +18,7 @@ engine = create_async_engine(
 async_session_factory = async_sessionmaker(
     engine,
     class_=AsyncSession,
+    sync_session_class=StorageReferenceGuardedSession,
     expire_on_commit=False,
     autoflush=False,
 )

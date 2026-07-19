@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,6 +13,7 @@ from typing import cast
 
 import pytest
 from sqlalchemy import UniqueConstraint, create_engine, select
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.ext.compiler import compiles
@@ -22,6 +24,7 @@ from app.models.credit import CreditAccount
 from app.models.credit_log import CreditLog
 from app.models.credit_reservation import CreditReservation
 from app.models.episode import Episode
+from app.models.media_storage_job import MediaStorageJob
 from app.models.script import Script
 from app.models.task_dispatch_outbox import TaskDispatchOutbox
 from app.models.timeline_render_job import TimelineRenderJob
@@ -97,6 +100,7 @@ def _make_db() -> tuple[object, Session]:
         CreditLog.__table__,
         TimelineRenderJob.__table__,
         TaskDispatchOutbox.__table__,
+        MediaStorageJob.__table__,
     ):
         table.create(engine)  # type: ignore[attr-defined]
     raw = Session(engine, expire_on_commit=False)
@@ -624,7 +628,35 @@ async def test_render_status_is_persistent_and_cancel_requires_owner_or_run_ai(m
         input_json={"segments": []},
         output_storage_key="generate_outputs/script-1/episode-1/render-1.mp4",
     )
-    raw.add(job)
+    active_outbox = TaskDispatchOutbox(
+        id="dispatch-timeline-cancel",
+        task_type="timeline.render",
+        job_id=job.job_id,
+        attempt=job.attempt,
+        payload={"job_id": job.job_id},
+        status="running",
+        lease_owner="dispatcher",
+        lease_token="dispatch-token",
+        lease_until=datetime.now(UTC) + timedelta(minutes=1),
+    )
+    wrong_attempt = TaskDispatchOutbox(
+        id="dispatch-timeline-wrong-attempt",
+        task_type="timeline.render",
+        job_id=job.job_id,
+        attempt=job.attempt + 1,
+        payload={"job_id": job.job_id},
+        status="published",
+        published_at=datetime.now(UTC),
+    )
+    wrong_task_type = TaskDispatchOutbox(
+        id="dispatch-timeline-wrong-type",
+        task_type="video.generate",
+        job_id=job.job_id,
+        attempt=job.attempt,
+        payload={"job_id": job.job_id},
+        status="pending",
+    )
+    raw.add_all([job, active_outbox, wrong_attempt, wrong_task_type])
     raw.commit()
 
     async def fake_check(db, user, script_id, action):
@@ -646,28 +678,60 @@ async def test_render_status_is_persistent_and_cancel_requires_owner_or_run_ai(m
 
     allow_owner = True
     canceled = await timeline_render.cancel_render("render-1", db, seed.owner)
+    await db.commit()
+    raw.expire_all()
+    active_outbox = raw.get(TaskDispatchOutbox, "dispatch-timeline-cancel")
+    wrong_attempt = raw.get(TaskDispatchOutbox, "dispatch-timeline-wrong-attempt")
+    wrong_task_type = raw.get(TaskDispatchOutbox, "dispatch-timeline-wrong-type")
+    assert active_outbox is not None
+    assert wrong_attempt is not None
+    assert wrong_task_type is not None
     assert canceled["status"] == "canceled"
     assert (seed.owner.user_id, timeline_render.Action.RUN_AI) in checks
     canceled_job = raw.get(TimelineRenderJob, "render-1")
     assert canceled_job is not None
     assert canceled_job.canceled_at is not None
+    assert active_outbox.status == "canceled"
+    assert active_outbox.lease_owner is None
+    assert active_outbox.lease_token is None
+    assert active_outbox.lease_until is None
+    assert wrong_attempt.status == "published"
+    assert wrong_task_type.status == "pending"
 
 
-def test_trim_command_uses_duration_and_concat_manifest_is_safe(tmp_path, monkeypatch) -> None:
+async def test_trim_command_uses_duration_and_concat_manifest_is_safe(tmp_path, monkeypatch) -> None:
     from app.workers import timeline_render as worker
 
     commands: list[list[str]] = []
 
-    def fake_run(cmd, check, capture_output):
+    async def fake_run(cmd, *, output_path: str, **_kwargs):
         commands.append(cmd)
-        Path(cmd[-1]).write_bytes(b"mp4")
-        return SimpleNamespace(returncode=0)
+        Path(output_path).write_bytes(b"mp4")
 
-    monkeypatch.setattr(worker.subprocess, "run", fake_run)
+    monkeypatch.setattr(worker, "_run_ffmpeg_command", fake_run)
 
-    worker._trim_segment(str(tmp_path / "input.mp4"), 1.5, 4.0, str(tmp_path / "out.mp4"))
-    worker._trim_segment(str(tmp_path / "input.mp4"), 2.0, None, str(tmp_path / "out2.mp4"))
-    worker._concat_segments([str(tmp_path / "out.mp4"), str(tmp_path / "out2.mp4")], str(tmp_path / "final.mp4"))
+    await worker._trim_segment(
+        str(tmp_path / "input.mp4"),
+        1.5,
+        4.0,
+        str(tmp_path / "out.mp4"),
+        job_id="render-command",
+        token="lease-token",
+    )
+    await worker._trim_segment(
+        str(tmp_path / "input.mp4"),
+        2.0,
+        None,
+        str(tmp_path / "out2.mp4"),
+        job_id="render-command",
+        token="lease-token",
+    )
+    await worker._concat_segments(
+        [str(tmp_path / "out.mp4"), str(tmp_path / "out2.mp4")],
+        str(tmp_path / "final.mp4"),
+        job_id="render-command",
+        token="lease-token",
+    )
 
     assert commands[0][0] == worker.FFMPEG_BIN
     assert "-ss" in commands[0]
@@ -678,6 +742,519 @@ def test_trim_command_uses_duration_and_concat_manifest_is_safe(tmp_path, monkey
     assert "-t" not in commands[1]
     assert commands[2][commands[2].index("-f") + 1] == "concat"
     assert commands[2][commands[2].index("-safe") + 1] == "1"
+
+
+async def test_ffmpeg_long_step_renews_lease_until_process_exits(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from app.workers import timeline_render as worker
+
+    done = asyncio.Event()
+    output_path = tmp_path / "output.mp4"
+    output_path.write_bytes(b"video")
+    heartbeats = 0
+
+    class Process:
+        returncode: int | None = None
+
+        async def wait(self) -> int:
+            await done.wait()
+            self.returncode = 0
+            return 0
+
+        def terminate(self) -> None:
+            raise AssertionError("活跃租约不得终止 ffmpeg")
+
+        def kill(self) -> None:
+            raise AssertionError("活跃租约不得杀死 ffmpeg")
+
+    async def spawn(_command: list[str]):
+        return Process()
+
+    async def active(*_args, **_kwargs):
+        return "active"
+
+    async def heartbeat(*_args, **_kwargs):
+        nonlocal heartbeats
+        heartbeats += 1
+        if heartbeats == 2:
+            done.set()
+        return True
+
+    monkeypatch.setattr(worker, "_spawn_ffmpeg_process", spawn, raising=False)
+    monkeypatch.setattr(worker, "_runtime_state", active)
+    monkeypatch.setattr(worker, "_heartbeat", heartbeat)
+
+    await worker._run_ffmpeg_command(
+        [worker.FFMPEG_BIN, "-version"],
+        output_path=str(output_path),
+        job_id="render-long-step",
+        token="lease-token",
+        heartbeat_interval=0.002,
+        poll_interval=0.001,
+    )
+
+    assert heartbeats >= 2
+
+
+async def test_ffmpeg_checks_cancellation_on_each_poll_before_heartbeat(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from app.workers import timeline_render as worker
+
+    done = asyncio.Event()
+    output_path = tmp_path / "output-canceled.mp4"
+    output_path.write_bytes(b"video")
+    state_checks = 0
+    terminated = False
+    wait_completed = False
+
+    class Process:
+        returncode: int | None = None
+
+        async def wait(self) -> int:
+            nonlocal wait_completed
+            try:
+                await asyncio.wait_for(done.wait(), timeout=0.02)
+            except TimeoutError:
+                self.returncode = 0
+                wait_completed = True
+                return 0
+            wait_completed = True
+            self.returncode = -15 if terminated else 0
+            return self.returncode
+
+        def terminate(self) -> None:
+            nonlocal terminated
+            terminated = True
+            done.set()
+
+        def kill(self) -> None:
+            done.set()
+
+    async def spawn(_command: list[str]):
+        return Process()
+
+    async def state(*_args, **_kwargs):
+        nonlocal state_checks
+        state_checks += 1
+        return "active" if state_checks == 1 else "canceled"
+
+    async def heartbeat(*_args, **_kwargs):
+        raise AssertionError("60 秒心跳尚未到期，不应续租")
+
+    monkeypatch.setattr(worker, "_spawn_ffmpeg_process", spawn)
+    monkeypatch.setattr(worker, "_runtime_state", state)
+    monkeypatch.setattr(worker, "_heartbeat", heartbeat)
+
+    with pytest.raises(worker._FfmpegStateChanged) as caught:
+        await worker._run_ffmpeg_command(
+            [worker.FFMPEG_BIN, "-version"],
+            output_path=str(output_path),
+            job_id="render-canceled-between-heartbeats",
+            token="lease-token",
+            heartbeat_interval=60.0,
+            poll_interval=0.001,
+        )
+
+    assert caught.value.state == "canceled"
+    assert state_checks >= 2
+    assert terminated is True
+    assert wait_completed is True
+
+
+@pytest.mark.parametrize("output_limit_bytes", [0, -1])
+async def test_ffmpeg_nonpositive_output_limit_does_not_spawn(
+    monkeypatch,
+    tmp_path,
+    output_limit_bytes: int,
+) -> None:
+    from app.workers import timeline_render as worker
+
+    spawned = False
+
+    class Process:
+        returncode = 0
+
+        async def wait(self) -> int:
+            return 0
+
+        def terminate(self) -> None:
+            raise AssertionError("非正输出上限不得启动或终止 ffmpeg")
+
+        def kill(self) -> None:
+            raise AssertionError("非正输出上限不得启动或杀死 ffmpeg")
+
+    async def spawn(_command: list[str]):
+        nonlocal spawned
+        spawned = True
+        return Process()
+
+    monkeypatch.setattr(worker, "_spawn_ffmpeg_process", spawn)
+
+    with pytest.raises(ValueError, match="文件过大"):
+        await worker._run_ffmpeg_command(
+            [worker.FFMPEG_BIN, "-version"],
+            output_path=str(tmp_path / "output.mp4"),
+            job_id="render-invalid-output-limit",
+            token="lease-token",
+            output_limit_bytes=output_limit_bytes,
+        )
+
+    assert spawned is False
+
+
+async def test_ffmpeg_lost_lease_terminates_and_reaps_process(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from app.workers import timeline_render as worker
+
+    done = asyncio.Event()
+    output_path = tmp_path / "output.mp4"
+    output_path.write_bytes(b"video")
+    terminated = False
+    wait_completed = False
+
+    class Process:
+        returncode: int | None = None
+
+        async def wait(self) -> int:
+            nonlocal wait_completed
+            await done.wait()
+            wait_completed = True
+            self.returncode = -15
+            return -15
+
+        def terminate(self) -> None:
+            nonlocal terminated
+            terminated = True
+            done.set()
+
+        def kill(self) -> None:
+            done.set()
+
+    async def spawn(_command: list[str]):
+        return Process()
+
+    async def lost(*_args, **_kwargs):
+        return "lost_lease"
+
+    monkeypatch.setattr(worker, "_spawn_ffmpeg_process", spawn, raising=False)
+    monkeypatch.setattr(worker, "_runtime_state", lost)
+
+    with pytest.raises(worker._FfmpegStateChanged) as caught:
+        await worker._run_ffmpeg_command(
+            [worker.FFMPEG_BIN, "-version"],
+            output_path=str(output_path),
+            job_id="render-lost-lease",
+            token="lease-token",
+            heartbeat_interval=0.001,
+            poll_interval=0.001,
+        )
+
+    assert caught.value.state == "lost_lease"
+    assert terminated is True
+    assert wait_completed is True
+
+
+async def test_ffmpeg_state_check_failure_terminates_and_reaps_process(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from app.workers import timeline_render as worker
+
+    done = asyncio.Event()
+    output_path = tmp_path / "output.mp4"
+    output_path.write_bytes(b"video")
+    terminated = False
+    wait_completed = False
+
+    class Process:
+        returncode: int | None = None
+
+        async def wait(self) -> int:
+            nonlocal wait_completed
+            await done.wait()
+            wait_completed = True
+            self.returncode = -15
+            return -15
+
+        def terminate(self) -> None:
+            nonlocal terminated
+            terminated = True
+            done.set()
+
+        def kill(self) -> None:
+            done.set()
+
+    async def spawn(_command: list[str]):
+        return Process()
+
+    async def fail_state_check(*_args, **_kwargs):
+        raise RuntimeError("heartbeat database unavailable")
+
+    monkeypatch.setattr(worker, "_spawn_ffmpeg_process", spawn)
+    monkeypatch.setattr(worker, "_runtime_state", fail_state_check)
+
+    with pytest.raises(RuntimeError, match="heartbeat database unavailable"):
+        await worker._run_ffmpeg_command(
+            [worker.FFMPEG_BIN, "-version"],
+            output_path=str(output_path),
+            job_id="render-state-error",
+            token="lease-token",
+            heartbeat_interval=0.001,
+            poll_interval=0.001,
+        )
+
+    assert terminated is True
+    assert wait_completed is True
+
+
+@pytest.mark.parametrize("fatal_error", [KeyboardInterrupt, SystemExit])
+async def test_ffmpeg_fatal_base_exception_terminates_and_reaps_before_reraise(
+    monkeypatch,
+    tmp_path,
+    fatal_error: type[BaseException],
+) -> None:
+    from app.workers import timeline_render as worker
+
+    done = asyncio.Event()
+    output_path = tmp_path / "output-fatal.mp4"
+    output_path.write_bytes(b"video")
+    terminated = False
+    wait_completed = False
+
+    class Process:
+        returncode: int | None = None
+
+        async def wait(self) -> int:
+            nonlocal wait_completed
+            await done.wait()
+            wait_completed = True
+            self.returncode = -15
+            return -15
+
+        def terminate(self) -> None:
+            nonlocal terminated
+            terminated = True
+            done.set()
+
+        def kill(self) -> None:
+            done.set()
+
+    async def spawn(_command: list[str]):
+        return Process()
+
+    async def fail_state_check(*_args, **_kwargs):
+        raise fatal_error("fatal worker interruption")
+
+    monkeypatch.setattr(worker, "_spawn_ffmpeg_process", spawn)
+    monkeypatch.setattr(worker, "_runtime_state", fail_state_check)
+
+    with pytest.raises(fatal_error, match="fatal worker interruption"):
+        await worker._run_ffmpeg_command(
+            [worker.FFMPEG_BIN, "-version"],
+            output_path=str(output_path),
+            job_id="render-fatal-state-error",
+            token="lease-token",
+            heartbeat_interval=0.001,
+            poll_interval=0.001,
+        )
+
+    assert terminated is True
+    assert wait_completed is True
+
+
+async def test_ffmpeg_signal_failure_does_not_replace_caller_cancellation(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from app.workers import timeline_render as worker
+
+    done = asyncio.Event()
+    spawned = asyncio.Event()
+    output_path = tmp_path / "output-signal-failure.mp4"
+    output_path.write_bytes(b"video")
+    kill_called = False
+    wait_completed = False
+
+    class Process:
+        returncode: int | None = None
+
+        async def wait(self) -> int:
+            nonlocal wait_completed
+            await done.wait()
+            wait_completed = True
+            self.returncode = -9
+            return -9
+
+        def terminate(self) -> None:
+            raise PermissionError("terminate denied")
+
+        def kill(self) -> None:
+            nonlocal kill_called
+            kill_called = True
+            done.set()
+
+    async def spawn(_command: list[str]):
+        spawned.set()
+        return Process()
+
+    monkeypatch.setattr(worker, "_spawn_ffmpeg_process", spawn)
+    task = asyncio.create_task(
+        worker._run_ffmpeg_command(
+            [worker.FFMPEG_BIN, "-version"],
+            output_path=str(output_path),
+            job_id="render-signal-failure",
+            token="lease-token",
+            heartbeat_interval=60.0,
+            poll_interval=1.0,
+        )
+    )
+    await spawned.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert kill_called is True
+    assert wait_completed is True
+
+
+async def test_ffmpeg_cancellation_during_termination_wait_is_preserved(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from app.workers import timeline_render as worker
+
+    done = asyncio.Event()
+    termination_started = asyncio.Event()
+    output_path = tmp_path / "output-cancel-during-termination.mp4"
+    output_path.write_bytes(b"video")
+    terminate_calls = 0
+    wait_completed = False
+
+    class Process:
+        returncode: int | None = None
+
+        async def wait(self) -> int:
+            nonlocal wait_completed
+            await done.wait()
+            wait_completed = True
+            self.returncode = -15
+            return -15
+
+        def terminate(self) -> None:
+            nonlocal terminate_calls
+            terminate_calls += 1
+            termination_started.set()
+            if terminate_calls >= 2:
+                done.set()
+
+        def kill(self) -> None:
+            done.set()
+
+    async def spawn(_command: list[str]):
+        return Process()
+
+    async def lost(*_args, **_kwargs):
+        return "lost_lease"
+
+    monkeypatch.setattr(worker, "_spawn_ffmpeg_process", spawn)
+    monkeypatch.setattr(worker, "_runtime_state", lost)
+    task = asyncio.create_task(
+        worker._run_ffmpeg_command(
+            [worker.FFMPEG_BIN, "-version"],
+            output_path=str(output_path),
+            job_id="render-cancel-during-termination",
+            token="lease-token",
+            heartbeat_interval=0.001,
+            poll_interval=0.001,
+        )
+    )
+    await termination_started.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert terminate_calls >= 2
+    assert wait_completed is True
+
+
+async def test_ffmpeg_cancellation_and_output_limit_terminate_and_reap(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from app.core.config import settings
+    from app.workers import timeline_render as worker
+
+    async def run_case(*, oversized: bool) -> tuple[bool, bool]:
+        done = asyncio.Event()
+        spawned = asyncio.Event()
+        output_path = tmp_path / f"output-{oversized}.mp4"
+        output_path.write_bytes(b"123456" if oversized else b"video")
+        terminated = False
+        wait_completed = False
+
+        class Process:
+            returncode: int | None = None
+
+            async def wait(self) -> int:
+                nonlocal wait_completed
+                await done.wait()
+                wait_completed = True
+                self.returncode = -15
+                return -15
+
+            def terminate(self) -> None:
+                nonlocal terminated
+                terminated = True
+                done.set()
+
+            def kill(self) -> None:
+                done.set()
+
+        async def spawn(_command: list[str]):
+            spawned.set()
+            return Process()
+
+        async def active(*_args, **_kwargs):
+            return "active"
+
+        async def heartbeat(*_args, **_kwargs):
+            return True
+
+        monkeypatch.setattr(worker, "_spawn_ffmpeg_process", spawn, raising=False)
+        monkeypatch.setattr(worker, "_runtime_state", active)
+        monkeypatch.setattr(worker, "_heartbeat", heartbeat)
+        task = asyncio.create_task(
+            worker._run_ffmpeg_command(
+                [worker.FFMPEG_BIN, "-version"],
+                output_path=str(output_path),
+                job_id="render-ffmpeg-stop",
+                token="lease-token",
+                heartbeat_interval=0.002,
+                poll_interval=0.001,
+            )
+        )
+        await spawned.wait()
+        if oversized:
+            with pytest.raises(ValueError, match="文件过大"):
+                await task
+        else:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        return terminated, wait_completed
+
+    monkeypatch.setattr(settings, "max_media_read_bytes", 5)
+
+    assert await run_case(oversized=False) == (True, True)
+    assert await run_case(oversized=True) == (True, True)
 
 
 async def test_worker_uses_async_storage_and_token_cas_then_cleans_temp(monkeypatch, tmp_path) -> None:
@@ -740,12 +1317,12 @@ async def test_worker_uses_async_storage_and_token_cas_then_cleans_temp(monkeypa
         async def delete(self, key: str) -> None:
             stored.pop(key, None)
 
-    def fake_trim(src, start, end, out):
+    async def fake_trim(src, start, end, out, **_kwargs):
         assert Path(src).read_bytes() == b"source"
         assert (start, end) == (0.5, 2.0)
         Path(out).write_bytes(b"trimmed")
 
-    def fake_concat(paths, out):
+    async def fake_concat(paths, out, **_kwargs):
         assert len(paths) == 1
         Path(out).write_bytes(b"final")
 
@@ -765,6 +1342,1109 @@ async def test_worker_uses_async_storage_and_token_cas_then_cleans_temp(monkeypa
     assert stored[saved.output_storage_key] == b"final"
     assert not any(key.endswith(".tmp") for key in stored)
     assert saved.lease_token is None
+    assert not any(tmp_path.iterdir())
+
+
+async def test_finish_commit_after_apply_preserves_authoritative_succeeded_output(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from app.workers import timeline_render as worker
+
+    _, raw = _make_db()
+    seed = _seed(raw)
+    job_id = "render-commit-after-apply"
+    base_key = f"generate_outputs/script-1/episode-1/{job_id}.mp4"
+    raw.add(
+        TimelineRenderJob(
+            job_id=job_id,
+            script_id=seed.script.id,
+            episode_id=seed.episode.episode_id,
+            owner_user_id=seed.owner.user_id,
+            idempotency_key=f"idem-{job_id}",
+            request_hash="hash",
+            input_version=1,
+            attempt=1,
+            status="starting",
+            progress=0,
+            input_json={"segments": [{"storage_key": "generate_images/mat/source.mp4"}]},
+            output_storage_key=base_key,
+        )
+    )
+    raw.commit()
+    disconnect_raised = False
+
+    class CommitAfterApplyAdapter(_AsyncSessionAdapter):
+        async def commit(self) -> None:
+            nonlocal disconnect_raised
+            self.session.commit()
+            saved = self.session.get(TimelineRenderJob, job_id)
+            if saved is not None and saved.status == "succeeded" and not disconnect_raised:
+                disconnect_raised = True
+                raise ConnectionError("commit response lost")
+
+    class FakeSessionFactory:
+        def __call__(self):
+            return self
+
+        async def __aenter__(self):
+            self.raw = Session(raw.get_bind(), expire_on_commit=False)
+            return cast(AsyncSession, CommitAfterApplyAdapter(self.raw))
+
+        async def __aexit__(self, exc_type, exc, tb):
+            self.raw.close()
+
+    stored = {"generate_images/mat/source.mp4": b"source"}
+    deleted: list[str] = []
+
+    class Storage:
+        async def get(self, key: str) -> bytes:
+            return stored[key]
+
+        async def put(self, key: str, data: bytes) -> str:
+            stored[key] = data
+            return key
+
+        async def promote(self, source_key: str, final_key: str) -> str:
+            stored[final_key] = stored.pop(source_key)
+            return final_key
+
+        async def delete(self, key: str) -> None:
+            deleted.append(key)
+            stored.pop(key, None)
+
+    async def fake_trim(_src, _start, _end, out, **_kwargs):
+        Path(out).write_bytes(b"trimmed")
+
+    async def fake_concat(_paths, out, **_kwargs):
+        Path(out).write_bytes(b"final")
+
+    monkeypatch.setattr(worker, "async_session_factory", FakeSessionFactory())
+    monkeypatch.setattr(worker, "get_storage", lambda: Storage())
+    monkeypatch.setattr(worker, "_trim_segment", fake_trim)
+    monkeypatch.setattr(worker, "_concat_segments", fake_concat)
+
+    result = await worker.run_render_job(job_id, owner="worker-a", temp_root=tmp_path)
+
+    raw.expire_all()
+    saved = raw.get(TimelineRenderJob, job_id)
+    intents = raw.scalars(select(MediaStorageJob)).all()
+    assert disconnect_raised is True
+    assert saved is not None and saved.status == "succeeded"
+    assert result == {
+        "job_id": job_id,
+        "status": "succeeded",
+        "storage_key": saved.output_storage_key,
+    }
+    assert stored[saved.output_storage_key] == b"final"
+    assert deleted == []
+    assert len(intents) == 2
+    assert {intent.status for intent in intents} == {"canceled"}
+
+
+@pytest.mark.parametrize(
+    ("intent_status", "finish_allowed"),
+    [
+        ("pending", True),
+        ("retry", True),
+        ("canceled", True),
+        ("running", True),
+        ("succeeded", False),
+        ("failed", False),
+    ],
+)
+async def test_finish_respects_delete_intent_state_race(
+    monkeypatch,
+    intent_status: str,
+    finish_allowed: bool,
+) -> None:
+    from app.workers import timeline_render as worker
+
+    _, raw = _make_db()
+    seed = _seed(raw)
+    job_id = f"render-delete-intent-{intent_status}"
+    lease_token = f"lease-{intent_status}"
+    output_key = f"generate_outputs/script-1/episode-1/{job_id}.attempt.mp4"
+    intent_key = worker._delete_intent_key(output_key)
+    raw.add_all(
+        [
+            TimelineRenderJob(
+                job_id=job_id,
+                script_id=seed.script.id,
+                episode_id=seed.episode.episode_id,
+                owner_user_id=seed.owner.user_id,
+                idempotency_key=f"idem-{job_id}",
+                request_hash="hash",
+                input_version=1,
+                attempt=1,
+                status="processing",
+                progress=95,
+                input_json={"segments": []},
+                # succeeded 是 durable tombstone；先用无关 key 构造合法 processing 行，
+                # 再由 _finish 更新到目标 key，验证 writer flush 被 tombstone 拒绝。
+                output_storage_key=(
+                    f"{output_key}.initial" if intent_status == "succeeded" else output_key
+                ),
+                lease_owner="render-worker",
+                lease_token=lease_token,
+                leased_until=datetime.now(UTC) + timedelta(seconds=60),
+            ),
+            MediaStorageJob(
+                id=f"intent-{intent_status}",
+                idempotency_key=intent_key,
+                job_type="delete",
+                source_key=output_key,
+                status=intent_status,
+                lease_owner="cleanup-worker" if intent_status == "running" else None,
+                lease_token="cleanup-lease" if intent_status == "running" else None,
+                lease_until=(
+                    datetime.now(UTC) + timedelta(seconds=60)
+                    if intent_status == "running"
+                    else None
+                ),
+                completed_at=(
+                    datetime.now(UTC)
+                    if intent_status in {"succeeded", "failed", "canceled"}
+                    else None
+                ),
+            ),
+        ]
+    )
+    raw.commit()
+    original_intent = raw.get(MediaStorageJob, f"intent-{intent_status}")
+    assert original_intent is not None
+    original_fields = (
+        original_intent.status,
+        original_intent.available_at,
+        original_intent.lease_owner,
+        original_intent.lease_token,
+        original_intent.lease_until,
+        original_intent.completed_at,
+    )
+
+    class FakeSessionFactory:
+        def __call__(self):
+            return self
+
+        async def __aenter__(self):
+            self.raw = Session(raw.get_bind(), expire_on_commit=False)
+            return cast(AsyncSession, _AsyncSessionAdapter(self.raw))
+
+        async def __aexit__(self, exc_type, exc, tb):
+            self.raw.close()
+
+    monkeypatch.setattr(worker, "async_session_factory", FakeSessionFactory())
+
+    conflict: RuntimeError | ConflictError | None = None
+    try:
+        finished = await worker._finish(
+            job_id,
+            lease_token,
+            status="succeeded",
+            output_storage_key=output_key,
+            output_json={"storage_key": output_key},
+            delete_intent_keys=(intent_key,),
+        )
+    except (RuntimeError, ConflictError) as exc:
+        conflict = exc
+        finished = False
+
+    raw.expire_all()
+    saved_job = raw.get(TimelineRenderJob, job_id)
+    saved_intent = raw.get(MediaStorageJob, f"intent-{intent_status}")
+    assert saved_job is not None and saved_intent is not None
+    if finish_allowed:
+        assert conflict is None
+        assert finished is True
+        assert saved_job.status == "succeeded"
+        assert saved_intent.status == "canceled"
+        if intent_status == "canceled":
+            assert (
+                saved_intent.status,
+                saved_intent.available_at,
+                saved_intent.lease_owner,
+                saved_intent.lease_token,
+                saved_intent.lease_until,
+                saved_intent.completed_at,
+            ) == original_fields
+        else:
+            assert saved_intent.lease_owner is None
+            assert saved_intent.lease_token is None
+            assert saved_intent.lease_until is None
+            assert saved_intent.completed_at is not None
+    else:
+        assert conflict is not None
+        if intent_status == "succeeded":
+            assert isinstance(conflict, ConflictError)
+            assert "正在删除或已删除" in str(conflict)
+        else:
+            assert str(conflict) == "timeline_delete_intent_state_conflict"
+        assert finished is False
+        assert saved_job.status == "processing"
+        assert saved_job.lease_token == lease_token
+        assert (
+            saved_intent.status,
+            saved_intent.available_at,
+            saved_intent.lease_owner,
+            saved_intent.lease_token,
+            saved_intent.lease_until,
+            saved_intent.completed_at,
+        ) == original_fields
+
+
+@pytest.mark.parametrize(
+    "intent_status",
+    ["pending", "retry", "canceled", "running", "succeeded", "failed"],
+)
+async def test_cleanup_attempt_objects_preserves_active_and_terminal_delete_intents(
+    monkeypatch,
+    intent_status: str,
+) -> None:
+    from app.workers import timeline_render as worker
+
+    _, raw = _make_db()
+    source_key = f"generate_outputs/script-1/cleanup-{intent_status}.mp4"
+    intent_key = worker._delete_intent_key(source_key)
+    lease_until = datetime.now(UTC) + timedelta(minutes=5)
+    completed_at = (
+        datetime.now(UTC) - timedelta(minutes=1)
+        if intent_status in {"canceled", "succeeded", "failed"}
+        else None
+    )
+    raw.add(
+        MediaStorageJob(
+            id=f"cleanup-{intent_status}",
+            idempotency_key=intent_key,
+            job_type="delete",
+            source_key=source_key,
+            status=intent_status,
+            attempt=3,
+            available_at=datetime.now(UTC) + timedelta(hours=1),
+            lease_owner="cleanup-worker" if intent_status == "running" else None,
+            lease_token="cleanup-lease" if intent_status == "running" else None,
+            lease_until=lease_until if intent_status == "running" else None,
+            last_error_type="StoredError",
+            last_error_message="safe error",
+            completed_at=completed_at,
+        )
+    )
+    raw.commit()
+    original = raw.get(MediaStorageJob, f"cleanup-{intent_status}")
+    assert original is not None
+    original_fields = (
+        original.status,
+        original.attempt,
+        original.available_at,
+        original.lease_owner,
+        original.lease_token,
+        original.lease_until,
+        original.last_error_type,
+        original.last_error_message,
+        original.completed_at,
+    )
+
+    class FakeSessionFactory:
+        def __call__(self):
+            return self
+
+        async def __aenter__(self):
+            self.raw = Session(raw.get_bind(), expire_on_commit=False)
+            return cast(AsyncSession, _AsyncSessionAdapter(self.raw))
+
+        async def __aexit__(self, exc_type, exc, tb):
+            self.raw.close()
+
+    deleted: list[str] = []
+
+    class Storage:
+        async def delete(self, key: str) -> None:
+            deleted.append(key)
+
+    monkeypatch.setattr(worker, "async_session_factory", FakeSessionFactory())
+
+    await worker._cleanup_attempt_objects(Storage(), (intent_key,), source_key)
+
+    raw.expire_all()
+    saved = raw.get(MediaStorageJob, f"cleanup-{intent_status}")
+    assert saved is not None
+    assert deleted == [source_key]
+    if intent_status in {"pending", "retry"}:
+        assert saved.status == "pending"
+        assert saved.available_at <= datetime.now(UTC).replace(tzinfo=None)
+        assert saved.lease_owner is None
+        assert saved.lease_token is None
+        assert saved.lease_until is None
+        assert saved.completed_at is None
+        assert saved.attempt == 3
+        assert saved.last_error_type == "StoredError"
+        assert saved.last_error_message == "safe error"
+    else:
+        assert (
+            saved.status,
+            saved.attempt,
+            saved.available_at,
+            saved.lease_owner,
+            saved.lease_token,
+            saved.lease_until,
+            saved.last_error_type,
+            saved.last_error_message,
+            saved.completed_at,
+        ) == original_fields
+
+
+@pytest.mark.parametrize(
+    "intent_status",
+    ["pending", "retry", "canceled", "running", "succeeded", "failed"],
+)
+async def test_cleanup_delete_failure_preserves_intent_state_and_retries_failed_generation(
+    monkeypatch,
+    intent_status: str,
+) -> None:
+    from app.workers import timeline_render as worker
+
+    _, raw = _make_db()
+    source_key = f"generate_outputs/script-1/cleanup-failure-{intent_status}.mp4"
+    intent_key = worker._delete_intent_key(source_key)
+    completed_at = (
+        datetime.now(UTC) - timedelta(minutes=1)
+        if intent_status in {"canceled", "succeeded", "failed"}
+        else None
+    )
+    raw.add(
+        MediaStorageJob(
+            id=f"cleanup-failure-{intent_status}",
+            idempotency_key=intent_key,
+            job_type="delete",
+            source_key=source_key,
+            status=intent_status,
+            attempt=8 if intent_status == "failed" else 3,
+            max_attempts=8,
+            available_at=datetime.now(UTC) + timedelta(hours=1),
+            lease_owner="cleanup-worker" if intent_status == "running" else None,
+            lease_token="cleanup-lease" if intent_status == "running" else None,
+            lease_until=(
+                datetime.now(UTC) + timedelta(minutes=5)
+                if intent_status == "running"
+                else None
+            ),
+            last_error_type="StoredError",
+            last_error_message="safe error",
+            completed_at=completed_at,
+        )
+    )
+    raw.commit()
+    original = raw.get(MediaStorageJob, f"cleanup-failure-{intent_status}")
+    assert original is not None
+    original_fields = (
+        original.status,
+        original.attempt,
+        original.available_at,
+        original.lease_owner,
+        original.lease_token,
+        original.lease_until,
+        original.last_error_type,
+        original.last_error_message,
+        original.completed_at,
+    )
+
+    class FakeSessionFactory:
+        def __call__(self):
+            return self
+
+        async def __aenter__(self):
+            self.raw = Session(raw.get_bind(), expire_on_commit=False)
+            return cast(AsyncSession, _AsyncSessionAdapter(self.raw))
+
+        async def __aexit__(self, exc_type, exc, tb):
+            self.raw.close()
+
+    deleted: list[str] = []
+
+    class Storage:
+        async def delete(self, key: str) -> None:
+            deleted.append(key)
+            raise RuntimeError("storage delete failed")
+
+    monkeypatch.setattr(worker, "async_session_factory", FakeSessionFactory())
+
+    await worker._cleanup_attempt_objects(Storage(), (intent_key,), source_key)
+
+    raw.expire_all()
+    rows = list(raw.scalars(select(MediaStorageJob).order_by(MediaStorageJob.idempotency_key)))
+    saved = raw.get(MediaStorageJob, f"cleanup-failure-{intent_status}")
+    assert saved is not None
+    assert deleted == [source_key]
+    if intent_status in {"pending", "retry"}:
+        assert len(rows) == 1
+        assert saved.status == "pending"
+        assert saved.available_at <= datetime.now(UTC).replace(tzinfo=None)
+        assert saved.lease_owner is None
+        assert saved.lease_token is None
+        assert saved.lease_until is None
+        assert saved.completed_at is None
+        assert saved.attempt == original_fields[1]
+    elif intent_status == "failed":
+        assert len(rows) == 2
+        assert (
+            saved.status,
+            saved.attempt,
+            saved.available_at,
+            saved.lease_owner,
+            saved.lease_token,
+            saved.lease_until,
+            saved.last_error_type,
+            saved.last_error_message,
+            saved.completed_at,
+        ) == original_fields
+        retry = next(row for row in rows if row.id != saved.id)
+        assert retry.idempotency_key == f"{intent_key}:retry:1"
+        assert retry.source_key == source_key
+        assert retry.status == "pending"
+        assert retry.available_at <= datetime.now(UTC).replace(tzinfo=None)
+        assert retry.lease_owner is None
+        assert retry.lease_token is None
+        assert retry.lease_until is None
+        assert retry.completed_at is None
+    else:
+        assert len(rows) == 1
+        assert (
+            saved.status,
+            saved.attempt,
+            saved.available_at,
+            saved.lease_owner,
+            saved.lease_token,
+            saved.lease_until,
+            saved.last_error_type,
+            saved.last_error_message,
+            saved.completed_at,
+        ) == original_fields
+
+
+async def test_cleanup_delete_failure_advances_past_failed_compensation_generations(
+    monkeypatch,
+) -> None:
+    from app.workers import timeline_render as worker
+
+    _, raw = _make_db()
+    source_key = "generate_outputs/script-1/cleanup-failure-generations.mp4"
+    intent_key = worker._delete_intent_key(source_key)
+    completed_at = datetime.now(UTC) - timedelta(minutes=1)
+    failed_rows = [
+        MediaStorageJob(
+            id=f"cleanup-generation-{generation}",
+            idempotency_key=(
+                intent_key if generation == 0 else f"{intent_key}:retry:{generation}"
+            ),
+            job_type="delete",
+            source_key=source_key,
+            status="failed",
+            attempt=8,
+            max_attempts=8,
+            available_at=datetime.now(UTC) - timedelta(hours=1),
+            last_error_type=f"StoredError{generation}",
+            last_error_message="safe error",
+            completed_at=completed_at,
+        )
+        for generation in range(2)
+    ]
+    raw.add_all(failed_rows)
+    raw.commit()
+    raw.expire_all()
+    original_fields = {
+        row.id: (
+            row.status,
+            row.attempt,
+            row.last_error_type,
+            row.last_error_message,
+            row.completed_at,
+        )
+        for row in failed_rows
+    }
+
+    class FakeSessionFactory:
+        def __call__(self):
+            return self
+
+        async def __aenter__(self):
+            self.raw = Session(raw.get_bind(), expire_on_commit=False)
+            return cast(AsyncSession, _AsyncSessionAdapter(self.raw))
+
+        async def __aexit__(self, exc_type, exc, tb):
+            self.raw.close()
+
+    class Storage:
+        async def delete(self, _key: str) -> None:
+            raise RuntimeError("storage delete failed")
+
+    monkeypatch.setattr(worker, "async_session_factory", FakeSessionFactory())
+
+    await worker._cleanup_attempt_objects(Storage(), (intent_key,), source_key)
+
+    raw.expire_all()
+    rows = list(raw.scalars(select(MediaStorageJob).order_by(MediaStorageJob.idempotency_key)))
+    assert len(rows) == 3
+    for row_id, expected in original_fields.items():
+        saved = raw.get(MediaStorageJob, row_id)
+        assert saved is not None
+        assert (
+            saved.status,
+            saved.attempt,
+            saved.last_error_type,
+            saved.last_error_message,
+            saved.completed_at,
+        ) == expected
+    retry = next(row for row in rows if row.id not in original_fields)
+    assert retry.idempotency_key == f"{intent_key}:retry:2"
+    assert retry.source_key == source_key
+    assert retry.status == "pending"
+    assert retry.available_at <= datetime.now(UTC).replace(tzinfo=None)
+
+
+async def test_authoritative_success_read_waits_for_inflight_commit(monkeypatch) -> None:
+    from app.workers import timeline_render as worker
+
+    read_started = asyncio.Event()
+    commit_applied = asyncio.Event()
+    attempt_key = "generate_outputs/script-1/render.attempt-1-lock.mp4"
+    processing = SimpleNamespace(status="processing", output_storage_key="base.mp4")
+    succeeded = SimpleNamespace(status="succeeded", output_storage_key=attempt_key)
+
+    class Result:
+        def __init__(self, row) -> None:
+            self.row = row
+
+        def scalar_one_or_none(self):
+            return self.row
+
+    class Db:
+        async def execute(self, statement):
+            read_started.set()
+            if statement._for_update_arg is None:  # noqa: SLF001 - 模拟 PostgreSQL MVCC 锁语义
+                return Result(processing)
+            await commit_applied.wait()
+            return Result(succeeded)
+
+    class Factory:
+        def __call__(self):
+            return self
+
+        async def __aenter__(self):
+            return Db()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+    monkeypatch.setattr(worker, "async_session_factory", Factory())
+    check = asyncio.create_task(
+        worker._authoritative_attempt_succeeded("render-inflight-commit", attempt_key)
+    )
+    await read_started.wait()
+    await asyncio.sleep(0)
+    assert check.done() is False
+
+    commit_applied.set()
+    assert await check is True
+
+
+@pytest.mark.parametrize("cancel_during_download", [False, True])
+async def test_worker_streams_video_files_without_bytes_storage_api(
+    monkeypatch,
+    tmp_path,
+    cancel_during_download: bool,
+) -> None:
+    from app.workers import timeline_render as worker
+
+    _, raw = _make_db()
+    seed = _seed(raw)
+    job_id = "render-stream-cancel" if cancel_during_download else "render-stream"
+    output_key = f"generate_outputs/script-1/episode-1/{job_id}.mp4"
+    raw.add(
+        TimelineRenderJob(
+            job_id=job_id,
+            script_id=seed.script.id,
+            episode_id=seed.episode.episode_id,
+            owner_user_id=seed.owner.user_id,
+            idempotency_key=f"idem-{job_id}",
+            request_hash="hash",
+            input_version=1,
+            attempt=1,
+            status="starting",
+            progress=0,
+            input_json={
+                "segments": [
+                    {"storage_key": "generate_images/mat/video-stream.mp4"}
+                ]
+            },
+            output_storage_key=output_key,
+        )
+    )
+    raw.commit()
+
+    class FakeSessionFactory:
+        def __call__(self):
+            return self
+
+        async def __aenter__(self):
+            self.raw = Session(raw.get_bind(), expire_on_commit=False)
+            return cast(AsyncSession, _AsyncSessionAdapter(self.raw))
+
+        async def __aexit__(self, exc_type, exc, tb):
+            self.raw.close()
+
+    stored: dict[str, bytes] = {
+        "generate_images/mat/video-stream.mp4": b"source-video"
+    }
+    iter_calls: list[tuple[str, int, int, int | None]] = []
+    upload_paths: list[str] = []
+    source_paths: list[str] = []
+
+    class FakeStorage:
+        async def get(self, _key: str) -> bytes:
+            raise AssertionError("大视频下载不得调用 get(bytes)")
+
+        async def put(self, _key: str, _data: bytes) -> str:
+            raise AssertionError("最终视频上传不得调用 put(bytes)")
+
+        async def iter_chunks(
+            self,
+            key: str,
+            *,
+            chunk_size: int,
+            start: int,
+            end: int | None,
+        ):
+            iter_calls.append((key, chunk_size, start, end))
+            yield b"source-"
+            if cancel_during_download:
+                claimed = raw.get(TimelineRenderJob, job_id)
+                assert claimed is not None
+                claimed.status = "canceled"
+                claimed.lease_owner = None
+                claimed.lease_token = None
+                claimed.leased_until = None
+                raw.commit()
+            yield b"video"
+
+        async def put_file(self, key: str, path: str) -> str:
+            upload_paths.append(path)
+            stored[key] = Path(path).read_bytes()
+            return key
+
+        async def promote(self, source_key: str, final_key: str) -> str:
+            stored[final_key] = stored.pop(source_key)
+            return final_key
+
+        async def delete(self, key: str) -> None:
+            stored.pop(key, None)
+
+    async def fake_trim(src, start, end, out, **_kwargs):
+        assert Path(src).read_bytes() == b"source-video"
+        source_paths.append(src)
+        Path(out).write_bytes(b"trimmed")
+
+    async def fake_concat(paths, out, **_kwargs):
+        assert len(paths) == 1
+        assert source_paths
+        assert all(not Path(path).exists() for path in source_paths)
+        Path(out).write_bytes(b"final-video")
+
+    monkeypatch.setattr(worker, "async_session_factory", FakeSessionFactory())
+    monkeypatch.setattr(worker, "get_storage", lambda: FakeStorage())
+    monkeypatch.setattr(worker, "_trim_segment", fake_trim)
+    monkeypatch.setattr(worker, "_concat_segments", fake_concat)
+
+    result = await worker.run_render_job(job_id, owner="worker-a", temp_root=tmp_path)
+
+    raw.expire_all()
+    saved = raw.get(TimelineRenderJob, job_id)
+    assert saved is not None
+    assert len(iter_calls) == 1
+    assert iter_calls[0][0] == "generate_images/mat/video-stream.mp4"
+    assert iter_calls[0][2:] == (0, None)
+    assert not any(tmp_path.iterdir())
+    if cancel_during_download:
+        assert result["status"] == "canceled"
+        assert saved.status == "canceled"
+        assert upload_paths == []
+        assert output_key not in stored
+    else:
+        assert result["status"] == "succeeded"
+        assert saved.status == "succeeded"
+        assert saved.lease_token is None
+        assert saved.output_storage_key != output_key
+        assert ".attempt-1-" in saved.output_storage_key
+        assert stored[saved.output_storage_key] == b"final-video"
+        assert output_key not in stored
+        assert len(upload_paths) == 1
+        assert not Path(upload_paths[0]).exists()
+
+
+async def test_worker_streaming_upload_error_cleans_partial_temp_object(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from app.workers import timeline_render as worker
+
+    _, raw = _make_db()
+    seed = _seed(raw)
+    job_id = "render-stream-upload-fail"
+    output_key = f"generate_outputs/script-1/episode-1/{job_id}.mp4"
+    raw.add(
+        TimelineRenderJob(
+            job_id=job_id,
+            script_id=seed.script.id,
+            episode_id=seed.episode.episode_id,
+            owner_user_id=seed.owner.user_id,
+            idempotency_key=f"idem-{job_id}",
+            request_hash="hash",
+            input_version=1,
+            attempt=1,
+            status="starting",
+            progress=0,
+            input_json={
+                "segments": [
+                    {"storage_key": "generate_images/mat/video-stream.mp4"}
+                ]
+            },
+            output_storage_key=output_key,
+        )
+    )
+    raw.commit()
+
+    class FakeSessionFactory:
+        def __call__(self):
+            return self
+
+        async def __aenter__(self):
+            self.raw = Session(raw.get_bind(), expire_on_commit=False)
+            return cast(AsyncSession, _AsyncSessionAdapter(self.raw))
+
+        async def __aexit__(self, exc_type, exc, tb):
+            self.raw.close()
+
+    stored: dict[str, bytes] = {}
+    upload_keys: list[str] = []
+    deleted: list[str] = []
+
+    class FakeStorage:
+        async def get(self, _key: str) -> bytes:
+            raise AssertionError("大视频下载不得调用 get(bytes)")
+
+        async def put(self, _key: str, _data: bytes) -> str:
+            raise AssertionError("最终视频上传不得调用 put(bytes)")
+
+        async def iter_chunks(self, _key: str, **_kwargs):
+            yield b"source-video"
+
+        async def put_file(self, key: str, path: str) -> str:
+            upload_keys.append(key)
+            stored[key] = Path(path).read_bytes()
+            raise RuntimeError("streaming upload failed")
+
+        async def promote(self, _source_key: str, _final_key: str) -> str:
+            raise AssertionError("上传失败后不得 promote")
+
+        async def delete(self, key: str) -> None:
+            deleted.append(key)
+            stored.pop(key, None)
+
+    async def fake_trim(src, start, end, out, **_kwargs):
+        Path(out).write_bytes(Path(src).read_bytes())
+
+    async def fake_concat(paths, out, **_kwargs):
+        Path(out).write_bytes(Path(paths[0]).read_bytes())
+
+    monkeypatch.setattr(worker, "async_session_factory", FakeSessionFactory())
+    monkeypatch.setattr(worker, "get_storage", lambda: FakeStorage())
+    monkeypatch.setattr(worker, "_trim_segment", fake_trim)
+    monkeypatch.setattr(worker, "_concat_segments", fake_concat)
+
+    result = await worker.run_render_job(job_id, owner="worker-a", temp_root=tmp_path)
+
+    raw.expire_all()
+    saved = raw.get(TimelineRenderJob, job_id)
+    intents = list(raw.scalars(select(MediaStorageJob)))
+    assert saved is not None
+    assert result["status"] == "failed"
+    assert saved.status == "failed"
+    assert saved.lease_token is None
+    assert len(upload_keys) == 1
+    assert upload_keys[0].endswith(".tmp")
+    assert upload_keys[0] in deleted
+    assert output_key not in deleted
+    assert len(intents) == 2
+    assert {intent.source_key for intent in intents} == {
+        upload_keys[0],
+        upload_keys[0].removesuffix(".tmp"),
+    }
+    assert {intent.status for intent in intents} == {"pending"}
+    now = datetime.now(UTC) + timedelta(seconds=1)
+    assert all(
+        (
+            intent.available_at.replace(tzinfo=UTC)
+            if intent.available_at.tzinfo is None
+            else intent.available_at
+        )
+        <= now
+        for intent in intents
+    )
+    assert stored == {}
+    assert not any(tmp_path.iterdir())
+
+
+async def test_timeline_stream_rejects_empty_source_and_removes_partial_file(tmp_path) -> None:
+    from app.workers import timeline_render as worker
+
+    class Storage:
+        async def get(self, _key: str) -> bytes:
+            raise AssertionError("存在流式接口时不得 fallback")
+
+        async def iter_chunks(self, _key: str, **_kwargs):
+            if False:
+                yield b""
+
+    local_path = tmp_path / "empty.mp4"
+    with pytest.raises(ValueError, match="为空"):
+        await worker._download_storage_file(
+            Storage(),
+            "generate_images/video/empty.mp4",
+            str(local_path),
+        )
+
+    assert not local_path.exists()
+
+
+async def test_timeline_upload_rejects_oversized_final_before_put_file(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from app.core.config import settings
+    from app.workers import timeline_render as worker
+
+    uploaded = False
+
+    class Storage:
+        async def put_file(self, _key: str, _path: str) -> str:
+            nonlocal uploaded
+            uploaded = True
+            return "unexpected"
+
+    final_path = tmp_path / "oversized-final.mp4"
+    final_path.write_bytes(b"123456")
+    monkeypatch.setattr(settings, "max_media_read_bytes", 5)
+
+    with pytest.raises(ValueError, match="文件过大"):
+        await worker._upload_storage_file(
+            Storage(),
+            "generate_outputs/script-1/oversized.mp4",
+            str(final_path),
+        )
+
+    assert uploaded is False
+
+
+async def test_timeline_rejects_cumulative_trimmed_size_before_concat(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from app.core.config import settings
+    from app.workers import timeline_render as worker
+
+    job = SimpleNamespace(
+        input_json={
+            "segments": [
+                {"storage_key": "generate_images/video/one.mp4"},
+                {"storage_key": "generate_images/video/two.mp4"},
+            ]
+        },
+        output_storage_key="generate_outputs/script-1/render-limit.mp4",
+        attempt=1,
+    )
+    concat_called = False
+    upload_called = False
+
+    async def load_claimed(*_args, **_kwargs):
+        return job, "lease-token"
+
+    async def active(*_args, **_kwargs):
+        return "active"
+
+    async def heartbeat(*_args, **_kwargs):
+        return True
+
+    async def finish(*_args, **_kwargs):
+        return True
+
+    class Storage:
+        async def get(self, _key: str) -> bytes:
+            raise AssertionError("大视频下载不得调用 get(bytes)")
+
+        async def iter_chunks(self, _key: str, **_kwargs):
+            yield b"x"
+
+        async def put_file(self, _key: str, _path: str) -> str:
+            nonlocal upload_called
+            upload_called = True
+            return "unexpected"
+
+        async def delete(self, _key: str) -> None:
+            return None
+
+    async def fake_trim(_src, _start, _end, out, **_kwargs):
+        Path(out).write_bytes(b"abc")
+
+    async def fake_concat(_paths, _out, **_kwargs):
+        nonlocal concat_called
+        concat_called = True
+        raise AssertionError("累计超限后不得 concat")
+
+    monkeypatch.setattr(settings, "max_media_read_bytes", 5)
+    monkeypatch.setattr(worker, "_load_claimed_job", load_claimed)
+    monkeypatch.setattr(worker, "_runtime_state", active)
+    monkeypatch.setattr(worker, "_heartbeat", heartbeat)
+    monkeypatch.setattr(worker, "_finish", finish)
+    monkeypatch.setattr(worker, "get_storage", lambda: Storage())
+    monkeypatch.setattr(worker, "_trim_segment", fake_trim)
+    monkeypatch.setattr(worker, "_concat_segments", fake_concat)
+
+    result = await worker.run_render_job(
+        "render-limit",
+        owner="worker-a",
+        temp_root=tmp_path,
+    )
+
+    assert result["status"] == "failed"
+    assert concat_called is False
+    assert upload_called is False
+    assert not any(tmp_path.iterdir())
+
+
+async def test_two_timeline_workers_keep_only_current_attempt_output(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from app.workers import timeline_render as worker
+
+    _, raw = _make_db()
+    seed = _seed(raw)
+    job_id = "render-two-workers"
+    base_key = f"generate_outputs/script-1/episode-1/{job_id}.mp4"
+    raw.add(
+        TimelineRenderJob(
+            job_id=job_id,
+            script_id=seed.script.id,
+            episode_id=seed.episode.episode_id,
+            owner_user_id=seed.owner.user_id,
+            idempotency_key="idem-two-workers",
+            request_hash="hash",
+            input_version=1,
+            attempt=1,
+            status="starting",
+            progress=0,
+            input_json={
+                "segments": [
+                    {"storage_key": "generate_images/mat/video-stream.mp4"}
+                ]
+            },
+            output_storage_key=base_key,
+        )
+    )
+    raw.commit()
+
+    class FakeSessionFactory:
+        def __call__(self):
+            return self
+
+        async def __aenter__(self):
+            self.raw = Session(raw.get_bind(), expire_on_commit=False)
+            return cast(AsyncSession, _AsyncSessionAdapter(self.raw))
+
+        async def __aexit__(self, exc_type, exc, tb):
+            self.raw.close()
+
+    stored: dict[str, bytes] = {}
+    promotions: list[tuple[str, str]] = []
+    deleted: list[str] = []
+
+    class Storage:
+        async def get(self, _key: str) -> bytes:
+            raise AssertionError("大视频下载不得调用 get(bytes)")
+
+        async def put(self, _key: str, _data: bytes) -> str:
+            raise AssertionError("最终视频上传不得调用 put(bytes)")
+
+        async def iter_chunks(self, _key: str, **_kwargs):
+            yield b"source-video"
+
+        async def put_file(self, key: str, path: str) -> str:
+            stored[key] = Path(path).read_bytes()
+            return key
+
+        async def promote(self, source_key: str, final_key: str) -> str:
+            promotions.append((source_key, final_key))
+            stored[final_key] = stored.pop(source_key)
+            if len(promotions) == 1:
+                claimed = raw.get(TimelineRenderJob, job_id)
+                assert claimed is not None
+                claimed.lease_owner = "worker-b"
+                claimed.lease_token = "replacement-token"
+                raw.commit()
+            return final_key
+
+        async def delete(self, key: str) -> None:
+            deleted.append(key)
+            stored.pop(key, None)
+
+    async def fake_trim(src, start, end, out, **_kwargs):
+        Path(out).write_bytes(Path(src).read_bytes())
+
+    async def fake_concat(paths, out, **_kwargs):
+        Path(out).write_bytes(Path(paths[0]).read_bytes())
+
+    storage = Storage()
+    monkeypatch.setattr(worker, "async_session_factory", FakeSessionFactory())
+    monkeypatch.setattr(worker, "get_storage", lambda: storage)
+    monkeypatch.setattr(worker, "_trim_segment", fake_trim)
+    monkeypatch.setattr(worker, "_concat_segments", fake_concat)
+
+    stale_result = await worker.run_render_job(
+        job_id,
+        owner="worker-a",
+        temp_root=tmp_path,
+    )
+    assert stale_result["status"] == "skipped"
+
+    raw.expire_all()
+    retry = raw.get(TimelineRenderJob, job_id)
+    assert retry is not None
+    retry.status = "starting"
+    retry.lease_owner = None
+    retry.lease_token = None
+    retry.leased_until = None
+    raw.commit()
+
+    current_result = await worker.run_render_job(
+        job_id,
+        owner="worker-b",
+        temp_root=tmp_path,
+    )
+
+    raw.expire_all()
+    saved = raw.get(TimelineRenderJob, job_id)
+    assert saved is not None
+    assert current_result["status"] == "succeeded"
+    assert len(promotions) == 2
+    stale_final = promotions[0][1]
+    current_final = promotions[1][1]
+    assert stale_final != current_final
+    assert all(".attempt-1-" in final_key for _, final_key in promotions)
+    assert stale_final in deleted
+    assert stale_final not in stored
+    assert current_final in stored
+    assert saved.output_storage_key == current_final
+    assert current_result["storage_key"] == current_final
+    assert base_key not in stored
+    assert base_key not in deleted
     assert not any(tmp_path.iterdir())
 
 
@@ -836,10 +2516,10 @@ async def test_worker_settle_failure_releases_reservation_and_deletes_output(mon
     async def failing_settle(*args, **kwargs):
         raise RuntimeError("settle backend down")
 
-    def fake_trim(src, start, end, out):
+    async def fake_trim(src, start, end, out, **_kwargs):
         Path(out).write_bytes(b"trimmed")
 
-    def fake_concat(paths, out):
+    async def fake_concat(paths, out, **_kwargs):
         Path(out).write_bytes(b"final")
 
     monkeypatch.setattr(worker, "async_session_factory", FakeSessionFactory())
@@ -863,7 +2543,8 @@ async def test_worker_settle_failure_releases_reservation_and_deletes_output(mon
     assert account.balance_points == 100
     assert account.frozen_points == 0
     assert saved.output_storage_key not in stored
-    assert saved.output_storage_key in deleted
+    assert saved.output_storage_key not in deleted
+    assert any(".attempt-1-" in key and not key.endswith(".tmp") for key in deleted)
 
 
 async def test_worker_release_failure_records_pending_cleanup_and_reconciler_releases(monkeypatch) -> None:
@@ -1047,23 +2728,33 @@ async def test_cancel_release_failure_records_pending_cleanup_and_reconciler_rel
         )
     )
     seed.account.frozen_points = 1
-    raw.add(
-        TimelineRenderJob(
-            job_id="render-cancel-release-fail",
-            script_id=seed.script.id,
-            episode_id=seed.episode.episode_id,
-            owner_user_id=seed.owner.user_id,
-            idempotency_key="idem-cancel-release-fail",
-            request_hash="hash",
-            input_version=1,
-            attempt=1,
-            reservation_id="reservation-cancel-release-fail",
-            status="starting",
-            progress=0,
-            input_json={"segments": []},
-            output_storage_key="generate_outputs/script-1/episode-1/render-cancel-release-fail.mp4",
-        )
+    render_job = TimelineRenderJob(
+        job_id="render-cancel-release-fail",
+        script_id=seed.script.id,
+        episode_id=seed.episode.episode_id,
+        owner_user_id=seed.owner.user_id,
+        idempotency_key="idem-cancel-release-fail",
+        request_hash="hash",
+        input_version=1,
+        attempt=1,
+        reservation_id="reservation-cancel-release-fail",
+        status="starting",
+        progress=0,
+        input_json={"segments": []},
+        output_storage_key="generate_outputs/script-1/episode-1/render-cancel-release-fail.mp4",
     )
+    outbox = TaskDispatchOutbox(
+        id="dispatch-render-cancel-release-fail",
+        task_type="timeline.render",
+        job_id=render_job.job_id,
+        attempt=render_job.attempt,
+        payload={"job_id": render_job.job_id},
+        status="running",
+        lease_owner="dispatcher",
+        lease_token="dispatch-token",
+        lease_until=datetime.now(UTC) + timedelta(minutes=1),
+    )
+    raw.add_all([render_job, outbox])
     raw.commit()
     db = cast(AsyncSession, _AsyncSessionAdapter(raw))
 
@@ -1082,13 +2773,18 @@ async def test_cancel_release_failure_records_pending_cleanup_and_reconciler_rel
     raw.expire_all()
     saved = raw.get(TimelineRenderJob, "render-cancel-release-fail")
     reservation = raw.get(CreditReservation, "reservation-cancel-release-fail")
-    assert saved is not None and reservation is not None
+    outbox = raw.get(TaskDispatchOutbox, "dispatch-render-cancel-release-fail")
+    assert saved is not None and reservation is not None and outbox is not None
     assert canceled["status"] == "canceled"
     assert saved.status == "canceled"
     assert reservation.status == "reserved"
     assert saved.output_json is not None
     assert saved.output_json["financial_cleanup"]["status"] == "pending"
     assert saved.output_json["financial_cleanup"]["action"] == "release"
+    assert outbox.status == "canceled"
+    assert outbox.lease_owner is None
+    assert outbox.lease_token is None
+    assert outbox.lease_until is None
 
     class FakeSessionFactory:
         def __call__(self):
@@ -1232,10 +2928,10 @@ async def test_worker_lost_lease_deletes_temp_and_final_orphans(monkeypatch, tmp
             deleted.append(key)
             stored.pop(key, None)
 
-    def fake_trim(src, start, end, out):
+    async def fake_trim(src, start, end, out, **_kwargs):
         Path(out).write_bytes(b"trimmed")
 
-    def fake_concat(paths, out):
+    async def fake_concat(paths, out, **_kwargs):
         Path(out).write_bytes(b"final")
 
     monkeypatch.setattr(worker, "async_session_factory", FakeSessionFactory())
@@ -1307,7 +3003,17 @@ async def test_stale_reconciler_requeues_starting_processing_and_missing_outbox(
         )
     )
     raw.commit()
-    db = cast(AsyncSession, _AsyncSessionAdapter(raw))
+    class RecordingSession(_AsyncSessionAdapter):
+        def __init__(self, session: Session) -> None:
+            super().__init__(session)
+            self.statements: list[object] = []
+
+        async def execute(self, statement):
+            self.statements.append(statement)
+            return await super().execute(statement)
+
+    recording_db = RecordingSession(raw)
+    db = cast(AsyncSession, recording_db)
 
     recovered = await worker.reconcile_stale_render_jobs(db, limit=10)
 
@@ -1319,6 +3025,22 @@ async def test_stale_reconciler_requeues_starting_processing_and_missing_outbox(
     outboxes = raw.scalars(select(TaskDispatchOutbox)).all()
     assert len(outboxes) == 2
     assert all(row.status == "pending" for row in outboxes)
+    statements = [
+        str(statement.compile(dialect=postgresql.dialect()))
+        for statement in recording_db.statements
+    ]
+    job_lock_index = next(
+        index
+        for index, statement in enumerate(statements)
+        if "FROM timeline_render_jobs" in statement
+        and "FOR UPDATE SKIP LOCKED" in statement
+    )
+    outbox_lock_index = next(
+        index
+        for index, statement in enumerate(statements)
+        if "FROM task_dispatch_outbox" in statement and "FOR UPDATE" in statement
+    )
+    assert job_lock_index < outbox_lock_index
 
 
 async def test_retry_render_creates_new_immutable_attempt_and_outbox(monkeypatch) -> None:

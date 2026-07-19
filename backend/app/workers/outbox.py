@@ -1,6 +1,5 @@
 """Celery outbox dispatcher worker。"""
 
-import asyncio
 import socket
 from typing import Any, cast
 
@@ -9,6 +8,7 @@ from celery.canvas import Signature
 
 from app.core.database import async_session_factory
 from app.services.task_dispatch import dispatch_outbox_batch, reconcile_pipeline_dispatches
+from app.workers.async_runtime import run_worker_async
 from app.workers.celery_app import app as celery_app
 
 _beat_schedule = dict(celery_app.conf.beat_schedule or {})
@@ -182,7 +182,7 @@ async def _dispatch() -> int:
 
 @celery_app.task(name="outbox.dispatch", bind=True, max_retries=0)
 def dispatch_outbox_task(self) -> int:
-    return asyncio.run(_dispatch())
+    return run_worker_async(_dispatch())
 
 
 async def _reconcile_pipeline() -> int:
@@ -194,4 +194,4 @@ async def _reconcile_pipeline() -> int:
 
 @celery_app.task(name="outbox.reconcile-pipeline", bind=True, max_retries=0)
 def reconcile_pipeline_task(self) -> int:
-    return asyncio.run(_reconcile_pipeline())
+    return run_worker_async(_reconcile_pipeline())

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator, Iterator
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -117,6 +118,27 @@ async def test_timeline_api_idempotency_conflict_returns_409(monkeypatch) -> Non
             headers={"Idempotency-Key": "idem-1"},
         )
     assert response.status_code == 409
+
+
+async def test_timeline_idempotency_key_http_max_length(monkeypatch) -> None:
+    app.dependency_overrides[get_db] = _override_db
+    app.dependency_overrides[get_current_user] = _override_user()
+    access = AsyncMock(side_effect=AssertionError("超长 header 不应进入时间线业务逻辑"))
+    render = AsyncMock(side_effect=AssertionError("超长 header 不应创建合成任务"))
+    monkeypatch.setattr(timeline_api, "check_timeline_script_access", access)
+    monkeypatch.setattr(timeline_api.timeline_render, "render", render)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            "/v3api/video-timeline-arrangements/render",
+            json={"script_id": "script-1", "episode_id": "episode-1"},
+            headers={"Idempotency-Key": "x" * 257},
+        )
+
+    assert response.status_code == 422
+    assert response.json() == {"detail": "字段校验失败"}
+    access.assert_not_awaited()
+    render.assert_not_awaited()
 
 
 async def test_timeline_api_patch_without_version_returns_422() -> None:

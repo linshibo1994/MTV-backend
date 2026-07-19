@@ -11,12 +11,16 @@
 替换被引用资产前检查 shot_group.materials 引用并返回影响摘要。
 """
 
+import hashlib
+from datetime import UTC, datetime
+
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import ConflictError, ForbiddenError, NotFoundError
 from app.crud import asset as asset_crud
 from app.models.asset_entry import AssetEntry
+from app.models.media_upload import MediaUpload
 from app.models.shot_group import ShotGroup
 from app.models.subject import Subject
 from app.schemas.asset import (
@@ -432,6 +436,45 @@ async def remove_candidate_with_recalc(
 
     if candidate.status != "candidate":
         raise ConflictError("只有候选状态的资产可以移出候选队列")
+
+    from app.providers.storage import validate_key_prefix
+    from app.services import media_storage_jobs
+
+    upload = (
+        await db.execute(
+            select(MediaUpload)
+            .where(MediaUpload.asset_id == candidate.id)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    delete_keys: set[str] = set()
+    if upload is not None:
+        delete_keys.update(
+            await media_storage_jobs.cancel_promotes_for_delete(
+                db,
+                asset_ids={candidate.id},
+                final_keys={upload.final_storage_key},
+            )
+        )
+        delete_keys.update({upload.temp_storage_key, upload.final_storage_key})
+        upload.status = "deleted"
+        upload.completed_at = datetime.now(UTC)
+    else:
+        # 兼容迁移前没有 MediaUpload 归属行的上传候选。
+        try:
+            delete_keys.add(validate_key_prefix(candidate.storage_key))
+        except ValueError:
+            pass
+
+    for key in sorted(delete_keys):
+        digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+        await media_storage_jobs.enqueue_delete(
+            db,
+            idempotency_key=f"asset-delete:{candidate.id}:{digest}",
+            source_key=key,
+            asset_id=candidate.id,
+            upload_id=upload.id if upload is not None else None,
+        )
 
     await asset_crud.remove_candidate(db, candidate)
 

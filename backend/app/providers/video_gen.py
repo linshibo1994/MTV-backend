@@ -4,11 +4,127 @@
 未知厂商立即失败，避免静默切换后产生错误计费。
 """
 
-from collections.abc import Callable
+import asyncio
+import logging
+import threading
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
+from contextvars import Context
 from dataclasses import dataclass, field
-from typing import Protocol, runtime_checkable
+from enum import StrEnum
+from typing import NoReturn, Protocol, runtime_checkable
+
+from billiard.exceptions import SoftTimeLimitExceeded, TimeLimitExceeded
 
 from app.core.config import settings
+
+logger = logging.getLogger(__name__)
+
+CancellationProbe = Callable[[], Awaitable[bool]]
+TaskCreatedCallback = Callable[[str], Awaitable[None]]
+SubmissionStateCallback = Callable[[], Awaitable[None]]
+_VIDEO_CLIENT_CLOSE_TIMEOUT = 2.0
+_VIDEO_CLIENT_CLOSE_ORPHANS: set[asyncio.Task[object]] = set()
+_VIDEO_CLIENT_CLOSE_ORPHANS_LOCK = threading.Lock()
+
+
+class _VideoClientCloseSlots:
+    """跨线程、跨事件循环限制未收敛的客户端 close 数量。"""
+
+    def __init__(self, limit: int) -> None:
+        self._limit = limit
+        self._lock = threading.Lock()
+        self._tokens: set[object] = set()
+
+    def reserve(self) -> object | None:
+        token = object()
+        with self._lock:
+            if len(self._tokens) >= self._limit:
+                return None
+            self._tokens.add(token)
+        return token
+
+    def release(self, token: object) -> None:
+        with self._lock:
+            self._tokens.discard(token)
+
+
+_VIDEO_CLIENT_CLOSE_SLOTS = _VideoClientCloseSlots(limit=1)
+
+
+class VideoCancellationOutcome(StrEnum):
+    """远端视频任务取消结果。"""
+
+    CANCELED = "canceled"
+    UNSUPPORTED = "unsupported"
+    FAILED = "failed"
+
+
+@dataclass(frozen=True)
+class VideoCancellationResult:
+    provider_task_id: str
+    outcome: VideoCancellationOutcome
+    detail: str | None = None
+
+
+class VideoGenerationCancelled(RuntimeError):
+    """本地任务取消后终止 Provider 等待，不进入 worker 失败补偿。"""
+
+    def __init__(self, result: VideoCancellationResult) -> None:
+        self.result = result
+        super().__init__(
+            "视频生成已取消 "
+            f"provider_task_id={result.provider_task_id} outcome={result.outcome.value}"
+        )
+
+
+class VideoGenerationRemoteTerminalError(RuntimeError):
+    """Provider 已确认远端任务失败或取消，可安全结束本地 attempt。"""
+
+    _NORMALIZED_STATUSES = {
+        "failed": "failed",
+        "error": "failed",
+        "cancelled": "canceled",
+        "canceled": "canceled",
+    }
+
+    def __init__(self, *, provider_task_id: str, terminal_status: str) -> None:
+        normalized = self._NORMALIZED_STATUSES.get(terminal_status.strip().lower())
+        if not provider_task_id or normalized is None:
+            raise ValueError("无效的视频远端终态证据")
+        self.provider_task_id = provider_task_id
+        self.terminal_status = normalized
+        super().__init__(f"video_generation_remote_terminal:{normalized}")
+
+
+class VideoGenerationSubmissionUncertain(RuntimeError):
+    """提交请求可能已被远端接受，但客户端没有取得可恢复任务 ID。"""
+
+    def __init__(self) -> None:
+        super().__init__("video_generation_submission_uncertain")
+
+
+class VideoGenerationSubmitRejected(RuntimeError):
+    """Provider 已明确拒绝提交，远端没有创建计费任务。"""
+
+    def __init__(self) -> None:
+        super().__init__("video_generation_submit_rejected")
+
+
+class VideoTaskCheckpointError(RuntimeError):
+    """远端任务 ID checkpoint 未形成可继续执行的权威事实。"""
+
+    def __init__(self, message: str, *, provider_task_id: str) -> None:
+        super().__init__(message)
+        self.provider_task_id = provider_task_id
+
+
+class VideoTaskCheckpointUnavailable(VideoTaskCheckpointError):
+    """远端任务 ID checkpoint 的持久通道暂时不可用。"""
+
+
+class VideoTaskCheckpointConflict(VideoTaskCheckpointError):
+    """远端任务 ID 与本地权威记录冲突。"""
 
 
 @dataclass(frozen=True)
@@ -23,6 +139,26 @@ class VideoGenerationRequest:
     first_frame: str | None = None
     duration_seconds: int | None = None
     metadata: dict = field(default_factory=dict)
+    cancel_requested: CancellationProbe | None = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
+    on_task_created: TaskCreatedCallback | None = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
+    before_submit: SubmissionStateCallback | None = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
+    on_submission_uncertain: SubmissionStateCallback | None = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
 
 
 @dataclass(frozen=True)
@@ -41,6 +177,307 @@ class VideoGenerationProgress:
 
 
 ProgressCallback = Callable[[VideoGenerationProgress], None]
+RemoteCancelCallback = Callable[[str], Awaitable[VideoCancellationResult]]
+
+
+async def await_video_task_checkpoint(
+    on_task_created: TaskCreatedCallback | None,
+    provider_task_id: str,
+) -> None:
+    """远端 ID 可见后等待持久 checkpoint，禁止越过该异步边界。"""
+
+    if on_task_created is None:
+        return
+    try:
+        await on_task_created(provider_task_id)
+    except TimeLimitExceeded:
+        raise
+    except VideoTaskCheckpointError:
+        raise
+    except SoftTimeLimitExceeded as exc:
+        raise VideoTaskCheckpointUnavailable(
+            "video_task_checkpoint_unavailable",
+            provider_task_id=provider_task_id,
+        ) from exc
+    except Exception as exc:
+        raise VideoTaskCheckpointUnavailable(
+            "video_task_checkpoint_unavailable",
+            provider_task_id=provider_task_id,
+        ) from exc
+
+
+def _video_submit_status_code(exc: Exception) -> int | None:
+    response = getattr(exc, "response", None)
+    for raw_status in (
+        getattr(exc, "status_code", None),
+        getattr(response, "status_code", None),
+        getattr(exc, "code", None),
+    ):
+        if raw_status is None:
+            continue
+        try:
+            status_code = int(raw_status)
+        except (TypeError, ValueError):
+            continue
+        if 100 <= status_code <= 599:
+            return status_code
+    return None
+
+
+def _video_submit_was_explicitly_rejected(exc: Exception) -> bool:
+    status_code = _video_submit_status_code(exc)
+    return status_code is not None and 400 <= status_code < 500 and status_code != 408
+
+
+async def _notify_video_submission_uncertain(
+    callback: SubmissionStateCallback | None,
+) -> None:
+    if callback is None:
+        return
+    try:
+        await callback()
+    except (SoftTimeLimitExceeded, TimeLimitExceeded):
+        raise
+    except Exception as exc:
+        raise VideoGenerationSubmissionUncertain() from exc
+
+
+async def execute_video_submission[SubmissionResult](
+    submit: Callable[[], Awaitable[SubmissionResult]],
+    *,
+    before_submit: SubmissionStateCallback | None,
+    on_submission_uncertain: SubmissionStateCallback | None,
+) -> SubmissionResult:
+    """先持久化提交意图，再把提交响应异常归一为可判权的 typed error。"""
+
+    if before_submit is not None:
+        await before_submit()
+    try:
+        return await submit()
+    except (SoftTimeLimitExceeded, TimeLimitExceeded):
+        raise
+    except (VideoGenerationSubmissionUncertain, VideoGenerationSubmitRejected):
+        raise
+    except Exception as exc:
+        if _video_submit_was_explicitly_rejected(exc):
+            raise VideoGenerationSubmitRejected() from exc
+        await _notify_video_submission_uncertain(on_submission_uncertain)
+        raise VideoGenerationSubmissionUncertain() from exc
+
+
+async def raise_video_submission_uncertain(
+    callback: SubmissionStateCallback | None,
+) -> NoReturn:
+    """提交已返回但缺少任务 ID，同样按响应不确定处理。"""
+
+    await _notify_video_submission_uncertain(callback)
+    raise VideoGenerationSubmissionUncertain()
+
+
+async def _close_video_client(
+    close: Callable[[], Awaitable[object]],
+    *,
+    provider_key: str,
+    primary_error: BaseException | None,
+) -> None:
+    """有界关闭客户端；普通 close 错误不得覆盖正在传播的主异常。"""
+
+    close_slot = _VIDEO_CLIENT_CLOSE_SLOTS.reserve()
+    if close_slot is None:
+        _poison_worker_async_runtime(provider_key)
+        exc = TimeoutError("video_provider_client_close_orphan_pending")
+        if primary_error is None:
+            raise exc
+        _log_video_client_close_failure(provider_key, exc)
+        return
+
+    async def _invoke_close() -> object:
+        return await close()
+
+    # 空 task-scope 上下文避免 WorkerAsyncRuntime 在 invocation 收尾时再次等待它。
+    close_coroutine = _invoke_close()
+    try:
+        task = asyncio.create_task(
+            close_coroutine,
+            name=f"video-provider-close:{provider_key}",
+            context=Context(),
+        )
+    except BaseException:
+        close_coroutine.close()
+        _VIDEO_CLIENT_CLOSE_SLOTS.release(close_slot)
+        raise
+
+    def _finalize_close(completed: asyncio.Task[object]) -> None:
+        _VIDEO_CLIENT_CLOSE_SLOTS.release(close_slot)
+        _consume_video_client_close_orphan(completed, provider_key)
+
+    task.add_done_callback(_finalize_close)
+    _register_worker_async_runtime_detached_close(
+        task,
+        on_abandon=lambda: _abandon_video_client_close(task, close_slot),
+    )
+    try:
+        done, _pending = await asyncio.wait(
+            {task},
+            timeout=_VIDEO_CLIENT_CLOSE_TIMEOUT,
+        )
+    except (asyncio.CancelledError, SoftTimeLimitExceeded, TimeLimitExceeded):
+        _register_video_client_close_orphan(task, provider_key)
+        task.cancel()
+        _poison_worker_async_runtime(provider_key)
+        raise
+
+    if task in done:
+        _finalize_close(task)
+        try:
+            task.result()
+        except (asyncio.CancelledError, SoftTimeLimitExceeded, TimeLimitExceeded):
+            raise
+        except Exception as exc:
+            if primary_error is None:
+                raise
+            _log_video_client_close_failure(provider_key, exc)
+        return
+
+    timeout_error = TimeoutError("video_provider_client_close_timeout")
+    _register_video_client_close_orphan(task, provider_key)
+    task.cancel()
+    try:
+        await asyncio.sleep(0)
+    finally:
+        if not task.done():
+            _poison_worker_async_runtime(provider_key)
+    if primary_error is None:
+        raise timeout_error
+    _log_video_client_close_failure(provider_key, timeout_error)
+
+
+def _register_video_client_close_orphan(
+    task: asyncio.Task[object],
+    provider_key: str,
+) -> None:
+    with _VIDEO_CLIENT_CLOSE_ORPHANS_LOCK:
+        _VIDEO_CLIENT_CLOSE_ORPHANS.add(task)
+    if task.done():
+        _consume_video_client_close_orphan(task, provider_key)
+
+
+def _consume_video_client_close_orphan(
+    task: asyncio.Task[object],
+    provider_key: str,
+) -> None:
+    with _VIDEO_CLIENT_CLOSE_ORPHANS_LOCK:
+        was_orphan = task in _VIDEO_CLIENT_CLOSE_ORPHANS
+        _VIDEO_CLIENT_CLOSE_ORPHANS.discard(task)
+    if not was_orphan or task.cancelled():
+        return
+    error = task.exception()
+    if error is not None:
+        _log_video_client_close_failure(provider_key, error)
+
+
+def _abandon_video_client_close(task: asyncio.Task[object], close_slot: object) -> None:
+    _VIDEO_CLIENT_CLOSE_SLOTS.release(close_slot)
+    with _VIDEO_CLIENT_CLOSE_ORPHANS_LOCK:
+        _VIDEO_CLIENT_CLOSE_ORPHANS.discard(task)
+
+
+def _register_worker_async_runtime_detached_close(
+    task: asyncio.Task[object],
+    *,
+    on_abandon: Callable[[], None],
+) -> None:
+    from app.workers.async_runtime import (
+        register_current_worker_async_runtime_detached_task,
+    )
+
+    register_current_worker_async_runtime_detached_task(
+        task,
+        on_abandon=on_abandon,
+    )
+
+
+def _poison_worker_async_runtime(provider_key: str) -> None:
+    try:
+        from app.workers.async_runtime import poison_current_worker_async_runtime
+
+        poison_current_worker_async_runtime()
+    except Exception as exc:  # noqa: BLE001 - 关闭超时路径不得覆盖主异常
+        logger.error(
+            "毒化视频 Provider 异步运行时失败 provider_key=%s error_type=%s",
+            provider_key,
+            type(exc).__name__,
+        )
+
+
+def _log_video_client_close_failure(provider_key: str, exc: BaseException) -> None:
+    logger.warning(
+        "关闭视频 Provider 客户端失败 provider_key=%s error_type=%s",
+        provider_key,
+        type(exc).__name__,
+    )
+
+
+@asynccontextmanager
+async def managed_video_client[ClientT](
+    client: ClientT,
+    close: Callable[[], Awaitable[object]],
+    *,
+    provider_key: str,
+) -> AsyncIterator[ClientT]:
+    """统一管理视频 Provider 客户端，并保持主异常与控制流信号。"""
+
+    primary_error: BaseException | None = None
+    try:
+        yield client
+    except BaseException as exc:
+        primary_error = exc
+        raise
+    finally:
+        await _close_video_client(
+            close,
+            provider_key=provider_key,
+            primary_error=primary_error,
+        )
+
+
+async def raise_if_video_cancel_requested_before_submit(
+    cancel_requested: CancellationProbe | None,
+) -> None:
+    """远端任务尚未创建时直接终止，避免产生无效调用和费用。"""
+    if cancel_requested is None or not await cancel_requested():
+        return
+    raise VideoGenerationCancelled(
+        VideoCancellationResult(
+            provider_task_id="",
+            outcome=VideoCancellationOutcome.CANCELED,
+            detail="本地取消发生在远端任务提交前",
+        )
+    )
+
+
+async def raise_if_video_cancel_requested(
+    cancel_requested: CancellationProbe | None,
+    provider_task_id: str,
+    cancel_remote: RemoteCancelCallback,
+) -> None:
+    """在远端任务 ID 已知后检查本地终态，并尽力停止远端任务。"""
+    if cancel_requested is None or not await cancel_requested():
+        return
+    result = await cancel_remote(provider_task_id)
+    raise VideoGenerationCancelled(result)
+
+
+def unsupported_video_cancellation(
+    provider_key: str,
+    provider_task_id: str,
+) -> VideoCancellationResult:
+    """为没有可靠取消语义的 Provider 返回可解释降级结果。"""
+    return VideoCancellationResult(
+        provider_task_id=provider_task_id,
+        outcome=VideoCancellationOutcome.UNSUPPORTED,
+        detail=f"{provider_key} 当前未提供可靠的远端视频任务取消能力",
+    )
 
 
 @runtime_checkable
@@ -58,6 +495,10 @@ class VideoGenProvider(Protocol):
         on_progress: ProgressCallback | None = None,
     ) -> VideoGenerationResult:
         """使用 typed 请求执行视频生成。"""
+        ...
+
+    async def cancel(self, provider_task_id: str) -> VideoCancellationResult:
+        """尽力取消已知 ID 的远端任务，并显式返回能力或失败状态。"""
         ...
 
     async def generate_all_reference(

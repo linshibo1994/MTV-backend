@@ -10,7 +10,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import noload
 
 from app.core.ids import new_id
-from app.models.video_generation_job import VideoGenerationJob
+from app.models.video_generation_job import (
+    VideoGenerationIdempotencyRequest,
+    VideoGenerationJob,
+)
 from app.models.video_provider import VideoProviderConfig
 
 # 任务处于以下状态时视为「活动中」，幂等去重时复用而非新建。
@@ -20,6 +23,11 @@ _ACTIVE_STATUSES = ("starting", "processing")
 
 # 终态：一旦进入这些状态，进度更新不得再覆盖（cancel 与 worker 收尾互不覆盖 canceled↔succeeded）。
 _TERMINAL_STATUSES = ("succeeded", "failed", "canceled")
+_PRESERVED_OUTPUT_DEBT_KEYS = (
+    "attempt_output_cleanup",
+    "provider_cancellation",
+    "orphan_provider_cancellations",
+)
 
 
 @dataclass(frozen=True)
@@ -28,6 +36,43 @@ class VideoJobClaim:
     lease_token: str
     attempt: int
     input_version: int
+
+
+@dataclass(frozen=True)
+class VideoIdempotencyBinding:
+    request_hash: str
+    job: VideoGenerationJob
+
+
+def _merge_latest_video_json(
+    current: dict[str, Any] | None,
+    incoming: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """以数据库最新值为底合并，恢复债务不得被调用方旧快照覆盖。"""
+
+    current_json = dict(current or {})
+    merged = {**current_json, **dict(incoming or {})}
+    for key in _PRESERVED_OUTPUT_DEBT_KEYS:
+        if key in current_json:
+            merged[key] = current_json[key]
+        else:
+            merged.pop(key, None)
+    return merged
+
+
+async def _lock_video_job_for_update(
+    db: AsyncSession,
+    job_id: str,
+) -> VideoGenerationJob | None:
+    return (
+        await db.execute(
+            select(VideoGenerationJob)
+            .where(VideoGenerationJob.job_id == job_id)
+            .options(noload(VideoGenerationJob.script))
+            .execution_options(populate_existing=True)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
 
 
 async def create_video_job(
@@ -94,19 +139,46 @@ async def get_video_job(db: AsyncSession, job_id: str) -> VideoGenerationJob | N
     return result.scalar_one_or_none()
 
 
-async def find_job_by_idempotency(
+async def find_idempotency_binding(
     db: AsyncSession, *, script_id: str, idempotency_key: str
-) -> VideoGenerationJob | None:
+) -> VideoIdempotencyBinding | None:
     result = await db.execute(
-        select(VideoGenerationJob)
+        select(VideoGenerationIdempotencyRequest.request_hash, VideoGenerationJob)
+        .join(
+            VideoGenerationJob,
+            VideoGenerationJob.job_id == VideoGenerationIdempotencyRequest.job_id,
+        )
         .where(
-            VideoGenerationJob.script_id == script_id,
-            VideoGenerationJob.idempotency_key == idempotency_key,
+            VideoGenerationIdempotencyRequest.script_id == script_id,
+            VideoGenerationIdempotencyRequest.idempotency_key == idempotency_key,
         )
         .options(noload(VideoGenerationJob.script))
         .limit(1)
     )
-    return result.scalar_one_or_none()
+    row = result.one_or_none()
+    if row is None:
+        return None
+    request_hash, job = row
+    return VideoIdempotencyBinding(request_hash=request_hash, job=job)
+
+
+async def bind_idempotency_request(
+    db: AsyncSession,
+    *,
+    script_id: str,
+    idempotency_key: str,
+    request_hash: str,
+    job_id: str,
+) -> VideoGenerationIdempotencyRequest:
+    binding = VideoGenerationIdempotencyRequest(
+        script_id=script_id,
+        idempotency_key=idempotency_key,
+        request_hash=request_hash,
+        job_id=job_id,
+    )
+    db.add(binding)
+    await db.flush()
+    return binding
 
 
 async def list_video_jobs(
@@ -201,6 +273,16 @@ async def update_video_job_progress(
     或已进入终态，不覆盖终态（cancel 与 worker 收尾不互相覆盖 canceled↔succeeded）。
     返回 True 表示更新命中，False 表示并发覆盖/终态保护未写入。
     """
+    current = await _lock_video_job_for_update(db, job_id)
+    if current is None or current.status in _TERMINAL_STATUSES:
+        return False
+    if expected_version is not None and current.version != expected_version:
+        return False
+    if lease_token is not None and (
+        current.status != "processing" or current.lease_token != lease_token
+    ):
+        return False
+
     values: dict = {"version": VideoGenerationJob.version + 1}
     if status is not None:
         values["status"] = status
@@ -217,9 +299,12 @@ async def update_video_job_progress(
     if retryable is not None:
         values["retryable"] = retryable
     if output_json is not None:
-        values["output_json"] = output_json
+        values["output_json"] = _merge_latest_video_json(
+            current.output_json,
+            output_json,
+        )
     if metrics is not None:
-        values["metrics"] = metrics
+        values["metrics"] = _merge_latest_video_json(current.metrics, metrics)
     # 状态守卫：绝不覆盖已进入终态的任务
     conds = [
         VideoGenerationJob.job_id == job_id,
@@ -228,6 +313,8 @@ async def update_video_job_progress(
     # CAS：调用方传入期望的旧版本号时，增加乐观锁条件防并发覆写
     if expected_version is not None:
         conds.append(VideoGenerationJob.version == expected_version)
+    else:
+        conds.append(VideoGenerationJob.version == current.version)
     if lease_token is not None:
         conds.extend(
             [
@@ -252,26 +339,35 @@ async def claim_video_job(
     owner: str,
     now: datetime | None = None,
     lease_seconds: int = 900,
+    allow_stale_processing: bool = True,
 ) -> VideoJobClaim | None:
-    """原子领取 starting 或租约过期的 processing job，返回新 lease token。"""
+    """原子领取可执行任务；worker 入口可禁用过期 processing 直接接管。"""
     current = now or datetime.now(UTC)
+    claimable = VideoGenerationJob.status == "starting"
+    if allow_stale_processing:
+        claimable = or_(
+            claimable,
+            (VideoGenerationJob.status == "processing")
+            & (VideoGenerationJob.lease_until.is_not(None))
+            & (VideoGenerationJob.lease_until <= current),
+        )
     row = (
         await db.execute(
             select(VideoGenerationJob)
             .where(
                 VideoGenerationJob.job_id == job_id,
-                or_(
-                    VideoGenerationJob.status == "starting",
-                    (VideoGenerationJob.status == "processing")
-                    & (VideoGenerationJob.lease_until.is_not(None))
-                    & (VideoGenerationJob.lease_until <= current),
-                ),
+                claimable,
             )
             .options(noload(VideoGenerationJob.script))
+            .execution_options(populate_existing=True)
             .with_for_update()
         )
     ).scalar_one_or_none()
     if row is None:
+        return None
+    from app.services.video_remote_cancellation import provider_submission_is_unresolved
+
+    if provider_submission_is_unresolved(row.output_json, row.metrics):
         return None
     from app.core.ids import new_id
 
@@ -362,6 +458,13 @@ async def finish_video_job(
 ) -> bool:
     if status not in _TERMINAL_STATUSES:
         raise ValueError("无效视频任务终态")
+    current = await _lock_video_job_for_update(db, job_id)
+    if (
+        current is None
+        or current.status != "processing"
+        or current.lease_token != lease_token
+    ):
+        return False
     values: dict = {
         "status": status,
         "lease_owner": None,
@@ -379,9 +482,12 @@ async def finish_video_job(
     if status == "canceled":
         values["canceled_at"] = datetime.now(UTC)
     if output_json is not None:
-        values["output_json"] = output_json
+        values["output_json"] = _merge_latest_video_json(
+            current.output_json,
+            output_json,
+        )
     if metrics is not None:
-        values["metrics"] = metrics
+        values["metrics"] = _merge_latest_video_json(current.metrics, metrics)
     if error_type is not None:
         values["error_type"] = error_type
     if error_message is not None:
@@ -396,6 +502,7 @@ async def finish_video_job(
                 VideoGenerationJob.job_id == job_id,
                 VideoGenerationJob.status == "processing",
                 VideoGenerationJob.lease_token == lease_token,
+                VideoGenerationJob.version == current.version,
             )
             .values(**values)
         ),
@@ -523,6 +630,7 @@ async def ensure_provider_configs(db: AsyncSession) -> None:
         "modelsai": settings.seedance_model,
         "bailian": settings.dashscope_video_model,
         "openai": settings.openai_video_model,
+        "gemini": settings.google_video_model,
     }
     for key, model in provider_models.items():
         existing = await get_provider_by_key(db, key, "all_reference")

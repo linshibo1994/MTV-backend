@@ -40,7 +40,7 @@ def _subject_out(*, image_id: str | None = None, audio_id: str | None = None) ->
 
 
 async def test_delete_subject_writes_success_audit(monkeypatch) -> None:
-    db = SimpleNamespace(commit=AsyncMock())
+    db = SimpleNamespace(commit=AsyncMock(), rollback=AsyncMock())
     user = SimpleNamespace(user_id="user-1", username="alice")
     subject = SimpleNamespace(
         id="subject-1",
@@ -58,7 +58,7 @@ async def test_delete_subject_writes_success_audit(monkeypatch) -> None:
         AsyncMock(return_value=subject),
     )
     monkeypatch.setattr(asset_library.asset_crud, "delete_subject", AsyncMock())
-    monkeypatch.setattr(asset_library, "audit_log", audit)
+    monkeypatch.setattr(asset_library, "strict_audit_log", audit)
 
     result = await asset_library.delete_subject(
         "script-1", "subject-1", db=db, user=user
@@ -71,7 +71,8 @@ async def test_delete_subject_writes_success_audit(monkeypatch) -> None:
     assert payload["resource_id"] == "subject-1"
     assert payload["before"]["image_entry_id"] == "image-1"
     assert payload["after"] is None
-    assert payload["commit"] is True
+    db.commit.assert_awaited_once()
+    db.rollback.assert_not_awaited()
 
 
 async def test_approve_image_audits_only_a_real_state_change(monkeypatch) -> None:
@@ -185,6 +186,12 @@ async def test_provider_switch_writes_before_and_after_audit(monkeypatch) -> Non
         provider_key="modelsai", job_type="all_reference", model="seedance"
     )
     audit = AsyncMock()
+    ensure_configs = AsyncMock()
+    monkeypatch.setattr(
+        video_generation.video_crud,
+        "ensure_provider_configs",
+        ensure_configs,
+    )
     monkeypatch.setattr(
         video_generation.video_crud,
         "get_provider_by_key",
@@ -207,6 +214,7 @@ async def test_provider_switch_writes_before_and_after_audit(monkeypatch) -> Non
     )
 
     assert result.provider_key == "modelsai"
+    ensure_configs.assert_awaited_once_with(db)
     payload = audit.await_args.kwargs
     assert payload["action"] == "provider_switch"
     assert payload["resource_type"] == "video_provider"

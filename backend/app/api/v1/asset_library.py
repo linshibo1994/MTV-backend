@@ -362,18 +362,21 @@ async def delete_subject(
         "image_entry_id": subject.image_entry_id,
     }
 
-    await asset_crud.delete_subject(db, subject)
-    await db.commit()
-    await audit_log(
-        db,
-        actor=user,
-        action="subject_delete",
-        resource_type="subject",
-        resource_id=subject_id,
-        before=before,
-        after=None,
-        commit=True,
-    )
+    try:
+        await asset_crud.delete_subject(db, subject)
+        await strict_audit_log(
+            db,
+            actor=user,
+            action="subject_delete",
+            resource_type="subject",
+            resource_id=subject_id,
+            before=before,
+            after=None,
+        )
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise
     return {"detail": "已删除"}
 
 

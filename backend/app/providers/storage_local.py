@@ -13,11 +13,16 @@ import asyncio
 import errno
 import os
 import stat
+import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
 
 from app.core.config import settings
-from app.providers.storage import normalize_key, validate_key_prefix
+from app.providers.storage import (
+    StorageObjectNotFoundError,
+    normalize_key,
+    validate_key_prefix,
+)
 
 
 class LocalStorageProvider:
@@ -55,13 +60,56 @@ class LocalStorageProvider:
     async def promote(self, source_key: str, final_key: str) -> str:
         source = self._full_path(source_key)
         final = self._full_path(final_key)
-        await asyncio.to_thread(self._promote_file, source, final)
+        await asyncio.to_thread(
+            self._promote_file,
+            source,
+            final,
+            normalize_key(source_key),
+        )
         return normalize_key(final_key)
 
+    async def promote_if_absent(self, source_key: str, final_key: str) -> bool:
+        source = self._full_path(source_key)
+        final = self._full_path(final_key)
+        return await asyncio.to_thread(
+            self._publish_file_if_absent,
+            source,
+            final,
+            normalize_key(source_key),
+        )
+
     @staticmethod
-    def _promote_file(source: str, final: str) -> None:
+    def _promote_file(source: str, final: str, source_key: str) -> None:
         os.makedirs(os.path.dirname(final), exist_ok=True)
-        os.replace(source, final)
+        try:
+            os.replace(source, final)
+        except FileNotFoundError as exc:
+            # promote 已完成但任务状态提交前崩溃时，source 不在而 final 已在。
+            if LocalStorageProvider._exists_file(final):
+                return
+            if not LocalStorageProvider._exists_file(source):
+                raise StorageObjectNotFoundError(source_key) from exc
+            raise
+
+    @staticmethod
+    def _publish_file_if_absent(source: str, final: str, source_key: str) -> bool:
+        """用同文件系统 hard link 原子创建目标，禁止覆盖并保留可恢复源。"""
+        os.makedirs(os.path.dirname(final), exist_ok=True)
+        try:
+            os.link(source, final, follow_symlinks=False)
+        except FileExistsError:
+            return False
+        except FileNotFoundError as exc:
+            if LocalStorageProvider._exists_file(final):
+                return False
+            if not LocalStorageProvider._exists_file(source):
+                raise StorageObjectNotFoundError(source_key) from exc
+            raise
+        try:
+            os.remove(source)
+        except FileNotFoundError:
+            pass
+        return True
 
     @staticmethod
     def _write_file(full: str, data: bytes) -> None:
@@ -81,24 +129,45 @@ class LocalStorageProvider:
     @staticmethod
     def _copy_file(source: str, full: str) -> None:
         os.makedirs(os.path.dirname(full), exist_ok=True)
+        part = os.path.join(
+            os.path.dirname(full),
+            f".{os.path.basename(full)}.part-{uuid.uuid4().hex}",
+        )
         read_flags = os.O_RDONLY
         write_flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
         if hasattr(os, "O_NOFOLLOW"):
             read_flags |= os.O_NOFOLLOW
             write_flags |= os.O_NOFOLLOW
+        src_fd: int | None = None
         try:
             src_fd = os.open(source, read_flags)
-            dst_fd = os.open(full, write_flags, 0o600)
+            dst_fd = os.open(part, write_flags, 0o600)
         except OSError as exc:
+            if src_fd is not None:
+                os.close(src_fd)
+            try:
+                os.remove(part)
+            except FileNotFoundError:
+                pass
             if exc.errno == errno.ELOOP:
                 raise ValueError("非法 storage_key") from exc
             raise
-        with os.fdopen(src_fd, "rb") as src, os.fdopen(dst_fd, "wb") as dst:
-            while True:
-                chunk = src.read(1024 * 1024)
-                if not chunk:
-                    break
-                dst.write(chunk)
+        try:
+            with os.fdopen(src_fd, "rb") as src, os.fdopen(dst_fd, "wb") as dst:
+                while True:
+                    chunk = src.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    dst.write(chunk)
+                dst.flush()
+                os.fsync(dst.fileno())
+            os.replace(part, full)
+        except BaseException:
+            try:
+                os.remove(part)
+            except FileNotFoundError:
+                pass
+            raise
 
     async def get(self, key: str) -> bytes:
         full = self._full_path(key)
@@ -117,6 +186,16 @@ class LocalStorageProvider:
     def _delete_file(full: str) -> None:
         if os.path.exists(full):
             os.remove(full)
+        # put_file 在完整复制前只写内部 part 文件；恢复删除必须同时清理强杀残留。
+        parent = os.path.dirname(full)
+        prefix = f".{os.path.basename(full)}.part-"
+        if os.path.isdir(parent):
+            for name in os.listdir(parent):
+                if name.startswith(prefix):
+                    try:
+                        os.remove(os.path.join(parent, name))
+                    except FileNotFoundError:
+                        pass
 
     async def exists(self, key: str) -> bool:
         full = self._full_path(key)
