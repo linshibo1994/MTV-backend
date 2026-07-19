@@ -116,6 +116,59 @@ def test_materials_has_monotonic_version_column():
     assert Materials.__table__.c.version.default.arg == 0
 
 
+def test_image_asset_storage_key_can_be_joined_to_media_proxy_prefix():
+    """图片元数据必须返回带前导斜杠的 key，避免前端拼出无效代理 URL。"""
+
+    async def scenario() -> None:
+        engine = create_engine("sqlite+pysqlite:///:memory:")
+        _canvas_tables(engine)
+        with Session(engine, expire_on_commit=False) as raw:
+            raw.add_all(
+                [
+                    Script(
+                        id="script-1",
+                        title="剧本",
+                        scope="personal",
+                        owner_user_id="user-1",
+                        created_by_user_id="user-1",
+                    ),
+                    Materials(id="material-1", name="画布", script_id="script-1"),
+                    Subject(
+                        id="subject-1",
+                        script_id="script-1",
+                        type="character",
+                        name="林舟",
+                        pipeline_name="林舟",
+                    ),
+                ]
+            )
+            raw.flush()
+            raw.add(
+                AssetEntry(
+                    id="asset-1",
+                    script_id="script-1",
+                    subject_id="subject-1",
+                    kind="image",
+                    storage_key="upload_images/material-1/portrait.png",
+                    mime_type="image/png",
+                    size_bytes=128,
+                    source="upload_images",
+                    status="approved",
+                )
+            )
+            raw.commit()
+
+            result = await materials_crud.get_image_asset(
+                _AsyncSessionAdapter(raw),
+                "material-1",
+                "asset-1",
+            )
+
+            assert result.storage_key == "/upload_images/material-1/portrait.png"
+
+    asyncio.run(scenario())
+
+
 def test_task_node_data_round_trips_without_dropping_fields():
     data = {
         "subjectId": "subject-1",

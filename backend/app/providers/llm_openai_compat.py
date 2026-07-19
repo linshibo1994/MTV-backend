@@ -26,7 +26,6 @@ from openai import (
     RateLimitError,
 )
 
-from app.providers.llm import require_non_empty_chat_content
 from app.providers.registry import ProviderConfigurationError
 
 LLMVendor = Literal["openai", "openai_compatible", "deepseek", "bailian", "gemini"]
@@ -132,12 +131,7 @@ class OpenAICompatLLMProvider:
             RateLimitError,
         ):
             raise ConnectionError("LLM 供应商暂不可用") from None
-        choices = getattr(response, "choices", None)
-        if not choices:
-            return require_non_empty_chat_content(None)
-        message = getattr(choices[0], "message", None)
-        content = getattr(message, "content", None)
-        return require_non_empty_chat_content(content)
+        return response.choices[0].message.content or ""
 
 
 def build_openai_compat(

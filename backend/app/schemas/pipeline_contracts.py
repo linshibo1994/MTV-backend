@@ -64,7 +64,7 @@ async def complete_json[ContractT: BaseModel](
     ) from last_error
 
 SubjectType = Literal["character", "scene", "prop", "sound"]
-ParentType = Literal["character", "background", "prop", "sound"]
+ParentType = Literal["character", "background", "scene", "prop", "sound"]
 PipelineVersion = Literal["pipeline.v1"]
 NonEmptyText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 ShortNonEmptyText = Annotated[

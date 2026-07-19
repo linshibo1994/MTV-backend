@@ -18,6 +18,7 @@ from app.models.canvas_edge import CanvasEdge
 from app.models.canvas_node import CanvasNode
 from app.models.materials import Materials
 from app.models.subject import Subject
+from app.providers.storage import validate_key_prefix
 from app.schemas.materials import (
     CanvasDeltaIn,
     CanvasEdgeOut,
@@ -296,7 +297,7 @@ async def get_image_asset(db: AsyncSession, material_id: str, image_id: str) -> 
         raise ForbiddenError("图片资产不属于当前剧本")
     return ImageAssetOut(
         image_id=entry.id,
-        storage_key=entry.storage_key,
+        storage_key=f"/{validate_key_prefix(entry.storage_key)}",
         mime_type=entry.mime_type,
         size_bytes=entry.size_bytes,
         source=entry.source,

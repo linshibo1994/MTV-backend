@@ -444,6 +444,113 @@ def test_merge_rejects_incomplete_or_extra_subject_keyset(monkeypatch, mode: str
     asyncio.run(scenario())
 
 
+def test_merge_normalizes_provider_false_child_flag_to_stage_invariant(monkeypatch) -> None:
+    """merge 的子主体标记由阶段定义，不能让供应商的 false 阻断真实任务。"""
+    extract_stage = SimpleNamespace(
+        detail={
+            "episodes": [
+                {
+                    "episode_no": 1,
+                    "subjects": [
+                        {
+                            "name": "主角",
+                            "type": "character",
+                            "description": "主角描述",
+                            "episode_nos": [1],
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+    replace = AsyncMock()
+    monkeypatch.setattr(merge, "get_stage", AsyncMock(return_value=extract_stage))
+    monkeypatch.setattr(merge, "replace_subjects", replace)
+
+    async def scenario() -> None:
+        await merge.run_merge(
+            _ServiceSession(_episode()),
+            "script-1",
+            episode_id="episode-1",
+            input_version=3,
+            provider=FakeProvider(
+                [
+                    {
+                        "schema_version": "pipeline.v1",
+                        "merged_subjects": [
+                            {
+                                "name": "主角",
+                                "type": "character",
+                                "description": "主角描述",
+                                "is_child": False,
+                                "episode_nos": [1],
+                            }
+                        ],
+                        "total_count": 1,
+                    }
+                ]
+            ),
+            provider_attempt=1,
+        )
+        assert replace.await_args.args[2][0]["is_child"] is True
+
+    asyncio.run(scenario())
+
+
+def test_merge_adapter_rejects_nonboolean_child_flag(monkeypatch) -> None:
+    """适配层不得把字符串等非精确布尔值放宽为合法主体。"""
+    extract_stage = SimpleNamespace(
+        detail={
+            "episodes": [
+                {
+                    "episode_no": 1,
+                    "subjects": [
+                        {
+                            "name": "主角",
+                            "type": "character",
+                            "description": "主角描述",
+                            "episode_nos": [1],
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+    replace = AsyncMock()
+    monkeypatch.setattr(merge, "get_stage", AsyncMock(return_value=extract_stage))
+    monkeypatch.setattr(merge, "replace_subjects", replace)
+
+    async def scenario() -> None:
+        with pytest.raises(pipeline_contracts.ProviderContractError):
+            await merge.run_merge(
+                _ServiceSession(_episode()),
+                "script-1",
+                episode_id="episode-1",
+                input_version=3,
+                provider=FakeProvider(
+                    [
+                        {
+                            "schema_version": "pipeline.v1",
+                            "merged_subjects": [
+                                {
+                                    "name": "主角",
+                                    "type": "character",
+                                    "description": "主角描述",
+                                    "is_child": "false",
+                                    "episode_nos": [1],
+                                }
+                            ],
+                            "total_count": 1,
+                        }
+                    ]
+                ),
+                provider_attempt=3,
+            )
+        replace.assert_not_awaited()
+
+    asyncio.run(scenario())
+
+
 def test_merge_keyset_failure_uses_remaining_durable_budget(monkeypatch) -> None:
     extract_stage = SimpleNamespace(
         detail={
@@ -3251,6 +3358,56 @@ def test_run_scoped_parents_stages_without_publishing(monkeypatch) -> None:
         assert isinstance(result, dict)
         assert result["parent_subjects"][0]["child_ids"] == ["subject-1"]
         publish.assert_not_awaited()
+
+    asyncio.run(scenario())
+
+
+def test_run_scoped_parents_normalizes_scene_alias_to_background(monkeypatch) -> None:
+    """父主体契约接受供应商常见的 scene 同义值，并在持久化前统一为 background。"""
+
+    async def scenario() -> None:
+        merge_output = {
+            "subjects": [
+                {
+                    "id": "subject-scene-1",
+                    "name": "实验室夜景",
+                    "type": "scene",
+                    "description": "夜间实验室",
+                    "episode_nos": [1],
+                }
+            ]
+        }
+        monkeypatch.setattr(
+            parents, "get_run_stage_output", AsyncMock(return_value=merge_output)
+        )
+        monkeypatch.setattr(parents, "replace_parent_subjects", AsyncMock())
+        monkeypatch.setattr(parents, "set_stage", AsyncMock())
+
+        result = await parents.run_parents(
+            _ServiceSession(_episode()),
+            "script-1",
+            episode_id="episode-1",
+            input_version=3,
+            run_id="run-1",
+            provider=FakeProvider(
+                [
+                    {
+                        "parent_subjects": [
+                            {
+                                "name": "实验室",
+                                "type": "scene",
+                                "description": "实验室场景集合",
+                                "child_count": 1,
+                                "child_ids": ["subject-scene-1"],
+                            }
+                        ]
+                    }
+                ]
+            ),
+        )
+
+        assert isinstance(result, dict)
+        assert result["parent_subjects"][0]["type"] == "background"
 
     asyncio.run(scenario())
 

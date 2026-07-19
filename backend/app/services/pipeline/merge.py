@@ -4,6 +4,8 @@
 读取 extract 阶段写入的 detail，调用 LLM 合并后落库到 subjects 表。
 """
 
+from typing import Any
+
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -21,7 +23,11 @@ from app.services.pipeline import (
 )
 
 # ---- 提示词骨架（06 文档第 12.2 节）----
-_SYSTEM = "你是一名短剧剧本分析师。请将多集提取的主体列表中跨集出现的同一主体合并, episode_nos 取并集。"
+_SYSTEM = (
+    "你是一名短剧剧本分析师。请将多集提取的主体列表中跨集出现的同一主体合并, "
+    "episode_nos 取并集。merge 阶段的产物只能是子主体：is_child 是服务端固定语义，"
+    "每一项必须输出 JSON 布尔值 true，严禁输出 false、字符串或省略该字段。"
+)
 
 _USER_TEMPLATE = """以下是多集提取的主体列表, 请将跨集出现的同一主体 (同名同类型) 合并, episode_nos 取并集。
 
@@ -35,6 +41,7 @@ _USER_TEMPLATE = """以下是多集提取的主体列表, 请将跨集出现的�
 2. description 保留最详细的版本, 或合并补充
 3. episode_nos 取并集并排序
 4. 保留所有不重复的主体
+5. merge 只负责去重子主体，不创建父主体；每个 is_child 必须为 JSON 布尔值 true
 
 输出 JSON:
 {{
@@ -45,6 +52,46 @@ _USER_TEMPLATE = """以下是多集提取的主体列表, 请将跨集出现的�
   "total_count": 44
 }}
 """
+
+
+def _normalize_merge_child_flags(payload: object) -> object:
+    """只修复供应商把阶段固定值错误写成 ``false`` 的已知漂移。
+
+    ``is_child`` 不是 merge 模型需要推理的业务结果，而是该阶段的服务端不变量。
+    适配只接受精确布尔 ``false`` 并改写为 ``true``；缺失、字符串、数字、非对象条目
+    及其他结构性错误全部原样交给严格 Pydantic 契约拒绝，避免扩大供应商输出容错面。
+    """
+    if not isinstance(payload, dict):
+        return payload
+    subjects = payload.get("merged_subjects")
+    if not isinstance(subjects, list):
+        return payload
+
+    normalized_subjects: list[object] = []
+    changed = False
+    for subject in subjects:
+        if isinstance(subject, dict) and subject.get("is_child") is False:
+            normalized = dict(subject)
+            normalized["is_child"] = True
+            normalized_subjects.append(normalized)
+            changed = True
+        else:
+            normalized_subjects.append(subject)
+    if not changed:
+        return payload
+    normalized_payload = dict(payload)
+    normalized_payload["merged_subjects"] = normalized_subjects
+    return normalized_payload
+
+
+class _MergeProviderAdapter:
+    """在严格 MergeOutput 校验前注入 merge 阶段的固定子主体语义。"""
+
+    def __init__(self, provider: Any) -> None:
+        self._provider = provider
+
+    async def complete_json(self, system: str, user: str) -> object:
+        return _normalize_merge_child_flags(await self._provider.complete_json(system, user))
 
 
 async def _prepare_staged_subjects(
@@ -225,7 +272,7 @@ async def run_merge(
             if set(subject.episode_nos) != required_episode_nos.get(key, set()):
                 raise ValueError("merge 输出 episode_nos 必须与 extract 输入一致")
 
-    provider = provider or get_llm_provider()
+    provider = _MergeProviderAdapter(provider or get_llm_provider())
     contract = await complete_json(
         provider,
         _SYSTEM,

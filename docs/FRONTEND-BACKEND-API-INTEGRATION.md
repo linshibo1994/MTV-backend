@@ -7,6 +7,17 @@
 
 本文是前端对接当前后端实现的主文档。接口、请求模型、响应模型、权限、幂等和并发规则均以当前 FastAPI 路由及 Pydantic Schema 为准；旧需求文档只用于解释业务背景，不作为字段契约来源。
 
+## 2026-07-19 本轮接口更新清单
+
+本轮仅有一项公开 HTTP 响应契约变更；其余稳定性修复不新增、删除或改变 HTTP operation。
+
+| 接口/范围 | 旧风险 | 新保证 | 前端修改动作 | 兼容建议 |
+| --- | --- | --- | --- | --- |
+| `GET /v3api/materials/{material_id}/image/{image_id}` 的 `ImageAssetOut.storage_key` | 旧服务可能返回无前导 `/` 或多个前导 `/` 的 key；若前端直接拼接，可能生成错误代理 URL，若客户端各自规范化，又会造成规则分散。 | 当前服务端总是返回**恰好一个**前导 `/` 的合法 storage key，例如 `/upload_images/<mid>/<file>.png`。 | 直接以 `MEDIA_PROXY_PREFIX + storage_key` 拼接媒体代理前缀；当前端点返回值不得再自行添加、删除、折叠或替换斜杠。 | 先部署后端再发布依赖该保证的前端。若同一前端必须临时连接旧后端，应在明确的旧后端适配层处理，而不是在当前端点的通用调用处重复规范化。 |
+| merge 稳定性修复（内部流水线实现） | 供应商将阶段固定的 `is_child` 错误输出为 JSON `false` 时，可能使 merge 任务失败。 | 服务端仅将精确布尔 `false` 归一为阶段不变量 `true`；缺失、字符串等非契约值仍由严格校验拒绝。 | 无需修改任何 HTTP 调用、字段解析或轮询逻辑。 | 既有接口路径、请求/响应字段和状态码均不变。 |
+
+> **图片 URL 规则（本轮生效）**：此端点的 `storage_key` 已是以 `/` 开头的相对媒体路径。前端只能将其原样拼到媒体代理前缀之后，不能再执行前导斜杠判断、斜杠替换、补 `/` 或去 `/` 等二次处理。
+
 ## 1. 快速接入
 
 ### 1.1 地址与协议
@@ -678,7 +689,18 @@ interface CandidateListOut {
 
 `MaterialsOut`：`id`、`name`、`script_id`、`version`、`created_at`、`updated_at`。
 
-`ImageAssetOut`：`image_id`、`storage_key`、`mime_type`、`size_bytes`、`source`。实际图片 URL 必须经媒体代理拼接，不能把 `storage_key` 当作公开对象存储 URL。
+`ImageAssetOut`：`image_id`、`storage_key`、`mime_type`、`size_bytes`、`source`。
+
+其中 `storage_key` 保证为**恰好一个前导 `/`** 的合法相对媒体路径。实际图片 URL 必须经媒体代理拼接，不能把 `storage_key` 当作公开对象存储 URL，也不能由前端二次增删斜杠：
+
+```ts
+const MEDIA_PROXY_PREFIX = "/api/x/cctv/zhihui/flow-app";
+
+function imageAssetUrl(storageKey: string): string {
+  // GET /materials/{material_id}/image/{image_id} 已保证 storageKey 恰有一个前导 /。
+  return `${MEDIA_PROXY_PREFIX}${storageKey}`;
+}
+```
 
 ### 9.2 画布状态
 
