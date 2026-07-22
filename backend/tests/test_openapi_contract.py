@@ -85,3 +85,32 @@ def test_openapi_operation_ids_are_unique() -> None:
     ]
 
     assert len(operation_ids) == len(set(operation_ids))
+
+
+def test_shot_group_merge_openapi_accepts_full_episode_shot_set() -> None:
+    schema = app.openapi()
+    shot_ids = schema["components"]["schemas"]["ShotGroupMergeIn"]["properties"]["shot_ids"]
+
+    assert shot_ids["minItems"] == 1
+    assert shot_ids["maxItems"] == 1000
+    response = schema["paths"][
+        "/v3api/scripts/{script_id}/episodes/{episode_id}/shot-groups/merge"
+    ]["post"]["responses"]["200"]["content"]["application/json"]["schema"]
+    assert response["$ref"].endswith("/VideoWorkbenchOut")
+
+
+def test_image_and_video_generation_openapi_expose_prompt_overrides() -> None:
+    schemas = app.openapi()["components"]["schemas"]
+
+    for single_name in ("CreateJobIn", "VideoJobCreateIn"):
+        prompt = schemas[single_name]["properties"]["prompt"]["anyOf"][0]
+        assert prompt == {"type": "string", "minLength": 1, "maxLength": 32000}
+
+    for batch_name in ("BatchCreateJobIn", "VideoJobBatchCreateIn"):
+        prompts = schemas[batch_name]["properties"]["prompts"]["anyOf"][0]
+        assert prompts["type"] == "object"
+        assert prompts["additionalProperties"] == {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 32000,
+        }

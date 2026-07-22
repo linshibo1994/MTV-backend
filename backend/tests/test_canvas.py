@@ -333,7 +333,7 @@ def test_complete_image_node_data_round_trips_through_real_canvas_transaction():
     asyncio.run(scenario())
 
 
-def test_image_upload_prompt_is_built_from_persisted_subject_not_client_fields():
+def test_image_upload_uses_persisted_subject_and_preserves_client_prompt():
     async def scenario() -> None:
         engine = create_engine("sqlite+pysqlite:///:memory:")
         _canvas_tables(engine)
@@ -344,7 +344,7 @@ def test_image_upload_prompt_is_built_from_persisted_subject_not_client_fields()
             "subjectName": "伪造名称",
             "subjectType": "sound",
             "subjectDescription": "伪造描述",
-            "prompt": "客户端伪造 prompt",
+            "prompt": "  客户端编辑后的 prompt  ",
             "model": "banana-2",
             "size": "2k",
             "aspect": "16:9",
@@ -387,8 +387,7 @@ def test_image_upload_prompt_is_built_from_persisted_subject_not_client_fields()
             assert node_data["subjectName"] == "真实主角"
             assert node_data["subjectType"] == "character"
             assert node_data["subjectDescription"] == "真实描述"
-            assert "主体名称：真实主角" in node_data["prompt"]
-            assert "客户端伪造" not in node_data["prompt"]
+            assert node_data["prompt"] == "客户端编辑后的 prompt"
 
     asyncio.run(scenario())
 

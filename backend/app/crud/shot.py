@@ -15,7 +15,7 @@ from sqlalchemy.orm import selectinload
 from app.models.episode import Episode
 from app.models.scene import Scene
 from app.models.shot import Shot
-from app.models.shot_group import ShotGroup
+from app.models.shot_group import FINAL_SHOT_GROUP_UNIT_PREFIX, ShotGroup
 from app.models.video_generation_job import VideoGenerationJob
 from app.schemas.shot import (
     CoverOut,
@@ -228,7 +228,7 @@ async def get_shot_hierarchy(
         select(Shot)
         .join(ShotGroup, ShotGroup.shot_group_id == Shot.shot_group_id)
         .where(ShotGroup.episode_id == episode_id)
-        .order_by(Shot.display_no)
+        .order_by(ShotGroup.group_index, Shot.display_no, Shot.shot_id)
     )
     all_shots = shots_result.scalars().all()
 
@@ -315,6 +315,7 @@ async def get_video_workbench(
         .where(
             ShotGroup.episode_id == episode_id,
             ShotGroup.scene_no.in_([s.scene_no for s in scenes]),
+            ShotGroup.unit_id.like(f"{FINAL_SHOT_GROUP_UNIT_PREFIX}%"),
         )
         .options(selectinload(ShotGroup.shots))
         .order_by(ShotGroup.scene_no, ShotGroup.group_no)
@@ -325,7 +326,7 @@ async def get_video_workbench(
         select(Shot)
         .join(ShotGroup, ShotGroup.shot_group_id == Shot.shot_group_id)
         .where(ShotGroup.episode_id == episode_id)
-        .order_by(Shot.display_no)
+        .order_by(ShotGroup.group_index, Shot.display_no, Shot.shot_id)
     )
     all_shots = shots_result.scalars().all()
 
@@ -359,6 +360,8 @@ async def get_video_workbench(
 
     # 按场景统计待生成镜头数: 累加无 succeeded 视频的镜头组内镜头数量
     pending_shot_count_by_scene: dict[int, int] = {}
+    for scene_no, pending_shots in ungrouped_by_scene.items():
+        pending_shot_count_by_scene[scene_no] = len(pending_shots)
     for g in groups:
         if g.unit_id not in succeeded_unit_ids:
             shot_count = len(g.shots) if g.shots else 0
@@ -455,7 +458,10 @@ async def get_cover(db: AsyncSession, script_id: str) -> CoverOut:
         # 查询该分集下第一个场景的第一个镜头组
         groups_result = await db.execute(
             select(ShotGroup)
-            .where(ShotGroup.episode_id == ep_id)
+            .where(
+                ShotGroup.episode_id == ep_id,
+                ShotGroup.unit_id.like(f"{FINAL_SHOT_GROUP_UNIT_PREFIX}%"),
+            )
             .order_by(ShotGroup.scene_no, ShotGroup.group_no)
         )
         groups = sorted(groups_result.scalars().all(), key=_group_sort_key)

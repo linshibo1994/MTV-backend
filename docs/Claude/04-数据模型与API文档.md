@@ -405,7 +405,7 @@ video-workbench 视角额外字段：
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| unit_id | string | 生成单元 ID（如 `group:<uuid>`） |
+| unit_id | string | `draft:<uuid>` 为分镜暂存容器；`group:<uuid>` 才是正式视频生成单元 |
 | unit_runtime_key | string | 运行时 key（如 `<runtime>:<scene_no>:group:<uuid>`） |
 | duration_seconds | int | 视频时长（秒） |
 | video_duration_seconds | int | 视频时长 |
@@ -435,10 +435,10 @@ video-workbench 视角额外字段：
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| shot_ids | string[2..5] | 同场景、叙事顺序连续的镜头 ID；服务端按现有顺序处理 |
+| shot_ids | string[1..1000] | 当前分集分镜生成结果中的全部且唯一的镜头 ID；服务端忽略数组顺序 |
 | expected_episode_version | int | 工作台当前分集版本，过期返回 409 |
 
-合并会创建新的 ShotGroup，并原子重算镜头时间轴、prompt、materials、audio_elements、时长和组号。成功后 `episode_version + 1`，响应完整 `VideoWorkbenchOut`；涉及的源组已有任意视频任务时拒绝修改。
+分镜生成先把小分镜保存在 `draft:` 暂存组中，供“分镜结果”列表展示。合并接口校验 ID 覆盖本集全部分镜，再按场景、LLM 叙事边界和原顺序自动创建多个 3～15 秒的 `group:` 正式组，原子重算时间轴、prompt、materials、audio_elements、时长和组号。成功后 `episode_version + 1` 并响应完整 `VideoWorkbenchOut`；它不创建 `VideoGenerationJob`、不扣积分，涉及的源组已有任意视频任务时拒绝修改。
 
 ### 1.16 Scene（场景，按背景聚合）
 
@@ -640,7 +640,7 @@ video-workbench 视角：
 |---|---|---|---|
 | GET | `/shots/<script_id>/cover` | - | 视频项目封面（取自首个镜头首帧） |
 | GET | `/scripts/<sid>/episodes/<eid>/shot-hierarchy` | - | ShotHierarchy（场景->镜头组->镜头） |
-| POST | `/scripts/<sid>/episodes/<eid>/shot-groups/merge` | JSON `ShotGroupMergeIn` | 合并连续镜头，返回更新后的 VideoWorkbench |
+| POST | `/scripts/<sid>/episodes/<eid>/shot-groups/merge` | JSON `ShotGroupMergeIn` | 提交本集全部分镜并自动生成多个正式镜头组，返回 VideoWorkbench |
 | GET | `/shots/<sid>/episodes/<eid>/video-workbench` | - | VideoWorkbench（含 unit_id/unit_runtime_key/materials/audio_elements） |
 
 ### 2.7 video-generation（视频生成）

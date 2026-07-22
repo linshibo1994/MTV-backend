@@ -138,13 +138,20 @@ async def _trusted_image_upload_data(
     if subject.script_id != material.script_id:
         raise ForbiddenError("主体不属于当前剧本")
     description = subject.description or ""
+    client_prompt = node_data.get("prompt")
+    prompt = (
+        client_prompt.strip()
+        if isinstance(client_prompt, str) and client_prompt.strip()
+        else build_subject_prompt(subject.name, subject.type, description)
+    )
     return {
         **node_data,
         "subjectId": subject.id,
         "subjectName": subject.name,
         "subjectType": subject.type,
         "subjectDescription": description,
-        "prompt": build_subject_prompt(subject.name, subject.type, description),
+        # 主体身份字段必须以服务端数据为准；prompt 是用户可编辑的生成参数，应保留。
+        "prompt": prompt,
     }
 
 

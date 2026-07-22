@@ -130,6 +130,7 @@ async def create_video_generation_job(
         shot_group_id=body.shot_group_id,
         user_id=user.user_id,
         idempotency_key=idempotency_key,
+        prompt=body.prompt,
     )
     return VideoJobOut.model_validate(job)
 
@@ -242,6 +243,8 @@ async def check_materials(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="镜头组不存在")
     if shot_group.script_id != script_id:
         raise ForbiddenError("镜头组不属于当前剧本")
+    if shot_group.unit_id != f"group:{shot_group.shot_group_id}":
+        raise ConflictError("请先完成镜头组合并，再检查视频素材")
 
     await _load_and_check_script(db, user, script_id, require_write=False)
 
@@ -283,6 +286,9 @@ async def batch_create_video_generation_jobs(
     await _load_and_check_script(db, user, body.script_id, require_write=True)
     if not idempotency_key or not idempotency_key.strip():
         raise BadRequestError("Idempotency-Key 必填")
+    unknown_prompt_ids = set(body.prompts or {}) - set(body.shot_group_ids)
+    if unknown_prompt_ids:
+        raise BadRequestError("prompts 包含非目标镜头组")
     derived_keys = _derive_batch_idempotency_keys(
         idempotency_key, len(body.shot_group_ids)
     )
@@ -300,6 +306,7 @@ async def batch_create_video_generation_jobs(
                 shot_group_id=sg_id,
                 user_id=user.user_id,
                 idempotency_key=key,
+                prompt=(body.prompts or {}).get(sg_id),
             )
             success.append(VideoJobOut.model_validate(job))
         except HTTPException as exc:

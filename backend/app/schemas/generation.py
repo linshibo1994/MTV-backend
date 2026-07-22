@@ -13,9 +13,9 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_serializer
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_serializer
 
 # 生图模型枚举：Google / OpenAI / 阿里百炼通义万相。
 ImageModelName = Literal[
@@ -28,6 +28,16 @@ ImageModelName = Literal[
     "qwen-image-2.0",
 ]
 
+MAX_IMAGE_PROMPT_LENGTH = 32_000
+ImagePrompt = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True,
+        min_length=1,
+        max_length=MAX_IMAGE_PROMPT_LENGTH,
+    ),
+]
+
 
 class CreateJobIn(BaseModel):
     """创建生图任务入参。"""
@@ -36,6 +46,10 @@ class CreateJobIn(BaseModel):
 
     material_id: str = Field(..., description="画布项目 ID")
     subject_id: str = Field(..., description="关联主体 ID")
+    prompt: ImagePrompt | None = Field(
+        None,
+        description="客户端可编辑的最终生图提示词；缺省时兼容旧客户端并回退服务端 enrich",
+    )
     model: ImageModelName = Field("banana-2", description="生图模型")
     size: str = Field("2k", description="尺寸，如 2k")
     aspect: str = Field("16:9", description="比例，如 16:9")
@@ -46,7 +60,7 @@ class BatchCreateJobIn(BaseModel):
     """一键设计 N 批量生图入参（06 §3.5）。
 
     subject_ids 为空时自动选取该剧本下未设计(not_designed)且非声音的主体。
-    prompt/resolved_prompt 由后端按各主体 description 构造（批量不接收单条 prompt）。
+    prompts 按 subject_id 分别覆盖最终生图提示词；缺失项兼容旧客户端并回退服务端 enrich。
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -54,6 +68,10 @@ class BatchCreateJobIn(BaseModel):
     material_id: str = Field(..., description="画布项目 ID")
     subject_ids: list[str] | None = Field(
         None, description="显式指定的主体 ID 列表；为空则自动选取未设计主体"
+    )
+    prompts: dict[str, ImagePrompt] | None = Field(
+        None,
+        description="每个主体的客户端可编辑最终生图提示词，键为 subject_id",
     )
     model: ImageModelName = Field("banana-2", description="生图模型")
     size: str = Field("2k", description="尺寸，如 2k")

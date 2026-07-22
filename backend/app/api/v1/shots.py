@@ -3,7 +3,7 @@
 端点:
 - POST /scripts/<sid>/episodes/<eid>/generate-storyboard  触发 LLM 分镜生成 (异步)
 - GET  /scripts/<sid>/episodes/<eid>/shot-hierarchy      分镜层级 (场景->镜头组->镜头)
-- POST /scripts/<sid>/episodes/<eid>/shot-groups/merge   合并连续镜头为新镜头组
+- POST /scripts/<sid>/episodes/<eid>/shot-groups/merge   自动组合本集全部小分镜
 - GET  /shots/<sid>/episodes/<eid>/video-workbench        视频工作台 (含 unit_id/materials)
 - GET  /shots/<script_id>/cover                           视频项目封面 (首个镜头首帧)
 """
@@ -555,8 +555,11 @@ async def shot_hierarchy(
 @router.post(
     "/scripts/{script_id}/episodes/{episode_id}/shot-groups/merge",
     response_model=VideoWorkbenchOut,
-    summary="合并连续镜头",
-    description="把同一场景中叙事顺序连续的 2～5 个镜头合并为新的视频生成单元。",
+    summary="自动组合全部分镜",
+    description=(
+        "接收当前分集的全部分镜 ID，按场景与服务端叙事顺序自动组合为多个 "
+        "3～15 秒的视频生成单元。"
+    ),
 )
 async def merge_shot_group(
     script_id: str,
@@ -565,7 +568,7 @@ async def merge_shot_group(
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> VideoWorkbenchOut:
-    """原子合并镜头并返回可直接替换页面状态的完整工作台。"""
+    """原子生成整集正式镜头组并返回可直接替换页面状态的完整工作台。"""
 
     await _validate_script_episode(
         db,
@@ -586,12 +589,14 @@ async def merge_shot_group(
         db,
         actor=user,
         action="shot_group_merge",
-        resource_type="shot_group",
-        resource_id=result.shot_group_id,
-        before={"shot_ids": payload.shot_ids},
+        resource_type="episode",
+        resource_id=episode_id,
+        before={"shot_count": len(payload.shot_ids)},
         after={
             "episode_version": result.episode_version,
+            "shot_group_ids": list(result.shot_group_ids),
             "removed_shot_group_ids": list(result.removed_shot_group_ids),
+            "already_grouped": result.already_grouped,
         },
     )
     workbench = await get_video_workbench(db, script_id, episode_id)

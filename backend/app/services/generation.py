@@ -447,19 +447,24 @@ async def create_generation_job(
     episode_id, input_version, input_client_save_seq, episode_snapshot = (
         await _subject_episode_snapshot(db, script.id, subject)
     )
-    prompt = build_base_prompt(subject)
+    prompt = payload.prompt or build_base_prompt(subject)
     if not prompt.strip():
         raise BadRequestError("主体缺少描述，无法生图")
-    resolved_prompt = await _load_server_resolved_prompt(
-        db,
-        script.id,
-        subject.id,
-        input_version,
-        input_client_save_seq,
-        episode_snapshot,
-        int(subject.subject_version or 1),
-        int(subject.enrich_version or 1),
-    )
+    if payload.prompt is not None:
+        # 客户端显式 prompt 是用户本次确认的最终输入，不再套用 enrich 十二段格式校验。
+        resolved_prompt = prompt
+    else:
+        # 兼容尚未升级的客户端：缺省时继续使用服务端 enrich 快照。
+        resolved_prompt = await _load_server_resolved_prompt(
+            db,
+            script.id,
+            subject.id,
+            input_version,
+            input_client_save_seq,
+            episode_snapshot,
+            int(subject.subject_version or 1),
+            int(subject.enrich_version or 1),
+        )
     request_payload = {
         "material_id": payload.material_id,
         "script_id": script.id,
@@ -539,6 +544,7 @@ async def create_batch_generation_jobs(
         "material_id": material.id,
         "script_id": script.id,
         "subject_ids": list(payload.subject_ids) if payload.subject_ids else None,
+        "prompts": payload.prompts,
         "model": payload.model,
         "size": payload.size,
         "aspect": payload.aspect,
@@ -584,6 +590,11 @@ async def create_batch_generation_jobs(
             ).scalars().all()
         )
 
+    target_subject_ids = {subject.id for subject in subjects}
+    unknown_prompt_ids = set(payload.prompts or {}) - target_subject_ids
+    if unknown_prompt_ids:
+        raise BadRequestError("prompts 包含非目标主体")
+
     batch = await _create_batch_request(
         db,
         owner_user_id=user.user_id,
@@ -604,8 +615,9 @@ async def create_batch_generation_jobs(
         if subject.type == "sound":
             skipped.append(subject.id)
             continue
-        # 无描述的主体无法构造 prompt，跳过
-        prompt = build_base_prompt(subject)
+        client_prompt = (payload.prompts or {}).get(subject.id)
+        # 旧客户端未提供 prompt 时，仍按主体描述构造基础 prompt。
+        prompt = client_prompt or build_base_prompt(subject)
         if not prompt.strip():
             skipped.append(subject.id)
             continue
@@ -613,16 +625,19 @@ async def create_batch_generation_jobs(
             episode_id, input_version, input_client_save_seq, episode_snapshot = (
                 await _subject_episode_snapshot(db, script.id, subject)
             )
-            resolved_prompt = await _load_server_resolved_prompt(
-                db,
-                script.id,
-                subject.id,
-                input_version,
-                input_client_save_seq,
-                episode_snapshot,
-                int(subject.subject_version or 1),
-                int(subject.enrich_version or 1),
-            )
+            if client_prompt is not None:
+                resolved_prompt = prompt
+            else:
+                resolved_prompt = await _load_server_resolved_prompt(
+                    db,
+                    script.id,
+                    subject.id,
+                    input_version,
+                    input_client_save_seq,
+                    episode_snapshot,
+                    int(subject.subject_version or 1),
+                    int(subject.enrich_version or 1),
+                )
             job = await _create_one_job(
                 db,
                 user=user,

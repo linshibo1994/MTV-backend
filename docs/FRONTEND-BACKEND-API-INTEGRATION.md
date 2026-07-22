@@ -113,7 +113,7 @@
 56. `POST /v3api/scripts/{script_id}/episodes/{episode_id}/storyboard/{job_id}/retry` - 重试分镜任务
 57. `GET /v3api/scripts/{script_id}/episodes/{episode_id}/storyboard-status` - 查询最新分镜状态
 58. `GET /v3api/scripts/{script_id}/episodes/{episode_id}/shot-hierarchy` - 查询镜头层级
-59. `POST /v3api/scripts/{script_id}/episodes/{episode_id}/shot-groups/merge` - 合并连续镜头为新镜头组
+59. `POST /v3api/scripts/{script_id}/episodes/{episode_id}/shot-groups/merge` - 将本集全部小分镜自动组合为正式镜头组
 60. `GET /v3api/shots/{script_id}/episodes/{episode_id}/video-workbench` - 获取视频工作台
 61. `GET /v3api/shots/{script_id}/cover` - 获取剧本封面
 
@@ -147,7 +147,7 @@
 
 ## 2026-07-22 镜头组合并接口
 
-新增同步结构编辑接口：选择同一场景内连续镜头，合并为新的镜头组；不触发视频生成或积分扣费。详细契约见第 11 节。
+新增同步结构编辑接口：前端提交本集分镜生成结果中的全部镜头 ID，后端按场景、叙事连续性和 3～15 秒规则自动生成多个正式镜头组；不触发视频生成或积分扣费。详细契约见第 11 节。
 
 ## 2026-07-19 本轮接口更新清单
 
@@ -279,7 +279,7 @@ const idempotencyKey = crypto.randomUUID();
 | 资源 | 读取字段 | 写入时必须回传 | 冲突处理 |
 | --- | --- | --- | --- |
 | 分集 | `episode_version`、`client_save_seq` | 两者均必填 | `409` 后重新加载分集并处理文本冲突 |
-| 镜头组合并 | `episode_version` | Body `expected_episode_version` | `409` 后重新获取 hierarchy/workbench，再重新选择镜头 |
+| 镜头组合并 | `episode_version` | Body `expected_episode_version` | `409` 后重新获取 hierarchy/workbench；若工作台已有正式组则视为已完成，否则以新版本重提全部 ID |
 | 主体 | `subject_version` | `expected_subject_version` | `409` 后刷新主体与待处理建议 |
 | 画布 | `version` | Delta 中的 `version` | `409` 后重新获取完整画布再合并本地变更 |
 | 时间线片段 | `version` | `expected_version` | `409` 后重新获取完整时间线 |
@@ -978,14 +978,19 @@ const latest = await api<CanvasStateOut>(
 | --- | --- | --- | --- | --- |
 | `material_id` | `string` | 是 | — | 画布项目 ID |
 | `subject_id` | `string` | 是 | — | 主体 ID，必须属于同一剧本 |
+| `prompt` | `string` | 否（新前端必须传） | 去首尾空白后 1–32000 字符 | 用户当前确认的最终生图提示词 |
 | `model` | 图片模型 | 否 | `banana-2` | 生图模型 |
 | `size` | `string` | 否 | `2k` | 输出尺寸 |
 | `aspect` | `string` | 否 | `16:9` | 宽高比 |
 | `count` | `integer` | 否 | 默认 1，1–4 | 生成张数 |
 
-`BatchCreateJobIn` 用 `subject_ids: string[] | null` 替代单个 `subject_id`，其余字段相同。`subject_ids` 为空时，服务端自动选择当前剧本下 `not_designed` 且非声音的主体。
+`BatchCreateJobIn` 用 `subject_ids: string[] | null` 替代单个 `subject_id`，并用
+`prompts: Record<subject_id, prompt> | null` 分别提交每个主体的提示词，其余字段相同。
+`subject_ids` 为空时，服务端自动选择当前剧本下 `not_designed` 且非声音的主体。
 
-请求体禁止额外字段。提示词由服务端根据主体与流水线 `enrich` 快照构造，前端不在创建请求中提交任意 prompt。
+请求体禁止额外字段。显式 `prompt`（或批量 `prompts` 中对应项）会作为最终 provider
+提示词，不要求符合 `enrich` 的十二段标题格式，并参与幂等请求哈希。为兼容旧客户端，缺省项
+暂时回退到服务端主体信息与 `enrich` 快照；新前端必须始终提交用户当前编辑后的 prompt。
 
 ### 10.3 `GenerationJobOut`
 
@@ -1082,14 +1087,16 @@ Idempotency-Key: <uuid>
 
 ```json
 {
-  "shot_ids": ["shot-1", "shot-2"],
+  "shot_ids": ["本集分镜-1", "本集分镜-2", "本集分镜-3", "本集分镜-4"],
   "expected_episode_version": 3
 }
 ```
 
-`shot_ids` 必须是同一场景中叙事顺序连续的 2～5 个镜头；服务端按当前分镜顺序合并，不按数组顺序重排。新组以及合并后保留的前后镜头组都必须保持 2～5 个镜头、3～15 秒。成功响应是 `episode_version` 已递增的完整 `VideoWorkbenchOut`，前端应直接替换当前工作台状态。
+前端应在分镜任务成功后，从 `shot-hierarchy.scenes[].groups[].shots[]` 收集当前分集的**全部且唯一** `shot_id`（若兼容历史未分组数据，还应并入 `ungrouped_shots[]`）。接口接受 1～1000 个 ID，请求数组顺序不参与排序；服务端使用数据库中的场景、LLM 叙事边界和原镜头顺序，为每个场景生成一个或多个连续的 3～15 秒正式镜头组，并重算组内时间轴、文生视频 Prompt、角色/背景/道具素材和音频元素。
 
-版本过期、活动分镜/视频任务，或源镜头组已有任意视频任务时返回 `409`；跨场景、不连续或时长非法返回 `400`；镜头属于其他剧本/分集返回 `403`；字段结构非法返回 `422`。
+成功响应是 `episode_version` 已递增的完整 `VideoWorkbenchOut`，前端应直接替换当前工作台状态。合并只创建可生成视频的工作台单元：此时 `GET /video-generation-jobs` 允许为空；用户点击单个或批量“生成视频”后才创建付费异步任务。已完成组合后，以当前版本重复提交同一全集 ID 会无副作用返回现有工作台。
+
+漏传本集任一镜头或时长无法合法分区返回 `400`；镜头属于其他剧本/分集返回 `403`；ID 不存在返回 `404`；版本过期、活动分镜任务、草稿/正式状态混杂或源组已有视频任务返回 `409`；空数组、重复 ID、超过 1000 项或字段非法返回 `422`。草稿镜头组不能调用素材检查或视频生成接口，会返回 `409`“请先完成镜头组合并”。
 
 ### 11.2 分镜任务字段
 
@@ -1253,8 +1260,15 @@ interface CheckMaterialsOut {
 | `script_id` | `string` | 是 | 剧本 ID |
 | `episode_id` | `string` | 是 | 分集 ID |
 | `shot_group_id` | `string` | 是 | 镜头组 ID |
+| `prompt` | `string` | 否（新前端必须传） | 用户当前编辑的视频提示词，去首尾空白后 1–32000 字符 |
 
-`VideoJobBatchCreateIn`：`script_id`、`episode_id`、`shot_group_ids`；其中 `shot_group_ids` 为 1–100 项。
+`VideoJobBatchCreateIn`：`script_id`、`episode_id`、`shot_group_ids`、
+`prompts: Record<shot_group_id, prompt> | null`；其中 `shot_group_ids` 为 1–100 项。
+映射中出现非目标镜头组会在创建任何任务前整体返回 `400`。
+
+显式 prompt 优先于镜头组已有 prompt，并参与幂等请求哈希；服务端会确保最终 Provider
+输入包含完整视频约束锁。未传 prompt 时继续回退镜头组 prompt，以兼容旧客户端。同一镜头组
+已有活动任务时，最终提示词相同才会复用；提示词不同返回 `409`，不会新增任务或冻结积分。
 
 批量接口用请求头作为前缀，服务端按 `<prefix>:<index>` 派生子任务键。前缀过长导致派生键超过 256 字符时返回 `400`。
 
@@ -1321,6 +1335,7 @@ interface VideoJobBatchOut {
 - 相同剧本、相同幂等键、相同请求快照：返回既有任务，不重复冻结积分；幂等绑定不按项目成员用户 ID 隔离。
 - 同一幂等键用于不同请求：`409`。
 - 同一镜头组已有 `starting/processing` 任务时，服务端复用该活动任务。
+- `draft:` 暂存组不是视频生成单元；素材检查和视频任务创建只接受规范的 `group:<shot_group_id>` 正式组。
 - 轮询到 `succeeded`、`failed`、`canceled` 后停止。
 - 取消仅接受 `starting/processing`；重复取消已 `canceled` 的任务幂等返回当前任务；其他终态返回 `409`。
 - 若远端提交结果处于未知状态，取消会返回 `409` 并保持冻结，前端应显示“等待系统核对”，不要反复取消。

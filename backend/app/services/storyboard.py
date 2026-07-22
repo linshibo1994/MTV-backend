@@ -3,9 +3,9 @@
 严格遵循 06-AI能力与Prompt工程文档.md 第 7 节 (分镜 Shot Prompt 结构) 与第 8 节 (视频生成约束锁)。
 
 输入: 单集剧本 + 主体列表
-LLM 产出: 场景 -> 镜头组 -> 镜头
+LLM 产出: 场景 -> 叙事分组建议 -> 小分镜
 每镜头: content (画面内容) + description (摄影级结构化描述)
-每镜头组: prompt (多镜头分时段组合 + 【角色】+【叙事目的】+【约束】9条)
+每个 draft 组: 多镜头分时段建议 + 叙事目的；后续由合并接口发布为正式视频单元
 解析引用主体填充 shot_group.materials {character/background/prop/other}
 audio_elements 需配音角色
 """
@@ -24,7 +24,7 @@ from app.models.asset_entry import AssetEntry
 from app.models.episode import Episode
 from app.models.scene import Scene
 from app.models.shot import Shot
-from app.models.shot_group import ShotGroup
+from app.models.shot_group import DRAFT_SHOT_GROUP_UNIT_PREFIX, ShotGroup
 from app.models.subject import Subject
 from app.models.video_generation_job import VideoGenerationJob
 from app.schemas.pipeline_contracts import ProviderContractError
@@ -88,12 +88,13 @@ Episode (集) -> Scene (场景, 按背景主体聚合) -> Shot Group (镜头组,
 ## 输出要求
 
 ### Scene (场景)
-- 按背景主体聚合 (同一背景的所有镜头归到同一场景)
+- Scene 表示一次连续的时空与叙事段落；背景、日夜、时间或连续叙事段落变化时建立新 Scene
+- 剧情离开后再次回到相同背景时也必须建立新的 scene_no，不得把不连续片段聚合到一起
 - scene_no: 从 1 开始递增
 - background: 背景主体名 (如 "养鸡场办公室-内-夜")
 
-### Shot Group (镜头组)
-- 视频生成的最小单元, 一个镜头组生成一段视频
+### Shot Group (叙事分组建议)
+- 此阶段只负责给连续小分镜提供语义边界；用户点击“合并镜头组”后才发布为视频生成单元
 - group_no: G1, G2, G3... (场景内递增)
 - narrative_purpose: 该镜头组的叙事目的
 - duration_seconds: 该镜头组的总时长 (秒), 为各镜头时长之和
@@ -496,10 +497,10 @@ async def generate_storyboard(
 
     1. 加载分集剧本 + 主体列表
     2. 构造 LLM prompt (严格 06 文档第 7 节)
-    3. 调用 LLM, 产出 场景->镜头组->镜头
-    4. 构造每镜头组组合 prompt (含约束锁 9 条)
+    3. 调用 LLM, 产出 场景->叙事分组建议->小分镜
+    4. 构造 draft 组合 prompt (含约束锁 9 条)
     5. 解析引用主体填充 materials + audio_elements
-    6. 落库 Scene/ShotGroup/Shot
+    6. 落库 Scene/draft ShotGroup/Shot；正式组由合并接口生成
     """
     # 1. 加载分集
     ep_result = await db.execute(
@@ -573,6 +574,7 @@ async def generate_storyboard(
         label = f"场 {scene_no} · {background}"
 
         # 创建 Scene
+        source_groups = scene_data.get("shot_groups", [])
         scene = Scene(
             id=new_id(),
             episode_id=episode_id,
@@ -580,13 +582,14 @@ async def generate_storyboard(
             scene_key=scene_key,
             background=background,
             label=label,
-            shot_group_count=len(scene_data.get("shot_groups", [])),
-            pending_shot_count=0,
+            # 此阶段只生成小分镜；正式视频单元由“合并镜头组”操作创建。
+            shot_group_count=0,
+            pending_shot_count=sum(len(group.get("shots", [])) for group in source_groups),
         )
         db.add(scene)
         total_scenes += 1
 
-        for group_data in scene_data.get("shot_groups", []):
+        for group_data in source_groups:
             group_no = group_data["group_no"]
             narrative_purpose = group_data.get("narrative_purpose", "")
             duration_seconds = group_data.get("duration_seconds", 0)
@@ -628,8 +631,10 @@ async def generate_storyboard(
             audio_elements = await _extract_audio_elements(db, shots_data, subjects)
 
             shot_group_id = new_id()
-            unit_id = f"group:{shot_group_id}"
-            unit_runtime_key = f"{episode_id}:{scene_no}:group:{shot_group_id}"
+            # Shot 当前必须归属于 ShotGroup，因此用 draft 组保存分镜生成阶段的
+            # 叙事顺序与 LLM 分组建议；draft 不是可提交视频生成的正式单元。
+            unit_id = f"{DRAFT_SHOT_GROUP_UNIT_PREFIX}{shot_group_id}"
+            unit_runtime_key = f"{episode_id}:{scene_no}:draft:{shot_group_id}"
 
             shot_group = ShotGroup(
                 shot_group_id=shot_group_id,

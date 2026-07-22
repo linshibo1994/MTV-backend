@@ -363,6 +363,34 @@ def test_subject_model_has_generation_input_version_fields():
     ]
 
 
+def test_generation_schema_accepts_optional_trimmed_prompt_with_length_limit():
+    without_prompt = CreateJobIn(
+        material_id="material-1",
+        subject_id="subject-1",
+    )
+    assert without_prompt.prompt is None
+
+    with_prompt = CreateJobIn(
+        material_id="material-1",
+        subject_id="subject-1",
+        prompt="  客户端最终提示词\n",
+    )
+    assert with_prompt.prompt == "客户端最终提示词"
+    assert CreateJobIn(
+        material_id="material-1",
+        subject_id="subject-1",
+        prompt="图" * 32000,
+    ).prompt == "图" * 32000
+
+    for invalid_prompt in ("", " \n\t ", "图" * 32001):
+        with pytest.raises(ValidationError):
+            CreateJobIn(
+                material_id="material-1",
+                subject_id="subject-1",
+                prompt=invalid_prompt,
+            )
+
+
 def test_generation_schema_rejects_client_resolved_prompt_forgery():
     with pytest.raises(ValidationError):
         CreateJobIn(
@@ -403,6 +431,64 @@ def test_load_batch_jobs_rejects_incomplete_reload(job_ids, loaded_job_ids):
             await generation_service._load_batch_jobs(
                 SimpleNamespace(execute=execute),
                 job_ids,
+            )
+
+    asyncio.run(scenario())
+
+
+def test_create_generation_job_uses_client_prompt_without_valid_enrich(monkeypatch):
+    async def scenario() -> None:
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        seeded.enrich.detail = {
+            "input_version": seeded.episode.episode_version,
+            "prompts": {},
+        }
+        raw.commit()
+        monkeypatch.setattr(generation_service, "enqueue_task", AsyncMock())
+
+        job = await generation_service.create_generation_job(
+            _AsyncSessionAdapter(raw),
+            user=seeded.user,
+            payload=_create_payload(prompt="  客户端自定义生图提示词  "),
+            idempotency_key="client-prompt-without-enrich",
+        )
+
+        assert job.input_json["prompt"] == "客户端自定义生图提示词"
+        assert job.input_json["resolved_prompts"]["final"] == "客户端自定义生图提示词"
+
+    asyncio.run(scenario())
+
+
+def test_create_generation_job_same_idempotency_key_rejects_changed_client_prompt(
+    monkeypatch,
+):
+    async def scenario() -> None:
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        db = _AsyncSessionAdapter(raw)
+        monkeypatch.setattr(generation_service, "enqueue_task", AsyncMock())
+
+        first = await generation_service.create_generation_job(
+            db,
+            user=seeded.user,
+            payload=_create_payload(prompt="第一版客户端提示词"),
+            idempotency_key="client-prompt-idempotency",
+        )
+        replay = await generation_service.create_generation_job(
+            db,
+            user=seeded.user,
+            payload=_create_payload(prompt="第一版客户端提示词"),
+            idempotency_key="client-prompt-idempotency",
+        )
+
+        assert replay.job_id == first.job_id
+        with pytest.raises(ConflictError):
+            await generation_service.create_generation_job(
+                db,
+                user=seeded.user,
+                payload=_create_payload(prompt="第二版客户端提示词"),
+                idempotency_key="client-prompt-idempotency",
             )
 
     asyncio.run(scenario())
@@ -593,6 +679,60 @@ def test_batch_requires_idempotency_key_and_reuses_same_payload(monkeypatch):
                 ),
                 idempotency_key="batch-key",
             )
+
+    asyncio.run(scenario())
+
+
+def test_batch_explicit_prompt_mapping_overrides_invalid_enrich(monkeypatch):
+    async def scenario() -> None:
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        seeded.enrich.detail = {
+            "input_version": seeded.episode.episode_version,
+            "prompts": {},
+        }
+        raw.commit()
+        monkeypatch.setattr(generation_service, "enqueue_task", AsyncMock())
+
+        created, skipped, failed = await generation_service.create_batch_generation_jobs(
+            _AsyncSessionAdapter(raw),
+            user=seeded.user,
+            payload=BatchCreateJobIn(
+                material_id=seeded.material.id,
+                subject_ids=[seeded.subject.id],
+                prompts={seeded.subject.id: "  批量客户端自定义提示词  "},
+                count=1,
+            ),
+            idempotency_key="batch-client-prompt",
+        )
+
+        assert skipped == []
+        assert failed == []
+        assert len(created) == 1
+        assert created[0].input_json["prompt"] == "批量客户端自定义提示词"
+        assert created[0].input_json["resolved_prompts"]["final"] == "批量客户端自定义提示词"
+
+    asyncio.run(scenario())
+
+
+def test_batch_rejects_prompt_mapping_for_non_target_subject():
+    async def scenario() -> None:
+        _, raw = _make_db()
+        seeded = _seed(raw)
+
+        with pytest.raises(BadRequestError, match="prompts 包含非目标主体"):
+            await generation_service.create_batch_generation_jobs(
+                _AsyncSessionAdapter(raw),
+                user=seeded.user,
+                payload=BatchCreateJobIn(
+                    material_id=seeded.material.id,
+                    subject_ids=[seeded.subject.id],
+                    prompts={"subject-other": "不属于目标主体的提示词"},
+                ),
+                idempotency_key="batch-unknown-prompt-subject",
+            )
+
+        assert raw.scalars(select(GenerationJob)).all() == []
 
     asyncio.run(scenario())
 

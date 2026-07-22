@@ -381,6 +381,40 @@ def test_video_job_model_declares_reliable_state_and_constraints() -> None:
     } <= set(VideoGenerationIdempotencyRequest.__table__.columns.keys())
 
 
+def test_video_job_create_schema_accepts_optional_trimmed_prompt_with_length_limit() -> None:
+    from app.schemas.video import VideoJobCreateIn
+
+    without_prompt = VideoJobCreateIn(
+        script_id="script-1",
+        episode_id="episode-1",
+        shot_group_id="sg-1",
+    )
+    assert without_prompt.prompt is None
+
+    with_prompt = VideoJobCreateIn(
+        script_id="script-1",
+        episode_id="episode-1",
+        shot_group_id="sg-1",
+        prompt="  客户端视频提示词\n",
+    )
+    assert with_prompt.prompt == "客户端视频提示词"
+    assert VideoJobCreateIn(
+        script_id="script-1",
+        episode_id="episode-1",
+        shot_group_id="sg-1",
+        prompt="镜" * 32000,
+    ).prompt == "镜" * 32000
+
+    for invalid_prompt in ("", " \n\t ", "镜" * 32001):
+        with pytest.raises(ValidationError):
+            VideoJobCreateIn(
+                script_id="script-1",
+                episode_id="episode-1",
+                shot_group_id="sg-1",
+                prompt=invalid_prompt,
+            )
+
+
 def test_video_json_merge_uses_locked_debt_state_without_resurrecting_stale_debt() -> None:
     from app.crud.video import _merge_latest_video_json
 
@@ -529,6 +563,112 @@ def test_create_video_job_requires_idempotency_key_and_uses_transactional_outbox
     asyncio.run(scenario())
 
 
+def test_create_video_job_persists_explicit_prompt_with_exactly_one_full_constraint_lock(
+    monkeypatch,
+) -> None:
+    async def scenario() -> None:
+        from app.services import video_generation
+
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        db = _AsyncSessionAdapter(raw)
+
+        async def fake_enqueue(db, **kwargs):
+            row = TaskDispatchOutbox(
+                id="dispatch-explicit-prompt",
+                task_type=kwargs["task_type"],
+                job_id=kwargs["job_id"],
+                attempt=kwargs["attempt"],
+                payload=kwargs["payload"],
+                status="pending",
+            )
+            db.add(row)
+            return row
+
+        monkeypatch.setattr(video_generation, "enqueue_task", fake_enqueue)
+
+        job = await video_generation.create_video_job(
+            db,
+            script_id=seeded.script.id,
+            episode_id=seeded.episode.episode_id,
+            shot_group_id=seeded.shot_group.shot_group_id,
+            user_id=seeded.user.user_id,
+            idempotency_key="explicit-video-prompt",
+            prompt="  客户端自定义运镜  ",
+        )
+
+        expected = f"客户端自定义运镜\n{video_generation._CONSTRAINT_LOCK_TEXT}"
+        assert job.input_json["prompt"] == expected
+        assert job.input_json["prompt"].count(video_generation._CONSTRAINT_LOCK_TEXT) == 1
+        assert video_generation._ensure_constraint_lock(expected) == expected
+
+        hollow_heading = "客户端自定义运镜\n【约束】"
+        repaired = video_generation._ensure_constraint_lock(hollow_heading)
+        assert repaired == f"{hollow_heading}\n{video_generation._CONSTRAINT_LOCK_TEXT}"
+        assert repaired.count(video_generation._CONSTRAINT_LOCK_TEXT) == 1
+
+    asyncio.run(scenario())
+
+
+def test_create_video_job_same_idempotency_key_rejects_changed_explicit_prompt(
+    monkeypatch,
+) -> None:
+    async def scenario() -> None:
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        db = _AsyncSessionAdapter(raw)
+
+        async def fake_enqueue(db, **kwargs):
+            row = TaskDispatchOutbox(
+                id="dispatch-same-key-prompt",
+                task_type=kwargs["task_type"],
+                job_id=kwargs["job_id"],
+                attempt=kwargs["attempt"],
+                payload=kwargs["payload"],
+                status="pending",
+            )
+            db.add(row)
+            return row
+
+        monkeypatch.setattr("app.services.video_generation.enqueue_task", fake_enqueue)
+
+        from app.services.video_generation import create_video_job
+
+        first = await create_video_job(
+            db,
+            script_id=seeded.script.id,
+            episode_id=seeded.episode.episode_id,
+            shot_group_id=seeded.shot_group.shot_group_id,
+            user_id=seeded.user.user_id,
+            idempotency_key="same-key-prompt",
+            prompt="第一版提示词",
+        )
+        replay = await create_video_job(
+            db,
+            script_id=seeded.script.id,
+            episode_id=seeded.episode.episode_id,
+            shot_group_id=seeded.shot_group.shot_group_id,
+            user_id=seeded.user.user_id,
+            idempotency_key="same-key-prompt",
+            prompt="第一版提示词",
+        )
+
+        assert replay.job_id == first.job_id
+        with pytest.raises(ConflictError) as exc_info:
+            await create_video_job(
+                db,
+                script_id=seeded.script.id,
+                episode_id=seeded.episode.episode_id,
+                shot_group_id=seeded.shot_group.shot_group_id,
+                user_id=seeded.user.user_id,
+                idempotency_key="same-key-prompt",
+                prompt="第二版提示词",
+            )
+        assert exc_info.value.detail == "幂等键已用于不同请求载荷"
+
+    asyncio.run(scenario())
+
+
 def test_create_video_job_reuses_active_unit_across_different_idempotency_keys(monkeypatch) -> None:
     async def scenario() -> None:
         _, raw = _make_db()
@@ -560,6 +700,7 @@ def test_create_video_job_reuses_active_unit_across_different_idempotency_keys(m
             shot_group_id=seeded.shot_group.shot_group_id,
             user_id=seeded.user.user_id,
             idempotency_key="active-key-1",
+            prompt="相同的客户端视频提示词",
         )
         replay = await create_video_job(
             db,
@@ -568,6 +709,7 @@ def test_create_video_job_reuses_active_unit_across_different_idempotency_keys(m
             shot_group_id=seeded.shot_group.shot_group_id,
             user_id=seeded.user.user_id,
             idempotency_key="active-key-2",
+            prompt="相同的客户端视频提示词",
         )
 
         assert replay.job_id == first.job_id
@@ -597,10 +739,81 @@ def test_create_video_job_reuses_active_unit_across_different_idempotency_keys(m
             shot_group_id=seeded.shot_group.shot_group_id,
             user_id=seeded.user.user_id,
             idempotency_key="active-key-2",
+            prompt="相同的客户端视频提示词",
         )
 
         assert terminal_replay.job_id == first.job_id
         assert len(raw.scalars(select(VideoGenerationJob)).all()) == 1
+        assert len(enqueued) == 1
+
+    asyncio.run(scenario())
+
+
+def test_create_video_job_rejects_different_prompt_for_active_unit_without_side_effects(
+    monkeypatch,
+) -> None:
+    async def scenario() -> None:
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        db = _AsyncSessionAdapter(raw)
+        enqueued: list[dict] = []
+
+        async def fake_enqueue(db, **kwargs):
+            enqueued.append(kwargs)
+            row = TaskDispatchOutbox(
+                id="dispatch-active-prompt",
+                task_type=kwargs["task_type"],
+                job_id=kwargs["job_id"],
+                attempt=kwargs["attempt"],
+                payload=kwargs["payload"],
+                status="pending",
+            )
+            db.add(row)
+            return row
+
+        monkeypatch.setattr("app.services.video_generation.enqueue_task", fake_enqueue)
+
+        from app.services.video_generation import create_video_job
+
+        first = await create_video_job(
+            db,
+            script_id=seeded.script.id,
+            episode_id=seeded.episode.episode_id,
+            shot_group_id=seeded.shot_group.shot_group_id,
+            user_id=seeded.user.user_id,
+            idempotency_key="active-prompt-key-1",
+            prompt="活动任务第一版提示词",
+        )
+        counts_before = (
+            len(raw.scalars(select(VideoGenerationJob)).all()),
+            len(raw.scalars(select(CreditReservation)).all()),
+            len(raw.scalars(select(TaskDispatchOutbox)).all()),
+            len(raw.scalars(select(VideoGenerationIdempotencyRequest)).all()),
+        )
+
+        with pytest.raises(ConflictError) as exc_info:
+            await create_video_job(
+                db,
+                script_id=seeded.script.id,
+                episode_id=seeded.episode.episode_id,
+                shot_group_id=seeded.shot_group.shot_group_id,
+                user_id=seeded.user.user_id,
+                idempotency_key="active-prompt-key-2",
+                prompt="活动任务第二版提示词",
+            )
+
+        assert exc_info.value.detail == (
+            "该镜头组已有使用不同提示词的生成任务，请等待完成或取消后重试"
+        )
+        assert (
+            len(raw.scalars(select(VideoGenerationJob)).all()),
+            len(raw.scalars(select(CreditReservation)).all()),
+            len(raw.scalars(select(TaskDispatchOutbox)).all()),
+            len(raw.scalars(select(VideoGenerationIdempotencyRequest)).all()),
+        ) == counts_before
+        assert raw.scalar(select(VideoGenerationJob)).job_id == first.job_id
+        bindings = raw.scalars(select(VideoGenerationIdempotencyRequest)).all()
+        assert [binding.idempotency_key for binding in bindings] == ["active-prompt-key-1"]
         assert len(enqueued) == 1
 
     asyncio.run(scenario())
@@ -3653,6 +3866,107 @@ def test_batch_create_requires_idempotency_key_before_creating_any_job(monkeypat
             )
 
         create.assert_not_awaited()
+
+    asyncio.run(scenario())
+
+
+def test_batch_create_forwards_prompts_by_shot_group_and_rejects_unknown_keys_before_create(
+    monkeypatch,
+) -> None:
+    async def scenario() -> None:
+        from app.api.v1 import video_generation as api
+        from app.schemas.video import VideoJobBatchCreateIn
+
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        db = _AsyncSessionAdapter(raw)
+        job = _add_worker_job(
+            raw,
+            seeded,
+            job_id="job-batch-prompt-forward",
+            reservation_id="reservation-batch-prompt-forward",
+        )
+        create = AsyncMock(return_value=job)
+        monkeypatch.setattr("app.services.video_generation.create_video_job", create)
+        monkeypatch.setattr(api, "_load_and_check_script", AsyncMock(return_value=seeded.script))
+
+        with pytest.raises(BadRequestError) as exc_info:
+            await api.batch_create_video_generation_jobs(
+                VideoJobBatchCreateIn(
+                    script_id=seeded.script.id,
+                    episode_id=seeded.episode.episode_id,
+                    shot_group_ids=["sg-10"],
+                    prompts={"sg-unknown": "未知镜头组提示词"},
+                ),
+                db=db,
+                user=seeded.user,
+                idempotency_key="batch-prompt-unknown",
+            )
+        assert exc_info.value.status_code == 400
+        assert exc_info.value.detail == "prompts 包含非目标镜头组"
+        create.assert_not_awaited()
+
+        result = await api.batch_create_video_generation_jobs(
+            VideoJobBatchCreateIn(
+                script_id=seeded.script.id,
+                episode_id=seeded.episode.episode_id,
+                shot_group_ids=["sg-10", "sg-2"],
+                prompts={
+                    "sg-10": "  第十组客户端提示词  ",
+                    "sg-2": "第二组客户端提示词",
+                },
+            ),
+            db=db,
+            user=seeded.user,
+            idempotency_key="batch-prompt-forward",
+        )
+
+        assert len(result.success) == 2
+        assert result.failed == []
+        assert [call.kwargs["shot_group_id"] for call in create.await_args_list] == [
+            "sg-10",
+            "sg-2",
+        ]
+        assert [call.kwargs["prompt"] for call in create.await_args_list] == [
+            "第十组客户端提示词",
+            "第二组客户端提示词",
+        ]
+
+    asyncio.run(scenario())
+
+
+def test_single_create_forwards_client_prompt(monkeypatch) -> None:
+    async def scenario() -> None:
+        from app.api.v1 import video_generation as api
+        from app.schemas.video import VideoJobCreateIn
+
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        job = _add_worker_job(
+            raw,
+            seeded,
+            job_id="job-single-prompt-forward",
+            reservation_id="reservation-single-prompt-forward",
+        )
+        create = AsyncMock(return_value=job)
+        monkeypatch.setattr("app.services.video_generation.create_video_job", create)
+        monkeypatch.setattr(api, "_load_and_check_script", AsyncMock(return_value=seeded.script))
+
+        result = await api.create_video_generation_job(
+            VideoJobCreateIn(
+                script_id=seeded.script.id,
+                episode_id=seeded.episode.episode_id,
+                shot_group_id=seeded.shot_group.shot_group_id,
+                prompt="  单个客户端视频提示词  ",
+            ),
+            db=_AsyncSessionAdapter(raw),
+            user=seeded.user,
+            idempotency_key="single-prompt-forward",
+        )
+
+        assert result.job_id == job.job_id
+        create.assert_awaited_once()
+        assert create.await_args.kwargs["prompt"] == "单个客户端视频提示词"
 
     asyncio.run(scenario())
 

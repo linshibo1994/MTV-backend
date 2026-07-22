@@ -1,4 +1,4 @@
-"""镜头组合并服务。"""
+"""将一集全部小分镜自动组合为正式视频镜头组。"""
 
 from __future__ import annotations
 
@@ -15,7 +15,11 @@ from app.models.episode import Episode
 from app.models.scene import Scene
 from app.models.script import Script
 from app.models.shot import Shot
-from app.models.shot_group import ShotGroup
+from app.models.shot_group import (
+    DRAFT_SHOT_GROUP_UNIT_PREFIX,
+    FINAL_SHOT_GROUP_UNIT_PREFIX,
+    ShotGroup,
+)
 from app.models.storyboard_job import StoryboardJob
 from app.models.subject import Subject
 from app.models.video_generation_job import VideoGenerationJob
@@ -28,32 +32,28 @@ from app.services.storyboard import (
 
 _SHOT_LINE_PREFIX = re.compile(r"^【镜头\d+\s*:\s*[^】]+】")
 _ACTIVE_STORYBOARD_STATUSES = ("pending", "running", "retry")
-_ACTIVE_VIDEO_STATUSES = ("starting", "processing")
+_MIN_GROUP_SECONDS = 3
+_MAX_GROUP_SECONDS = 15
+_PREFERRED_GROUP_SECONDS = 6
 
 
 @dataclass(frozen=True)
 class ShotGroupMergeResult:
-    """合并后的关键事实，供路由审计使用。"""
+    """整集合并后的关键事实，供路由审计使用。"""
 
-    shot_group_id: str
+    shot_group_ids: tuple[str, ...]
     removed_shot_group_ids: tuple[str, ...]
     episode_version: int
+    already_grouped: bool = False
 
 
 def _duration(shot: Shot) -> int:
     value = int(shot.end_seconds) - int(shot.start_seconds)
     if value <= 0:
         raise BadRequestError("镜头时长必须大于 0 秒")
+    if value > _MAX_GROUP_SECONDS:
+        raise BadRequestError("单个镜头时长不能超过 15 秒")
     return value
-
-
-def _validate_group_shape(shots: list[Shot], *, label: str) -> int:
-    if not 2 <= len(shots) <= 5:
-        raise BadRequestError(f"{label}必须包含 2～5 个镜头")
-    duration = sum(_duration(shot) for shot in shots)
-    if not 3 <= duration <= 15:
-        raise BadRequestError(f"{label}总时长必须为 3～15 秒")
-    return duration
 
 
 def _rewrite_shot_line(shot: Shot, display_no: int, start: int, end: int) -> str:
@@ -75,6 +75,64 @@ def _shot_payload(shot: Shot) -> dict:
     }
 
 
+def _is_final_group(group: ShotGroup) -> bool:
+    return group.unit_id == f"{FINAL_SHOT_GROUP_UNIT_PREFIX}{group.shot_group_id}"
+
+
+def _is_draft_group(group: ShotGroup) -> bool:
+    return group.unit_id == f"{DRAFT_SHOT_GROUP_UNIT_PREFIX}{group.shot_group_id}"
+
+
+def _partition_scene_shots(
+    shots: list[Shot],
+    *,
+    duration_by_shot: dict[str, int],
+    preferred_boundaries: set[int],
+) -> list[list[Shot]]:
+    """把同一场景的连续镜头切成 3～15 秒的组。
+
+    Provider 在分镜生成阶段给出的 draft 边界代表 LLM 对叙事连续性的建议；
+    动态规划优先保留这些边界，再选择更接近 6 秒的合法分区。请求数组
+    顺序不参与分区，避免客户端重排叙事。
+    """
+
+    count = len(shots)
+    # dp[i] = (代价, 从 i 开始的分组下标区间)。代价按叙事边界破坏数、
+    # 时长偏差、组数、切点顺序依次比较，确保结果稳定且尾组始终合法。
+    dp: dict[int, tuple[tuple[int, int, int, tuple[int, ...]], list[tuple[int, int]]]] = {
+        count: ((0, 0, 0, ()), [])
+    }
+    for start in range(count - 1, -1, -1):
+        total = 0
+        best: tuple[tuple[int, int, int, tuple[int, ...]], list[tuple[int, int]]] | None = None
+        for end in range(start + 1, count + 1):
+            total += duration_by_shot[shots[end - 1].shot_id]
+            if total > _MAX_GROUP_SECONDS:
+                break
+            if total < _MIN_GROUP_SECONDS or end not in dp:
+                continue
+
+            skipped_boundaries = sum(1 for boundary in preferred_boundaries if start < boundary < end)
+            added_boundary = int(end < count and end not in preferred_boundaries)
+            tail_cost, tail_groups = dp[end]
+            cut_points = (end,) + tail_cost[3]
+            cost = (
+                skipped_boundaries + added_boundary + tail_cost[0],
+                abs(total - _PREFERRED_GROUP_SECONDS) + tail_cost[1],
+                1 + tail_cost[2],
+                cut_points,
+            )
+            candidate = (cost, [(start, end), *tail_groups])
+            if best is None or candidate[0] < best[0]:
+                best = candidate
+        if best is not None:
+            dp[start] = best
+
+    if 0 not in dp:
+        raise BadRequestError("当前场景的分镜时长无法自动组合为 3～15 秒镜头组")
+    return [shots[start:end] for start, end in dp[0][1]]
+
+
 async def _refresh_group(
     db: AsyncSession,
     group: ShotGroup,
@@ -85,7 +143,7 @@ async def _refresh_group(
     subjects: list[Subject],
     duration_by_shot: dict[str, int],
 ) -> None:
-    """按当前镜头顺序重建一个发生结构变化的镜头组。"""
+    """按组内叙事顺序重建时间轴、Prompt、素材与音频。"""
 
     cursor = 0
     referenced_names: list[str] = [background] if background else []
@@ -131,23 +189,23 @@ async def _refresh_group(
     }
 
 
-async def _raise_for_missing_shots(
+async def _raise_for_unknown_shots(
     db: AsyncSession,
     requested_ids: set[str],
     local_ids: set[str],
 ) -> None:
-    missing_ids = requested_ids - local_ids
-    if not missing_ids:
+    unknown_ids = requested_ids - local_ids
+    if not unknown_ids:
         return
     existing_result = await db.execute(
-        select(Shot.shot_id).where(Shot.shot_id.in_(missing_ids)).limit(1)
+        select(Shot.shot_id).where(Shot.shot_id.in_(unknown_ids)).limit(1)
     )
     if existing_result.scalar_one_or_none() is not None:
         raise ForbiddenError("镜头不属于当前剧本/分集")
     raise NotFoundError("镜头不存在")
 
 
-async def merge_shots_into_group(
+async def merge_shots_into_groups(
     db: AsyncSession,
     *,
     script_id: str,
@@ -155,11 +213,7 @@ async def merge_shots_into_group(
     shot_ids: list[str],
     expected_episode_version: int,
 ) -> ShotGroupMergeResult:
-    """把同一场景中连续镜头合并为新的 ShotGroup。
-
-    固定锁序为 Script -> Episode -> Scene -> ShotGroup -> Shot，与视频任务创建保持一致。
-    服务仅 flush，事务提交由 API 路由负责。
-    """
+    """接收当前分集全部小分镜，自动生成多个正式视频镜头组。"""
 
     locked_script_id = (
         await db.execute(
@@ -198,7 +252,7 @@ async def merge_shots_into_group(
         )
     ).scalar_one_or_none()
     if active_storyboard_id is not None:
-        raise ConflictError("分镜生成任务运行中，暂不可合并镜头")
+        raise ConflictError("分镜生成任务运行中，暂不可合并镜头组")
 
     scenes = list(
         (
@@ -212,7 +266,7 @@ async def merge_shots_into_group(
     )
     scene_by_no = {scene.scene_no: scene for scene in scenes}
 
-    groups = list(
+    source_groups = list(
         (
             await db.execute(
                 select(ShotGroup)
@@ -226,8 +280,8 @@ async def merge_shots_into_group(
             )
         ).scalars().all()
     )
-    if not groups:
-        raise ConflictError("当前分集尚无可合并的镜头组")
+    if not source_groups:
+        raise ConflictError("当前分集尚未生成分镜")
 
     all_shots = list(
         (
@@ -238,65 +292,37 @@ async def merge_shots_into_group(
                     ShotGroup.script_id == script_id,
                     ShotGroup.episode_id == episode_id,
                 )
-                .order_by(
-                    ShotGroup.group_index,
-                    Shot.display_no,
-                    Shot.shot_id,
-                )
+                .order_by(ShotGroup.group_index, Shot.display_no, Shot.shot_id)
                 .with_for_update(of=Shot)
             )
         ).scalars().all()
     )
+    if not all_shots:
+        raise ConflictError("当前分集没有可合并的小分镜")
 
+    if len(shot_ids) != len(set(shot_ids)):
+        raise BadRequestError("shot_ids 不得重复")
     requested_ids = set(shot_ids)
     local_ids = {shot.shot_id for shot in all_shots}
-    await _raise_for_missing_shots(db, requested_ids, local_ids)
-    selected = [shot for shot in all_shots if shot.shot_id in requested_ids]
-    scene_nos = {shot.scene_no for shot in selected}
-    if len(scene_nos) != 1:
-        raise BadRequestError("只能合并同一场景中的镜头")
-    scene_no = next(iter(scene_nos))
-    scene = scene_by_no.get(scene_no)
-    if scene is None:
-        raise ConflictError("镜头所属场景不存在")
+    await _raise_for_unknown_shots(db, requested_ids, local_ids)
+    omitted_count = len(local_ids - requested_ids)
+    if omitted_count:
+        raise BadRequestError(f"必须提交当前分集全部分镜 ID，缺少 {omitted_count} 个")
 
-    scene_shots = [shot for shot in all_shots if shot.scene_no == scene_no]
-    selected_positions = [
-        index for index, shot in enumerate(scene_shots) if shot.shot_id in requested_ids
-    ]
-    if selected_positions != list(
-        range(selected_positions[0], selected_positions[0] + len(selected_positions))
-    ):
-        raise BadRequestError("只能合并叙事顺序连续的镜头")
+    final_groups = [group for group in source_groups if _is_final_group(group)]
+    draft_groups = [group for group in source_groups if _is_draft_group(group)]
+    if len(final_groups) == len(source_groups):
+        # 网络重试或重复点击：全量 ID 一致时直接返回当前结果，不重复改组和涨版本。
+        return ShotGroupMergeResult(
+            shot_group_ids=tuple(group.shot_group_id for group in final_groups),
+            removed_shot_group_ids=(),
+            episode_version=episode.episode_version,
+            already_grouped=True,
+        )
+    if len(draft_groups) != len(source_groups):
+        raise ConflictError("当前分集镜头组状态不一致，请重新生成分镜")
 
-    group_by_id = {group.shot_group_id: group for group in groups}
-    source_group_ids = _ordered_unique([shot.shot_group_id for shot in selected])
-    if len(source_group_ids) < 2:
-        raise BadRequestError("所选镜头已属于同一镜头组，无需合并")
-    source_groups = [group_by_id[group_id] for group_id in source_group_ids]
-
-    target_duration = _validate_group_shape(selected, label="合并后的镜头组")
-    shots_by_group: dict[str, list[Shot]] = {group.shot_group_id: [] for group in groups}
-    for shot in all_shots:
-        shots_by_group[shot.shot_group_id].append(shot)
-
-    first_group = source_groups[0]
-    last_group = source_groups[-1]
-    first_shots = shots_by_group[first_group.shot_group_id]
-    last_shots = shots_by_group[last_group.shot_group_id]
-    first_selected_index = next(
-        index for index, shot in enumerate(first_shots) if shot.shot_id in requested_ids
-    )
-    last_selected_index = max(
-        index for index, shot in enumerate(last_shots) if shot.shot_id in requested_ids
-    )
-    prefix_shots = first_shots[:first_selected_index]
-    suffix_shots = last_shots[last_selected_index + 1 :]
-    if prefix_shots:
-        _validate_group_shape(prefix_shots, label="合并后保留的前置镜头组")
-    if suffix_shots:
-        _validate_group_shape(suffix_shots, label="合并后保留的后置镜头组")
-
+    source_group_ids = [group.shot_group_id for group in source_groups]
     source_video_job_id = (
         await db.execute(
             select(VideoGenerationJob.job_id)
@@ -305,21 +331,41 @@ async def merge_shots_into_group(
         )
     ).scalar_one_or_none()
     if source_video_job_id is not None:
-        raise ConflictError("所选镜头组已有视频任务，不能修改其分镜结构")
-    active_video_job_id = (
-        await db.execute(
-            select(VideoGenerationJob.job_id)
-            .where(
-                VideoGenerationJob.episode_id == episode_id,
-                VideoGenerationJob.status.in_(_ACTIVE_VIDEO_STATUSES),
-            )
-            .limit(1)
-        )
-    ).scalar_one_or_none()
-    if active_video_job_id is not None:
-        raise ConflictError("当前分集有视频生成任务运行中，暂不可合并镜头")
+        raise ConflictError("分镜已关联视频生成任务，不能重新组合")
 
     duration_by_shot = {shot.shot_id: _duration(shot) for shot in all_shots}
+    shots_by_source_group: dict[str, list[Shot]] = {
+        group.shot_group_id: [] for group in source_groups
+    }
+    shots_by_scene: dict[int, list[Shot]] = {}
+    for shot in all_shots:
+        if shot.scene_no not in scene_by_no:
+            raise ConflictError("镜头所属场景不存在")
+        shots_by_source_group[shot.shot_group_id].append(shot)
+        shots_by_scene.setdefault(shot.scene_no, []).append(shot)
+
+    final_shot_buckets: list[tuple[Scene, list[Shot]]] = []
+    for scene in scenes:
+        scene_shots = shots_by_scene.get(scene.scene_no, [])
+        if not scene_shots:
+            continue
+        preferred_boundaries: set[int] = set()
+        cursor = 0
+        for source_group in source_groups:
+            if source_group.scene_no != scene.scene_no:
+                continue
+            cursor += len(shots_by_source_group[source_group.shot_group_id])
+            preferred_boundaries.add(cursor)
+        for bucket in _partition_scene_shots(
+            scene_shots,
+            duration_by_shot=duration_by_shot,
+            preferred_boundaries=preferred_boundaries,
+        ):
+            final_shot_buckets.append((scene, bucket))
+
+    if sum(len(bucket) for _, bucket in final_shot_buckets) != len(all_shots):
+        raise ConflictError("自动组合未覆盖全部分镜")
+
     subjects = list(
         (
             await db.execute(
@@ -327,146 +373,92 @@ async def merge_shots_into_group(
             )
         ).scalars().all()
     )
+    source_group_by_id = {group.shot_group_id: group for group in source_groups}
 
-    # 先释放源组内 display_no/shot_no 唯一值，避免搬迁和重排时瞬时冲突。
-    source_shots = [shot for group_id in source_group_ids for shot in shots_by_group[group_id]]
-    for index, shot in enumerate(source_shots, start=1):
+    # 先释放源组内唯一编号，避免批量搬迁时命中非延迟唯一约束。
+    for index, shot in enumerate(all_shots, start=1):
         shot.display_no = 100_000 + index
         shot.shot_no = f"tmp-{new_id()}"
     await db.flush()
 
-    target_group_id = new_id()
-    target_group = ShotGroup(
-        shot_group_id=target_group_id,
-        script_id=script_id,
-        episode_id=episode_id,
-        scene_no=scene_no,
-        group_index=max(group.group_index for group in groups) + 10_000,
-        group_no=f"TMP{new_id()[:20]}",
-        duration_seconds=target_duration,
-        video_duration_seconds=target_duration,
-    )
-    db.add(target_group)
-
-    narrative_parts = _ordered_unique(
-        [group.description_text for group in source_groups if group.description_text]
-    )
-    target_narrative = "；".join(narrative_parts)
-    await _refresh_group(
-        db,
-        target_group,
-        selected,
-        background=scene.background,
-        narrative_purpose=target_narrative,
-        subjects=subjects,
-        duration_by_shot=duration_by_shot,
-    )
-
-    kept_source_ids: set[str] = set()
-    if prefix_shots:
-        kept_source_ids.add(first_group.shot_group_id)
+    created_groups: list[ShotGroup] = []
+    temporary_base = max(group.group_index for group in source_groups) + 10_000
+    for index, (scene, bucket) in enumerate(final_shot_buckets, start=1):
+        shot_group_id = new_id()
+        group = ShotGroup(
+            shot_group_id=shot_group_id,
+            script_id=script_id,
+            episode_id=episode_id,
+            scene_no=scene.scene_no,
+            group_index=temporary_base + index,
+            group_no=f"TMP{index}-{new_id()[:12]}",
+            unit_id=f"{FINAL_SHOT_GROUP_UNIT_PREFIX}{shot_group_id}",
+            unit_runtime_key=f"{episode_id}:{scene.scene_no}:group:{shot_group_id}",
+        )
+        db.add(group)
+        narrative_parts = _ordered_unique(
+            [
+                source_group_by_id[shot.shot_group_id].description_text
+                for shot in bucket
+                if source_group_by_id[shot.shot_group_id].description_text
+            ]
+        )
         await _refresh_group(
             db,
-            first_group,
-            prefix_shots,
+            group,
+            bucket,
             background=scene.background,
-            narrative_purpose=first_group.description_text,
+            narrative_purpose="；".join(narrative_parts),
             subjects=subjects,
             duration_by_shot=duration_by_shot,
         )
-    if suffix_shots:
-        kept_source_ids.add(last_group.shot_group_id)
-        await _refresh_group(
-            db,
-            last_group,
-            suffix_shots,
-            background=scene.background,
-            narrative_purpose=last_group.description_text,
-            subjects=subjects,
-            duration_by_shot=duration_by_shot,
-        )
+        created_groups.append(group)
 
-    removed_ids = tuple(
-        group_id for group_id in source_group_ids if group_id not in kept_source_ids
-    )
     await db.flush()
-    if removed_ids:
-        await db.execute(
-            delete(ShotGroup)
-            .where(ShotGroup.shot_group_id.in_(removed_ids))
-            .execution_options(synchronize_session="fetch")
-        )
-        await db.flush()
-
-    shots_by_group[target_group_id] = selected
-    if prefix_shots:
-        shots_by_group[first_group.shot_group_id] = prefix_shots
-    if suffix_shots:
-        shots_by_group[last_group.shot_group_id] = suffix_shots
-    for removed_id in removed_ids:
-        shots_by_group.pop(removed_id, None)
-
-    source_id_set = set(source_group_ids)
-    final_groups: list[ShotGroup] = []
-    for group in groups:
-        if group.shot_group_id == first_group.shot_group_id:
-            if prefix_shots:
-                final_groups.append(first_group)
-            final_groups.append(target_group)
-            continue
-        if group.shot_group_id in source_id_set:
-            if group.shot_group_id == last_group.shot_group_id and suffix_shots:
-                final_groups.append(last_group)
-            continue
-        final_groups.append(group)
-
-    # 两阶段重排组索引/组号，规避非延迟唯一约束的瞬时碰撞。
-    temporary_base = len(groups) + 100_000
-    for index, group in enumerate(final_groups, start=1):
-        group.group_index = temporary_base + index
-        group.group_no = f"TMP{index}-{new_id()[:16]}"
-        for shot in shots_by_group[group.shot_group_id]:
-            shot.group_no = group.group_no
+    await db.execute(
+        delete(ShotGroup)
+        .where(ShotGroup.shot_group_id.in_(source_group_ids))
+        .execution_options(synchronize_session="fetch")
+    )
     await db.flush()
 
     next_group_no_by_scene: dict[int, int] = {}
-    for group_index, group in enumerate(final_groups, start=1):
+    shots_by_final_group = {
+        group.shot_group_id: bucket
+        for group, (_, bucket) in zip(created_groups, final_shot_buckets, strict=True)
+    }
+    for group_index, group in enumerate(created_groups, start=1):
         group.group_index = group_index
         next_no = next_group_no_by_scene.get(group.scene_no, 0) + 1
         next_group_no_by_scene[group.scene_no] = next_no
         group.group_no = f"G{next_no}"
-        for shot in shots_by_group[group.shot_group_id]:
+        for shot in shots_by_final_group[group.shot_group_id]:
             shot.group_no = group.group_no
 
     groups_by_scene: dict[int, list[ShotGroup]] = {}
-    for group in final_groups:
+    for group in created_groups:
         groups_by_scene.setdefault(group.scene_no, []).append(group)
-    succeeded_unit_ids = set(
-        (
-            await db.execute(
-                select(VideoGenerationJob.unit_id).where(
-                    VideoGenerationJob.episode_id == episode_id,
-                    VideoGenerationJob.status == "succeeded",
-                )
-            )
-        ).scalars().all()
-    )
-    for current_scene in scenes:
-        scene_groups = groups_by_scene.get(current_scene.scene_no, [])
-        current_scene.shot_group_count = len(scene_groups)
-        current_scene.pending_shot_count = sum(
-            len(shots_by_group[group.shot_group_id])
-            for group in scene_groups
-            if group.unit_id not in succeeded_unit_ids
+    for scene in scenes:
+        scene_groups = groups_by_scene.get(scene.scene_no, [])
+        scene.shot_group_count = len(scene_groups)
+        scene.pending_shot_count = sum(
+            len(shots_by_final_group[group.shot_group_id]) for group in scene_groups
         )
 
     episode.episode_version += 1
     await db.flush()
     return ShotGroupMergeResult(
-        shot_group_id=target_group_id,
-        removed_shot_group_ids=removed_ids,
+        shot_group_ids=tuple(group.shot_group_id for group in created_groups),
+        removed_shot_group_ids=tuple(source_group_ids),
         episode_version=episode.episode_version,
     )
 
 
-__all__ = ["ShotGroupMergeResult", "merge_shots_into_group"]
+# 兼容内部旧导入名；语义已经变为整集合并并产生多个组。
+merge_shots_into_group = merge_shots_into_groups
+
+__all__ = [
+    "ShotGroupMergeResult",
+    "merge_shots_into_group",
+    "merge_shots_into_groups",
+]

@@ -158,9 +158,14 @@ class VideoWorkbenchOut(BaseModel):
 
 
 class ShotGroupMergeIn(BaseModel):
-    """把连续分镜合并为新镜头组。"""
+    """把当前分集的全部小分镜自动组合为正式镜头组。"""
 
-    shot_ids: list[str] = Field(..., min_length=2, max_length=5)
+    shot_ids: list[str] = Field(
+        ...,
+        min_length=1,
+        max_length=1000,
+        description="当前分集分镜生成结果中的全部镜头 ID；数组顺序不作为叙事顺序",
+    )
     expected_episode_version: int = Field(..., ge=1)
 
     @field_validator("shot_ids")
@@ -170,7 +175,7 @@ class ShotGroupMergeIn(BaseModel):
         if any(not value or len(value) > 36 for value in normalised):
             raise ValueError("shot_ids 包含非法镜头 ID")
         if len(set(normalised)) != len(normalised):
-            raise ValueError("shot_ids 不得重复")
+            raise ValueError("shot_ids 必须是当前分集全部且唯一的镜头 ID")
         return normalised
 
 

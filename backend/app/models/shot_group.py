@@ -7,6 +7,9 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.core.ids import new_id
 from app.models.base import Base, TimestampMixin
 
+DRAFT_SHOT_GROUP_UNIT_PREFIX = "draft:"
+FINAL_SHOT_GROUP_UNIT_PREFIX = "group:"
+
 
 class ShotGroup(TimestampMixin, Base):
     """镜头组 — 视频生成单元，多镜头分时段 prompt + 参考帧 + 素材汇总。"""
@@ -63,7 +66,7 @@ class ShotGroup(TimestampMixin, Base):
         if (kwargs.get("group_index") or 0) <= 0:
             kwargs["group_index"] = 1
         if shot_group_id:
-            kwargs.setdefault("unit_id", f"group:{shot_group_id}")
+            kwargs.setdefault("unit_id", f"{FINAL_SHOT_GROUP_UNIT_PREFIX}{shot_group_id}")
         if shot_group_id and episode_id and scene_no:
             kwargs.setdefault("unit_runtime_key", f"{episode_id}:{scene_no}:group:{shot_group_id}")
         elif shot_group_id and episode_id and group_no:

@@ -1,9 +1,19 @@
 """视频生成模块 Pydantic 模型 — VideoGenerationJob 出参、激活供应商配置、创建入参。"""
 
 from datetime import datetime
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+
+MAX_VIDEO_PROMPT_LENGTH = 32_000
+VideoPrompt = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True,
+        min_length=1,
+        max_length=MAX_VIDEO_PROMPT_LENGTH,
+    ),
+]
 
 
 class VideoJobOut(BaseModel):
@@ -58,6 +68,10 @@ class VideoJobCreateIn(BaseModel):
     script_id: str
     episode_id: str
     shot_group_id: str
+    prompt: VideoPrompt | None = Field(
+        None,
+        description="客户端可编辑的视频提示词；缺省时兼容旧客户端并回退镜头组 prompt",
+    )
 
 
 class VideoJobBatchCreateIn(BaseModel):
@@ -67,6 +81,10 @@ class VideoJobBatchCreateIn(BaseModel):
     episode_id: str
     shot_group_ids: list[str] = Field(
         ..., min_length=1, max_length=100, description="镜头组 ID 列表"
+    )
+    prompts: dict[str, VideoPrompt] | None = Field(
+        None,
+        description="每个镜头组的客户端可编辑视频提示词，键为 shot_group_id",
     )
 
 

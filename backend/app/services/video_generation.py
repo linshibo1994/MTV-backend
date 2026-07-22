@@ -77,6 +77,7 @@ async def create_video_job(
     shot_group_id: str,
     user_id: str,
     idempotency_key: str | None = None,
+    prompt: str | None = None,
 ) -> "VideoGenerationJob":
     """创建视频生成任务 — 幂等去重 → 汇聚参考图/音频 → 首帧衔接 → 落库 → reserve 积分 → 投递 worker。
 
@@ -87,6 +88,7 @@ async def create_video_job(
         shot_group_id: 镜头组 ID（绑定生成单元）。
         user_id: 触发用户（积分扣减归属，按 user owner 维度账户）。
         idempotency_key: 可选幂等键（来自 Idempotency-Key 头）。
+        prompt: 客户端显式视频提示词；缺省时回退镜头组 prompt。
 
     Returns:
         VideoGenerationJob ORM 对象（重复创建时返回已存在任务）。
@@ -102,14 +104,19 @@ async def create_video_job(
         raise BadRequestError("Idempotency-Key 必填")
     if len(idempotency_key) > VIDEO_IDEMPOTENCY_KEY_MAX_LENGTH:
         raise BadRequestError("Idempotency-Key 过长")
+    client_prompt = prompt.strip() if isinstance(prompt, str) else None
+    if prompt is not None and not client_prompt:
+        raise BadRequestError("视频提示词不能为空")
     unit_id = f"group:{shot_group_id}"
-    request_hash = _request_hash(
-        {
-            "script_id": script_id,
-            "episode_id": episode_id,
-            "shot_group_id": shot_group_id,
-        }
-    )
+    request_payload = {
+        "script_id": script_id,
+        "episode_id": episode_id,
+        "shot_group_id": shot_group_id,
+    }
+    # 缺省时保持历史 hash 结构，兼容部署中的旧客户端和旧幂等绑定。
+    if client_prompt is not None:
+        request_payload["prompt"] = client_prompt
+    request_hash = _request_hash(request_payload)
 
     # 1. 幂等去重（doc 08 §4.2）
     existing_before_lock = await _resolve_idempotent_job(
@@ -174,6 +181,12 @@ async def create_video_job(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="镜头组不存在")
     if episode is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="分集不存在")
+    if shot_group.unit_id != unit_id:
+        raise ConflictError("请先完成镜头组合并，再创建视频生成任务")
+
+    prompt_text = _ensure_constraint_lock(
+        client_prompt if client_prompt is not None else shot_group.prompt or ""
+    )
 
     # 等待镜头组锁期间，另一个事务可能已建立同 key 映射，锁后必须重新读取。
     existing = await _resolve_idempotent_job(
@@ -184,6 +197,9 @@ async def create_video_job(
 
     active_job = await video_crud.find_active_job_by_unit(db, unit_id)
     if active_job is not None:
+        active_prompt = (active_job.input_json or {}).get("prompt")
+        if client_prompt is not None and active_prompt != prompt_text:
+            raise ConflictError("该镜头组已有使用不同提示词的生成任务，请等待完成或取消后重试")
         logger.info(
             "视频生成任务活动单元复用 job_id=%s unit_id=%s",
             active_job.job_id,
@@ -230,7 +246,6 @@ async def create_video_job(
     # 6. 构造 input_json 并落库任务
     # prompt 兜底：约束锁9条属上游 enrich/分镜产物，video 模块仅透传；但上游漏写
     # 时补齐，保证传入 provider 的 prompt 含约束段（doc06 §8.1）。
-    prompt_text = _ensure_constraint_lock(shot_group.prompt or "")
     input_json = {
         "model": model,
         "prompt": prompt_text,
@@ -863,7 +878,7 @@ def _ensure_constraint_lock(prompt: str) -> str:
     """
     if not prompt:
         return _CONSTRAINT_LOCK_TEXT
-    if "【约束】" in prompt:
+    if _CONSTRAINT_LOCK_TEXT in prompt:
         return prompt
     return f"{prompt}\n{_CONSTRAINT_LOCK_TEXT}"
 

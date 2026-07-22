@@ -51,6 +51,7 @@ from app.services.pipeline.extract import run_extract
 from app.services.pipeline.merge import run_merge
 from app.services.pipeline.parents import run_parents
 from app.services.pipeline.split import run_split
+from app.services.shot_group_merge import merge_shots_into_groups
 from app.services.task_dispatch import dispatch_outbox_batch
 from app.workers import timeline_render as timeline_worker
 from app.workers.video_generation import run_video_generation_once
@@ -629,8 +630,24 @@ async def test_full_backend_flow_reaches_succeeded_render_job(monkeypatch, tmp_p
         "shot_groups": 1,
         "shots": 2,
     }
-    shot_group = (await db.execute(select(ShotGroup).where(ShotGroup.episode_id == episode_id))).scalar_one()
-    assert len(list((await db.execute(select(Shot))).scalars())) == 2
+    draft_group = (
+        await db.execute(select(ShotGroup).where(ShotGroup.episode_id == episode_id))
+    ).scalar_one()
+    storyboard_shots = list((await db.execute(select(Shot))).scalars())
+    assert len(storyboard_shots) == 2
+    merge_result = await merge_shots_into_groups(
+        db,
+        script_id=script_id,
+        episode_id=episode_id,
+        shot_ids=[shot.shot_id for shot in storyboard_shots],
+        expected_episode_version=2,
+    )
+    await db.commit()
+    assert merge_result.removed_shot_group_ids == (draft_group.shot_group_id,)
+    shot_group = (
+        await db.execute(select(ShotGroup).where(ShotGroup.episode_id == episode_id))
+    ).scalar_one()
+    assert shot_group.unit_id == f"group:{shot_group.shot_group_id}"
 
     monkeypatch.setattr(video_generation_service.settings, "video_provider_selection_mode", "database")
     video_job = await video_generation_service.create_video_job(
@@ -670,7 +687,7 @@ async def test_full_backend_flow_reaches_succeeded_render_job(monkeypatch, tmp_p
     assert finished_video.output_json is not None
     video_storage_key = finished_video.output_json["video_storage_key"]
     assert video_storage_key == f"generate_images/v5/{video_job.job_id}.mp4"
-    assert finished_video.input_version == 2
+    assert finished_video.input_version == 3
     assert fake_video.request is not None
     assert fake_video.request.reference_images
     assert fake_video.request.reference_audios
@@ -744,7 +761,7 @@ async def test_full_backend_flow_reaches_succeeded_render_job(monkeypatch, tmp_p
         render_job = verify.get(TimelineRenderJob, render_id)
         assert render_job is not None
         assert render_job.status == "succeeded"
-        assert render_job.input_version == 2
+        assert render_job.input_version == 3
         assert render_job.output_json is not None
         assert render_job.output_json["storage_key"] == render_job.output_storage_key
         assert render_job.output_storage_key in storage.objects
