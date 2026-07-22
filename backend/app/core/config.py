@@ -37,8 +37,8 @@ class Settings(BaseSettings):
     )
 
     # 数据库 / 缓存
-    database_url: str = "postgresql+asyncpg://flow:flow@localhost:5432/flowapp"
-    database_sync_url: str = "postgresql+psycopg2://flow:flow@localhost:5432/flowapp"
+    database_url: str = "postgresql+asyncpg://flow:flow@localhost:55432/flowapp"
+    database_sync_url: str = "postgresql+psycopg2://flow:flow@localhost:55432/flowapp"
     redis_url: str = "redis://localhost:6379/0"
     celery_broker_url: str = "redis://localhost:6379/1"
     celery_result_backend: str = "redis://localhost:6379/2"

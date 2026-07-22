@@ -32,7 +32,7 @@
 | 能力 | 模型 / 方式 | 用途 |
 |---|---|---|
 | LLM 文本理解 | 后端编排 | 剧集拆分 / 主体提取 / 跨集合并 / 设计线索增强(prompt 扩展) / 父主体归纳 / 分镜生成 |
-| 文生图 | `banana-2` (Nano Banana / Gemini 2.5 Flash Image)、`gpt-image-2` (GPT Image 2) | 主体设计参考图 (2k, 16:9, 白底摄影棚) |
+| 文生图 | `banana-2` (Nano Banana / Gemini 3.1 Flash Image)、`gpt-image-2` (GPT Image 2) | 主体设计参考图 (2k, 16:9, 白底摄影棚) |
 | 图生视频 | `doubao-seedance-2-0-260128` (Seedance 2.0, 字节) | 镜头组多参考图生视频 (provider: jianyu / modelsai, job_type: all_reference) |
 
 ## 文档索引

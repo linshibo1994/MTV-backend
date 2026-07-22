@@ -30,6 +30,7 @@ from app.providers.video_gen import (
 from tests.test_video_generation import (
     _add_worker_job,
     _AsyncSessionAdapter,
+    _DetachOnRollbackSessionAdapter,
     _make_db,
     _seed,
 )
@@ -188,13 +189,53 @@ async def test_submission_boundary_classifies_timeout_and_explicit_rejection() -
         error.response = response
         raise error
 
-    with pytest.raises(VideoGenerationSubmitRejected):
+    with pytest.raises(VideoGenerationSubmitRejected) as exc_info:
         await execute_video_submission(
             rejected_submit,
             before_submit=before_submit,
             on_submission_uncertain=on_uncertain,
         )
     assert events == ["intent", "remote"]
+    assert exc_info.value.diagnostics == {"status_code": 400}
+
+    events.clear()
+
+    async def response_only_rejected_submit():
+        events.append("remote")
+        error = RuntimeError("response-only bad request")
+        error.response = SimpleNamespace(status_code=400)
+        raise error
+
+    with pytest.raises(VideoGenerationSubmitRejected) as exc_info:
+        await execute_video_submission(
+            response_only_rejected_submit,
+            before_submit=before_submit,
+            on_submission_uncertain=on_uncertain,
+        )
+    assert events == ["intent", "remote"]
+    assert exc_info.value.diagnostics == {"status_code": 400}
+
+
+def test_submit_rejection_diagnostics_constructor_is_fail_closed() -> None:
+    from app.providers.video_gen import VideoGenerationSubmitRejected
+
+    sentinel = "constructor-private-sentinel"
+    error = VideoGenerationSubmitRejected(
+        diagnostics={
+            "status_code": True,
+            "code": "InvalidParameter",
+            "param": ["duration", sentinel],
+            "type": "错误类型",
+            "request_id": "r" * 129,
+            "message": sentinel,
+            "body": {"secret": sentinel},
+            "request": object(),
+            "response": object(),
+        }
+    )
+
+    assert error.diagnostics == {"code": "InvalidParameter"}
+    assert sentinel not in str(error)
 
 
 def test_openai_video_client_disables_sdk_submit_retries(monkeypatch) -> None:
@@ -1194,6 +1235,105 @@ async def test_volcengine_awaits_task_checkpoint_before_post_submit_cancellation
         ("checkpoint_finished", "volcengine-task-1"),
         ("cancellation_probe", "volcengine-task-1"),
     ]
+    client.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_volcengine_submit_rejection_keeps_only_fail_closed_ark_tokens(
+    monkeypatch,
+) -> None:
+    import traceback
+
+    import httpx
+    from volcenginesdkarkruntime._exceptions import ArkBadRequestError
+
+    from app.providers import video_gen_volcengine
+    from app.providers.video_gen import VideoGenerationSubmitRejected
+    from app.providers.video_gen_volcengine import VolcengineVideoGenProvider
+
+    private_prompt = '第一行\n{"authorization":"json-private-secret"}\n第三行'
+    json_escaped_prompt = private_prompt.replace("\n", "\\n").replace('"', '\\"')
+    private_image_url = "data:image/png;base64,cHJpdmF0ZS1pbWFnZQ=="
+    private_key = "resolved-private-ark-key"
+    private_basic = "Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ=="
+    private_unlabeled = "unlabeled-private-credential"
+    request = httpx.Request(
+        "POST",
+        f"https://ark.example/tasks?api_key={private_key}",
+    )
+    response = httpx.Response(400, request=request)
+    error = ArkBadRequestError(
+        (
+            f"duration invalid prompt={private_prompt} json={json_escaped_prompt} "
+            f"image={private_image_url} key={private_key} auth={private_basic} "
+            f"credential={private_unlabeled}"
+        ),
+        response=response,
+        body={
+            "code": "InvalidParameter",
+            "param": "duration",
+            # 该值本身满足 ASCII token；只有 resolved API key exact 防御能让它被丢弃。
+            "type": f"Bad{private_key}Request",
+            "prompt": private_prompt,
+            "json_prompt": json_escaped_prompt,
+            "raw_media": private_image_url,
+            "api_key": private_key,
+            "basic": private_basic,
+            "unlabeled": private_unlabeled,
+        },
+        request_id="req-safe-123",
+    )
+    tasks = SimpleNamespace(
+        create=AsyncMock(side_effect=error),
+        get=AsyncMock(side_effect=AssertionError("提交被拒后不得轮询")),
+    )
+    client = SimpleNamespace(
+        content_generation=SimpleNamespace(tasks=tasks),
+        close=AsyncMock(),
+    )
+    provider = VolcengineVideoGenProvider()
+    monkeypatch.setattr(provider, "_build_client", lambda: client)
+    monkeypatch.setattr(provider, "_resolve_ark_api_key", lambda: private_key)
+    monkeypatch.setattr(
+        video_gen_volcengine,
+        "raise_if_video_cancel_requested_before_submit",
+        AsyncMock(),
+    )
+
+    with pytest.raises(VideoGenerationSubmitRejected) as exc_info:
+        await provider._submit_and_poll(
+            "video-model",
+            private_prompt,
+            [private_image_url],
+            [],
+            None,
+            Mock(),
+            before_submit=AsyncMock(),
+            on_submission_uncertain=AsyncMock(),
+        )
+
+    diagnostics = exc_info.value.diagnostics
+    assert diagnostics["status_code"] == 400
+    assert diagnostics["code"] == "InvalidParameter"
+    assert diagnostics["param"] == "duration"
+    assert diagnostics["request_id"] == "req-safe-123"
+    assert set(diagnostics) == {"status_code", "code", "param", "request_id"}
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+    rendered = "".join(traceback.format_exception(exc_info.value))
+    serialized = repr(diagnostics)
+    for sentinel in (
+        private_prompt,
+        json_escaped_prompt,
+        private_image_url,
+        private_key,
+        private_basic,
+        private_unlabeled,
+    ):
+        assert sentinel not in str(exc_info.value)
+        assert sentinel not in rendered
+        assert sentinel not in serialized
+    tasks.get.assert_not_awaited()
     client.close.assert_awaited_once()
 
 
@@ -2607,11 +2747,12 @@ async def test_submission_uncertain_is_durable_and_keeps_credit_frozen(
         job_id="job-submission-uncertain",
         reservation_id="reservation-submission-uncertain",
     )
-    db = _AsyncSessionAdapter(raw)
+    job_id = job.job_id
+    reservation_id = job.reservation_id
+    db = _DetachOnRollbackSessionAdapter(raw)
     events: list[str] = []
 
     class Provider:
-        provider_key = "modelsai"
         cancel = AsyncMock(side_effect=AssertionError("未知提交不得尝试无 ID 取消"))
 
         async def generate(self, request, _on_progress=None):
@@ -2631,7 +2772,7 @@ async def test_submission_uncertain_is_durable_and_keeps_credit_frozen(
 
     await worker.run_video_generation_once(
         db,
-        job.job_id,
+        job_id,
         owner="submission-worker",
         provider=Provider(),
         extract_last_frame=AsyncMock(),
@@ -2640,8 +2781,8 @@ async def test_submission_uncertain_is_durable_and_keeps_credit_frozen(
     assert events == ["remote_submit_started"]
     release.assert_not_awaited()
     raw.expire_all()
-    saved = raw.get(VideoGenerationJob, job.job_id)
-    reservation = raw.get(CreditReservation, job.reservation_id)
+    saved = raw.get(VideoGenerationJob, job_id)
+    reservation = raw.get(CreditReservation, reservation_id)
     assert saved is not None
     assert reservation is not None
     assert saved.status == "processing"
@@ -2708,9 +2849,13 @@ async def test_submit_intent_alone_keeps_processing_after_untyped_provider_error
 
 
 @pytest.mark.asyncio
-async def test_submit_rejected_fails_and_releases_credit(monkeypatch) -> None:
+async def test_submit_rejected_logs_only_safe_diagnostics_and_releases_credit(
+    monkeypatch,
+    caplog,
+) -> None:
     from app.models.credit_reservation import CreditReservation
     from app.providers.video_gen import VideoGenerationSubmitRejected
+    from app.schemas.video import VideoJobOut
     from app.workers import video_generation as worker
 
     engine, raw = _make_db()
@@ -2721,33 +2866,71 @@ async def test_submit_rejected_fails_and_releases_credit(monkeypatch) -> None:
         job_id="job-submit-rejected",
         reservation_id="reservation-submit-rejected",
     )
-    db = _AsyncSessionAdapter(raw)
+    job_id = job.job_id
+    reservation_id = job.reservation_id
+    db = _DetachOnRollbackSessionAdapter(raw)
+
+    private_message = "worker-private-message"
+    private_body = "worker-private-body"
+    private_request = "worker-private-request"
+    private_object = "worker-private-object"
+    private_unicode = "worker-private-中文"
+    private_long = "x" * 129 + "worker-private-long"
+    rejection = VideoGenerationSubmitRejected(
+        diagnostics={
+            "status_code": "400",
+            "code": "ConstructorSafeCode",
+            "param": [private_object],
+            "type": private_unicode,
+            "request_id": private_long,
+            "message": private_message,
+            "body": private_body,
+            "request": private_request,
+        }
+    )
+    assert rejection.diagnostics == {"code": "ConstructorSafeCode"}
+    # 模拟 typed error 在构造后被不可信 Provider 篡改，worker 必须重新校验。
+    rejection.diagnostics = {
+        "status_code": 400,
+        "code": "InvalidParameter",
+        "param": ["duration", private_object],
+        "type": private_unicode,
+        "request_id": "req-safe-123",
+        "message": private_message,
+        "body": {"secret": private_body},
+        "request": object(),
+        "response": object(),
+        "nested": {"value": private_object},
+        "object": object(),
+        "long": private_long,
+        "unicode": private_unicode,
+    }
 
     class Provider:
-        provider_key = "modelsai"
         cancel = AsyncMock()
 
         async def generate(self, request, _on_progress=None):
             assert request.before_submit is not None
             await request.before_submit()
-            raise VideoGenerationSubmitRejected()
+            raise rejection
 
     monkeypatch.setattr(
         "app.core.database.async_session_factory",
         _SQLiteAsyncSessionFactory(engine),
     )
+    caplog.set_level(logging.WARNING, logger="app.workers.video_generation")
 
     await worker.run_video_generation_once(
         db,
-        job.job_id,
+        job_id,
         owner="submission-worker",
         provider=Provider(),
         extract_last_frame=AsyncMock(),
     )
 
     raw.expire_all()
-    saved = raw.get(VideoGenerationJob, job.job_id)
-    reservation = raw.get(CreditReservation, job.reservation_id)
+    saved = raw.get(VideoGenerationJob, job_id)
+    reservation = raw.get(CreditReservation, reservation_id)
     assert saved is not None
     assert reservation is not None
     assert saved.status == "failed"
@@ -2759,6 +2942,36 @@ async def test_submit_rejected_fails_and_releases_credit(monkeypatch) -> None:
         "provider_key": "modelsai",
         "attempt": 1,
     }
+    assert (saved.metrics or {})["provider_submission"] == (
+        saved.output_json or {}
+    )["provider_submission"]
+    public = VideoJobOut.model_validate(saved)
+    assert "diagnostics" not in (public.output_json or {})["provider_submission"]
+    assert "diagnostics" not in (public.metrics or {})["provider_submission"]
+
+    records = [
+        record
+        for record in caplog.records
+        if getattr(record, "event", None) == "video_provider_submit_rejected"
+    ]
+    assert len(records) == 1
+    assert getattr(records[0], "provider_diagnostics") == {
+        "status_code": 400,
+        "code": "InvalidParameter",
+        "request_id": "req-safe-123",
+    }
+    assert "code=InvalidParameter" in caplog.text
+    assert "request_id=req-safe-123" in caplog.text
+    for sentinel in (
+        private_message,
+        private_body,
+        private_request,
+        private_object,
+        private_unicode,
+        private_long,
+    ):
+        assert sentinel not in caplog.text
+        assert sentinel not in repr(getattr(records[0], "provider_diagnostics"))
 
 
 @pytest.mark.asyncio

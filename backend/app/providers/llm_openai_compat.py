@@ -26,6 +26,7 @@ from openai import (
     RateLimitError,
 )
 
+from app.providers.llm import LLMJSONResponseError, require_non_empty_chat_content
 from app.providers.registry import ProviderConfigurationError
 
 LLMVendor = Literal["openai", "openai_compatible", "deepseek", "bailian", "gemini"]
@@ -92,7 +93,7 @@ class OpenAICompatLLMProvider:
             RateLimitError,
         ):
             raise ConnectionError("LLM 供应商暂不可用") from None
-        content = response.choices[0].message.content or "{}"
+        content = response.choices[0].message.content or ""
         # 去除部分厂商偶发的 markdown 代码块包裹
         stripped = content.strip()
         if stripped.startswith("```"):
@@ -100,9 +101,16 @@ class OpenAICompatLLMProvider:
             stripped = stripped[1] if len(stripped) >= 2 else content
         try:
             parsed = json.loads(stripped)
-            return parsed if isinstance(parsed, dict) else {}
+            if isinstance(parsed, dict):
+                return parsed
+            kind = type(parsed).__name__
+            raise LLMJSONResponseError(
+                "non_object_json", kind=kind, content_length=len(stripped)
+            )
         except json.JSONDecodeError:
-            return {}
+            raise LLMJSONResponseError(
+                "invalid_json", kind="text", content_length=len(stripped)
+            ) from None
 
     async def chat(
         self,
@@ -131,7 +139,12 @@ class OpenAICompatLLMProvider:
             RateLimitError,
         ):
             raise ConnectionError("LLM 供应商暂不可用") from None
-        return response.choices[0].message.content or ""
+        choices = getattr(response, "choices", None)
+        if not choices:
+            return require_non_empty_chat_content(None)
+        message = getattr(choices[0], "message", None)
+        content = getattr(message, "content", None)
+        return require_non_empty_chat_content(content)
 
 
 def build_openai_compat(

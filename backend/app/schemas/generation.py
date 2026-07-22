@@ -25,6 +25,7 @@ ImageModelName = Literal[
     "wan2.1-t2i-turbo",
     "wanx-v1",
     "qwen-image",
+    "qwen-image-2.0",
 ]
 
 

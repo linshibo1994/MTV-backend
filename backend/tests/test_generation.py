@@ -4,6 +4,7 @@ import os
 import secrets
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from PIL import Image
@@ -118,6 +119,12 @@ def _twelve_sections() -> str:
     return "\n".join(f"【{name}】内容 {index}" for index, name in enumerate(names, 1))
 
 
+def _numbered_twelve_sections() -> str:
+    return "\n".join(
+        f"{index}. {line}" for index, line in enumerate(_twelve_sections().splitlines(), 1)
+    )
+
+
 def _make_db() -> tuple[object, Session]:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     for table in (
@@ -207,6 +214,7 @@ def _seed(raw: Session, *, subject_type: str = "character") -> SimpleNamespace:
         material=material,
         episode=episode,
         subject=subject,
+        enrich=enrich,
         account=account,
     )
 
@@ -455,7 +463,11 @@ def test_create_generation_job_requires_server_prompt_and_idempotent_outbox(monk
 
 
 def test_enrich_prompt_requires_exact_ordered_unique_twelve_sections():
-    generation_service._validate_twelve_section_prompt(_twelve_sections())
+    assert generation_service._validate_twelve_section_prompt(_twelve_sections()) == _twelve_sections()
+    assert (
+        generation_service._validate_twelve_section_prompt(_numbered_twelve_sections())
+        == _twelve_sections()
+    )
     duplicate = _twelve_sections().replace("【写实质感锚定】", "【形制描述】")
     with pytest.raises(ConflictError):
         generation_service._validate_twelve_section_prompt(duplicate)
@@ -487,6 +499,40 @@ def test_enrich_prompt_requires_exact_ordered_unique_twelve_sections():
     extra = f"{_twelve_sections()}\n【额外段落】不允许"
     with pytest.raises(ConflictError):
         generation_service._validate_twelve_section_prompt(extra)
+    wrong_number = _numbered_twelve_sections().replace("2. 【材质钉死】", "3. 【材质钉死】")
+    with pytest.raises(ConflictError):
+        generation_service._validate_twelve_section_prompt(wrong_number)
+
+
+def test_create_generation_job_accepts_and_normalizes_numbered_legacy_enrich_prompt(
+    monkeypatch,
+):
+    async def scenario() -> None:
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        stage = seeded.enrich
+        stage.detail = {
+            **stage.detail,
+            "prompts": {
+                seeded.subject.id: {
+                    **stage.detail["prompts"][seeded.subject.id],
+                    "resolved_prompts": {"final": _numbered_twelve_sections()},
+                }
+            },
+        }
+        raw.commit()
+        monkeypatch.setattr(generation_service, "enqueue_task", AsyncMock())
+
+        job = await generation_service.create_generation_job(
+            _AsyncSessionAdapter(raw),
+            user=seeded.user,
+            payload=_create_payload(),
+            idempotency_key="numbered-legacy",
+        )
+
+        assert job.input_json["resolved_prompts"]["final"] == _twelve_sections()
+
+    asyncio.run(scenario())
 
 
 def test_batch_requires_idempotency_key_and_reuses_same_payload(monkeypatch):
@@ -2553,10 +2599,10 @@ def test_bailian_image_model_is_accepted_and_routes_to_provider() -> None:
     request = CreateJobIn(
         material_id="material-1",
         subject_id="subject-1",
-        model="wan2.1-t2i-plus",
+        model="qwen-image-2.0",
     )
 
-    assert request.model == "wan2.1-t2i-plus"
+    assert request.model == "qwen-image-2.0"
     assert isinstance(get_image_provider(request.model), BailianImageGenProvider)
     with pytest.raises(RuntimeError, match="provider_download_url_invalid"):
         BailianImageGenProvider._validate_download_host(

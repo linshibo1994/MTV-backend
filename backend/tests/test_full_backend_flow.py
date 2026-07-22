@@ -97,8 +97,12 @@ class _AsyncSessionAdapter:
     async def rollback(self) -> None:
         self.session.rollback()
 
-    async def refresh(self, row: Any) -> None:
-        self.session.refresh(row)
+    async def refresh(
+        self,
+        row: Any,
+        attribute_names: list[str] | None = None,
+    ) -> None:
+        self.session.refresh(row, attribute_names=attribute_names)
 
     async def delete(self, row: Any) -> None:
         self.session.delete(row)

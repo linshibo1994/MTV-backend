@@ -1,12 +1,13 @@
-version: "3.9"
-
 x-backend-common: &backend-common
-  image: python:3.12-slim
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: flowapp-backend:local
   working_dir: /app
   volumes:
     - .:/app
   environment:
-    APP_ENV: local
+    APP_ENV: dev
     DATABASE_URL: postgresql+asyncpg://flow:flow@postgres:5432/flowapp
     DATABASE_SYNC_URL: postgresql+psycopg2://flow:flow@postgres:5432/flowapp
     REDIS_URL: redis://redis:6379/0
@@ -27,7 +28,7 @@ services:
       POSTGRES_USER: flow
       POSTGRES_PASSWORD: flow
       POSTGRES_DB: flowapp
-    ports: ["5432:5432"]
+    ports: ["${MTV_POSTGRES_PORT:-55432}:5432"]
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -39,7 +40,7 @@ services:
   redis:
     image: redis:7-alpine
     container_name: flowapp-redis
-    ports: ["6379:6379"]
+    ports: ["${MTV_REDIS_PORT:-56379}:6379"]
     volumes:
       - redis_data:/data
     healthcheck:
@@ -51,16 +52,12 @@ services:
   celery-worker:
     <<: *backend-common
     container_name: flowapp-celery-worker
-    command: >
-      sh -lc "pip install -e . &&
-      celery -A app.workers.celery_app worker -l info"
+    command: celery -A app.workers.celery_app worker -l info
 
   celery-beat:
     <<: *backend-common
     container_name: flowapp-celery-beat
-    command: >
-      sh -lc "pip install -e . &&
-      celery -A app.workers.celery_app beat -l info"
+    command: celery -A app.workers.celery_app beat -l info --schedule /tmp/celerybeat-schedule
 
 volumes:
   postgres_data:

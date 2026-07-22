@@ -109,22 +109,26 @@ async def run_parents(
     child_ids = {subject.id for subject in subjects}
     child_types = {subject.id: subject.type for subject in subjects}
     assigned_ids: set[str] = set()
+    valid_parents: list[dict] = []
     for parent in parents_data:
         ids = set(parent["child_ids"])
-        if not ids <= child_ids or assigned_ids & ids:
+        if not ids <= child_ids:
             raise ValueError("parent child_ids 必须属于同一剧本且只能归属一个父主体")
         parent_type = "background" if parent.get("type") == "scene" else parent.get("type")
-        for child_id in ids:
-            child_type = child_types[child_id]
-            normalized_child_type = "background" if child_type == "scene" else child_type
-            if normalized_child_type != parent_type:
-                raise ValueError("父子主体类型必须一致")
+        if any(
+            ("background" if child_types[child_id] == "scene" else child_types[child_id])
+            != parent_type
+            for child_id in ids
+        ):
+            # 父主体只是派生分组；模型跨类型归纳时丢弃该组，子主体保持未分组，
+            # 不能因此阻断已完成的角色、场景、道具和声音主体发布。
+            continue
+        if assigned_ids & ids:
+            raise ValueError("parent child_ids 必须属于同一剧本且只能归属一个父主体")
         assigned_ids |= ids
-
-    # 归一化类型（背景与场景同义，统一存 background）
-    for item in parents_data:
-        if item.get("type") == "scene":
-            item["type"] = "background"
+        parent["type"] = parent_type
+        valid_parents.append(parent)
+    parents_data = valid_parents
 
     if not await input_episode_is_current(
         db,

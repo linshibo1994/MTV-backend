@@ -16,7 +16,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 from fastapi import HTTPException
 from pydantic import ValidationError
-from sqlalchemy import CheckConstraint, UniqueConstraint, create_engine, select
+from sqlalchemy import CheckConstraint, UniqueConstraint, create_engine, inspect, select
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.compiler import compiles
@@ -83,11 +83,22 @@ class _AsyncSessionAdapter:
         self.rollback_count += 1
         self.session.rollback()
 
+    async def refresh(self, instance, attribute_names=None) -> None:
+        self.session.refresh(instance, attribute_names=attribute_names)
+
     def add(self, row) -> None:
         self.session.add(row)
 
     def begin_nested(self):
         return _AsyncNested(self.session.begin_nested())
+
+
+class _DetachOnRollbackSessionAdapter(_AsyncSessionAdapter):
+    """模拟 AsyncSession 回滚后旧 ORM 实例不可再隐式加载。"""
+
+    async def rollback(self) -> None:
+        await super().rollback()
+        self.session.expunge_all()
 
 
 def _make_db() -> tuple[object, Session]:
@@ -479,6 +490,13 @@ def test_create_video_job_requires_idempotency_key_and_uses_transactional_outbox
             user_id=seeded.user.user_id,
             idempotency_key="idem-1",
         )
+        assert "updated_at" not in inspect(job).expired_attributes
+
+        from app.schemas.video import VideoJobOut
+
+        response = VideoJobOut.model_validate(job)
+        assert response.updated_at is not None
+
         same = await create_video_job(
             db,
             script_id=seeded.script.id,
@@ -895,6 +913,117 @@ def test_video_claim_heartbeat_finish_are_token_guarded() -> None:
             output_json={"video_storage_key": "generate_images/video/job-lease.mp4"},
         )
         assert raw.get(VideoGenerationJob, "job-lease").status == "succeeded"
+
+    asyncio.run(scenario())
+
+
+def test_failed_video_terminal_overrides_stale_success_progress() -> None:
+    async def scenario() -> None:
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        job = VideoGenerationJob(
+            job_id="job-failed-terminal-progress",
+            script_id=seeded.script.id,
+            episode_id=seeded.episode.episode_id,
+            shot_group_id=seeded.shot_group.shot_group_id,
+            owner_user_id=seeded.user.user_id,
+            scene_no=1,
+            unit_id="group:sg-10",
+            unit_runtime_key="episode-1:1:G10",
+            provider_key="modelsai",
+            job_type="all_reference",
+            idempotency_key="failed-terminal-progress-key",
+            request_hash="h",
+            input_version=7,
+            attempt=1,
+            status="processing",
+            progress=100,
+            progress_stage="succeeded",
+            progress_message="视频生成完成",
+            lease_owner="worker",
+            lease_token="lease-token",
+            input_json={},
+        )
+        raw.add(job)
+        raw.commit()
+        db = _AsyncSessionAdapter(raw)
+
+        from app.crud.video import finish_video_job
+
+        assert await finish_video_job(
+            db,
+            job.job_id,
+            "lease-token",
+            "failed",
+            error_type="frame_extraction_failed",
+            error_message="frame_extraction_failed",
+            retryable=False,
+        )
+
+        raw.expire_all()
+        saved = raw.get(VideoGenerationJob, job.job_id)
+        assert saved.status == "failed"
+        assert saved.progress == 100
+        assert saved.progress_stage == "failed"
+        assert saved.progress_message == "视频生成失败"
+        assert saved.error_type == "frame_extraction_failed"
+        assert saved.error_message == "frame_extraction_failed"
+        assert saved.retryable is False
+
+    asyncio.run(scenario())
+
+
+def test_canceled_video_terminal_overrides_stale_progress_message() -> None:
+    async def scenario() -> None:
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        job = VideoGenerationJob(
+            job_id="job-canceled-terminal-progress",
+            script_id=seeded.script.id,
+            episode_id=seeded.episode.episode_id,
+            shot_group_id=seeded.shot_group.shot_group_id,
+            owner_user_id=seeded.user.user_id,
+            scene_no=1,
+            unit_id="group:sg-10",
+            unit_runtime_key="episode-1:1:G10",
+            provider_key="modelsai",
+            job_type="all_reference",
+            idempotency_key="canceled-terminal-progress-key",
+            request_hash="h",
+            input_version=7,
+            attempt=1,
+            status="processing",
+            progress=73,
+            progress_stage="generating",
+            progress_message="视频生成中",
+            lease_owner="worker",
+            lease_token="lease-token",
+            input_json={},
+        )
+        raw.add(job)
+        raw.commit()
+        db = _AsyncSessionAdapter(raw)
+
+        from app.crud.video import finish_video_job
+
+        assert await finish_video_job(
+            db,
+            job.job_id,
+            "lease-token",
+            "canceled",
+        )
+
+        raw.expire_all()
+        saved = raw.get(VideoGenerationJob, job.job_id)
+        assert saved.status == "canceled"
+        assert saved.progress == 73
+        assert saved.progress_stage == "canceled"
+        assert saved.progress_message == "用户取消"
+        assert saved.finished_at is not None
+        assert saved.canceled_at is not None
+        assert saved.lease_owner is None
+        assert saved.lease_token is None
+        assert saved.lease_until is None
 
     asyncio.run(scenario())
 
@@ -1602,7 +1731,8 @@ def test_worker_frame_failure_rolls_back_settle_releases_and_deletes_video() -> 
             job_id="job-frame-failure",
             reservation_id="reservation-frame-failure",
         )
-        db = _AsyncSessionAdapter(raw)
+        db = _DetachOnRollbackSessionAdapter(raw)
+        job_id = job.job_id
         deleted: list[str] = []
 
         class Provider:
@@ -1624,14 +1754,14 @@ def test_worker_frame_failure_rolls_back_settle_releases_and_deletes_video() -> 
 
         await run_video_generation_once(
             db,
-            job.job_id,
+            job_id,
             owner="worker",
             provider=Provider(),
             extract_last_frame=fail_frame,
             storage=Storage(),
         )
 
-        refreshed = raw.get(VideoGenerationJob, job.job_id)
+        refreshed = raw.get(VideoGenerationJob, job_id)
         reservation = raw.get(CreditReservation, "reservation-frame-failure")
         account = raw.get(CreditAccount, "account-1")
         assert refreshed.status == "failed"

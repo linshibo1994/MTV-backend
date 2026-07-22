@@ -19,11 +19,13 @@ from app.core.config import settings
 # - upload_images/<mid>/<id>.<ext>     用户上传图/视频/音频
 # - generate_outputs/<script_id>/...  生成产物（时间线合成最终视频等，按 script_id 鉴权）
 # - render_outputs/<script_id>/...     旧合成产物前缀，兼容存量记录
+# - upload_scripts/<script_id>/...     原始剧本文档，按 script_id 鉴权
 ALLOWED_KEY_PREFIXES: tuple[str, ...] = (
     "generate_images/",
     "upload_images/",
     "generate_outputs/",
     "render_outputs/",
+    "upload_scripts/",
 )
 
 _storage_singleton: StorageProvider | None = None

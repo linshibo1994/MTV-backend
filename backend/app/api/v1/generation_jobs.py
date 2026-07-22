@@ -73,6 +73,7 @@ def _sanitize_metrics(raw: dict[str, Any] | None) -> dict[str, Any] | None:
 
 _PUBLIC_ERROR_MESSAGES = {
     "provider_or_storage_error": "生成失败，请稍后重试",
+    "provider_configuration_error": "生成服务配置异常，请联系管理员",
     "financial_cleanup": "生成清算中，请稍后重试",
     "invalid_job_input": "生成任务参数无效",
     "superseded_input": "剧本内容已更新，请重新发起生成",

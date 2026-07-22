@@ -2,7 +2,7 @@
 
 通过 google-genai SDK 的 generate_content 接口，开启 IMAGE 输出模态生成图片。
 模型优先读取 IMAGE_GEN_MODEL；Key 和网关同样优先读取图片能力级配置。
-缺 Key 时抛 RuntimeError，由 worker 捕获后 release 积分（不卡死队列）。
+缺 Key 或尺寸配置非法时抛 ProviderConfigurationError，由 worker 捕获后 release 积分（不卡死队列）。
 """
 
 from __future__ import annotations
@@ -23,14 +23,21 @@ class GoogleImageGenProvider:
     """
 
     async def _generate_one(
-        self, client: genai.Client, prompt: str, aspect: str, model: str
+        self,
+        client: genai.Client,
+        prompt: str,
+        aspect: str,
+        image_size: str,
+        model: str,
     ) -> ImageResult:
         """单次调用 Nano Banana 生成一张图片。"""
         # 开启图像输出模态，Nano Banana 据此返回 inline 图片数据。
-        # 通过 image_config.aspect_ratio 传入比例（06 §3.1 契约要求 16:9 等），
-        # Nano Banana 目前不支持固定像素尺寸（如 2k），尺寸由模型侧控制，
-        # 输出分辨率默认 2k 量级，此处不做强制（契约保真度由模型保证）。
-        image_config = gtypes.ImageConfig(aspect_ratio=aspect or None)
+        # Google SDK 要求 image_size 使用大写 K；未传时会退回 1K，因此这里必须
+        # 显式传递画布请求的 1K/2K/4K 档位，避免前端选择 2K 却静默生成 1K。
+        image_config = gtypes.ImageConfig(
+            aspect_ratio=aspect or None,
+            image_size=image_size,
+        )
         config = gtypes.GenerateContentConfig(
             response_modalities=["IMAGE"],
             image_config=image_config,
@@ -69,6 +76,11 @@ class GoogleImageGenProvider:
     async def generate(
         self, prompt: str, model: str, size: str, aspect: str, count: int = 1
     ) -> list[ImageResult]:
+        normalized_size = (size or "1k").strip().upper()
+        if normalized_size not in {"1K", "2K", "4K"}:
+            raise ProviderConfigurationError(
+                "Gemini 图片尺寸仅支持 1K、2K 或 4K"
+            )
         api_key = (
             settings.image_gen_api_key
             if settings.is_explicitly_configured("image_gen_api_key")
@@ -105,7 +117,13 @@ class GoogleImageGenProvider:
         results: list[ImageResult] = []
         try:
             for _ in range(max(count, 1)):
-                data = await self._generate_one(client, prompt, aspect, use_model)
+                data = await self._generate_one(
+                    client,
+                    prompt,
+                    aspect,
+                    normalized_size,
+                    use_model,
+                )
                 results.append(data)
         finally:
             await client.aio.aclose()

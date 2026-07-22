@@ -1,11 +1,153 @@
 # 智绘 Flow App 前后端全接口对接文档
 
-> 文档日期：2026-07-19
+> 文档日期：2026-07-22
 > 适用版本：当前工作区后端代码契约
-> 接口规模：65 个路径、79 个 HTTP 操作
+> 接口规模：66 个路径、80 个 HTTP 操作
 > 面向读者：Web 前端、客户端、联调与测试工程师
 
 本文是前端对接当前后端实现的主文档。接口、请求模型、响应模型、权限、幂等和并发规则均以当前 FastAPI 路由及 Pydantic Schema 为准；旧需求文档只用于解释业务背景，不作为字段契约来源。
+
+## 0. 前后端功能与接口目录
+
+> **使用方式**：先按“功能对接顺序”完成一个页面或工作流，再打开对应的“详细契约”章节实现请求、字段、权限、幂等和异常处理。下方“完整接口目录”是 80 个公开 HTTP 操作的唯一联调清单；每完成一个接口可在本地勾选，避免遗漏。
+
+### 0.1 功能对接顺序
+
+| 顺序 | 前端功能/页面 | 接口范围 | 前置依赖 | 详细契约 |
+| --- | --- | --- | --- | --- |
+| 1 | 应用启动、登录、组织切换 | 健康检查、鉴权与组织（5） | 无 | [第 3、4 节](#3-健康检查) |
+| 2 | 积分账户与流水页 | 积分（3） | 已登录；下发操作还需账户管理权限 | [第 5 节](#5-积分账户与流水) |
+| 3 | 剧本列表、创建、详情与分集编辑 | 剧本与分集（12） | 已登录；团队项目须先切换活动组织 | [第 6 节](#6-剧本分集与项目成员) |
+| 4 | 团队成员管理页 | 项目成员（4） | 团队项目；当前用户为 owner 或 manager | [第 6.3 节](#63-项目成员接口) |
+| 5 | 文本分析进度、重新提取与失败重试 | AI 流水线（3） | 分集已保存；运行类操作需要 RUN_AI | [第 7 节](#7-剧本-ai-流水线) |
+| 6 | 主体资产库、候选素材与审核 | 资产库（14） | 流水线已产出主体，或手工创建主体 | [第 8 节](#8-资产库与主体审核) |
+| 7 | 创作画布与图片生成 | 画布、图片任务（9） | 已确保画布项目；生成需 RUN_AI 与积分 | [第 9、10 节](#9-创作画布) |
+| 8 | 分镜编辑、镜头层级与视频工作台 | 分镜与工作台（11） | 分集、主体及审核素材已准备 | [第 11 节](#11-分镜任务与视频工作台) |
+| 9 | 视频供应商设置与镜头组视频生成 | 视频生成（8） | 镜头组存在；管理员设置供应商；生成前检查素材 | [第 12 节](#12-视频生成) |
+| 10 | 视频时间线、最终合成与播放 | 时间线（9）、媒体（2） | 视频任务成功；合成完成后通过媒体代理读取 | [第 13、14 节](#13-视频时间线与最终合成) |
+
+### 0.2 跨功能规则
+
+- 所有需要登录的调用都使用 Cookie 会话；接入方式见 [1.2 会话鉴权](#12-会话鉴权)。
+- 创建、下发、生成、流水线和合成等写入型异步操作，先检查 [1.3 通用请求头](#13-通用请求头) 的 `Idempotency-Key` 要求。
+- 分集、主体、画布和时间线的保存都需要回传版本字段；处理方式见 [1.6 并发控制字段](#16-并发控制字段)。
+- 所有异步任务统一持久化 `job_id` 并轮询，状态与停止条件见 [15.2 推荐轮询器](#152-推荐轮询器)。
+
+### 0.3 完整接口目录（80 个操作）
+
+#### 应用入口与鉴权（5）
+
+1. `GET /v3api/health` - 服务健康检查
+2. `POST /v3api/auth/login` - 登录并建立 Cookie 会话
+3. `POST /v3api/auth/logout` - 退出当前会话
+4. `POST /v3api/auth/switch-org` - 切换活动组织
+5. `GET /v3api/auth/me` - 获取当前用户与活动组织
+
+#### 积分账户与流水（3）
+
+6. `GET /v3api/credits/accounts` - 查询可访问账户
+7. `GET /v3api/credits/logs` - 查询账户流水
+8. `POST /v3api/credits/grant` - 下发积分
+
+#### 剧本、分集与 AI 流水线（15）
+
+9. `GET /v3api/scripts/page` - 分页查询剧本
+10. `POST /v3api/scripts` - 创建剧本
+11. `GET /v3api/scripts/news-broadcast/jobs` - 新闻播报任务占位查询
+12. `GET /v3api/scripts/{script_id}` - 获取剧本
+13. `PATCH /v3api/scripts/{script_id}` - 修改剧本标题
+14. `DELETE /v3api/scripts/{script_id}` - 删除剧本
+15. `POST /v3api/scripts/{script_id}/copy` - 复制剧本和分集文本
+16. `GET /v3api/scripts/{script_id}/episodes` - 获取分集列表
+17. `POST /v3api/scripts/{script_id}/episodes` - 创建分集
+18. `PUT /v3api/scripts/{script_id}/episodes/{episode_id}` - 保存分集并按需触发流水线
+19. `DELETE /v3api/scripts/{script_id}/episodes/{episode_id}` - 删除分集
+20. `GET /v3api/scripts/{script_id}/episodes/{episode_id}/breakdown` - 获取分集拆解结果
+21. `GET /v3api/scripts/{script_id}/pipeline-status` - 查询五阶段流水线状态
+22. `GET /v3api/scripts/{script_id}/extract-subjects-status` - 查询主体提取与合并状态
+23. `POST /v3api/scripts/{script_id}/episodes/{episode_id}/pipeline-runs` - 手工重提取或重试失败流水线
+
+#### 团队项目成员（4）
+
+24. `GET /v3api/scripts/{script_id}/members` - 查询项目成员
+25. `POST /v3api/scripts/{script_id}/members` - 添加项目成员
+26. `PATCH /v3api/scripts/{script_id}/members/{member_id}` - 修改成员角色
+27. `DELETE /v3api/scripts/{script_id}/members/{member_id}` - 移除项目成员
+
+#### 主体资产库与审核（14）
+
+28. `GET /v3api/scripts/{script_id}/asset/entries` - 查询资产条目
+29. `GET /v3api/scripts/{script_id}/asset-library/subjects` - 分页查询主体
+30. `POST /v3api/scripts/{script_id}/asset-library/subjects` - 手工创建主体
+31. `GET /v3api/scripts/{script_id}/asset-library/parent-subjects` - 查询父主体聚合
+32. `PATCH /v3api/scripts/{script_id}/asset-library/subjects/{subject_id}` - 修改主体
+33. `DELETE /v3api/scripts/{script_id}/asset-library/subjects/{subject_id}` - 删除主体
+34. `GET /v3api/scripts/{script_id}/asset-library/subjects/{subject_id}/suggestions` - 查询主体差异建议
+35. `POST /v3api/scripts/{script_id}/asset-library/subjects/{subject_id}/suggestions/{suggestion_id}/resolve` - 处理差异建议
+36. `GET /v3api/scripts/{script_id}/asset-library/subjects/{subject_id}/candidates` - 查询候选图片和音频
+37. `POST /v3api/scripts/{script_id}/asset-library/subjects/{subject_id}/approve-image` - 审核正式主体图片
+38. `GET /v3api/scripts/{script_id}/asset-library/subjects/{subject_id}/replace-impact` - 预检查正式图片替换影响
+39. `POST /v3api/scripts/{script_id}/asset-library/subjects/{subject_id}/approve-audio` - 审核主体音频
+40. `DELETE /v3api/scripts/{script_id}/asset-library/subjects/{subject_id}/candidates/{candidate_id}` - 删除候选素材
+41. `GET /v3api/scripts/{script_id}/canvas-project/ensure` - 获取或创建创作画布项目
+
+#### 创作画布与图片生成（9）
+
+42. `GET /v3api/materials/{material_id}` - 获取画布素材项目
+43. `GET /v3api/materials/{material_id}/canvas` - 获取完整画布状态
+44. `POST /v3api/materials/{material_id}/canvas/delta` - 提交画布增量
+45. `GET /v3api/materials/{material_id}/image/{image_id}` - 获取图片资产元数据
+46. `POST /v3api/generation-jobs` - 创建图片生成任务
+47. `GET /v3api/generation-jobs` - 查询图片生成任务列表
+48. `POST /v3api/generation-jobs/batch` - 批量创建图片生成任务
+49. `GET /v3api/generation-jobs/{job_id}` - 查询图片生成任务状态
+50. `POST /v3api/generation-jobs/{job_id}/cancel` - 取消图片生成任务
+
+#### 分镜、镜头与视频工作台（11）
+
+51. `POST /v3api/scripts/{script_id}/episodes/{episode_id}/generate-storyboard` - 创建分镜生成任务
+52. `POST /v3api/scripts/{script_id}/episodes/{episode_id}/storyboard/{job_id}/cancel` - 取消分镜任务
+53. `GET /v3api/scripts/{script_id}/episodes/{episode_id}/storyboard-jobs` - 查询分镜任务历史
+54. `GET /v3api/scripts/{script_id}/episodes/{episode_id}/storyboard/{job_id}` - 查询指定分镜任务
+55. `PATCH /v3api/scripts/{script_id}/episodes/{episode_id}/storyboard/{job_id}` - 编辑分镜任务结果
+56. `POST /v3api/scripts/{script_id}/episodes/{episode_id}/storyboard/{job_id}/retry` - 重试分镜任务
+57. `GET /v3api/scripts/{script_id}/episodes/{episode_id}/storyboard-status` - 查询最新分镜状态
+58. `GET /v3api/scripts/{script_id}/episodes/{episode_id}/shot-hierarchy` - 查询镜头层级
+59. `POST /v3api/scripts/{script_id}/episodes/{episode_id}/shot-groups/merge` - 合并连续镜头为新镜头组
+60. `GET /v3api/shots/{script_id}/episodes/{episode_id}/video-workbench` - 获取视频工作台
+61. `GET /v3api/shots/{script_id}/cover` - 获取剧本封面
+
+#### 视频供应商与视频生成（8）
+
+62. `GET /v3api/video-generation/active-provider` - 查询当前视频供应商
+63. `POST /v3api/video-generation/active-provider` - 更新当前视频供应商
+64. `GET /v3api/video-generation/check-materials` - 检查镜头组素材完整性
+65. `POST /v3api/video-generation-jobs` - 创建单个镜头组视频任务
+66. `GET /v3api/video-generation-jobs` - 查询视频任务列表
+67. `GET /v3api/video-generation/{job_id}` - 查询指定视频任务
+68. `POST /v3api/video-generation/{job_id}/cancel` - 取消视频任务
+69. `POST /v3api/video-generation-jobs/batch` - 批量创建视频任务
+
+#### 视频时间线与最终合成（9）
+
+70. `GET /v3api/video-timeline-arrangements` - 获取时间线
+71. `POST /v3api/video-timeline-arrangements` - 向时间线添加片段
+72. `PATCH /v3api/video-timeline-arrangements/{arrangement_id}` - 修改时间线片段
+73. `DELETE /v3api/video-timeline-arrangements/{arrangement_id}` - 删除时间线片段
+74. `PUT /v3api/video-timeline-arrangements/reorder` - 重排时间线片段
+75. `POST /v3api/video-timeline-arrangements/render` - 创建最终视频合成任务
+76. `GET /v3api/video-timeline-arrangements/render/{job_id}` - 查询合成任务状态
+77. `POST /v3api/video-timeline-arrangements/render/{job_id}/cancel` - 取消合成任务
+78. `POST /v3api/video-timeline-arrangements/render/{job_id}/retry` - 重试合成任务
+
+#### 媒体上传、播放与下载（2）
+
+79. `GET /api/x/cctv/zhihui/flow-app/{storage_key:path}` - 通过鉴权代理读取媒体
+80. `POST /api/x/cctv/zhihui/flow-app/upload_images/{mid}/{filename}` - 上传图片素材
+
+## 2026-07-22 镜头组合并接口
+
+新增同步结构编辑接口：选择同一场景内连续镜头，合并为新的镜头组；不触发视频生成或积分扣费。详细契约见第 11 节。
 
 ## 2026-07-19 本轮接口更新清单
 
@@ -137,6 +279,7 @@ const idempotencyKey = crypto.randomUUID();
 | 资源 | 读取字段 | 写入时必须回传 | 冲突处理 |
 | --- | --- | --- | --- |
 | 分集 | `episode_version`、`client_save_seq` | 两者均必填 | `409` 后重新加载分集并处理文本冲突 |
+| 镜头组合并 | `episode_version` | Body `expected_episode_version` | `409` 后重新获取 hierarchy/workbench，再重新选择镜头 |
 | 主体 | `subject_version` | `expected_subject_version` | `409` 后刷新主体与待处理建议 |
 | 画布 | `version` | Delta 中的 `version` | `409` 后重新获取完整画布再合并本地变更 |
 | 时间线片段 | `version` | `expected_version` | `409` 后重新获取完整时间线 |
@@ -922,6 +1065,7 @@ interface BatchJobOut {
 | `POST /v3api/scripts/{script_id}/episodes/{episode_id}/storyboard/{job_id}/retry` | RUN_AI | Header `Idempotency-Key` | `GenerateStoryboardResponse` |
 | `GET /v3api/scripts/{script_id}/episodes/{episode_id}/storyboard-status` | READ | 路径 ID | 最新 `StoryboardStatusOut` |
 | `GET /v3api/scripts/{script_id}/episodes/{episode_id}/shot-hierarchy` | READ | 路径 ID | `ShotHierarchyOut` |
+| `POST /v3api/scripts/{script_id}/episodes/{episode_id}/shot-groups/merge` | EDIT | `ShotGroupMergeIn` | 完整 `VideoWorkbenchOut` |
 | `GET /v3api/shots/{script_id}/episodes/{episode_id}/video-workbench` | READ | 路径 ID | `VideoWorkbenchOut` |
 | `GET /v3api/shots/{script_id}/cover` | READ | 路径 ID | `CoverOut` |
 
@@ -933,6 +1077,19 @@ Idempotency-Key: <uuid>
 ```
 
 分集没有 `script_text`、版本过期、已有 `pending/running` 分镜任务时返回 `409`；缺少有效积分账户返回 `402`。
+
+镜头组合并为同步编辑，不需要 `Idempotency-Key`：
+
+```json
+{
+  "shot_ids": ["shot-1", "shot-2"],
+  "expected_episode_version": 3
+}
+```
+
+`shot_ids` 必须是同一场景中叙事顺序连续的 2～5 个镜头；服务端按当前分镜顺序合并，不按数组顺序重排。新组以及合并后保留的前后镜头组都必须保持 2～5 个镜头、3～15 秒。成功响应是 `episode_version` 已递增的完整 `VideoWorkbenchOut`，前端应直接替换当前工作台状态。
+
+版本过期、活动分镜/视频任务，或源镜头组已有任意视频任务时返回 `409`；跨场景、不连续或时长非法返回 `400`；镜头属于其他剧本/分集返回 `403`；字段结构非法返回 `422`。
 
 ### 11.2 分镜任务字段
 
@@ -1467,120 +1624,7 @@ async function pollJob<T extends { status: string }>(
 - 文件名进入 Path 前使用 `encodeURIComponent`。
 - 不在前端日志、埋点或错误上报中记录密码、会话 Cookie、完整剧本文本或供应商字段。
 
-## 17. 79 个操作覆盖索引
-
-以下索引用于联调验收，确保没有遗漏公开接口。
-
-### Meta 与鉴权（5）
-
-1. `GET /v3api/health`
-2. `POST /v3api/auth/login`
-3. `POST /v3api/auth/logout`
-4. `POST /v3api/auth/switch-org`
-5. `GET /v3api/auth/me`
-
-### 积分（3）
-
-6. `GET /v3api/credits/accounts`
-7. `GET /v3api/credits/logs`
-8. `POST /v3api/credits/grant`
-
-### 剧本、分集与流水线（15）
-
-9. `GET /v3api/scripts/page`
-10. `POST /v3api/scripts`
-11. `GET /v3api/scripts/news-broadcast/jobs`
-12. `GET /v3api/scripts/{script_id}`
-13. `PATCH /v3api/scripts/{script_id}`
-14. `DELETE /v3api/scripts/{script_id}`
-15. `POST /v3api/scripts/{script_id}/copy`
-16. `GET /v3api/scripts/{script_id}/episodes`
-17. `POST /v3api/scripts/{script_id}/episodes`
-18. `PUT /v3api/scripts/{script_id}/episodes/{episode_id}`
-19. `DELETE /v3api/scripts/{script_id}/episodes/{episode_id}`
-20. `GET /v3api/scripts/{script_id}/episodes/{episode_id}/breakdown`
-21. `GET /v3api/scripts/{script_id}/pipeline-status`
-22. `GET /v3api/scripts/{script_id}/extract-subjects-status`
-23. `POST /v3api/scripts/{script_id}/episodes/{episode_id}/pipeline-runs`
-
-### 项目成员（4）
-
-24. `GET /v3api/scripts/{script_id}/members`
-25. `POST /v3api/scripts/{script_id}/members`
-26. `PATCH /v3api/scripts/{script_id}/members/{member_id}`
-27. `DELETE /v3api/scripts/{script_id}/members/{member_id}`
-
-### 资产库（14）
-
-28. `GET /v3api/scripts/{script_id}/asset/entries`
-29. `GET /v3api/scripts/{script_id}/asset-library/subjects`
-30. `POST /v3api/scripts/{script_id}/asset-library/subjects`
-31. `GET /v3api/scripts/{script_id}/asset-library/parent-subjects`
-32. `PATCH /v3api/scripts/{script_id}/asset-library/subjects/{subject_id}`
-33. `DELETE /v3api/scripts/{script_id}/asset-library/subjects/{subject_id}`
-34. `GET /v3api/scripts/{script_id}/asset-library/subjects/{subject_id}/suggestions`
-35. `POST /v3api/scripts/{script_id}/asset-library/subjects/{subject_id}/suggestions/{suggestion_id}/resolve`
-36. `GET /v3api/scripts/{script_id}/asset-library/subjects/{subject_id}/candidates`
-37. `POST /v3api/scripts/{script_id}/asset-library/subjects/{subject_id}/approve-image`
-38. `GET /v3api/scripts/{script_id}/asset-library/subjects/{subject_id}/replace-impact`
-39. `POST /v3api/scripts/{script_id}/asset-library/subjects/{subject_id}/approve-audio`
-40. `DELETE /v3api/scripts/{script_id}/asset-library/subjects/{subject_id}/candidates/{candidate_id}`
-41. `GET /v3api/scripts/{script_id}/canvas-project/ensure`
-
-### 画布与图片任务（9）
-
-42. `GET /v3api/materials/{material_id}`
-43. `GET /v3api/materials/{material_id}/canvas`
-44. `POST /v3api/materials/{material_id}/canvas/delta`
-45. `GET /v3api/materials/{material_id}/image/{image_id}`
-46. `POST /v3api/generation-jobs`
-47. `GET /v3api/generation-jobs`
-48. `POST /v3api/generation-jobs/batch`
-49. `GET /v3api/generation-jobs/{job_id}`
-50. `POST /v3api/generation-jobs/{job_id}/cancel`
-
-### 分镜与工作台（10）
-
-51. `POST /v3api/scripts/{script_id}/episodes/{episode_id}/generate-storyboard`
-52. `POST /v3api/scripts/{script_id}/episodes/{episode_id}/storyboard/{job_id}/cancel`
-53. `GET /v3api/scripts/{script_id}/episodes/{episode_id}/storyboard-jobs`
-54. `GET /v3api/scripts/{script_id}/episodes/{episode_id}/storyboard/{job_id}`
-55. `PATCH /v3api/scripts/{script_id}/episodes/{episode_id}/storyboard/{job_id}`
-56. `POST /v3api/scripts/{script_id}/episodes/{episode_id}/storyboard/{job_id}/retry`
-57. `GET /v3api/scripts/{script_id}/episodes/{episode_id}/storyboard-status`
-58. `GET /v3api/scripts/{script_id}/episodes/{episode_id}/shot-hierarchy`
-59. `GET /v3api/shots/{script_id}/episodes/{episode_id}/video-workbench`
-60. `GET /v3api/shots/{script_id}/cover`
-
-### 视频生成（8）
-
-61. `GET /v3api/video-generation/active-provider`
-62. `POST /v3api/video-generation/active-provider`
-63. `GET /v3api/video-generation/check-materials`
-64. `POST /v3api/video-generation-jobs`
-65. `GET /v3api/video-generation-jobs`
-66. `GET /v3api/video-generation/{job_id}`
-67. `POST /v3api/video-generation/{job_id}/cancel`
-68. `POST /v3api/video-generation-jobs/batch`
-
-### 时间线（9）
-
-69. `GET /v3api/video-timeline-arrangements`
-70. `POST /v3api/video-timeline-arrangements`
-71. `PATCH /v3api/video-timeline-arrangements/{arrangement_id}`
-72. `DELETE /v3api/video-timeline-arrangements/{arrangement_id}`
-73. `PUT /v3api/video-timeline-arrangements/reorder`
-74. `POST /v3api/video-timeline-arrangements/render`
-75. `GET /v3api/video-timeline-arrangements/render/{job_id}`
-76. `POST /v3api/video-timeline-arrangements/render/{job_id}/cancel`
-77. `POST /v3api/video-timeline-arrangements/render/{job_id}/retry`
-
-### 媒体（2）
-
-78. `GET /api/x/cctv/zhihui/flow-app/{storage_key:path}`
-79. `POST /api/x/cctv/zhihui/flow-app/upload_images/{mid}/{filename}`
-
-## 18. 联调检查清单
+## 17. 联调检查清单
 
 - 所有 JSON 请求都使用正确前缀并携带 Cookie。
 - 上传使用 `FormData`，未手动覆盖 multipart `Content-Type`。

@@ -471,6 +471,41 @@ def test_canvas_edge_declares_material_scoped_endpoint_foreign_keys():
     assert len(endpoint_constraints) == 2
 
 
+def test_canvas_models_persist_react_flow_ids_longer_than_uuid():
+    """业务前缀节点与 React Flow 组合边 ID 不应受 UUID 长度限制。"""
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    _canvas_tables(engine)
+    source_id = f"ent-node-{'a' * 36}"
+    target_id = f"ent-node-{'b' * 36}"
+    edge_id = f"xy-edge__{source_id}-source-{target_id}-target"
+
+    with Session(engine) as session:
+        session.add_all([
+            Script(
+                id="script-1", title="剧本", scope="personal", owner_user_id="user-1",
+                created_by_user_id="user-1",
+            ),
+            Materials(id="material-1", name="画布", script_id="script-1"),
+            CanvasNode(id=source_id, material_id="material-1", type="text"),
+            CanvasNode(id=target_id, material_id="material-1", type="text"),
+            CanvasEdge(
+                id=edge_id,
+                material_id="material-1",
+                source=source_id,
+                target=target_id,
+            ),
+        ])
+        session.commit()
+
+        assert session.get(CanvasNode, source_id) is not None
+        assert session.get(CanvasEdge, edge_id) is not None
+
+    assert CanvasNode.__table__.c.id.type.length == 255
+    assert CanvasEdge.__table__.c.id.type.length == 255
+    assert CanvasEdge.__table__.c.source.type.length == 255
+    assert CanvasEdge.__table__.c.target.type.length == 255
+
+
 def test_database_rejects_cross_material_edge_endpoints():
     engine = create_engine("sqlite+pysqlite:///:memory:")
 
@@ -940,6 +975,92 @@ def test_canvas_delta_http_rejects_missing_null_and_negative_version_without_mut
             assert raw.scalars(select(CanvasNode)).all() == []
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("payload", "error_location"),
+    [
+        (
+            {"move_nodes": [{"id": "x" * 256, "position": {"x": 1}}]},
+            ("move_nodes", 0, "id"),
+        ),
+        (
+            {
+                "upsert_nodes": [
+                    {"id": "x" * 256, "type": "text", "data": {"content": "A"}}
+                ]
+            },
+            ("upsert_nodes", 0, "id"),
+        ),
+        ({"delete_nodes": ["x" * 256]}, ("delete_nodes", 0)),
+        (
+            {"upsert_edges": [{"id": "x" * 256, "source": "node-1", "target": "node-2"}]},
+            ("upsert_edges", 0, "id"),
+        ),
+        (
+            {"upsert_edges": [{"source": "x" * 256, "target": "node-2"}]},
+            ("upsert_edges", 0, "source"),
+        ),
+        (
+            {"upsert_edges": [{"source": "node-1", "target": "x" * 256}]},
+            ("upsert_edges", 0, "target"),
+        ),
+        ({"delete_edges": ["x" * 256]}, ("delete_edges", 0)),
+    ],
+)
+def test_canvas_delta_schema_rejects_ids_over_database_limit(
+    payload: dict,
+    error_location: tuple,
+):
+    """所有写入或引用画布实体的 ID 都必须先受数据库长度约束。"""
+    with pytest.raises(ValueError) as exc_info:
+        CanvasDeltaIn.model_validate({"version": 0, **payload})
+
+    error = exc_info.value.errors()[0]
+    assert error["type"] == "string_too_long"
+    assert error["loc"] == error_location
+
+
+def test_canvas_delta_schema_accepts_id_at_database_limit():
+    entity_id = "x" * 255
+
+    delta = CanvasDeltaIn.model_validate(
+        {
+            "version": 0,
+            "move_nodes": [{"id": entity_id, "position": {"x": 1}}],
+            "upsert_nodes": [
+                {"id": entity_id, "type": "text", "data": {"content": "A"}}
+            ],
+            "delete_nodes": [entity_id],
+            "upsert_edges": [{"id": entity_id, "source": entity_id, "target": entity_id}],
+            "delete_edges": [entity_id],
+        }
+    )
+
+    assert delta.move_nodes[0].id == entity_id
+    assert delta.upsert_edges[0].target == entity_id
+
+
+def test_canvas_delta_schema_accepts_legacy_prefixed_uuid_and_react_flow_edge_id():
+    source_id = "ent-node-dff41ee0-6e49-4acf-9167-5da7c012de1d"
+    target_id = "ent-node-f70fb4b4-5f4b-427c-bdcb-9c4d4315d2a3"
+    edge_id = f"xy-edge__{source_id}-source-{target_id}-target"
+
+    delta = CanvasDeltaIn.model_validate(
+        {
+            "version": 0,
+            "upsert_nodes": [
+                {"id": source_id, "type": "text", "data": {"content": "A"}},
+                {"id": target_id, "type": "text", "data": {"content": "B"}},
+            ],
+            "upsert_edges": [
+                {"id": edge_id, "source": source_id, "target": target_id}
+            ],
+        }
+    )
+
+    assert delta.upsert_nodes[0].id == source_id
+    assert delta.upsert_edges[0].id == edge_id
 
 
 def test_node_data_preserves_nested_explicit_null_fields():

@@ -586,6 +586,17 @@ class VolcengineVideoGenProvider:
                     _submit_video,
                     before_submit=before_submit,
                     on_submission_uncertain=on_submission_uncertain,
+                    rejection_sensitive_values=tuple(
+                        value
+                        for value in [
+                            self._resolve_ark_api_key(),
+                            prompt,
+                            first_frame_url,
+                            *image_urls,
+                            *audio_urls,
+                        ]
+                        if isinstance(value, str) and value
+                    ),
                 )
                 task_id = self._extract_task_id(submit_resp)
                 if not task_id:
@@ -714,15 +725,6 @@ class VolcengineVideoGenProvider:
             if isinstance(content, dict):
                 return str(content.get("last_frame_url") or "")
         return ""
-
-    @staticmethod
-    def _extract_error(resp) -> str:
-        error = getattr(resp, "error", None)
-        if error is None and isinstance(resp, dict):
-            error = resp.get("error") or resp.get("data", {}).get("error")
-        if isinstance(error, dict):
-            return str(error.get("message") or error.get("code") or "unknown")
-        return str(getattr(error, "message", None) or getattr(error, "code", None) or error or "unknown")
 
     async def _download_to_file(
         self,

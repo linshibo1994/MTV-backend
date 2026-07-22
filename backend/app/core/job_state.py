@@ -19,6 +19,86 @@ _SAFE_FAILURES: dict[str, tuple[str, bool]] = {
     "internal_error": ("任务执行失败", False),
 }
 
+_SAFE_DIAGNOSTIC_CATEGORIES = frozenset(
+    {"invalid_json", "non_object_json", "schema_validation", "semantic_validation"}
+)
+_SAFE_DIAGNOSTIC_SCHEMAS = frozenset(
+    {"SplitOutput", "ExtractOutput", "MergeOutput", "EnrichOutput", "ParentsOutput"}
+)
+
+
+def _safe_diagnostic(value: object) -> dict[str, object] | None:
+    """仅透传合约层定义的枚举和字段路径，禁止异常携带任意内容出站。"""
+    if not isinstance(value, dict):
+        return None
+    category = value.get("category")
+    schema = value.get("schema")
+    if (
+        category not in _SAFE_DIAGNOSTIC_CATEGORIES
+        or schema not in _SAFE_DIAGNOSTIC_SCHEMAS
+    ):
+        return None
+    if category in {"invalid_json", "non_object_json"}:
+        response = value.get("response")
+        if not isinstance(response, dict):
+            return None
+        kind = response.get("kind")
+        length_bucket = response.get("length_bucket")
+        top_level_kind = response.get("top_level_kind")
+        if (
+            not isinstance(kind, str)
+            or length_bucket not in {"0", "1_128", "129_2048", "over_2048"}
+            or top_level_kind not in {"invalid_json", "list", "str", "int", "float", "bool", "NoneType"}
+        ):
+            return None
+        return {
+            "version": 1,
+            "category": category,
+            "schema": schema,
+            "response": {
+                "kind": kind,
+                "length_bucket": length_bucket,
+                "top_level_kind": top_level_kind,
+            },
+        }
+    validation = value.get("validation")
+    if not isinstance(validation, dict):
+        return None
+    raw_codes = validation.get("codes")
+    raw_paths = validation.get("paths")
+    if not isinstance(raw_codes, list) or not isinstance(raw_paths, list):
+        return None
+    codes = [
+        item
+        for item in raw_codes[:8]
+        if isinstance(item, str) and item.replace("_", "").isalnum()
+    ]
+    paths = [
+        item
+        for item in raw_paths[:8]
+        if isinstance(item, str)
+        and len(item) <= 255
+        and all(char.isalnum() or char in "._<>[]" for char in item)
+    ]
+    if not codes or not paths:
+        return None
+    raw_error_count = validation.get("error_count")
+    error_count = (
+        raw_error_count
+        if isinstance(raw_error_count, int) and raw_error_count >= 0
+        else len(codes)
+    )
+    return {
+        "version": 1,
+        "category": category,
+        "schema": schema,
+        "validation": {
+            "error_count": min(error_count, 8),
+            "codes": codes,
+            "paths": paths,
+        },
+    }
+
 
 @dataclass
 class LeaseState:
@@ -45,6 +125,7 @@ class PipelineFailure:
     error_type: str
     error_message: str
     retryable: bool
+    diagnostic: dict[str, object] | None = None
 
     @classmethod
     def from_exception(cls, exc: Exception) -> PipelineFailure:
@@ -63,14 +144,18 @@ class PipelineFailure:
             error_type = "internal_error"
         message, default_retryable = _SAFE_FAILURES[error_type]
         retryable = bool(getattr(exc, "retryable", default_retryable))
-        return cls(error_type, message, retryable)
+        diagnostic = _safe_diagnostic(getattr(exc, "diagnostic", None))
+        return cls(error_type, message, retryable, diagnostic)
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "error_type": self.error_type,
             "error_message": self.error_message,
             "retryable": self.retryable,
         }
+        if self.diagnostic is not None:
+            payload["diagnostic"] = self.diagnostic
+        return payload
 
 
 def claim_lease(

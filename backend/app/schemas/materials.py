@@ -6,9 +6,9 @@ prompt 自动构造用 06 文档第 5 节固定模板。
 
 from __future__ import annotations
 
-from typing import Any, Literal, cast
+from typing import Annotated, Any, Literal, cast
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
 # ---------------------------------------------------------------------------
 # 主体类型 → 中文映射 (06 文档固定模板使用中文主体类型)
@@ -106,10 +106,17 @@ class ImageAssetOut(BaseModel):
 # ---------------------------------------------------------------------------
 # 增量保存入参 (Delta)
 # ---------------------------------------------------------------------------
+CanvasEntityId = Annotated[
+    str,
+    StringConstraints(min_length=1, max_length=255),
+]
+
+
 class NodeMoveIn(BaseModel):
     """节点位置移动。"""
 
-    id: str
+    # 与 canvas_nodes.id 的 VARCHAR(255) 保持一致，避免数据库层截断异常。
+    id: CanvasEntityId
     position: dict[str, Any]
 
 
@@ -254,7 +261,7 @@ class NodeUpsertIn(BaseModel):
     id 已存在则更新，不存在则新增。
     """
 
-    id: str
+    id: CanvasEntityId
     type: CanvasNodeType
     position: dict[str, Any] | None = None
     data: dict[str, Any] | None = None
@@ -273,9 +280,9 @@ class EdgeUpsertIn(BaseModel):
     id 提供且已存在则更新，否则新增。
     """
 
-    id: str | None = None
-    source: str
-    target: str
+    id: CanvasEntityId | None = None
+    source: CanvasEntityId
+    target: CanvasEntityId
     data: dict[str, Any] | None = None
 
 
@@ -287,8 +294,8 @@ class CanvasDeltaIn(BaseModel):
 
     move_nodes: list[NodeMoveIn] = Field(default_factory=list)
     upsert_nodes: list[NodeUpsertIn] = Field(default_factory=list)
-    delete_nodes: list[str] = Field(default_factory=list)
+    delete_nodes: list[CanvasEntityId] = Field(default_factory=list)
     upsert_edges: list[EdgeUpsertIn] = Field(default_factory=list)
-    delete_edges: list[str] = Field(default_factory=list)
+    delete_edges: list[CanvasEntityId] = Field(default_factory=list)
     # 乐观锁：客户端必须携带已知版本，不一致则 409 强制刷新。
     version: int = Field(ge=0)

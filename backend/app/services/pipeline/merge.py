@@ -6,15 +6,23 @@
 
 from typing import Any
 
+from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.ids import new_id
 from app.crud import asset as asset_crud
-from app.crud.script import replace_subjects
+from app.crud.script import replace_parent_subjects, replace_subjects
+from app.models.episode import Episode
 from app.models.subject import Subject
 from app.providers import get_llm_provider
-from app.schemas.pipeline_contracts import MergeOutput, complete_json
+from app.schemas.pipeline_contracts import (
+    MergeOutput,
+    PipelineSubject,
+    ProviderContractError,
+    SupplementalSubject,
+    complete_json,
+)
 from app.services.pipeline import (
     get_run_stage_output,
     get_stage,
@@ -25,15 +33,22 @@ from app.services.pipeline import (
 # ---- 提示词骨架（06 文档第 12.2 节）----
 _SYSTEM = (
     "你是一名短剧剧本分析师。请将多集提取的主体列表中跨集出现的同一主体合并, "
-    "episode_nos 取并集。merge 阶段的产物只能是子主体：is_child 是服务端固定语义，"
-    "每一项必须输出 JSON 布尔值 true，严禁输出 false、字符串或省略该字段。"
+    "episode_nos 取并集；同时重新核对分集原文，补出首次提取漏掉的可制作主体。"
+    "必须逐类检查角色(character)、场景(scene)、道具(prop)、声音/配音音色(sound)，"
+    "但原文没有可制作实体的类别可以为空。merge 阶段的产物只能是子主体：is_child "
+    "是服务端固定语义，每一项必须输出 JSON 布尔值 true，严禁输出 false、字符串或省略该字段。"
 )
 
-_USER_TEMPLATE = """以下是多集提取的主体列表, 请将跨集出现的同一主体 (同名同类型) 合并, episode_nos 取并集。
+_USER_TEMPLATE = """以下是多集提取的主体列表，以及对应的分集原文。请先合并首次提取结果，再基于原文补漏。
 
 输入主体列表:
 ---
 {multi_episode_subjects_json}
+---
+
+分集原文:
+---
+{episodes_json}
 ---
 
 合并规则:
@@ -41,13 +56,19 @@ _USER_TEMPLATE = """以下是多集提取的主体列表, 请将跨集出现的�
 2. description 保留最详细的版本, 或合并补充
 3. episode_nos 取并集并排序
 4. 保留所有不重复的主体
-5. merge 只负责去重子主体，不创建父主体；每个 is_child 必须为 JSON 布尔值 true
+5. merged_subjects 必须逐项保留输入主体；不得删除、改名或新增输入之外的主体
+6. supplemental_subjects 只放原文中存在、但输入主体列表遗漏的角色、场景、道具或声音；每项至少给出一条逐字原文证据 quote，并填写该证据所在 episode_no
+7. 不要把每句台词当作独立声音；声音主体应为说话人音色、旁白、环境音、音效或音乐。道具应是画面中可制作、可复用或推动剧情的实体
+8. merge 只负责去重子主体，不创建父主体；每个 is_child 必须为 JSON 布尔值 true
 
 输出 JSON:
 {{
   "schema_version": "pipeline.v1",
   "merged_subjects": [
     {{"name": "<主体名>", "type": "character|scene|prop|sound", "description": "<合并后描述>", "episode_nos": [1, 2], "is_child": true}}
+  ],
+  "supplemental_subjects": [
+    {{"name": "<遗漏主体名>", "type": "character|scene|prop|sound", "description": "<详细描述>", "episode_nos": [1], "is_child": true, "evidence": [{{"episode_no": 1, "quote": "<原文逐字片段>"}}]}}
   ],
   "total_count": 44
 }}
@@ -63,25 +84,23 @@ def _normalize_merge_child_flags(payload: object) -> object:
     """
     if not isinstance(payload, dict):
         return payload
-    subjects = payload.get("merged_subjects")
-    if not isinstance(subjects, list):
-        return payload
-
-    normalized_subjects: list[object] = []
-    changed = False
-    for subject in subjects:
-        if isinstance(subject, dict) and subject.get("is_child") is False:
-            normalized = dict(subject)
-            normalized["is_child"] = True
-            normalized_subjects.append(normalized)
-            changed = True
-        else:
-            normalized_subjects.append(subject)
-    if not changed:
-        return payload
     normalized_payload = dict(payload)
-    normalized_payload["merged_subjects"] = normalized_subjects
-    return normalized_payload
+    changed = False
+    for field in ("merged_subjects", "supplemental_subjects"):
+        subjects = payload.get(field)
+        if not isinstance(subjects, list):
+            continue
+        normalized_subjects: list[object] = []
+        for subject in subjects:
+            if isinstance(subject, dict) and subject.get("is_child") is False:
+                normalized = dict(subject)
+                normalized["is_child"] = True
+                normalized_subjects.append(normalized)
+                changed = True
+            else:
+                normalized_subjects.append(subject)
+        normalized_payload[field] = normalized_subjects
+    return normalized_payload if changed else payload
 
 
 class _MergeProviderAdapter:
@@ -89,9 +108,64 @@ class _MergeProviderAdapter:
 
     def __init__(self, provider: Any) -> None:
         self._provider = provider
+        self.supplemental_subjects: list[object] = []
 
     async def complete_json(self, system: str, user: str) -> object:
-        return _normalize_merge_child_flags(await self._provider.complete_json(system, user))
+        payload = _normalize_merge_child_flags(await self._provider.complete_json(system, user))
+        if not isinstance(payload, dict):
+            self.supplemental_subjects = []
+            return payload
+
+        normalized_payload = dict(payload)
+        supplemental_subjects = normalized_payload.pop("supplemental_subjects", [])
+        self.supplemental_subjects = (
+            supplemental_subjects if isinstance(supplemental_subjects, list) else []
+        )
+        merged_subjects = normalized_payload.get("merged_subjects")
+        if isinstance(merged_subjects, list):
+            # total_count 是基础合并产物的派生值，不能被可选补漏项影响。
+            normalized_payload["total_count"] = len(merged_subjects)
+        return normalized_payload
+
+
+def _build_extract_baseline(per_episodes: list[object]) -> list[dict]:
+    """从已完成 extract 的暂存结果构造可直接发布的确定性主体基线。"""
+    subjects_by_key: dict[tuple[str, str], dict] = {}
+    for raw_episode in per_episodes:
+        if not isinstance(raw_episode, dict):
+            raise ValueError("extract 暂存输出包含非法分集")
+        episode_no = raw_episode.get("episode_no")
+        if type(episode_no) is not int or episode_no < 1:
+            raise ValueError("extract 暂存输出缺少合法集号")
+        raw_subjects = raw_episode.get("subjects")
+        if not isinstance(raw_subjects, list):
+            raise ValueError("extract 暂存输出缺少主体列表")
+        for raw_subject in raw_subjects:
+            if not isinstance(raw_subject, dict):
+                raise ValueError("extract 暂存输出包含非法主体")
+            subject_payload = dict(raw_subject)
+            # 这两个字段由当前阶段确定，不能让过往模型输出阻断已成功的抽取结果。
+            subject_payload["is_child"] = True
+            subject_payload["episode_nos"] = [episode_no]
+            try:
+                subject = PipelineSubject.model_validate(subject_payload)
+            except ValidationError as exc:
+                raise ValueError("extract 暂存输出包含非法主体") from exc
+            item = subject.model_dump()
+            key = (item["type"], item["name"])
+            existing = subjects_by_key.get(key)
+            if existing is None:
+                subjects_by_key[key] = item
+                continue
+            existing["episode_nos"] = sorted(
+                set(existing["episode_nos"]).union(item["episode_nos"])
+            )
+            if (len(item["description"]), item["description"]) > (
+                len(existing["description"]),
+                existing["description"],
+            ):
+                existing["description"] = item["description"]
+    return [subjects_by_key[key] for key in sorted(subjects_by_key)]
 
 
 async def _prepare_staged_subjects(
@@ -242,51 +316,98 @@ async def run_merge(
         extract_detail = (extract_stage.detail if extract_stage else None) or {}
     per_episodes = extract_detail.get("episodes", []) or []
 
-    # 汇总所有集的主体作为 LLM 输入
-    all_subjects: list[dict] = []
-    for ep in per_episodes:
-        for subj in ep.get("subjects", []) or []:
-            entry = {
-                "name": subj.get("name"),
-                "type": subj.get("type"),
-                "description": subj.get("description"),
-                "episode_nos": subj.get("episode_nos") or [ep.get("episode_no")],
-            }
-            all_subjects.append(entry)
+    extract_baseline = _build_extract_baseline(per_episodes)
+    all_subjects = [
+        {
+            "name": subject["name"],
+            "type": subject["type"],
+            "description": subject["description"],
+            "episode_nos": subject["episode_nos"],
+        }
+        for subject in extract_baseline
+    ]
 
     import json
 
-    required_episode_nos: dict[tuple[str, str], set[int]] = {}
-    for subject in all_subjects:
-        key = (str(subject["type"]), str(subject["name"]))
-        required_episode_nos.setdefault(key, set()).update(subject["episode_nos"])
-
-    def validate_keyset(contract: MergeOutput) -> None:
-        output_keys = {
-            (subject.type, subject.name) for subject in contract.merged_subjects
-        }
-        if output_keys != set(required_episode_nos):
-            raise ValueError("merge 输出主体集合与输入不一致")
-        for subject in contract.merged_subjects:
-            key = (subject.type, subject.name)
-            if set(subject.episode_nos) != required_episode_nos.get(key, set()):
-                raise ValueError("merge 输出 episode_nos 必须与 extract 输入一致")
+    episode_rows = list(
+        (
+            await db.execute(
+                select(Episode).where(Episode.script_id == script_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    episode_text_by_no = {
+        int(episode.episode_no): str(episode.script_text or "")
+        for episode in episode_rows
+    }
 
     provider = _MergeProviderAdapter(provider or get_llm_provider())
-    contract = await complete_json(
-        provider,
-        _SYSTEM,
-        _USER_TEMPLATE.format(
-            multi_episode_subjects_json=json.dumps(all_subjects, ensure_ascii=False)
-        ),
-        MergeOutput,
-        durable_attempt=provider_attempt,
-        validator=validate_keyset,
-    )
-    merged_subjects = [subject.model_dump() for subject in contract.merged_subjects]
-    for subject in merged_subjects:
-        key = (subject["type"], subject["name"])
-        subject["episode_nos"] = sorted(required_episode_nos.get(key, set()))
+    merge_mode = "model_enhanced"
+    fallback_reason: str | None = None
+    try:
+        contract = await complete_json(
+            provider,
+            _SYSTEM,
+            _USER_TEMPLATE.format(
+                multi_episode_subjects_json=json.dumps(all_subjects, ensure_ascii=False),
+                episodes_json=json.dumps(
+                    [
+                        {
+                            "episode_no": episode.episode_no,
+                            "script_text": episode.script_text or "",
+                        }
+                        for episode in episode_rows
+                    ],
+                    ensure_ascii=False,
+                ),
+            ),
+            MergeOutput,
+            durable_attempt=provider_attempt,
+        )
+    except (ProviderContractError, OSError) as exc:
+        # merge 不是基础主体的权威来源：供应商不可用或字段漂移时直接发布 extract 基线。
+        merged_subjects = [dict(subject) for subject in extract_baseline]
+        merge_mode = "extract_fallback"
+        fallback_reason = (
+            "provider_contract"
+            if getattr(exc, "error_type", None) == "provider_contract_error"
+            else "provider_transport"
+        )
+    else:
+        descriptions_by_key = {
+            (subject.type, subject.name): subject.description
+            for subject in contract.merged_subjects
+        }
+        merged_subjects = []
+        for subject in extract_baseline:
+            item = dict(subject)
+            item["description"] = descriptions_by_key.get(
+                (item["type"], item["name"]), item["description"]
+            )
+            merged_subjects.append(item)
+
+        existing_keys = {(subject["type"], subject["name"]) for subject in merged_subjects}
+        for raw_supplemental in provider.supplemental_subjects:
+            try:
+                supplemental = SupplementalSubject.model_validate(raw_supplemental)
+            except ValidationError:
+                continue
+            supplemental_key = (supplemental.type, supplemental.name)
+            if supplemental_key in existing_keys:
+                continue
+            evidence_episode_nos = {evidence.episode_no for evidence in supplemental.evidence}
+            if evidence_episode_nos != set(supplemental.episode_nos):
+                continue
+            if any(
+                not (script_text := episode_text_by_no.get(evidence.episode_no))
+                or evidence.quote not in script_text
+                for evidence in supplemental.evidence
+            ):
+                continue
+            merged_subjects.append(supplemental.model_dump(exclude={"evidence"}))
+            existing_keys.add(supplemental_key)
 
     if not await input_episode_is_current(
         db,
@@ -299,25 +420,35 @@ async def run_merge(
         return 0
 
     staged_subjects = await _prepare_staged_subjects(db, script_id, merged_subjects)
-    if run_id is None:
-        await asset_crud.persist_subject_suggestions(
-            db,
-            script_id,
-            staged_subjects,
-            source_run_id=None,
-        )
-        await replace_subjects(db, script_id, staged_subjects)
+    await asset_crud.persist_subject_suggestions(
+        db,
+        script_id,
+        staged_subjects,
+        source_run_id=run_id,
+    )
+    await replace_subjects(db, script_id, staged_subjects)
+    if run_id is not None:
+        # 父分组属于派生产物；子主体已更新时不能继续引用上一轮的分组。
+        await replace_parent_subjects(db, script_id, [])
+    stage_detail = {
+        "count": len(staged_subjects),
+        "input_version": input_version,
+        "input_client_save_seq": input_client_save_seq,
+        "merge_mode": merge_mode,
+    }
+    if fallback_reason is not None:
+        stage_detail["fallback_reason"] = fallback_reason
     await set_stage(
         db,
         script_id,
         "merge",
         status="done",
-        detail={
-            "count": len(staged_subjects),
-            "input_version": input_version,
-            "input_client_save_seq": input_client_save_seq,
-        },
+        detail=stage_detail,
     )
     if run_id is not None:
-        return {"count": len(staged_subjects), "subjects": staged_subjects}
+        return {
+            "count": len(staged_subjects),
+            "subjects": staged_subjects,
+            "subjects_published": True,
+        }
     return len(staged_subjects)

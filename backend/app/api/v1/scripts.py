@@ -19,17 +19,20 @@
   - 资源级授权: 改 URL id 时服务端重新校验归属（permissions.check_script_access）
 """
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, File, Query, UploadFile, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth import get_current_user
+from app.core.config import settings
 from app.core.database import get_db
 from app.core.errors import ConflictError, ForbiddenError
+from app.core.ids import new_id
 from app.core.permissions import Action, check_script_access
 from app.crud import script as script_crud
 from app.models.episode import Episode
 from app.models.user import User
+from app.providers.storage import get_storage
 from app.schemas.script import (
     BreakdownOut,
     BreakdownShot,
@@ -51,10 +54,14 @@ from app.schemas.script import (
     ScriptOut,
     ScriptPageOut,
     ScriptUpdateIn,
+    ScriptUploadOut,
+    SubjectCatalogStateOut,
 )
 from app.services.audit import best_effort_log as audit_log
 from app.services.pipeline import get_stage
+from app.services.pipeline.catalog import get_subject_catalog_state
 from app.services.pipeline.orchestrator import get_pipeline_status, trigger_pipeline
+from app.services.script_document import cleanup_staged_script_document, stage_script_document
 
 router = APIRouter(prefix="/scripts", tags=["scripts"])
 
@@ -114,6 +121,112 @@ async def create_script(
     """新建剧本。"""
     script = await script_crud.create_script(db, body.title, body.scope, user)
     return ScriptOut.model_validate(script)
+
+
+@router.post(
+    "/{script_id}/upload-and-split",
+    response_model=ScriptUploadOut,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="上传剧本文档并自动分析",
+)
+async def upload_and_split_script(
+    script_id: str,
+    file: UploadFile = File(...),
+    auto: bool = Query(True, description="是否立即启动五阶段 AI 流水线"),
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> ScriptUploadOut:
+    """接收 .txt/.docx 全文，创建源分集并按需启动既有 AI 流水线。
+
+    首版只接受尚未产生分集的剧本，防止一次上传重写已有分镜、资产或视频数据。
+    ``PipelineJob.run_id`` 同时作为兼容央视频轮询语义的 ``analysis_job_id``。
+    """
+    script = await script_crud.get_script(db, script_id)
+    await check_script_access(db, user, script, action=Action.EDIT)
+    if auto:
+        await check_script_access(db, user, script, action=Action.RUN_AI)
+
+    document = await stage_script_document(file, max_bytes=settings.max_upload_bytes)
+    storage_key = f"upload_scripts/{script_id}/{new_id()}{document.suffix}"
+    storage = get_storage()
+    source_episode: Episode | None = None
+    source_episode_id: str | None = None
+    stored = False
+    pipeline_result: dict | None = None
+    try:
+        # 解析期间不持有行锁；写入前再锁定并复查，避免长上传阻塞其他编辑操作。
+        locked_script = await script_crud.get_script_for_update(db, script_id)
+        await check_script_access(db, user, locked_script, action=Action.EDIT)
+        existing_episode = (
+            await db.execute(
+                select(Episode.episode_id)
+                .where(Episode.script_id == script_id)
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if existing_episode is not None:
+            raise ConflictError("剧本已有分集，暂不支持覆盖上传；请新建剧本后上传")
+
+        await storage.put_file(storage_key, document.temp_path)
+        stored = True
+        source_title = document.original_filename.rsplit(".", 1)[0].strip() or "上传剧本"
+        source_episode_id = new_id()
+        source_episode = Episode(
+            episode_id=source_episode_id,
+            script_id=script_id,
+            episode_no=1,
+            title=source_title[:255],
+            script_text=document.script_text,
+            script_file_storage_key=storage_key,
+            schema_version=1,
+            episode_version=1,
+            client_save_seq=0,
+        )
+        db.add(source_episode)
+        await db.flush()
+        await audit_log(
+            db,
+            actor=user,
+            action="script_document_upload",
+            resource_type="episode",
+            resource_id=source_episode.episode_id,
+            before=None,
+            after={
+                "filename": document.original_filename,
+                "size_bytes": document.size_bytes,
+                "sha256": document.sha256,
+                "auto": auto,
+            },
+        )
+        if auto:
+            # trigger_pipeline 在同一事务内提交源分集、阶段、积分预约、outbox 与任务记录。
+            pipeline_result = await trigger_pipeline(db, script_id, source_episode.episode_id)
+        else:
+            await db.commit()
+    except Exception:
+        await db.rollback()
+        if stored:
+            try:
+                await storage.delete(storage_key)
+            except Exception:
+                pass
+        raise
+    finally:
+        cleanup_staged_script_document(document)
+
+    if source_episode is None or source_episode_id is None:
+        raise RuntimeError("剧本文档上传未创建源分集")
+    return ScriptUploadOut(
+        analysis_job_id=pipeline_result["run_id"] if pipeline_result else None,
+        pipeline_run_id=pipeline_result["run_id"] if pipeline_result else None,
+        dispatch_id=pipeline_result["dispatch_id"] if pipeline_result else None,
+        script_id=script_id,
+        source_episode_id=source_episode_id,
+        filename=document.original_filename,
+        script_file_storage_key=storage_key,
+        auto=auto,
+        status="queued" if auto else "uploaded",
+    )
 
 
 @router.get("/news-broadcast/jobs", response_model=list)
@@ -418,10 +531,18 @@ async def get_breakdown(
     await check_script_access(db, user, script, action=Action.READ)
 
     data = await script_crud.get_breakdown(db, script_id, episode_id)
-    subjects = [BreakdownSubject.model_validate(s) for s in data["subjects"]]
+    subject_catalog = await get_subject_catalog_state(db, script_id)
+    # 新一轮分析未发布前，历史主体不能继续被当作本轮抽取结果展示。
+    source_subjects = (
+        data["subjects"]
+        if subject_catalog["state"] in {"current", "untracked"}
+        else []
+    )
+    subjects = [BreakdownSubject.model_validate(s) for s in source_subjects]
     return BreakdownOut(
         episode=EpisodeOut.model_validate(data["episode"]),
         subjects=subjects,
+        subject_catalog=SubjectCatalogStateOut.model_validate(subject_catalog),
         shots=[BreakdownShot.model_validate(item) for item in data["shots"]],
         shot_groups=[BreakdownShotGroup.model_validate(item) for item in data["shot_groups"]],
     )
@@ -447,6 +568,9 @@ async def get_pipeline_status_endpoint(
         running=status["running"],
         failed=status["failed"],
         all_done=status["all_done"],
+        subject_catalog=SubjectCatalogStateOut.model_validate(
+            await get_subject_catalog_state(db, script_id)
+        ),
     )
 
 
@@ -528,4 +652,7 @@ async def get_extract_subjects_status(
         merge_status=merge_status,
         merge_job_id=merge_job_id,
         has_active_merge=merge_status == "running",
+        subject_catalog=SubjectCatalogStateOut.model_validate(
+            await get_subject_catalog_state(db, script_id)
+        ),
     )

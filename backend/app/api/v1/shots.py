@@ -3,6 +3,7 @@
 端点:
 - POST /scripts/<sid>/episodes/<eid>/generate-storyboard  触发 LLM 分镜生成 (异步)
 - GET  /scripts/<sid>/episodes/<eid>/shot-hierarchy      分镜层级 (场景->镜头组->镜头)
+- POST /scripts/<sid>/episodes/<eid>/shot-groups/merge   合并连续镜头为新镜头组
 - GET  /shots/<sid>/episodes/<eid>/video-workbench        视频工作台 (含 unit_id/materials)
 - GET  /shots/<script_id>/cover                           视频项目封面 (首个镜头首帧)
 """
@@ -45,13 +46,16 @@ from app.models.user import User
 from app.schemas.shot import (
     CoverOut,
     GenerateStoryboardResponse,
+    ShotGroupMergeIn,
     ShotHierarchyOut,
     StoryboardJobEditIn,
     StoryboardJobListOut,
     StoryboardStatusOut,
     VideoWorkbenchOut,
 )
+from app.services.audit import best_effort_log as audit_log
 from app.services.credits import release, reserve
+from app.services.shot_group_merge import merge_shots_into_group
 from app.services.task_dispatch import enqueue_task
 
 logger = logging.getLogger(__name__)
@@ -546,6 +550,53 @@ async def shot_hierarchy(
     """获取分镜层级结构。"""
     await _validate_script_episode(db, user, script_id, episode_id)
     return await get_shot_hierarchy(db, script_id, episode_id)
+
+
+@router.post(
+    "/scripts/{script_id}/episodes/{episode_id}/shot-groups/merge",
+    response_model=VideoWorkbenchOut,
+    summary="合并连续镜头",
+    description="把同一场景中叙事顺序连续的 2～5 个镜头合并为新的视频生成单元。",
+)
+async def merge_shot_group(
+    script_id: str,
+    episode_id: str,
+    payload: ShotGroupMergeIn,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> VideoWorkbenchOut:
+    """原子合并镜头并返回可直接替换页面状态的完整工作台。"""
+
+    await _validate_script_episode(
+        db,
+        user,
+        script_id,
+        episode_id,
+        action=Action.EDIT,
+        expected_episode_version=payload.expected_episode_version,
+    )
+    result = await merge_shots_into_group(
+        db,
+        script_id=script_id,
+        episode_id=episode_id,
+        shot_ids=payload.shot_ids,
+        expected_episode_version=payload.expected_episode_version,
+    )
+    await audit_log(
+        db,
+        actor=user,
+        action="shot_group_merge",
+        resource_type="shot_group",
+        resource_id=result.shot_group_id,
+        before={"shot_ids": payload.shot_ids},
+        after={
+            "episode_version": result.episode_version,
+            "removed_shot_group_ids": list(result.removed_shot_group_ids),
+        },
+    )
+    workbench = await get_video_workbench(db, script_id, episode_id)
+    await db.commit()
+    return workbench
 
 
 # ---------------------------------------------------------------------------

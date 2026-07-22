@@ -6,6 +6,7 @@
 
 import asyncio
 import logging
+import re
 import threading
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
@@ -26,6 +27,30 @@ SubmissionStateCallback = Callable[[], Awaitable[None]]
 _VIDEO_CLIENT_CLOSE_TIMEOUT = 2.0
 _VIDEO_CLIENT_CLOSE_ORPHANS: set[asyncio.Task[object]] = set()
 _VIDEO_CLIENT_CLOSE_ORPHANS_LOCK = threading.Lock()
+_VIDEO_SUBMIT_DIAGNOSTIC_TEXT_FIELDS = ("code", "param", "type", "request_id")
+_VIDEO_SUBMIT_DIAGNOSTIC_TOKEN = re.compile(
+    r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z",
+    re.ASCII,
+)
+
+
+def sanitize_video_submit_rejection_diagnostics(
+    value: object,
+) -> dict[str, int | str]:
+    """仅接受固定 JSON 标量与短 ASCII token；其他输入一律丢弃。"""
+
+    if type(value) is not dict:
+        return {}
+    raw = value
+    diagnostics: dict[str, int | str] = {}
+    status_code = raw.get("status_code")
+    if type(status_code) is int and 400 <= status_code < 500 and status_code != 408:
+        diagnostics["status_code"] = status_code
+    for field_name in _VIDEO_SUBMIT_DIAGNOSTIC_TEXT_FIELDS:
+        field_value = raw.get(field_name)
+        if type(field_value) is str and _VIDEO_SUBMIT_DIAGNOSTIC_TOKEN.fullmatch(field_value):
+            diagnostics[field_name] = field_value
+    return diagnostics
 
 
 class _VideoClientCloseSlots:
@@ -107,7 +132,8 @@ class VideoGenerationSubmissionUncertain(RuntimeError):
 class VideoGenerationSubmitRejected(RuntimeError):
     """Provider 已明确拒绝提交，远端没有创建计费任务。"""
 
-    def __init__(self) -> None:
+    def __init__(self, *, diagnostics: object = None) -> None:
+        self.diagnostics = sanitize_video_submit_rejection_diagnostics(diagnostics)
         super().__init__("video_generation_submit_rejected")
 
 
@@ -229,6 +255,40 @@ def _video_submit_was_explicitly_rejected(exc: Exception) -> bool:
     return status_code is not None and 400 <= status_code < 500 and status_code != 408
 
 
+def _replace_video_submit_sensitive_values(
+    value: object,
+    *,
+    sensitive_values: tuple[str, ...],
+) -> object:
+    """候选标量先做 exact 替换；替换标记会被 ASCII token 校验拒绝。"""
+
+    if type(value) is not str:
+        return value
+    redacted = value
+    for sensitive in sensitive_values:
+        if type(sensitive) is str and sensitive:
+            redacted = redacted.replace(sensitive, "[REDACTED]")
+    return redacted
+
+
+def _video_submit_rejection_diagnostics(
+    exc: Exception,
+    *,
+    sensitive_values: tuple[str, ...],
+) -> dict[str, int | str]:
+    """从 SDK 固定属性提取诊断；绝不读取 message、body、request 或 response 内容。"""
+
+    raw_diagnostics: dict[str, object] = {
+        "status_code": _video_submit_status_code(exc),
+    }
+    for field_name in _VIDEO_SUBMIT_DIAGNOSTIC_TEXT_FIELDS:
+        raw_diagnostics[field_name] = _replace_video_submit_sensitive_values(
+            getattr(exc, field_name, None),
+            sensitive_values=sensitive_values,
+        )
+    return sanitize_video_submit_rejection_diagnostics(raw_diagnostics)
+
+
 async def _notify_video_submission_uncertain(
     callback: SubmissionStateCallback | None,
 ) -> None:
@@ -247,6 +307,7 @@ async def execute_video_submission[SubmissionResult](
     *,
     before_submit: SubmissionStateCallback | None,
     on_submission_uncertain: SubmissionStateCallback | None,
+    rejection_sensitive_values: tuple[str, ...] = (),
 ) -> SubmissionResult:
     """先持久化提交意图，再把提交响应异常归一为可判权的 typed error。"""
 
@@ -256,13 +317,23 @@ async def execute_video_submission[SubmissionResult](
         return await submit()
     except (SoftTimeLimitExceeded, TimeLimitExceeded):
         raise
-    except (VideoGenerationSubmissionUncertain, VideoGenerationSubmitRejected):
+    except VideoGenerationSubmissionUncertain:
         raise
+    except VideoGenerationSubmitRejected as exc:
+        rejection_diagnostics = sanitize_video_submit_rejection_diagnostics(
+            exc.diagnostics
+        )
     except Exception as exc:
         if _video_submit_was_explicitly_rejected(exc):
-            raise VideoGenerationSubmitRejected() from exc
-        await _notify_video_submission_uncertain(on_submission_uncertain)
-        raise VideoGenerationSubmissionUncertain() from exc
+            rejection_diagnostics = _video_submit_rejection_diagnostics(
+                exc,
+                sensitive_values=rejection_sensitive_values,
+            )
+        else:
+            await _notify_video_submission_uncertain(on_submission_uncertain)
+            raise VideoGenerationSubmissionUncertain() from exc
+    # 必须离开原始 SDK exception handler 后再抛出，避免 provider 内容进入 cause/context traceback。
+    raise VideoGenerationSubmitRejected(diagnostics=rejection_diagnostics)
 
 
 async def raise_video_submission_uncertain(

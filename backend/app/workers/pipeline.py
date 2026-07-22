@@ -37,6 +37,7 @@ from app.core.config import settings
 from app.core.database import async_session_factory
 from app.core.ids import new_id
 from app.core.job_state import PipelineFailure
+from app.crud import asset as asset_crud
 from app.crud.script import replace_parent_subjects, replace_subjects
 from app.models.episode import Episode
 from app.models.pipeline_job import PipelineJob
@@ -534,7 +535,7 @@ async def finalize_pipeline_jobs(
     reservation_id: str | None,
     estimated: int,
 ) -> bool:
-    """按统一锁序结算，并在同一事务发布 run-scoped 业务产物。"""
+    """按统一锁序结算，并在同一事务发布父分组。"""
 
     async def load_leaves(*, lock: bool) -> list[PipelineJob]:
         query = (
@@ -590,25 +591,27 @@ async def finalize_pipeline_jobs(
     if locked_input != preview_input:
         raise RuntimeError("pipeline leaves changed during finalization")
 
-    merge_output = (
+    merge_job = (
         (
             await db.execute(
-                select(PipelineJob.output_json)
+                select(PipelineJob)
                 .where(
                     PipelineJob.run_id == run_id,
                     PipelineJob.stage == "merge",
                     PipelineJob.status == "done",
-                    PipelineJob.output_json.is_not(None),
                 )
+                .options(noload(PipelineJob.script))
                 .order_by(PipelineJob.attempt.desc())
                 .limit(1)
+                .with_for_update()
             )
         )
         .scalar_one_or_none()
     )
+    merge_output = merge_job.output_json if merge_job is not None else None
     enrich_output = latest["enrich"].output_json or {}
     parents_output = latest["parents"].output_json or {}
-    if not merge_output or "subjects" not in merge_output:
+    if merge_job is None or not isinstance(merge_output, dict):
         raise RuntimeError("pipeline merge staging output is missing")
     if "prompts" not in enrich_output or "parent_subjects" not in parents_output:
         raise RuntimeError("pipeline leaf staging output is missing")
@@ -616,16 +619,19 @@ async def finalize_pipeline_jobs(
     if reservation_id:
         await _settle_pipeline(db, script_id, reservation_id, estimated)
 
-    # settle、业务发布和 job/stage 终态共用当前事务；任一步失败将整体回滚。
-    from app.crud import asset as asset_crud
-
-    await asset_crud.persist_subject_suggestions(
-        db,
-        script_id,
-        merge_output["subjects"],
-        source_run_id=run_id,
-    )
-    await replace_subjects(db, script_id, merge_output["subjects"])
+    # 结算、父分组发布和 job/stage 终态共用当前事务；任一步失败将整体回滚。
+    if merge_output.get("subjects_published") is not True:
+        subjects = merge_output.get("subjects")
+        if not isinstance(subjects, list):
+            raise RuntimeError("pipeline merge staging output is missing subjects")
+        # 兼容部署前已完成 merge 的运行：它们仅在 finalizer 中发布主体。
+        await asset_crud.persist_subject_suggestions(
+            db,
+            script_id,
+            subjects,
+            source_run_id=run_id,
+        )
+        await replace_subjects(db, script_id, subjects)
     await replace_parent_subjects(
         db, script_id, parents_output.get("parent_subjects") or []
     )
@@ -777,7 +783,10 @@ async def _run_stage_async(
                 "provider_attempt": claim.attempt,
                 "commit": False,
             }
-            if stage != "split":
+            # split 只消费触发分集的整段原文；extract 则必须遍历当前剧本的所有
+            # 分集。若把本次触发的 episode_id 传给 extract，上传后拆出的第二集及
+            # 后续分集永远不会进入本轮主体目录。
+            if stage not in {"split", "extract"}:
                 kwargs["episode_id"] = episode_id
             if stage in {"merge", "enrich", "parents"}:
                 kwargs["run_id"] = run_id

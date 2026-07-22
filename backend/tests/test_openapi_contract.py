@@ -40,7 +40,13 @@ REQUIRED_OPERATIONS = {
     ("GET", "/v3api/generation-jobs/{job_id}"),
     ("GET", "/v3api/generation-jobs"),
     ("POST", "/v3api/scripts/{script_id}/episodes/{episode_id}/generate-storyboard"),
+    ("POST", "/v3api/scripts/{script_id}/upload-and-split"),
+    ("GET", "/v3api/analysis-jobs/{analysis_job_id}"),
     ("GET", "/v3api/scripts/{script_id}/episodes/{episode_id}/shot-hierarchy"),
+    (
+        "POST",
+        "/v3api/scripts/{script_id}/episodes/{episode_id}/shot-groups/merge",
+    ),
     ("GET", "/v3api/shots/{script_id}/episodes/{episode_id}/video-workbench"),
     ("GET", "/v3api/shots/{script_id}/cover"),
     ("POST", "/v3api/video-generation-jobs"),

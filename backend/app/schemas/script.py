@@ -74,6 +74,42 @@ class ScriptPageOut(BaseModel):
     total: int
 
 
+class ScriptUploadOut(BaseModel):
+    """上传剧本文档后的受理结果。"""
+
+    analysis_job_id: str | None = None
+    pipeline_run_id: str | None = None
+    dispatch_id: str | None = None
+    script_id: str
+    source_episode_id: str
+    filename: str
+    script_file_storage_key: str
+    auto: bool
+    status: str
+
+
+class AnalysisJobStageOut(BaseModel):
+    """分析任务中单个流水线阶段的当前 attempt 状态。"""
+
+    stage: str
+    status: str
+    error_type: str | None = None
+
+
+class AnalysisJobOut(BaseModel):
+    """按 PipelineJob.run_id 聚合出的上传分析任务视图。"""
+
+    id: str
+    script_id: str
+    source_episode_id: str | None = None
+    status: str
+    current_stage: str | None = None
+    stages: list[AnalysisJobStageOut]
+    error_type: str | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
 # --------------------------------------------------------------------------- #
 # Episode
 # --------------------------------------------------------------------------- #
@@ -176,6 +212,18 @@ class LifecycleDeleteOut(BaseModel):
 # --------------------------------------------------------------------------- #
 # Breakdown
 # --------------------------------------------------------------------------- #
+class SubjectCatalogStateOut(BaseModel):
+    """主体列表相对最新流水线的发布状态。"""
+
+    state: Literal["current", "processing", "failed", "superseded", "untracked"]
+    is_current: bool
+    latest_run_id: str | None = None
+    published_run_id: str | None = None
+    failure_stage: str | None = None
+    error_type: str | None = None
+    stale_subject_count: int = 0
+
+
 class BreakdownSubject(BaseModel):
     """breakdown 视角的主体（精简字段）。"""
 
@@ -217,6 +265,7 @@ class BreakdownOut(BaseModel):
 
     episode: EpisodeOut
     subjects: list[BreakdownSubject] = Field(default_factory=list)
+    subject_catalog: SubjectCatalogStateOut
     shots: list[BreakdownShot] = Field(default_factory=list)
     shot_groups: list[BreakdownShotGroup] = Field(default_factory=list)
 
@@ -253,6 +302,7 @@ class PipelineStageOut(BaseModel):
     detail: Any = None
     current: int | None = None
     total: int | None = None
+    error: dict[str, object] | None = None
 
     @model_validator(mode="after")
     def _detail_to_display_str(self) -> "PipelineStageOut":
@@ -301,6 +351,7 @@ class PipelineStatusOut(BaseModel):
     running: bool
     failed: bool
     all_done: bool
+    subject_catalog: SubjectCatalogStateOut
 
 
 # --------------------------------------------------------------------------- #
@@ -326,3 +377,4 @@ class ExtractSubjectsStatusOut(BaseModel):
     merge_status: str
     merge_job_id: str | None = None
     has_active_merge: bool
+    subject_catalog: SubjectCatalogStateOut

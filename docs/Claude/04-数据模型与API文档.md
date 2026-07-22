@@ -327,7 +327,7 @@ breakdown 视角字段（精简）：
 
 | 值 | 含义 |
 |---|---|
-| `banana-2` | Google Nano Banana（Gemini 2.5 Flash Image）— 主体参考图 |
+| `banana-2` | Google Nano Banana（Gemini 3.1 Flash Image）— 主体参考图 |
 | `gpt-image-2` | OpenAI GPT Image 2 |
 
 **variant 枚举（已观察）**：`generated` / `uploaded` / `text` / `storyboard`（可能还有更多）。
@@ -430,6 +430,15 @@ video-workbench 视角额外字段：
 - 【角色】列出引用主体
 - 【叙事目的】
 - 【约束】人物特征一致/不脸崩/不畸形/切镜丝滑/4K 稳定/语音清晰/唇形动作对位/禁字幕
+
+**ShotGroupMergeIn（本项目扩展，非央视频已实测写契约）**
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| shot_ids | string[2..5] | 同场景、叙事顺序连续的镜头 ID；服务端按现有顺序处理 |
+| expected_episode_version | int | 工作台当前分集版本，过期返回 409 |
+
+合并会创建新的 ShotGroup，并原子重算镜头时间轴、prompt、materials、audio_elements、时长和组号。成功后 `episode_version + 1`，响应完整 `VideoWorkbenchOut`；涉及的源组已有任意视频任务时拒绝修改。
 
 ### 1.16 Scene（场景，按背景聚合）
 
@@ -631,6 +640,7 @@ video-workbench 视角：
 |---|---|---|---|
 | GET | `/shots/<script_id>/cover` | - | 视频项目封面（取自首个镜头首帧） |
 | GET | `/scripts/<sid>/episodes/<eid>/shot-hierarchy` | - | ShotHierarchy（场景->镜头组->镜头） |
+| POST | `/scripts/<sid>/episodes/<eid>/shot-groups/merge` | JSON `ShotGroupMergeIn` | 合并连续镜头，返回更新后的 VideoWorkbench |
 | GET | `/shots/<sid>/episodes/<eid>/video-workbench` | - | VideoWorkbench（含 unit_id/unit_runtime_key/materials/audio_elements） |
 
 ### 2.7 video-generation（视频生成）

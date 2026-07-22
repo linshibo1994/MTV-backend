@@ -48,24 +48,10 @@ from app.models.script import Script
 from app.models.subject import Subject
 from app.models.user import User
 from app.schemas.generation import BatchCreateJobIn, CreateJobIn
+from app.schemas.pipeline_contracts import normalize_enrich_prompt
 from app.services.credits import reserve
 from app.services.pipeline.enrich import build_base_prompt
 from app.services.task_dispatch import enqueue_task
-
-_ENRICH_SECTION_LABELS = [
-    "形制描述",
-    "材质钉死",
-    "使用痕迹",
-    "摆放姿态",
-    "反悬浮锁",
-    "时代锚定",
-    "画面构图",
-    "画风统一锁",
-    "三点柔光箱白底布光",
-    "反水印锁",
-    "文字渲染降级方案",
-    "写实质感锚定",
-]
 
 _SINGLE_IDEMPOTENCY_NAMESPACE = "single:"
 _BATCH_JOB_IDEMPOTENCY_NAMESPACE = "batch-job:"
@@ -261,29 +247,11 @@ async def _subject_episode_snapshot(
     )
 
 
-def _validate_twelve_section_prompt(prompt: str) -> None:
-    sections: list[tuple[str, str]] = []
-    current_label: str | None = None
-    current_body: list[str] = []
-    for line in prompt.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("【") and "】" in stripped:
-            label, body = stripped[1:].split("】", 1)
-            if current_label is not None:
-                sections.append((current_label, "\n".join(current_body).strip()))
-            current_label = label
-            current_body = [body.strip()]
-        elif current_label is not None:
-            current_body.append(line)
-        elif stripped:
-            raise ConflictError("enrich resolved prompt 段落结构无效")
-    if current_label is not None:
-        sections.append((current_label, "\n".join(current_body).strip()))
-    labels = [label for label, _ in sections]
-    if labels != _ENRICH_SECTION_LABELS:
-        raise ConflictError("enrich resolved prompt 段落顺序无效")
-    if any(not body.strip() for _, body in sections):
-        raise ConflictError("enrich resolved prompt 段落正文不能为空")
+def _validate_twelve_section_prompt(prompt: str) -> str:
+    try:
+        return normalize_enrich_prompt(prompt)
+    except ValueError as exc:
+        raise ConflictError(f"enrich resolved prompt 无效：{exc}") from exc
 
 
 async def _load_server_resolved_prompt(
@@ -356,8 +324,7 @@ async def _load_server_resolved_prompt(
     prompt = (prompt_entry.get("resolved_prompts") or {}).get("final")
     if not isinstance(prompt, str) or not prompt.strip():
         raise ConflictError("缺少服务端 enrich resolved prompt")
-    _validate_twelve_section_prompt(prompt)
-    return prompt
+    return _validate_twelve_section_prompt(prompt)
 
 
 def _request_hash(payload: dict) -> str:

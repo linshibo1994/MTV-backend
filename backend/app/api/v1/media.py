@@ -77,6 +77,8 @@ _ALLOWED_UPLOAD_MIME_TYPES: set[str] = (
 
 # 扩展名 → MIME 兜底映射 (探测失败时使用)
 _EXT_MIME: dict[str, str] = {
+    ".txt": "text/plain; charset=utf-8",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     ".png": "image/png",
     ".jpg": "image/jpeg",
     ".jpeg": "image/jpeg",
@@ -637,7 +639,7 @@ async def _authorize_by_storage_key(
 
     两类鉴权路径：
     - generate_images/ 或 upload_images/ 前缀：解析 mid -> Materials -> Script -> check_script_access
-    - generate_outputs/ 或 render_outputs/ 前缀：合成产物按 script_id 鉴权
+    - generate_outputs/、render_outputs/ 或 upload_scripts/ 前缀：按 script_id 鉴权
       （第二段为 script_id，非 mid）-> Script -> check_script_access
     """
     try:
@@ -650,7 +652,12 @@ async def _authorize_by_storage_key(
         return
 
     # 合成产物（时间线最终视频等）必须精确绑定 render job。
-    if parts and parts[0] in ("generate_outputs", "render_outputs"):
+    if parts and parts[0] in ("generate_outputs", "render_outputs", "upload_scripts"):
+        if parts[0] == "upload_scripts":
+            if len(parts) != 3:
+                raise ForbiddenError("非法剧本文档路径")
+            await _authorize_script(db, parts[1], user, require_write)
+            return
         await _authorize_timeline_media_key(db, rel, user, require_write)
         return
     # 资源素材按 mid 鉴权

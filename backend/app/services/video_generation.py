@@ -315,6 +315,10 @@ async def create_video_job(
             },
         )
         job.dispatch_id = dispatch.id
+        # updated_at 由数据库侧 onupdate 生成；flush 后会被 SQLAlchemy 标记为过期。
+        # 提交前定向刷新，避免响应序列化在同步属性访问中触发异步隐式查询。
+        await db.flush()
+        await db.refresh(job, attribute_names=["updated_at"])
         await db.commit()
     except IntegrityError as exc:
         await db.rollback()

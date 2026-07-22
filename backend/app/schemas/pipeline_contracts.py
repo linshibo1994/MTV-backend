@@ -1,6 +1,7 @@
 """流水线 LLM 输出的 Pydantic v2 合约。"""
 
-from collections.abc import Callable
+import re
+from collections.abc import Callable, Sequence
 from typing import Annotated, Literal
 
 from pydantic import (
@@ -9,6 +10,7 @@ from pydantic import (
     Field,
     StringConstraints,
     ValidationError,
+    field_validator,
     model_validator,
 )
 
@@ -19,12 +21,115 @@ class ProviderContractError(ValueError):
     error_type = "provider_contract_error"
     retryable = False
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        diagnostic: dict[str, object] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.diagnostic = diagnostic
+
 
 class RetryableProviderContractError(ConnectionError):
     """尚有持久 attempt 预算的供应商合约错误。"""
 
     error_type = "provider_contract_error"
     retryable = True
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        diagnostic: dict[str, object] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.diagnostic = diagnostic
+
+
+_PROVIDER_DIAGNOSTIC_CATEGORIES = frozenset({"invalid_json", "non_object_json"})
+_DIAGNOSTIC_FIELDS = frozenset(
+    {
+        "schema_version",
+        "episodes",
+        "episode_no",
+        "title",
+        "script_text",
+        "subjects",
+        "merged_subjects",
+        "supplemental_subjects",
+        "total_count",
+        "name",
+        "type",
+        "description",
+        "is_child",
+        "episode_nos",
+        "evidence",
+        "quote",
+        "resolved_prompts",
+        "final",
+        "parent_subjects",
+        "child_count",
+        "child_ids",
+    }
+)
+
+
+def _diagnostic_path(loc: tuple[object, ...]) -> str:
+    """只保留合约字段和数组位置，避免错误诊断泄露模型输出。"""
+    parts: list[str] = []
+    for item in loc:
+        if isinstance(item, int):
+            if parts:
+                parts[-1] = f"{parts[-1]}[]"
+            continue
+        if isinstance(item, str) and item in _DIAGNOSTIC_FIELDS:
+            parts.append(item)
+        else:
+            parts.append("<unknown_field>")
+    return ".".join(parts) or "<root>"
+
+
+def _contract_diagnostic(schema: type[BaseModel], exc: ValueError) -> dict[str, object]:
+    """构造可展示但不含输入值、异常原文或提示词的合约失败摘要。"""
+    provider_diagnostic = getattr(exc, "diagnostic", None)
+    if (
+        isinstance(provider_diagnostic, dict)
+        and provider_diagnostic.get("category") in _PROVIDER_DIAGNOSTIC_CATEGORIES
+        and isinstance(provider_diagnostic.get("response"), dict)
+    ):
+        response = provider_diagnostic["response"]
+        return {
+            "version": 1,
+            "category": provider_diagnostic["category"],
+            "schema": schema.__name__,
+            "response": {
+                "kind": response.get("kind"),
+                "length_bucket": response.get("length_bucket"),
+                "top_level_kind": response.get("top_level_kind"),
+            },
+        }
+    if isinstance(exc, ValidationError):
+        errors = exc.errors(include_url=False)
+        codes = sorted({str(item.get("type", "validation_error")) for item in errors})[:8]
+        paths = list(dict.fromkeys(_diagnostic_path(tuple(item.get("loc", ()))) for item in errors))[:8]
+        error_count = min(len(errors), 8)
+        category = "schema_validation"
+    else:
+        codes = ["semantic_validation"]
+        paths = ["<root>"]
+        error_count = 1
+        category = "semantic_validation"
+    return {
+        "version": 1,
+        "category": category,
+        "schema": schema.__name__,
+        "validation": {
+            "error_count": error_count,
+            "codes": codes,
+            "paths": paths,
+        },
+    }
 
 
 async def complete_json[ContractT: BaseModel](
@@ -43,24 +148,28 @@ async def complete_json[ContractT: BaseModel](
     if durable_attempt is not None and not 1 <= durable_attempt <= max_attempts:
         raise ValueError("durable_attempt 超出 Provider 总预算")
     last_error: ValueError | None = None
+    last_diagnostic: dict[str, object] | None = None
     calls = 1 if durable_attempt is not None else max_attempts
     for _ in range(calls):
-        payload = await provider.complete_json(system, user)
         try:
+            payload = await provider.complete_json(system, user)
             contract = schema.model_validate(payload)
             if validator is not None:
                 validator(contract)
             return contract
         except (ValidationError, ValueError) as exc:
             last_error = exc
+            last_diagnostic = _contract_diagnostic(schema, exc)
     if last_error is None:
         raise RuntimeError("Provider 合约校验未执行")
     if durable_attempt is not None and durable_attempt < max_attempts:
         raise RetryableProviderContractError(
-            f"供应商第 {durable_attempt} 次响应不符合 {schema.__name__} 合约"
+            f"供应商第 {durable_attempt} 次响应不符合 {schema.__name__} 合约",
+            diagnostic=last_diagnostic,
         ) from last_error
     raise ProviderContractError(
-        f"供应商响应在 {max_attempts} 次总预算内不符合 {schema.__name__} 合约"
+        f"供应商响应在 {max_attempts} 次总预算内不符合 {schema.__name__} 合约",
+        diagnostic=last_diagnostic,
     ) from last_error
 
 SubjectType = Literal["character", "scene", "prop", "sound"]
@@ -72,7 +181,7 @@ ShortNonEmptyText = Annotated[
     StringConstraints(strip_whitespace=True, min_length=1, max_length=255),
 ]
 PositiveEpisodeNo = Annotated[int, Field(strict=True, ge=1)]
-_SECTIONS = (
+ENRICH_SECTION_LABELS = (
     "形制描述",
     "材质钉死",
     "使用痕迹",
@@ -86,6 +195,49 @@ _SECTIONS = (
     "文字渲染降级方案",
     "写实质感锚定",
 )
+
+_ENRICH_SECTION_HEADING = re.compile(
+    r"^(?:(?P<number>[1-9]\d*)\.\s*)?【(?P<label>[^】]+)】(?P<body>.*)$"
+)
+
+
+def normalize_enrich_prompt(prompt: str) -> str:
+    """校验并归一化 enrich 的十二段 prompt，兼容历史数字编号。"""
+    sections: list[tuple[int | None, str, str]] = []
+    current_number: int | None = None
+    current_label: str | None = None
+    current_body: list[str] = []
+
+    for line in prompt.splitlines():
+        stripped = line.strip()
+        match = _ENRICH_SECTION_HEADING.fullmatch(stripped)
+        if match is not None:
+            if current_label is not None:
+                sections.append(
+                    (current_number, current_label, "\n".join(current_body).strip())
+                )
+            number = match.group("number")
+            current_number = int(number) if number is not None else None
+            current_label = match.group("label").strip()
+            current_body = [match.group("body").strip()]
+        elif current_label is not None:
+            current_body.append(line)
+        elif stripped:
+            raise ValueError("prompt 段落必须以【标题】或历史数字编号标题开头")
+
+    if current_label is not None:
+        sections.append((current_number, current_label, "\n".join(current_body).strip()))
+
+    labels = [label for _, label, _ in sections]
+    if labels != list(ENRICH_SECTION_LABELS):
+        raise ValueError("prompt 必须包含顺序固定且不重复的十二个段落")
+    for index, (number, label, body) in enumerate(sections, 1):
+        if number is not None and number != index:
+            raise ValueError(f"prompt 段落编号与顺序不一致：{label}")
+        if not body:
+            raise ValueError(f"prompt 段落内容为空：{label}")
+
+    return "\n".join(f"【{label}】{body}" for _, label, body in sections)
 
 
 class StrictPipelineModel(BaseModel):
@@ -127,7 +279,20 @@ class PipelineSubject(StrictPipelineModel):
         return self
 
 
-def _subject_keys_are_unique(subjects: list[PipelineSubject]) -> None:
+class SupplementalEvidence(StrictPipelineModel):
+    """合并阶段补漏主体的原文证据。"""
+
+    episode_no: PositiveEpisodeNo
+    quote: NonEmptyText
+
+
+class SupplementalSubject(PipelineSubject):
+    """合并阶段从原文补出的主体，必须具备可验证证据。"""
+
+    evidence: list[SupplementalEvidence] = Field(min_length=1)
+
+
+def _subject_keys_are_unique(subjects: Sequence[PipelineSubject]) -> None:
     keys = [(subject.type, subject.name) for subject in subjects]
     if len(keys) != len(set(keys)):
         raise ValueError("同名同类主体不得重复")
@@ -159,22 +324,10 @@ class MergeOutput(StrictPipelineModel):
 class ResolvedPrompts(StrictPipelineModel):
     final: NonEmptyText
 
-    @model_validator(mode="after")
-    def contains_twelve_nonempty_ordered_sections(self) -> "ResolvedPrompts":
-        positions: list[int] = []
-        for label in _SECTIONS:
-            marker = f"【{label}】"
-            position = self.final.find(marker)
-            if position < 0:
-                raise ValueError(f"缺少 prompt 段落：{label}")
-            positions.append(position)
-        if positions != sorted(positions):
-            raise ValueError("prompt 段落顺序错误")
-        for index, position in enumerate(positions):
-            next_position = positions[index + 1] if index + 1 < len(positions) else len(self.final)
-            if not self.final[position + len(_SECTIONS[index]) + 2 : next_position].strip():
-                raise ValueError(f"prompt 段落内容为空：{_SECTIONS[index]}")
-        return self
+    @field_validator("final")
+    @classmethod
+    def contains_twelve_nonempty_ordered_sections(cls, value: str) -> str:
+        return normalize_enrich_prompt(value)
 
 
 class EnrichOutput(StrictPipelineModel):

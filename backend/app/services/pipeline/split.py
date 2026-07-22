@@ -90,6 +90,34 @@ async def run_split(
         else "full_script"
     )
 
+    # 已经拆分为多集后，保存其中一集只应触发该剧本的重新分析，不能将单集正文
+    # 再交给模型按“从第 1 集开始”拆分。否则模型常返回第 1 集，后续按触发集号
+    # 过滤时会得到空集，造成状态与实际分集脱节。
+    if split_mode == "single_episode":
+        if not await input_episode_is_current(
+            db,
+            script_id,
+            episode_id,
+            input_version,
+            input_client_save_seq,
+            lock=True,
+        ):
+            return 0
+        await set_stage(
+            db,
+            script_id,
+            "split",
+            status="done",
+            detail={
+                "count": 1,
+                "mode": split_mode,
+                "active_episode_nos": [trigger_episode_no],
+                "input_version": input_version,
+                "input_client_save_seq": input_client_save_seq,
+            },
+        )
+        return 1
+
     if not script_text.strip():
         if not await input_episode_is_current(
             db,
@@ -125,13 +153,6 @@ async def run_split(
         durable_attempt=provider_attempt,
     )
     episodes_data = [item.model_dump() for item in contract.episodes]
-    if split_mode == "single_episode":
-        episodes_data = [
-            item
-            for item in episodes_data
-            if int(item.get("episode_no", 0)) == trigger_episode_no
-        ]
-
     # LLM 返回后再次检查用户是否已保存新版文本；过期任务不得覆盖任何分集。
     if not await input_episode_is_current(
         db,

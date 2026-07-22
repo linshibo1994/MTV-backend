@@ -19,7 +19,7 @@
 | 异步任务 | Celery 5 (prefetch=1, acks_late=True) | AI job 链式编排 (split→extract→merge→enrich→parents) |
 | 会话 | Starlette SessionMiddleware (itsdangerous signed Cookie, httpOnly) | httpOnly Cookie 鉴权 |
 | AI-LLM | OpenAI SDK (gpt-4o) | split/extract/merge/enrich/parents/storyboard |
-| AI-文生图 | openai (gpt-image-2) + google-genai (gemini-2.5-flash-image = banana-2/Nano Banana) | 主体参考图 |
+| AI-文生图 | openai (gpt-image-2) + google-genai (gemini-3.1-flash-image = banana-2/Nano Banana) | 主体参考图 |
 | AI-视频 | volcengine SDK (doubao-seedance-2-0-260128 = Seedance 2.0) | 多参考图图生视频，provider_key jianyu/modelsai |
 | 对象存储 | 本地 FS (开发) / S3 兼容 MinIO (生产) | storage_key 抽象 |
 | 媒体探测 | Pillow (图) / pydub (音频) / ffmpeg (视频 MIME/元数据) | 上传校验真实 MIME |
@@ -181,7 +181,7 @@ class VideoGenProvider(Protocol):
 | 文档标识 | 实际模型 | SDK | 端点 |
 |---|---|---|---|
 | LLM (未暴露) | gpt-4o | openai | chat.completions (response_format=json) |
-| banana-2 | gemini-2.5-flash-image (Nano Banana) | google-genai | generate_image |
+| banana-2 | gemini-3.1-flash-image (Nano Banana) | google-genai | generate_image |
 | gpt-image-2 | gpt-image-2 | openai | images.generate |
 | doubao-seedance-2-0-260128 | 豆包 Seedance 2.0 | volcengine | 视频生成 2.0 all_reference |
 

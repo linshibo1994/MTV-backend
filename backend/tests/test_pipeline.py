@@ -5,7 +5,7 @@ import secrets
 import sys
 from datetime import UTC, datetime, timedelta
 from types import ModuleType, SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import ANY, AsyncMock
 
 import pytest
 from pydantic import ValidationError
@@ -63,6 +63,7 @@ from app.services.pipeline import (
     parents,
     split,
 )
+from app.services.pipeline import catalog as pipeline_catalog
 from app.workers import pipeline as pipeline_worker
 
 
@@ -232,6 +233,12 @@ def _twelve_sections() -> str:
     return "\n".join(f"【{label}】有效内容" for label in labels)
 
 
+def _numbered_twelve_sections() -> str:
+    return "\n".join(
+        f"{index}. {line}" for index, line in enumerate(_twelve_sections().splitlines(), 1)
+    )
+
+
 def _strict_contract_payloads() -> dict[type, dict]:
     return {
         SplitOutput: {
@@ -365,7 +372,8 @@ def test_pipeline_contracts_reject_whitespace_gaps_and_duplicates() -> None:
 
 
 @pytest.mark.parametrize("mode", ["missing", "extra"])
-def test_merge_rejects_incomplete_or_extra_subject_keyset(monkeypatch, mode: str) -> None:
+def test_merge_preserves_extract_subjects_when_model_keyset_differs(monkeypatch, mode: str) -> None:
+    """模型漏项或额外项不能阻断 extract 已确认的主体发布。"""
     extract_stage = SimpleNamespace(
         detail={
             "episodes": [
@@ -420,26 +428,34 @@ def test_merge_rejects_incomplete_or_extra_subject_keyset(monkeypatch, mode: str
     replace = AsyncMock()
     monkeypatch.setattr(merge, "get_stage", AsyncMock(return_value=extract_stage))
     monkeypatch.setattr(merge, "replace_subjects", replace)
+    monkeypatch.setattr(merge.asset_crud, "persist_subject_suggestions", AsyncMock())
+    stage = AsyncMock()
+    monkeypatch.setattr(merge, "set_stage", stage)
 
     async def scenario() -> None:
-        with pytest.raises(pipeline_contracts.ProviderContractError):
-            await merge.run_merge(
-                _ServiceSession(_episode()),
-                "script-1",
-                episode_id="episode-1",
-                input_version=3,
-                provider=FakeProvider(
-                    [
-                        {
-                            "schema_version": "pipeline.v1",
-                            "merged_subjects": subjects,
-                            "total_count": len(subjects),
-                        }
-                    ]
-                ),
-                provider_attempt=3,
-            )
-        replace.assert_not_awaited()
+        assert await merge.run_merge(
+            _ServiceSession(_episode()),
+            "script-1",
+            episode_id="episode-1",
+            input_version=3,
+            provider=FakeProvider(
+                [
+                    {
+                        "schema_version": "pipeline.v1",
+                        "merged_subjects": subjects,
+                        "total_count": len(subjects),
+                    }
+                ]
+            ),
+            provider_attempt=1,
+        ) == 2
+        published = replace.await_args.args[2]
+        assert {(item["type"], item["name"]) for item in published} == {
+            ("character", "主角"),
+            ("scene", "场景"),
+        }
+        assert next(item for item in published if item["name"] == "场景")["description"] == "场景描述"
+        assert stage.await_args.kwargs["detail"]["merge_mode"] == "model_enhanced"
 
     asyncio.run(scenario())
 
@@ -497,8 +513,8 @@ def test_merge_normalizes_provider_false_child_flag_to_stage_invariant(monkeypat
     asyncio.run(scenario())
 
 
-def test_merge_adapter_rejects_nonboolean_child_flag(monkeypatch) -> None:
-    """适配层不得把字符串等非精确布尔值放宽为合法主体。"""
+def test_merge_falls_back_to_extract_when_model_has_invalid_child_flag(monkeypatch) -> None:
+    """模型字段非法时也必须发布 extract 已确认的主体。"""
     extract_stage = SimpleNamespace(
         detail={
             "episodes": [
@@ -519,39 +535,42 @@ def test_merge_adapter_rejects_nonboolean_child_flag(monkeypatch) -> None:
     replace = AsyncMock()
     monkeypatch.setattr(merge, "get_stage", AsyncMock(return_value=extract_stage))
     monkeypatch.setattr(merge, "replace_subjects", replace)
+    monkeypatch.setattr(merge.asset_crud, "persist_subject_suggestions", AsyncMock())
+    stage = AsyncMock()
+    monkeypatch.setattr(merge, "set_stage", stage)
 
     async def scenario() -> None:
-        with pytest.raises(pipeline_contracts.ProviderContractError):
-            await merge.run_merge(
-                _ServiceSession(_episode()),
-                "script-1",
-                episode_id="episode-1",
-                input_version=3,
-                provider=FakeProvider(
-                    [
-                        {
-                            "schema_version": "pipeline.v1",
-                            "merged_subjects": [
-                                {
-                                    "name": "主角",
-                                    "type": "character",
-                                    "description": "主角描述",
-                                    "is_child": "false",
-                                    "episode_nos": [1],
-                                }
-                            ],
-                            "total_count": 1,
-                        }
-                    ]
-                ),
-                provider_attempt=3,
-            )
-        replace.assert_not_awaited()
+        assert await merge.run_merge(
+            _ServiceSession(_episode()),
+            "script-1",
+            episode_id="episode-1",
+            input_version=3,
+            provider=FakeProvider(
+                [
+                    {
+                        "schema_version": "pipeline.v1",
+                        "merged_subjects": [
+                            {
+                                "name": "主角",
+                                "type": "character",
+                                "description": "主角描述",
+                                "is_child": "false",
+                                "episode_nos": [1],
+                            }
+                        ],
+                        "total_count": 1,
+                    }
+                ]
+            ),
+            provider_attempt=1,
+        ) == 1
+        assert replace.await_args.args[2][0]["name"] == "主角"
+        assert stage.await_args.kwargs["detail"]["merge_mode"] == "extract_fallback"
 
     asyncio.run(scenario())
 
 
-def test_merge_keyset_failure_uses_remaining_durable_budget(monkeypatch) -> None:
+def test_merge_falls_back_to_extract_when_provider_connection_fails(monkeypatch) -> None:
     extract_stage = SimpleNamespace(
         detail={
             "episodes": [
@@ -570,20 +589,25 @@ def test_merge_keyset_failure_uses_remaining_durable_budget(monkeypatch) -> None
         }
     )
     monkeypatch.setattr(merge, "get_stage", AsyncMock(return_value=extract_stage))
-    monkeypatch.setattr(merge, "replace_subjects", AsyncMock())
+    replace = AsyncMock()
+    monkeypatch.setattr(merge, "replace_subjects", replace)
+    monkeypatch.setattr(merge.asset_crud, "persist_subject_suggestions", AsyncMock())
+    monkeypatch.setattr(merge, "set_stage", AsyncMock())
+
+    class UnavailableProvider:
+        async def complete_json(self, system: str, user: str) -> dict:
+            raise ConnectionError("temporary upstream failure")
 
     async def scenario() -> None:
-        with pytest.raises(pipeline_contracts.RetryableProviderContractError):
-            await merge.run_merge(
-                _ServiceSession(_episode()),
-                "script-1",
-                episode_id="episode-1",
-                input_version=3,
-                provider=FakeProvider(
-                    [{"merged_subjects": [], "total_count": 0}]
-                ),
-                provider_attempt=1,
-            )
+        assert await merge.run_merge(
+            _ServiceSession(_episode()),
+            "script-1",
+            episode_id="episode-1",
+            input_version=3,
+            provider=UnavailableProvider(),
+            provider_attempt=1,
+        ) == 1
+        assert replace.await_args.args[2][0]["name"] == "主角"
 
     asyncio.run(scenario())
 
@@ -602,30 +626,23 @@ def test_provider_budget_combines_schema_and_transport_across_durable_attempts(
             return {"invalid": True}
 
     provider = MixedFailureProvider()
-    monkeypatch.setattr(
-        merge, "get_stage", AsyncMock(return_value=SimpleNamespace(detail={"episodes": []}))
-    )
-    monkeypatch.setattr(merge, "replace_subjects", AsyncMock())
-
     async def scenario() -> None:
         for attempt in (1, 2):
             with pytest.raises(ConnectionError):
-                await merge.run_merge(
-                    _ServiceSession(_episode()),
-                    "script-1",
-                    episode_id="episode-1",
-                    input_version=3,
+                await pipeline_contracts.complete_json(
                     provider=provider,
-                    provider_attempt=attempt,
+                    system="system",
+                    user="user",
+                    schema=MergeOutput,
+                    durable_attempt=attempt,
                 )
         with pytest.raises(pipeline_contracts.ProviderContractError) as exc_info:
-            await merge.run_merge(
-                _ServiceSession(_episode()),
-                "script-1",
-                episode_id="episode-1",
-                input_version=3,
+            await pipeline_contracts.complete_json(
                 provider=provider,
-                provider_attempt=3,
+                system="system",
+                user="user",
+                schema=MergeOutput,
+                durable_attempt=3,
             )
         failure = PipelineFailure.from_exception(exc_info.value)
         assert failure.error_type == "provider_contract_error"
@@ -697,6 +714,65 @@ def test_invalid_prompt_and_sound_subject_are_not_visual_enrichment() -> None:
         )
     assert not should_enrich_subject("sound")
     assert should_enrich_subject("character")
+
+
+def test_enrich_contract_normalizes_numbered_prompt_and_rejects_invalid_sections() -> None:
+    contract = EnrichOutput.model_validate(
+        {
+            "schema_version": "pipeline.v1",
+            "resolved_prompts": {"final": _numbered_twelve_sections()},
+        }
+    )
+    assert contract.resolved_prompts.final == _twelve_sections()
+    assert "不得添加 `1. `" in enrich._USER_TEMPLATE
+
+    invalid_prompts = [
+        "\n".join(reversed(_twelve_sections().splitlines())),
+        "\n".join(_twelve_sections().splitlines()[:-1]),
+        _twelve_sections().replace("【材质钉死】有效内容", "【材质钉死】"),
+    ]
+    for prompt in invalid_prompts:
+        with pytest.raises(ValidationError):
+            EnrichOutput.model_validate(
+                {
+                    "schema_version": "pipeline.v1",
+                    "resolved_prompts": {"final": prompt},
+                }
+            )
+
+
+def test_enrich_stage_persists_canonical_prompt_from_numbered_provider_output(monkeypatch) -> None:
+    subject = Subject(
+        id="subject-1",
+        script_id="script-1",
+        name="主角",
+        type="character",
+        description="红衣角色",
+        episode_nos=[1],
+        is_child=True,
+        is_parent=False,
+    )
+    set_stage = AsyncMock()
+    monkeypatch.setattr(enrich, "set_stage", set_stage)
+
+    result = asyncio.run(
+        enrich.run_enrich(
+            _ServiceSession(_episode(), [subject]),
+            "script-1",
+            episode_id="episode-1",
+            input_version=3,
+            provider=FakeProvider(
+                [{"resolved_prompts": {"final": _numbered_twelve_sections()}}]
+            ),
+            commit=False,
+        )
+    )
+
+    assert result == 1
+    assert (
+        set_stage.await_args.kwargs["detail"]["prompts"]["subject-1"]["resolved_prompts"]["final"]
+        == _twelve_sections()
+    )
 
 
 def test_pipeline_metadata_parent_fk_attempt_uniqueness_reset_and_failure_shape() -> None:
@@ -1624,7 +1700,7 @@ def test_all_five_services_retry_invalid_provider_contracts_before_writing(monke
     asyncio.run(scenario())
 
 
-def test_provider_contract_failure_stops_after_three_attempts_without_partial_write(
+def test_provider_contract_failure_publishes_verified_extract_baseline(
     monkeypatch,
 ) -> None:
     provider = FakeProvider([{"invalid": True}] * 3)
@@ -1635,19 +1711,427 @@ def test_provider_contract_failure_stops_after_three_attempts_without_partial_wr
     monkeypatch.setattr(merge, "set_stage", set_stage)
 
     async def scenario() -> None:
+        assert await merge.run_merge(
+            _ServiceSession(_episode()),
+            "script-1",
+            episode_id="episode-1",
+            input_version=3,
+            provider=provider,
+        ) == 0
+        replace.assert_awaited_once_with(ANY, "script-1", [])
+        assert set_stage.await_args.kwargs["status"] == "done"
+        assert set_stage.await_args.kwargs["detail"]["merge_mode"] == "extract_fallback"
+
+    asyncio.run(scenario())
+
+
+def test_provider_contract_diagnostic_is_structured_and_never_echoes_payload() -> None:
+    sentinel = "模型原文不得出现在诊断中"
+    provider = FakeProvider(
+        [
+            {"schema_version": "pipeline.v1", "subjects": sentinel},
+            {"schema_version": "pipeline.v1", "subjects": sentinel},
+            {"schema_version": "pipeline.v1", "subjects": sentinel},
+        ]
+    )
+
+    async def scenario() -> None:
         with pytest.raises(pipeline_contracts.ProviderContractError) as exc_info:
-            await merge.run_merge(
-                _ServiceSession(_episode()),
-                "script-1",
-                episode_id="episode-1",
-                input_version=3,
-                provider=provider,
-            )
+            await pipeline_contracts.complete_json(provider, "system", "user", ExtractOutput)
+        diagnostic = exc_info.value.diagnostic
+        assert diagnostic == {
+            "version": 1,
+            "category": "schema_validation",
+            "schema": "ExtractOutput",
+            "validation": {
+                "error_count": 1,
+                "codes": ["list_type"],
+                "paths": ["subjects"],
+            },
+        }
+        assert sentinel not in repr(diagnostic)
         failure = PipelineFailure.from_exception(exc_info.value)
-        assert failure.to_dict()["error_type"] == "provider_contract_error"
-        assert failure.to_dict()["retryable"] is False
-        replace.assert_not_awaited()
-        set_stage.assert_not_awaited()
+        assert failure.to_dict()["diagnostic"] == diagnostic
+
+    asyncio.run(scenario())
+
+
+def test_provider_json_failure_preserves_only_response_shape_diagnostic() -> None:
+    from app.providers.llm import LLMJSONResponseError
+
+    class InvalidJsonProvider:
+        async def complete_json(self, system: str, user: str) -> dict:
+            raise LLMJSONResponseError("invalid_json", kind="text", content_length=512)
+
+    async def scenario() -> None:
+        with pytest.raises(pipeline_contracts.ProviderContractError) as exc_info:
+            await pipeline_contracts.complete_json(
+                InvalidJsonProvider(), "system", "user", ExtractOutput
+            )
+        diagnostic = exc_info.value.diagnostic
+        assert diagnostic == {
+            "version": 1,
+            "category": "invalid_json",
+            "schema": "ExtractOutput",
+            "response": {
+                "kind": "text",
+                "length_bucket": "129_2048",
+                "top_level_kind": "invalid_json",
+            },
+        }
+        assert PipelineFailure.from_exception(exc_info.value).to_dict()["diagnostic"] == diagnostic
+
+    asyncio.run(scenario())
+
+
+def test_merge_supplements_missing_entities_with_verifiable_script_evidence(
+    monkeypatch,
+) -> None:
+    episode = _episode()
+    episode.script_text = "保安拿着手电筒走进仓库，警报声响起。"
+    extract_stage = SimpleNamespace(
+        detail={
+            "episodes": [
+                {
+                    "episode_no": 1,
+                    "subjects": [
+                        {
+                            "name": "保安",
+                            "type": "character",
+                            "description": "穿制服的保安",
+                            "episode_nos": [1],
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+
+    class MergeSession(_ServiceSession):
+        def __init__(self) -> None:
+            super().__init__(episode)
+            self.calls = 0
+
+        async def execute(self, statement):
+            self.calls += 1
+            return _RowsResult([episode] if self.calls == 1 else [])
+
+    provider = FakeProvider(
+        [
+            {
+                "merged_subjects": [
+                    {
+                        "name": "保安",
+                        "type": "character",
+                        "description": "穿制服的保安",
+                        "is_child": True,
+                        "episode_nos": [1],
+                    }
+                ],
+                "supplemental_subjects": [
+                    {
+                        "name": "仓库-内-未知",
+                        "type": "scene",
+                        "description": "昏暗仓库",
+                        "is_child": True,
+                        "episode_nos": [1],
+                        "evidence": [{"episode_no": 1, "quote": "走进仓库"}],
+                    },
+                    {
+                        "name": "手电筒",
+                        "type": "prop",
+                        "description": "保安手持的照明工具",
+                        "is_child": True,
+                        "episode_nos": [1],
+                        "evidence": [{"episode_no": 1, "quote": "手电筒"}],
+                    },
+                    {
+                        "name": "警报声",
+                        "type": "sound",
+                        "description": "仓库中响起的警报音效",
+                        "is_child": True,
+                        "episode_nos": [1],
+                        "evidence": [{"episode_no": 1, "quote": "警报声响起"}],
+                    },
+                ],
+                "total_count": 4,
+            }
+        ]
+    )
+    persist = AsyncMock()
+    replace = AsyncMock()
+    monkeypatch.setattr(merge, "get_stage", AsyncMock(return_value=extract_stage))
+    monkeypatch.setattr(merge.asset_crud, "persist_subject_suggestions", persist)
+    monkeypatch.setattr(merge, "replace_subjects", replace)
+    monkeypatch.setattr(merge, "set_stage", AsyncMock())
+
+    async def scenario() -> None:
+        assert await merge.run_merge(MergeSession(), "script-1", provider=provider) == 4
+        merged_subjects = replace.await_args.args[2]
+        assert {item["type"] for item in merged_subjects} == {
+            "character",
+            "scene",
+            "prop",
+            "sound",
+        }
+        assert all("evidence" not in item for item in merged_subjects)
+
+    asyncio.run(scenario())
+
+
+def test_merge_discards_supplemental_subject_without_verifiable_evidence(monkeypatch) -> None:
+    episode = _episode()
+    episode.script_text = "保安走进仓库。"
+    extract_stage = SimpleNamespace(detail={"episodes": [{"episode_no": 1, "subjects": []}]})
+
+    class MergeSession(_ServiceSession):
+        def __init__(self) -> None:
+            super().__init__(episode)
+
+        async def execute(self, statement):
+            return _RowsResult([episode])
+
+    payload = {
+        "merged_subjects": [],
+        "supplemental_subjects": [
+            {
+                "name": "不存在的道具",
+                "type": "prop",
+                "description": "不应被接受",
+                "is_child": True,
+                "episode_nos": [1],
+                "evidence": [{"episode_no": 1, "quote": "不存在的证据"}],
+            }
+        ],
+        "total_count": 1,
+    }
+    replace = AsyncMock()
+    monkeypatch.setattr(merge, "get_stage", AsyncMock(return_value=extract_stage))
+    monkeypatch.setattr(merge, "replace_subjects", replace)
+    monkeypatch.setattr(merge.asset_crud, "persist_subject_suggestions", AsyncMock())
+    monkeypatch.setattr(merge, "_prepare_staged_subjects", AsyncMock(return_value=[]))
+    monkeypatch.setattr(merge, "set_stage", AsyncMock())
+
+    async def scenario() -> None:
+        assert await merge.run_merge(
+            MergeSession(),
+            "script-1",
+            provider=FakeProvider([payload]),
+        ) == 0
+        assert replace.await_args.args[2] == []
+
+    asyncio.run(scenario())
+
+
+def test_merge_publishes_baseline_when_supplemental_payload_is_invalid(monkeypatch) -> None:
+    """补漏字段失真时，已提取的基础主体仍必须发布。"""
+    extract_stage = SimpleNamespace(
+        detail={
+            "episodes": [
+                {
+                    "episode_no": 1,
+                    "subjects": [
+                        {
+                            "name": "保安",
+                            "type": "character",
+                            "description": "穿制服的保安",
+                            "episode_nos": [1],
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+    replace = AsyncMock()
+    monkeypatch.setattr(merge, "get_stage", AsyncMock(return_value=extract_stage))
+    monkeypatch.setattr(merge, "replace_subjects", replace)
+    monkeypatch.setattr(merge.asset_crud, "persist_subject_suggestions", AsyncMock())
+    monkeypatch.setattr(merge, "set_stage", AsyncMock())
+
+    class Provider:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def complete_json(self, system: str, user: str) -> dict:
+            self.calls += 1
+            return {
+                "schema_version": "pipeline.v1",
+                "merged_subjects": [
+                    {
+                        "name": "保安",
+                        "type": "character",
+                        "description": "穿制服的保安",
+                        "is_child": True,
+                        "episode_nos": [1],
+                    }
+                ],
+                "supplemental_subjects": [{"name": "不完整补漏"}],
+                "total_count": 2,
+            }
+
+    provider = Provider()
+
+    async def scenario() -> None:
+        assert await merge.run_merge(
+            _ServiceSession(_episode()),
+            "script-1",
+            episode_id="episode-1",
+            input_version=3,
+            provider=provider,
+            provider_attempt=3,
+        ) == 1
+        assert provider.calls == 1
+        assert [item["name"] for item in replace.await_args.args[2]] == ["保安"]
+
+    asyncio.run(scenario())
+
+
+def test_subject_catalog_state_marks_previous_subjects_stale_after_extract_failure() -> None:
+    jobs = [
+        SimpleNamespace(stage=stage, status="done", attempt=1)
+        for stage in STAGE_ORDER
+    ]
+    state, failure_stage, error_type = pipeline_catalog._run_state(
+        pipeline_catalog._latest_stage_jobs(jobs)
+    )
+    assert (state, failure_stage, error_type) == ("current", None, None)
+
+    failed_jobs = [
+        SimpleNamespace(
+            stage=stage,
+            status="failed" if stage == "extract" else "pending",
+            attempt=1,
+            error_type="provider_contract_error" if stage == "extract" else None,
+        )
+        for stage in STAGE_ORDER
+    ]
+    state, failure_stage, error_type = pipeline_catalog._run_state(
+        pipeline_catalog._latest_stage_jobs(failed_jobs)
+    )
+    assert (state, failure_stage, error_type) == (
+        "failed",
+        "extract",
+        "provider_contract_error",
+    )
+
+
+def test_subject_catalog_state_keeps_merged_subjects_current_after_leaf_failure() -> None:
+    jobs = [
+        SimpleNamespace(
+            stage=stage,
+            status="failed" if stage == "parents" else "done",
+            attempt=1,
+            error_type="invalid_pipeline_data" if stage == "parents" else None,
+            output_json={"subjects_published": True} if stage == "merge" else None,
+        )
+        for stage in STAGE_ORDER
+    ]
+
+    state, failure_stage, error_type = pipeline_catalog._run_state(
+        pipeline_catalog._latest_stage_jobs(jobs)
+    )
+
+    assert (state, failure_stage, error_type) == (
+        "current",
+        "parents",
+        "invalid_pipeline_data",
+    )
+
+
+def test_subject_catalog_waits_for_unpublished_legacy_merge() -> None:
+    jobs = [
+        SimpleNamespace(
+            stage=stage,
+            status="ready" if stage in {"enrich", "parents"} else "done",
+            attempt=1,
+            output_json={"subjects": []} if stage == "merge" else None,
+        )
+        for stage in STAGE_ORDER
+    ]
+
+    state, failure_stage, error_type = pipeline_catalog._run_state(
+        pipeline_catalog._latest_stage_jobs(jobs)
+    )
+
+    assert (state, failure_stage, error_type) == ("processing", None, None)
+
+
+def test_subject_catalog_marks_published_merge_with_skipped_leaves_superseded() -> None:
+    jobs = [
+        SimpleNamespace(
+            stage=stage,
+            status="skipped" if stage in {"enrich", "parents"} else "done",
+            attempt=1,
+            output_json={"subjects_published": True} if stage == "merge" else None,
+        )
+        for stage in STAGE_ORDER
+    ]
+
+    state, failure_stage, error_type = pipeline_catalog._run_state(
+        pipeline_catalog._latest_stage_jobs(jobs)
+    )
+
+    assert (state, failure_stage, error_type) == ("superseded", None, None)
+
+
+def test_breakdown_hides_stale_subjects_after_latest_pipeline_failure(monkeypatch) -> None:
+    episode = SimpleNamespace(
+        episode_id="episode-1",
+        script_id="script-1",
+        episode_no=1,
+        title="第一集",
+        script_text="正文",
+        script_file_storage_key=None,
+        schema_version=1,
+        episode_version=1,
+        client_save_seq=0,
+        created_at=datetime(2026, 1, 1, tzinfo=UTC),
+        updated_at=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+    subject = SimpleNamespace(
+        id="old-subject",
+        type="character",
+        name="旧角色",
+        description="不应伪装成本轮结果",
+        is_child=True,
+        episode_nos=[1],
+    )
+    catalog_state = {
+        "state": "failed",
+        "is_current": False,
+        "latest_run_id": "failed-run",
+        "published_run_id": "previous-run",
+        "failure_stage": "extract",
+        "error_type": "provider_contract_error",
+        "stale_subject_count": 1,
+    }
+    monkeypatch.setattr(scripts_api.script_crud, "get_script", AsyncMock(return_value=object()))
+    monkeypatch.setattr(scripts_api, "check_script_access", AsyncMock())
+    monkeypatch.setattr(
+        scripts_api.script_crud,
+        "get_breakdown",
+        AsyncMock(
+            return_value={
+                "episode": episode,
+                "subjects": [subject],
+                "shots": [],
+                "shot_groups": [],
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        scripts_api,
+        "get_subject_catalog_state",
+        AsyncMock(return_value=catalog_state),
+    )
+
+    async def scenario() -> None:
+        result = await scripts_api.get_breakdown(
+            "script-1", "episode-1", db=object(), user=SimpleNamespace()
+        )
+        assert result.subjects == []
+        assert result.subject_catalog.state == "failed"
+        assert result.subject_catalog.stale_subject_count == 1
 
     asyncio.run(scenario())
 
@@ -1792,6 +2276,52 @@ def test_split_derived_write_does_not_increment_other_episode_user_version(monke
             assert refreshed.script_text == "用户版本"
             assert refreshed.episode_version == 5
             assert refreshed.client_save_seq == 4
+
+    asyncio.run(scenario())
+
+
+def test_split_skips_llm_when_saving_an_existing_episode(monkeypatch) -> None:
+    """多集剧本保存单集不能把该集正文重新当作完整剧本拆分。"""
+    episode_one = SimpleNamespace(
+        episode_id="episode-1",
+        script_id="script-1",
+        episode_no=1,
+        title="第一集",
+        script_text="第一集正文",
+        episode_version=3,
+        client_save_seq=1,
+    )
+    episode_two = SimpleNamespace(
+        episode_id="episode-2",
+        script_id="script-1",
+        episode_no=2,
+        title="第二集",
+        script_text="第二集正文",
+        episode_version=4,
+        client_save_seq=2,
+    )
+    provider = SimpleNamespace(complete_json=AsyncMock())
+    set_stage = AsyncMock()
+    monkeypatch.setattr(split, "set_stage", set_stage)
+
+    async def scenario() -> None:
+        result = await split.run_split(
+            _ServiceSession(episode_two, [episode_one, episode_two]),
+            "script-1",
+            "episode-2",
+            input_version=4,
+            input_client_save_seq=2,
+            provider=provider,
+        )
+        assert result == 1
+        provider.complete_json.assert_not_awaited()
+        assert set_stage.await_args.kwargs["detail"] == {
+            "count": 1,
+            "mode": "single_episode",
+            "active_episode_nos": [2],
+            "input_version": 4,
+            "input_client_save_seq": 2,
+        }
 
     asyncio.run(scenario())
 
@@ -2008,7 +2538,77 @@ def test_extract_single_episode_rerun_uses_only_current_episode_and_persists_pro
     asyncio.run(scenario())
 
 
-def test_extract_rejects_subject_episode_nos_outside_current_episode(monkeypatch) -> None:
+def test_extract_full_pipeline_covers_every_episode_with_own_episode_no(monkeypatch) -> None:
+    """整剧本流水线必须将拆分出的每一集都送入主体提取。"""
+    episode_one = SimpleNamespace(
+        episode_id="episode-1",
+        script_id="script-1",
+        episode_no=1,
+        title="第一集",
+        script_text="角色甲进入办公室。",
+        episode_version=3,
+        client_save_seq=1,
+    )
+    episode_two = SimpleNamespace(
+        episode_id="episode-2",
+        script_id="script-1",
+        episode_no=2,
+        title="第二集",
+        script_text="角色乙拿着铜钥匙走进仓库。",
+        episode_version=4,
+        client_save_seq=2,
+    )
+    stage_writes: list[dict] = []
+
+    async def record_stage(db, script_id, stage, **kwargs):
+        stage_writes.append(kwargs)
+
+    monkeypatch.setattr(extract, "set_stage", record_stage)
+    provider = FakeProvider(
+        [
+            {
+                "subjects": [
+                    {
+                        "name": "角色甲",
+                        "type": "character",
+                        "description": "办公室中的人物",
+                        "is_child": True,
+                        "episode_nos": [1],
+                    }
+                ]
+            },
+            {
+                "subjects": [
+                    {
+                        "name": "铜钥匙",
+                        "type": "prop",
+                        "description": "角色乙手持的铜质钥匙",
+                        "is_child": True,
+                        "episode_nos": [2],
+                    }
+                ]
+            },
+        ]
+    )
+
+    async def scenario() -> None:
+        result = await extract.run_extract(
+            _ServiceSession(episode_one, [episode_one, episode_two]),
+            "script-1",
+            provider=provider,
+        )
+        assert [item["episode_id"] for item in result["episodes"]] == [
+            "episode-1",
+            "episode-2",
+        ]
+        assert result["episodes"][0]["subjects"][0]["episode_nos"] == [1]
+        assert result["episodes"][1]["subjects"][0]["episode_nos"] == [2]
+        assert stage_writes[-1]["total"] == 2
+
+    asyncio.run(scenario())
+
+
+def test_extract_normalizes_model_owned_episode_fields(monkeypatch) -> None:
     episode_two = SimpleNamespace(
         episode_id="episode-2",
         script_id="script-1",
@@ -2021,56 +2621,36 @@ def test_extract_rejects_subject_episode_nos_outside_current_episode(monkeypatch
     monkeypatch.setattr(extract, "set_stage", AsyncMock())
 
     async def scenario() -> None:
-        with pytest.raises(pipeline_contracts.ProviderContractError):
-            await extract.run_extract(
-                _ServiceSession(episode_two, [episode_two]),
-                "script-1",
-                episode_id="episode-2",
-                input_version=4,
-                input_client_save_seq=2,
-                provider=FakeProvider(
-                    [
-                        {
-                            "subjects": [
-                                {
-                                    "name": "串集角色",
-                                    "type": "character",
-                                    "description": "错误集号",
-                                    "is_child": True,
-                                    "episode_nos": [1, 2],
-                                }
-                            ]
-                        },
-                        {
-                            "subjects": [
-                                {
-                                    "name": "串集角色",
-                                    "type": "character",
-                                    "description": "错误集号",
-                                    "is_child": True,
-                                    "episode_nos": [1, 2],
-                                }
-                            ]
-                        },
-                        {
-                            "subjects": [
-                                {
-                                    "name": "串集角色",
-                                    "type": "character",
-                                    "description": "错误集号",
-                                    "is_child": True,
-                                    "episode_nos": [1, 2],
-                                }
-                            ]
-                        },
-                    ]
-                ),
-            )
+        result = await extract.run_extract(
+            _ServiceSession(episode_two, [episode_two]),
+            "script-1",
+            episode_id="episode-2",
+            input_version=4,
+            input_client_save_seq=2,
+            provider=FakeProvider(
+                [
+                    {
+                        "subjects": [
+                            {
+                                "name": "串集角色",
+                                "type": "character",
+                                "description": "错误集号",
+                                "is_child": "false",
+                                "episode_nos": [1, 2],
+                            }
+                        ]
+                    }
+                ]
+            ),
+            provider_attempt=1,
+        )
+        assert result["episodes"][0]["subjects"][0]["is_child"] is True
+        assert result["episodes"][0]["subjects"][0]["episode_nos"] == [2]
 
     asyncio.run(scenario())
 
 
-def test_merge_rejects_subject_episode_nos_not_seen_in_extract(monkeypatch) -> None:
+def test_merge_uses_extract_episode_nos_when_model_returns_wrong_values(monkeypatch) -> None:
     extract_stage = SimpleNamespace(
         detail={
             "episodes": [
@@ -2088,63 +2668,42 @@ def test_merge_rejects_subject_episode_nos_not_seen_in_extract(monkeypatch) -> N
             ]
         }
     )
+    replace = AsyncMock()
     monkeypatch.setattr(merge, "get_stage", AsyncMock(return_value=extract_stage))
-    monkeypatch.setattr(merge, "replace_subjects", AsyncMock())
+    monkeypatch.setattr(merge, "replace_subjects", replace)
+    monkeypatch.setattr(merge.asset_crud, "persist_subject_suggestions", AsyncMock())
+    monkeypatch.setattr(merge, "set_stage", AsyncMock())
 
     async def scenario() -> None:
-        with pytest.raises(pipeline_contracts.ProviderContractError):
-            await merge.run_merge(
-                _ServiceSession(_episode()),
-                "script-1",
-                episode_id="episode-1",
-                input_version=3,
-                provider=FakeProvider(
-                    [
-                        {
-                            "merged_subjects": [
-                                {
-                                    "name": "主角",
-                                    "type": "character",
-                                    "description": "红衣角色",
-                                    "is_child": True,
-                                    "episode_nos": [1, 2],
-                                }
-                            ],
-                            "total_count": 1,
-                        },
-                        {
-                            "merged_subjects": [
-                                {
-                                    "name": "主角",
-                                    "type": "character",
-                                    "description": "红衣角色",
-                                    "is_child": True,
-                                    "episode_nos": [1, 2],
-                                }
-                            ],
-                            "total_count": 1,
-                        },
-                        {
-                            "merged_subjects": [
-                                {
-                                    "name": "主角",
-                                    "type": "character",
-                                    "description": "红衣角色",
-                                    "is_child": True,
-                                    "episode_nos": [1, 2],
-                                }
-                            ],
-                            "total_count": 1,
-                        },
-                    ]
-                ),
-            )
+        assert await merge.run_merge(
+            _ServiceSession(_episode()),
+            "script-1",
+            episode_id="episode-1",
+            input_version=3,
+            provider=FakeProvider(
+                [
+                    {
+                        "merged_subjects": [
+                            {
+                                "name": "主角",
+                                "type": "character",
+                                "description": "红衣角色",
+                                "is_child": True,
+                                "episode_nos": [1, 2],
+                            }
+                        ],
+                        "total_count": 1,
+                    }
+                ]
+            ),
+        ) == 1
+        assert replace.await_args.args[2][0]["episode_nos"] == [1]
 
     asyncio.run(scenario())
 
 
-def test_parents_rejects_parent_child_type_mismatch(monkeypatch) -> None:
-    subject = Subject(
+def test_parents_filters_cross_type_children_without_blocking_pipeline(monkeypatch) -> None:
+    character = Subject(
         id="subject-character",
         script_id="script-1",
         name="主角",
@@ -2153,31 +2712,44 @@ def test_parents_rejects_parent_child_type_mismatch(monkeypatch) -> None:
         is_child=True,
         is_parent=False,
     )
+    prop = Subject(
+        id="subject-prop",
+        script_id="script-1",
+        name="钥匙",
+        type="prop",
+        description="道具",
+        is_child=True,
+        is_parent=False,
+    )
     monkeypatch.setattr(parents, "replace_parent_subjects", AsyncMock())
+    monkeypatch.setattr(parents, "set_stage", AsyncMock())
 
     async def scenario() -> None:
-        with pytest.raises(ValueError, match="父子主体类型必须一致"):
-            await parents.run_parents(
-                _ServiceSession(_episode(), [subject]),
-                "script-1",
-                episode_id="episode-1",
-                input_version=3,
-                provider=FakeProvider(
-                    [
-                        {
-                            "parent_subjects": [
-                                {
-                                    "name": "错误父主体",
-                                    "type": "prop",
-                                    "description": "类型不一致",
-                                    "child_count": 1,
-                                    "child_ids": ["subject-character"],
-                                }
-                            ]
-                        }
-                    ]
-                ),
-            )
+        result = await parents.run_parents(
+            _ServiceSession(_episode(), [character, prop]),
+            "script-1",
+            episode_id="episode-1",
+            input_version=3,
+            provider=FakeProvider(
+                [
+                    {
+                        "parent_subjects": [
+                            {
+                                "name": "主角相关主体",
+                                "type": "character",
+                                "description": "模型错误混入了道具",
+                                "child_count": 2,
+                                "child_ids": ["subject-character", "subject-prop"],
+                            }
+                        ]
+                    }
+                ]
+            ),
+        )
+
+        assert result == 0
+        published = parents.replace_parent_subjects.await_args.args[2]
+        assert published == []
 
     asyncio.run(scenario())
 
@@ -2288,7 +2860,11 @@ def test_openai_provider_uses_one_external_call_per_schema_attempt(monkeypatch) 
     provider._model = "fake"
 
     async def scenario() -> None:
-        assert await provider.complete_json("system", "user") == {}
+        from app.providers.llm import LLMJSONResponseError
+
+        with pytest.raises(LLMJSONResponseError) as exc_info:
+            await provider.complete_json("system", "user")
+        assert exc_info.value.diagnostic["category"] == "invalid_json"
         assert completions.calls == 1
 
     asyncio.run(scenario())
@@ -2388,6 +2964,8 @@ def test_worker_duplicate_stage_passes_context_so_pending_downstream_can_resume(
         assert propagated == "script-1"
         assert service.await_count == 2
         assert finish.await_count == 2
+        assert service.await_args_list[0].kwargs["episode_id"] == "episode-1"
+        assert "episode_id" not in service.await_args_list[1].kwargs
 
     asyncio.run(scenario())
 
@@ -3193,7 +3771,7 @@ def test_explicit_celery_retry_creates_new_immutable_attempt() -> None:
     asyncio.run(scenario())
 
 
-def test_run_scoped_merge_stages_subjects_without_publishing(monkeypatch) -> None:
+def test_run_scoped_merge_publishes_subjects_before_leaf_stages(monkeypatch) -> None:
     async def scenario() -> None:
         extract_output = {
             "episodes": [
@@ -3225,6 +3803,8 @@ def test_run_scoped_merge_stages_subjects_without_publishing(monkeypatch) -> Non
             }
         ]
         publish = AsyncMock()
+        persist = AsyncMock()
+        clear_parents = AsyncMock()
         stage = AsyncMock()
         monkeypatch.setattr(
             merge, "get_run_stage_output", AsyncMock(return_value=extract_output)
@@ -3233,6 +3813,8 @@ def test_run_scoped_merge_stages_subjects_without_publishing(monkeypatch) -> Non
             merge, "_prepare_staged_subjects", AsyncMock(return_value=staged)
         )
         monkeypatch.setattr(merge, "replace_subjects", publish)
+        monkeypatch.setattr(merge.asset_crud, "persist_subject_suggestions", persist)
+        monkeypatch.setattr(merge, "replace_parent_subjects", clear_parents)
         monkeypatch.setattr(merge, "set_stage", stage)
 
         result = await merge.run_merge(
@@ -3259,8 +3841,19 @@ def test_run_scoped_merge_stages_subjects_without_publishing(monkeypatch) -> Non
             ),
         )
 
-        assert result == {"count": 1, "subjects": staged}
-        publish.assert_not_awaited()
+        assert result == {
+            "count": 1,
+            "subjects": staged,
+            "subjects_published": True,
+        }
+        persist.assert_awaited_once_with(
+            ANY,
+            "script-1",
+            staged,
+            source_run_id="run-1",
+        )
+        publish.assert_awaited_once_with(ANY, "script-1", staged)
+        clear_parents.assert_awaited_once_with(ANY, "script-1", [])
         assert stage.await_args.kwargs["detail"]["count"] == 1
 
     asyncio.run(scenario())
@@ -3429,7 +4022,7 @@ def test_finalizer_settles_once_before_marking_both_leaf_jobs_done(monkeypatch) 
                     status="done",
                     input_version=3,
                     attempt=1,
-                    output_json={"subjects": []},
+                    output_json={"subjects_published": True},
                 )
             )
             for stage in ("enrich", "parents"):
@@ -3468,7 +4061,6 @@ def test_finalizer_settles_once_before_marking_both_leaf_jobs_done(monkeypatch) 
             )
             monkeypatch.setattr(pipeline_worker, "_mark_stage", mark_stage)
             monkeypatch.setattr(pipeline_worker, "_settle_pipeline", settle)
-            monkeypatch.setattr(pipeline_worker, "replace_subjects", AsyncMock())
             monkeypatch.setattr(pipeline_worker, "replace_parent_subjects", AsyncMock())
 
             assert await pipeline_worker.finalize_pipeline_jobs(
@@ -3677,6 +4269,10 @@ def test_finalizer_uses_latest_immutable_leaf_attempt(monkeypatch) -> None:
                 )
             ).all()
             assert dict(latest_statuses) == {"enrich": "done", "parents": "done"}
+            merge_output = raw_session.execute(
+                select(PipelineJob.output_json).where(PipelineJob.id == "job-merge-latest")
+            ).scalar_one()
+            assert merge_output == {"subjects": []}
 
     asyncio.run(scenario())
 

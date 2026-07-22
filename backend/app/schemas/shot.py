@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 # ---------------------------------------------------------------------------
 # 基础出参
@@ -157,6 +157,23 @@ class VideoWorkbenchOut(BaseModel):
     scenes: list[SceneWorkbenchOut] = Field(default_factory=list)
 
 
+class ShotGroupMergeIn(BaseModel):
+    """把连续分镜合并为新镜头组。"""
+
+    shot_ids: list[str] = Field(..., min_length=2, max_length=5)
+    expected_episode_version: int = Field(..., ge=1)
+
+    @field_validator("shot_ids")
+    @classmethod
+    def validate_shot_ids(cls, values: list[str]) -> list[str]:
+        normalised = [value.strip() for value in values]
+        if any(not value or len(value) > 36 for value in normalised):
+            raise ValueError("shot_ids 包含非法镜头 ID")
+        if len(set(normalised)) != len(normalised):
+            raise ValueError("shot_ids 不得重复")
+        return normalised
+
+
 # ---------------------------------------------------------------------------
 # Cover — GET /shots/<script_id>/cover
 # ---------------------------------------------------------------------------
@@ -237,6 +254,7 @@ __all__ = [
     "ShotGroupWorkbenchOut",
     "SceneWorkbenchOut",
     "VideoWorkbenchOut",
+    "ShotGroupMergeIn",
     "CoverOut",
     "GenerateStoryboardResponse",
     "StoryboardStatusOut",

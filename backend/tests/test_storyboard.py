@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import logging
+import traceback
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -141,7 +143,10 @@ def test_storyboard_contract_rejects_empty_scene_groups_and_empty_global_product
         (lambda p: p["scenes"][0].update(scene_no=2), "scene_no"),
         (lambda p: p["scenes"][0]["shot_groups"][0].update(group_no="G2"), "group_no"),
         (lambda p: p["scenes"][0]["shot_groups"][0].update(duration_seconds=16), "duration"),
+        (lambda p: p["scenes"][0]["shot_groups"][0]["shots"][1].update(display_no=3), "display_no"),
         (lambda p: p["scenes"][0]["shot_groups"][0]["shots"][1].update(start_seconds=4), "continuous"),
+        (lambda p: p["scenes"][0]["shot_groups"][0]["shots"][0].update(start_seconds=0.5), "start_seconds"),
+        (lambda p: p["scenes"][0]["shot_groups"][0]["shots"][0].update(end_seconds=0), "greater"),
         (lambda p: p["scenes"][0]["shot_groups"][0]["shots"][0].update(characters=["外部角色"]), "subject"),
         (lambda p: p["scenes"][0]["shot_groups"][0]["shots"][0].update(description="自由发挥"), "description"),
         (lambda p: p["scenes"][0]["shot_groups"][0]["shots"][0].update(shot_line="镜头1 0-3"), "shot_line"),
@@ -201,7 +206,92 @@ async def test_storyboard_llm_call_uses_shared_provider_factory(monkeypatch) -> 
     assert await storyboard_service._call_llm("system", "user") == {"scenes": []}
 
 
+async def test_storyboard_retries_invalid_contract_within_one_job(monkeypatch) -> None:
+    from app.services import storyboard as storyboard_service
+
+    invalid_display_no = _valid_storyboard_payload()
+    invalid_display_no["scenes"][0]["shot_groups"][0]["shots"][1]["display_no"] = 3
+    invalid_fractional_time = _valid_storyboard_payload()
+    invalid_fractional_time["scenes"][0]["shot_groups"][0]["shots"][0]["end_seconds"] = 2.5
+    call_llm = AsyncMock(
+        side_effect=[
+            invalid_display_no,
+            invalid_fractional_time,
+            _valid_storyboard_payload(),
+        ]
+    )
+    monkeypatch.setattr(storyboard_service, "_call_llm", call_llm)
+
+    contract = await storyboard_service._call_llm_with_contract(
+        "system",
+        "user",
+        _subject_catalog(),
+    )
+
+    assert contract.scenes[0].shot_groups[0].shots[1].display_no == 2
+    assert call_llm.await_count == 3
+
+
+async def test_storyboard_contract_exhaustion_redacts_provider_payload(
+    monkeypatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from app.schemas.pipeline_contracts import ProviderContractError
+    from app.services import storyboard as storyboard_service
+
+    sensitive_sentinel = "STORYBOARD_PRIVATE_DIALOGUE_92f5c4c7"
+    invalid_payload = _valid_storyboard_payload()
+    invalid_payload["scenes"][0]["shot_groups"][0]["shots"][0][
+        "start_seconds"
+    ] = sensitive_sentinel
+    call_llm = AsyncMock(return_value=invalid_payload)
+    monkeypatch.setattr(storyboard_service, "_call_llm", call_llm)
+    caplog.set_level(logging.WARNING, logger=storyboard_service.__name__)
+
+    with pytest.raises(ProviderContractError) as exc_info:
+        await storyboard_service._call_llm_with_contract(
+            "system",
+            "user",
+            _subject_catalog(),
+        )
+
+    assert call_llm.await_count == 3
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+    assert sensitive_sentinel not in "".join(traceback.format_exception(exc_info.value))
+    assert sensitive_sentinel not in caplog.text
+    assert [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == storyboard_service.__name__
+    ] == [
+        "分镜 Provider 第 1/3 次响应未通过契约",
+        "分镜 Provider 第 2/3 次响应未通过契约",
+        "分镜 Provider 第 3/3 次响应未通过契约",
+    ]
+
+
+def test_storyboard_prompt_and_response_schema_require_integer_continuous_timing() -> None:
+    from app.services import storyboard as storyboard_service
+
+    assert "display_no 必须严格为 1, 2, ..., N" in storyboard_service._SYSTEM_PROMPT
+    assert "所有时间字段只能使用整数秒" in storyboard_service._SYSTEM_PROMPT
+    user_prompt = storyboard_service._build_user_prompt(
+        SimpleNamespace(episode_no=1, title="第一集", script_text="剧情"),
+        [],
+    )
+    assert '"display_no": 2' in user_prompt
+    assert '"start_seconds": 4' in user_prompt
+    assert '"end_seconds": 7' in user_prompt
+    shot_properties = storyboard_service._RESPONSE_SCHEMA["properties"]["scenes"]["items"][
+        "properties"
+    ]["shot_groups"]["items"]["properties"]["shots"]["items"]["properties"]
+    assert shot_properties["start_seconds"] == {"type": "integer", "minimum": 0}
+    assert shot_properties["end_seconds"] == {"type": "integer", "minimum": 0}
+
+
 async def test_invalid_provider_contract_does_not_delete_old_storyboard(monkeypatch) -> None:
+    from app.schemas.pipeline_contracts import ProviderContractError
     from app.services import storyboard as storyboard_service
 
     episode = SimpleNamespace(
@@ -241,12 +331,14 @@ async def test_invalid_provider_contract_does_not_delete_old_storyboard(monkeypa
         add=lambda _: None,
     )
     cleanup = AsyncMock()
-    monkeypatch.setattr(storyboard_service, "_call_llm", AsyncMock(return_value={"scenes": []}))
+    call_llm = AsyncMock(return_value={"scenes": []})
+    monkeypatch.setattr(storyboard_service, "_call_llm", call_llm)
     monkeypatch.setattr(storyboard_service, "_cleanup_existing_storyboard", cleanup)
 
-    with pytest.raises(ValueError):
+    with pytest.raises(ProviderContractError):
         await storyboard_service.generate_storyboard(db, "script-1", "episode-1", expected_episode_version=7)
 
+    assert call_llm.await_count == 3
     cleanup.assert_not_awaited()
     db.flush.assert_not_awaited()
 

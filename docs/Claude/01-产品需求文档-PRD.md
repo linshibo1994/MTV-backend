@@ -339,7 +339,7 @@
 
 | 模型标识 | 对应模型 | 用途 |
 |---|---|---|
-| banana-2 | Google Nano Banana (Gemini 2.5 Flash Image) | 主体参考图 |
+| banana-2 | Google Nano Banana (Gemini 3.1 Flash Image) | 主体参考图 |
 | gpt-image-2 | GPT Image 2 (OpenAI) | 主体参考图 / 宣传图/海报/封面 |
 
 **图片资产元数据 — GET /v3api/materials/&lt;mid&gt;/image/&lt;image_id&gt;:**

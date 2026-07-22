@@ -349,6 +349,7 @@ async def get_pipeline_status(db: AsyncSession, script_id: str) -> dict:
                 "detail": row.detail,
                 "current": row.current,
                 "total": row.total,
+                "error": row.error,
             }
         )
         statuses.append(row.status)

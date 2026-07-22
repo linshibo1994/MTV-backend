@@ -50,6 +50,7 @@ from app.models.materials import Materials
 from app.models.subject import Subject
 from app.models.task_dispatch_outbox import TaskDispatchOutbox
 from app.providers.image_gen import ImageResult, get_image_provider
+from app.providers.registry import ProviderError
 from app.providers.storage import get_storage
 from app.services.credits import release as credits_release
 from app.services.credits import settle as credits_settle
@@ -61,6 +62,32 @@ from app.workers.celery_app import celery_app
 logger = logging.getLogger(__name__)
 _LEASE_SECONDS = 300
 _TERMINAL_STATUSES = {"succeeded", "failed", "canceled"}
+
+
+def _safe_log_generation_exception(
+    exc: Exception,
+    *,
+    job_id: str,
+    model: str,
+    stage: str,
+) -> None:
+    """记录可定位的堆栈，同时避免把供应商响应正文写入日志。"""
+    safe_error = RuntimeError(type(exc).__name__)
+    logger.error(
+        "生图任务异常 job_id=%s model=%s stage=%s error_class=%s",
+        job_id,
+        model,
+        stage,
+        type(exc).__name__,
+        exc_info=(RuntimeError, safe_error, exc.__traceback__),
+    )
+
+
+def _generation_error_type(exc: Exception) -> str:
+    """将可操作的配置错误与运行期供应商/存储错误分开。"""
+    if isinstance(exc, ProviderError):
+        return "provider_configuration_error"
+    return "provider_or_storage_error"
 
 
 @dataclass(frozen=True)
@@ -680,10 +707,12 @@ async def run_generation_once(
             retryable=False,
         )
         return
-    provider = provider or get_image_provider(model)
-    storage = storage or get_storage()
     generated: list[PersistedImage] = []
     try:
+        # 工厂本身也可能因 provider/storage 配置错误抛异常，必须与实际生成调用
+        # 进入同一失败清算边界，避免任务停在 processing 等待租约重投。
+        provider = provider or get_image_provider(model)
+        storage = storage or get_storage()
         if not await _job_token_is_current(db, job_id, claim.lease_token):
             return
         if not await _heartbeat_or_stop(db, job_id, claim.lease_token):
@@ -778,7 +807,13 @@ async def run_generation_once(
         try:
             await _promote_generated_objects(storage, generated)
             await db.commit()
-        except Exception:
+        except Exception as exc:
+            _safe_log_generation_exception(
+                exc,
+                job_id=job_id,
+                model=model,
+                stage="promote",
+            )
             await db.rollback()
             await _delete_generated_objects(storage, generated, db)
             await _fail_generation_with_release(
@@ -789,15 +824,22 @@ async def run_generation_once(
                 error_type="provider_or_storage_error",
                 retryable=False,
             )
-    except Exception:
+    except Exception as exc:
+        _safe_log_generation_exception(
+            exc,
+            job_id=job_id,
+            model=model,
+            stage="execute",
+        )
         await db.rollback()
-        await _delete_generated_objects(storage, generated, db)
+        if storage is not None:
+            await _delete_generated_objects(storage, generated, db)
         await _fail_generation_with_release(
             db,
             job_id,
             claim.lease_token,
             reservation_id,
-            error_type="provider_or_storage_error",
+            error_type=_generation_error_type(exc),
             retryable=False,
         )
 

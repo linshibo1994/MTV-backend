@@ -22,6 +22,11 @@ from typing import Any
 import httpx
 
 from app.core.config import settings
+from app.providers.llm import (
+    LLMJSONResponseError,
+    LLMResponseContractError,
+    require_non_empty_chat_content,
+)
 from app.providers.registry import ProviderConfigurationError
 
 _API_VERSION = "2023-06-01"
@@ -124,18 +129,28 @@ class AnthropicLLMProvider:
                 if isinstance(inp, str):
                     try:
                         parsed = json.loads(inp)
-                        return parsed if isinstance(parsed, dict) else {}
+                        if isinstance(parsed, dict):
+                            return parsed
+                        raise LLMJSONResponseError(
+                            "non_object_json", kind=type(parsed).__name__, content_length=len(inp)
+                        )
                     except json.JSONDecodeError:
-                        return {}
+                        raise LLMJSONResponseError(
+                            "invalid_json", kind="tool_input", content_length=len(inp)
+                        ) from None
         # 退化：模型未调用工具时尝试从 text 块解析 JSON
         for block in data.get("content", []):
             if block.get("type") == "text":
                 try:
                     parsed = json.loads(block.get("text", ""))
-                    return parsed if isinstance(parsed, dict) else {}
+                    if isinstance(parsed, dict):
+                        return parsed
+                    raise LLMJSONResponseError(
+                        "non_object_json", kind=type(parsed).__name__, content_length=len(block.get("text", ""))
+                    )
                 except json.JSONDecodeError:
                     continue
-        return {}
+        raise LLMJSONResponseError("invalid_json", kind="empty")
 
     async def chat(
         self,
@@ -157,12 +172,17 @@ class AnthropicLLMProvider:
             max_tokens=max_tokens,
             temperature=temperature,
         )
-        texts = [
-            block.get("text", "")
-            for block in data.get("content", [])
-            if block.get("type") == "text"
-        ]
-        return "".join(texts)
+        texts: list[str] = []
+        blocks = data.get("content", [])
+        if isinstance(blocks, list):
+            for block in blocks:
+                if not isinstance(block, dict) or block.get("type") != "text":
+                    continue
+                text = block.get("text")
+                if not isinstance(text, str):
+                    raise LLMResponseContractError
+                texts.append(text)
+        return require_non_empty_chat_content("".join(texts))
 
 
 def _normalize_messages(

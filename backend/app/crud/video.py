@@ -479,8 +479,17 @@ async def finish_video_job(
             progress_stage="succeeded",
             progress_message="视频生成完成",
         )
-    if status == "canceled":
-        values["canceled_at"] = datetime.now(UTC)
+    elif status == "failed":
+        values.update(
+            progress_stage="failed",
+            progress_message="视频生成失败",
+        )
+    elif status == "canceled":
+        values.update(
+            progress_stage="canceled",
+            progress_message="用户取消",
+            canceled_at=datetime.now(UTC),
+        )
     if output_json is not None:
         values["output_json"] = _merge_latest_video_json(
             current.output_json,

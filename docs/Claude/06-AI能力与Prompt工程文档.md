@@ -185,7 +185,7 @@ GET /v3api/scripts/<script_id>/extract-subjects-status
 
 | 模型标识 | 模型名称 | 适用场景 | 尺寸 | 比例 |
 |---------|---------|---------|------|------|
-| `banana-2` | Google Nano Banana (Gemini 2.5 Flash Image) | 主体参考图生成 (角色/场景/道具) | 2k | 16:9 |
+| `banana-2` | Google Nano Banana (Gemini 3.1 Flash Image) | 主体参考图生成 (角色/场景/道具) | 2k | 16:9 |
 | `gpt-image-2` | OpenAI GPT Image 2 | 宣传图/海报/封面/自由创作 | 2k | 16:9 |
 
 ### 3.2 主体设计图生成流程
@@ -839,7 +839,7 @@ shot_group 的 materials 字段标明引用的主体, 系统据此自动汇聚�
 
 | model 值 | 模型 | 适用场景 |
 |---------|------|---------|
-| `banana-2` | Google Nano Banana (Gemini 2.5 Flash Image) | 主体参考图 (角色/场景/道具) |
+| `banana-2` | Google Nano Banana (Gemini 3.1 Flash Image) | 主体参考图 (角色/场景/道具) |
 | `gpt-image-2` | OpenAI GPT Image 2 | 宣传图/海报/封面/自由创作 |
 
 **生图设置面板** (`[生图设置]` 按钮): 模型/尺寸/比例/风格等参数配置, 在画布右侧栏。

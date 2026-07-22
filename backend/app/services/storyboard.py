@@ -27,9 +27,12 @@ from app.models.shot import Shot
 from app.models.shot_group import ShotGroup
 from app.models.subject import Subject
 from app.models.video_generation_job import VideoGenerationJob
-from app.schemas.storyboard_contracts import validate_storyboard_contract
+from app.schemas.pipeline_contracts import ProviderContractError
+from app.schemas.storyboard_contracts import StoryboardContract, validate_storyboard_contract
 
 logger = logging.getLogger(__name__)
+
+_STORYBOARD_CONTRACT_MAX_ATTEMPTS = 3
 
 
 # ---------------------------------------------------------------------------
@@ -97,12 +100,13 @@ Episode (集) -> Scene (场景, 按背景主体聚合) -> Shot Group (镜头组,
 
 ### Shot (镜头)
 - 每镜头包含: content (画面内容, 自然语言) + description (摄影级结构化描述)
+- display_no: 每个镜头组内必须按 shots 数组顺序从 1 开始连续编号 (1, 2, 3...), 不得跳号或重复; 新镜头组重新从 1 开始
 - description 必须严格使用模板: "在【{背景}】中采用【{机位}】拍摄视角，画面主体【{角色}】的关键动作是【{动作}】，整体表现的画面是【{画面}】，表达了【{情绪}】，整体画面的光影效果是【{光影}】，整个镜头的叙事目的是【{叙事目的}】。"
 - shot_line: 该镜头在组合 prompt 中的单行, 格式 "【镜头N:起s～止s】场景是{场景}，{景别}·{机位}，{运镜}，{光影}，{画面动作}，{情绪}，{角色名}:{台词}"
 - 景别可选: 全景/中景/近景/特写/俯拍特写
 - 机位可选: 平视/俯拍/仰拍/侧拍
 - 运镜可选: 固定/推轨/拉轨/摇镜/跟拍
-- start_seconds / end_seconds: 该镜头在镜头组内的时间区间
+- start_seconds / end_seconds: 该镜头在镜头组内的非负整数秒时间区间, 禁止小数
 - characters: 出场角色名列表
 - dialogue_character: 有台词的角色名 (如有)
 - props: 该镜头出现的道具主体名列表 (引用主体列表中的 prop 类型, 无则空数组)
@@ -110,10 +114,14 @@ Episode (集) -> Scene (场景, 按背景主体聚合) -> Shot Group (镜头组,
 
 ## 关键规则
 1. 引用的主体名必须来自提供的主体列表
-2. 一个镜头组通常 2~5 个镜头, 总时长 3~10 秒
-3. 时间段连续: 镜头1: 0~4s, 镜头2: 4~7s...
-4. description 的背景场景、角色、光影等需与剧本内容贴合
-5. 只输出 JSON, 不要任何额外文本
+2. 一个镜头组必须包含 2~5 个镜头, 总时长 3~15 秒
+3. 每组 display_no 必须严格为 1, 2, ..., N, 与 shots 数组顺序一致
+4. 每组首镜头 start_seconds 必须为 0; 后续镜头 start_seconds 必须等于前一镜头 end_seconds
+5. end_seconds 必须严格大于 start_seconds, 最后一个 end_seconds 必须等于 duration_seconds
+6. 所有时间字段只能使用整数秒, 例如 0、3、7; 禁止 2.5 等小数
+7. shot_line 中的镜头编号和起止秒数必须与 display_no/start_seconds/end_seconds 完全一致
+8. description 的背景场景、角色、光影等需与剧本内容贴合
+9. 只输出 JSON, 不要任何额外文本
 """
 
 
@@ -160,6 +168,13 @@ def _build_user_prompt(episode: Episode, subjects: list[Subject]) -> str:
 ## 可引用的主体列表
 {subject_block}
 
+## 输出前自检
+- 每个 Scene 的 scene_no 从 1 连续递增
+- 每个 Scene 内的 group_no 从 G1 连续递增
+- 每个 Shot Group 内的 display_no 从 1 连续递增, 不跳号、不重复
+- start_seconds/end_seconds 只能是非负整数; 首镜头从 0 开始, 相邻区间首尾相接
+- 每个镜头必须满足 end_seconds > start_seconds, 末镜头 end_seconds 等于 duration_seconds
+
 ## 输出 JSON 格式
 {{
   "scenes": [
@@ -183,6 +198,18 @@ def _build_user_prompt(episode: Episode, subjects: list[Subject]) -> str:
               "dialogue_character": "有台词的角色名 (无则为空字符串)",
               "props": ["道具主体名1"],
               "sounds": ["声音主体名1"]
+            }},
+            {{
+              "display_no": 2,
+              "content": "下一镜头画面内容 (自然语言)",
+              "description": "在【背景】中采用【机位】拍摄视角，画面主体【角色】的关键动作是【动作】，整体表现的画面是【画面】，表达了【情绪】，整体画面的光影效果是【光影】，整个镜头的叙事目的是【叙事目的】。",
+              "shot_line": "【镜头2:4s～7s】场景是背景，中景·平视机位，固定，光影描述，画面动作，情绪，角色名:",
+              "start_seconds": 4,
+              "end_seconds": 7,
+              "characters": ["角色名1"],
+              "dialogue_character": "",
+              "props": [],
+              "sounds": []
             }}
           ]
         }}
@@ -199,30 +226,38 @@ _RESPONSE_SCHEMA: dict[str, Any] = {
     "properties": {
         "scenes": {
             "type": "array",
+            "minItems": 1,
             "items": {
                 "type": "object",
                 "properties": {
-                    "scene_no": {"type": "integer"},
+                    "scene_no": {"type": "integer", "minimum": 1},
                     "background": {"type": "string"},
                     "shot_groups": {
                         "type": "array",
+                        "minItems": 1,
                         "items": {
                             "type": "object",
                             "properties": {
                                 "group_no": {"type": "string"},
                                 "narrative_purpose": {"type": "string"},
-                                "duration_seconds": {"type": "integer"},
+                                "duration_seconds": {
+                                    "type": "integer",
+                                    "minimum": 3,
+                                    "maximum": 15,
+                                },
                                 "shots": {
                                     "type": "array",
+                                    "minItems": 2,
+                                    "maxItems": 5,
                                     "items": {
                                         "type": "object",
                                         "properties": {
-                                            "display_no": {"type": "integer"},
+                                            "display_no": {"type": "integer", "minimum": 1},
                                             "content": {"type": "string"},
                                             "description": {"type": "string"},
                                             "shot_line": {"type": "string"},
-                                            "start_seconds": {"type": "number"},
-                                            "end_seconds": {"type": "number"},
+                                            "start_seconds": {"type": "integer", "minimum": 0},
+                                            "end_seconds": {"type": "integer", "minimum": 0},
                                             "characters": {
                                                 "type": "array",
                                                 "items": {"type": "string"},
@@ -422,6 +457,28 @@ async def _call_llm(system: str, user: str) -> dict:
     return await provider.complete_json(system=system, user=user)
 
 
+async def _call_llm_with_contract(
+    system: str,
+    user: str,
+    subject_catalog: dict[str, str],
+) -> StoryboardContract:
+    """在单个分镜任务内有限重试 Provider 契约错误。"""
+    for attempt in range(1, _STORYBOARD_CONTRACT_MAX_ATTEMPTS + 1):
+        payload = await _call_llm(system, user)
+        try:
+            return validate_storyboard_contract(payload, subject_catalog)
+        except ValueError:
+            logger.warning(
+                "分镜 Provider 第 %d/%d 次响应未通过契约",
+                attempt,
+                _STORYBOARD_CONTRACT_MAX_ATTEMPTS,
+            )
+    raise ProviderContractError(
+        f"供应商响应在 {_STORYBOARD_CONTRACT_MAX_ATTEMPTS} 次总预算内"
+        "不符合 StoryboardContract 合约"
+    ) from None
+
+
 # ---------------------------------------------------------------------------
 # 主入口: generate_storyboard
 # ---------------------------------------------------------------------------
@@ -472,11 +529,10 @@ async def generate_storyboard(
     system_prompt = _SYSTEM_PROMPT
     user_prompt = _build_user_prompt(episode, subjects)
 
-    # 4. 调用 LLM
-    llm_result = await _call_llm(system_prompt, user_prompt)
-
     catalog = _subject_catalog(subjects, episode.episode_no)
-    contract = validate_storyboard_contract(llm_result, catalog)
+
+    # 4. 调用 LLM；契约失败在同一任务内最多追加两次尝试。
+    contract = await _call_llm_with_contract(system_prompt, user_prompt, catalog)
     scenes_data = contract.model_dump()["scenes"]
 
     fresh_ep_result = await db.execute(

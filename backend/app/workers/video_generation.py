@@ -45,6 +45,7 @@ from app.providers.video_gen import (
     VideoTaskCheckpointConflict,
     VideoTaskCheckpointUnavailable,
     get_video_provider,
+    sanitize_video_submit_rejection_diagnostics,
 )
 from app.workers.async_runtime import (
     WorkerAsyncRuntimeStopping,
@@ -1503,10 +1504,13 @@ async def run_video_generation_once(
             raise RuntimeError("video_job_missing_after_claim")
         input_json = job.input_json or {}
         output_json = job.output_json or {}
+        actor_user_id = job.owner_user_id
+        job_provider_key = job.provider_key
+        unit_id = job.unit_id
         script_id = getattr(job, "script_id", None)
         shot_group_id = getattr(job, "shot_group_id", None)
-        if not shot_group_id and str(job.unit_id or "").startswith("group:"):
-            shot_group_id = str(job.unit_id).removeprefix("group:") or None
+        if not shot_group_id and str(unit_id or "").startswith("group:"):
+            shot_group_id = str(unit_id).removeprefix("group:") or None
         reservation_id = job.reservation_id or input_json.get("reservation_id")
         if not await _input_version_is_current(db, job):
             await _fail_video_with_release(
@@ -1514,7 +1518,7 @@ async def run_video_generation_once(
                 job_id,
                 claim.lease_token,
                 reservation_id,
-                actor_user_id=job.owner_user_id,
+                actor_user_id=actor_user_id,
                 error_type="stale_input_version",
                 retryable=False,
             )
@@ -1522,7 +1526,7 @@ async def run_video_generation_once(
         first_frame = await _resolve_execution_first_frame(db, job, input_json)
         provider_task_id = _provider_task_id_from_job(job)
         storage_attempt_id = _storage_attempt_id(claim.lease_token)
-        provider = provider or get_video_provider(job.provider_key)
+        provider = provider or get_video_provider(job_provider_key)
         request_metadata = {"storage_attempt_id": storage_attempt_id}
         if provider_task_id:
             request_metadata["provider_task_id"] = provider_task_id
@@ -1549,7 +1553,7 @@ async def run_video_generation_once(
                 job_id,
                 claim.lease_token,
                 state=state,
-                provider_key=job.provider_key,
+                provider_key=job_provider_key,
                 attempt=claim.attempt,
             )
             if not persisted:
@@ -1644,7 +1648,7 @@ async def run_video_generation_once(
             output_json["provider_task_id"] = provider_task_id
         metrics = {
             "model": request.model,
-            "provider_key": job.provider_key,
+            "provider_key": job_provider_key,
             "reference_count": len(request.reference_images),
             **(result.metrics or {}),
         }
@@ -1656,7 +1660,7 @@ async def run_video_generation_once(
                     db,
                     reservation_id=reservation_id,
                     actual=settings.price_video_gen,
-                    actor_user_id=job.owner_user_id,
+                    actor_user_id=actor_user_id,
                     commit=False,
                 )
             except (SoftTimeLimitExceeded, TimeLimitExceeded):
@@ -1684,7 +1688,7 @@ async def run_video_generation_once(
                     job_id,
                     claim.lease_token,
                     reservation_id,
-                    actor_user_id=job.owner_user_id,
+                    actor_user_id=actor_user_id,
                     error_type="financial_cleanup",
                     retryable=True,
                 )
@@ -1693,12 +1697,12 @@ async def run_video_generation_once(
             if extract_last_frame is None:
                 last_frame_storage_key = await _update_last_frame(
                     db,
-                    job.unit_id,
+                    unit_id,
                     result.video_storage_key,
                     storage_attempt_id,
                 )
             else:
-                maybe = extract_last_frame(db, job.unit_id, result.video_storage_key, claim.lease_token)
+                maybe = extract_last_frame(db, unit_id, result.video_storage_key, claim.lease_token)
                 if hasattr(maybe, "__await__"):
                     maybe = await maybe
                 if isinstance(maybe, str):
@@ -1770,7 +1774,7 @@ async def run_video_generation_once(
                 job_id,
                 claim.lease_token,
                 reservation_id,
-                actor_user_id=job.owner_user_id,
+                actor_user_id=actor_user_id,
                 error_type="frame_extraction_failed",
                 retryable=False,
             )
@@ -1868,7 +1872,7 @@ async def run_video_generation_once(
                 state="submission_uncertain",
                 provider_key=str(
                     getattr(provider, "provider_key", "")
-                    or getattr(job, "provider_key", "")
+                    or job_provider_key
                 ),
                 attempt=claim.attempt,
             )
@@ -1886,7 +1890,8 @@ async def run_video_generation_once(
             job_id,
         )
         return
-    except VideoGenerationSubmitRejected:
+    except VideoGenerationSubmitRejected as exc:
+        diagnostics = sanitize_video_submit_rejection_diagnostics(exc.diagnostics)
         rolled_back = await _best_effort_rollback(
             db,
             job_id=job_id,
@@ -1896,13 +1901,29 @@ async def run_video_generation_once(
             raise
         provider_key = str(
             getattr(provider, "provider_key", "")
-            or getattr(job, "provider_key", "")
+            or job_provider_key
         )
         evidence = {
             "state": "submit_rejected",
             "provider_key": provider_key,
             "attempt": claim.attempt,
         }
+        logger.warning(
+            "视频远端提交被明确拒绝 job_id=%s provider_key=%s attempt=%s "
+            "status_code=%s code=%s param=%s provider_error_type=%s request_id=%s",
+            job_id,
+            provider_key,
+            claim.attempt,
+            diagnostics.get("status_code", ""),
+            diagnostics.get("code", ""),
+            diagnostics.get("param", ""),
+            diagnostics.get("type", ""),
+            diagnostics.get("request_id", ""),
+            extra={
+                "event": "video_provider_submit_rejected",
+                "provider_diagnostics": diagnostics,
+            },
+        )
         terminal_state = {"provider_submission": evidence}
         if rolled_back:
             await _mark_failed_and_release_once(

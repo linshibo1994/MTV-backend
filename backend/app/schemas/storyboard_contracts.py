@@ -24,12 +24,12 @@ SHOT_LINE_RE = re.compile(r"^【镜头(?P<n>\d+):(?P<start>\d+)s～(?P<end>\d+)s
 class StoryboardShotContract(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    display_no: int
+    display_no: int = Field(ge=1)
     content: str
     description: str
     shot_line: str
-    start_seconds: int
-    end_seconds: int
+    start_seconds: int = Field(ge=0)
+    end_seconds: int = Field(ge=0)
     characters: list[str] = Field(default_factory=list)
     dialogue_character: str = ""
     props: list[str] = Field(default_factory=list)
@@ -41,14 +41,14 @@ class StoryboardShotGroupContract(BaseModel):
 
     group_no: str
     narrative_purpose: str
-    duration_seconds: int
+    duration_seconds: int = Field(ge=3, le=15)
     shots: list[StoryboardShotContract] = Field(min_length=1)
 
 
 class StoryboardSceneContract(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    scene_no: int
+    scene_no: int = Field(ge=1)
     background: str
     shot_groups: list[StoryboardShotGroupContract] = Field(min_length=1)
 

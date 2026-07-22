@@ -216,7 +216,7 @@ T10 媒体代理 (sapi 等价) 贯穿 T5/T6/T8
 
 ### T6.3 文生图 Provider
 - [ ] `providers/image_gen.py` 抽象 `ImageGenProvider`
-- [ ] `providers/image_gen_google.py` banana-2 = Google Nano Banana (Gemini 2.5 Flash Image)，2k 16:9
+- [ ] `providers/image_gen_google.py` banana-2 = Google Nano Banana (Gemini 3.1 Flash Image)，2k 16:9
 - [ ] `providers/image_gen_openai.py` gpt-image-2 = OpenAI GPT Image 2
 - [ ] `workers/generation.py` Celery worker：读 input_json → 调 provider → 存图 (storage_key=/generate_images/<mid>/<id>.png) → 更新 imageOutputs[] → settle 积分
 - [ ] 支持生成多张选一 (imageOutputs[] + primaryImageIndex)
@@ -361,7 +361,7 @@ OPENAI_IMAGE_MODEL=gpt-image-2
 OPENAI_LLM_MODEL=gpt-4o
 
 GOOGLE_API_KEY=...
-GOOGLE_IMAGE_MODEL=gemini-2.5-flash-image  # banana-2 / Nano Banana
+GOOGLE_IMAGE_MODEL=gemini-3.1-flash-image  # banana-2 / Nano Banana
 
 VOLCENGINE_ACCESS_KEY=...   # 字节豆包 Seedance
 VOLCENGINE_SECRET_KEY=...

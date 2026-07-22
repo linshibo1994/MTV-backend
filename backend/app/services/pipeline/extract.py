@@ -5,6 +5,8 @@
 提取结果（每集主体）写入 pipeline_stage.detail 作为 merge 阶段的输入。
 """
 
+from typing import Any
+
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -44,6 +46,34 @@ _USER_TEMPLATE = """对每个主体, 生成:
   ]
 }}
 """
+
+
+class _ExtractProviderAdapter:
+    """在严格 ExtractOutput 校验前写入当前阶段可确定的字段。"""
+
+    def __init__(self, provider: Any, episode_no: int) -> None:
+        self._provider = provider
+        self._episode_no = episode_no
+
+    async def complete_json(self, system: str, user: str) -> object:
+        payload = await self._provider.complete_json(system, user)
+        if not isinstance(payload, dict):
+            return payload
+        subjects = payload.get("subjects")
+        if not isinstance(subjects, list):
+            return payload
+        normalized_payload = dict(payload)
+        normalized_subjects: list[object] = []
+        for subject in subjects:
+            if not isinstance(subject, dict):
+                normalized_subjects.append(subject)
+                continue
+            normalized_subject = dict(subject)
+            normalized_subject["is_child"] = True
+            normalized_subject["episode_nos"] = [self._episode_no]
+            normalized_subjects.append(normalized_subject)
+        normalized_payload["subjects"] = normalized_subjects
+        return normalized_payload
 
 
 async def run_extract(
@@ -91,20 +121,14 @@ async def run_extract(
         else:
             expected_episode_no = int(episode.episode_no)
 
-            def validate_current_episode(contract: ExtractOutput) -> None:
-                for subject in contract.subjects:
-                    if set(subject.episode_nos) != {expected_episode_no}:
-                        raise ValueError("extract 输出 episode_nos 必须等于当前集")
-
             contract = await complete_json(
-                provider,
+                _ExtractProviderAdapter(provider, expected_episode_no),
                 _SYSTEM,
                 _USER_TEMPLATE.format(
                     script_text=script_text, episode_no=episode.episode_no
                 ),
                 ExtractOutput,
                 durable_attempt=provider_attempt,
-                validator=validate_current_episode,
             )
             subjects = [subject.model_dump() for subject in contract.subjects]
             per_episode.append(
