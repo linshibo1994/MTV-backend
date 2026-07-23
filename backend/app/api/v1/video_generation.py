@@ -232,7 +232,8 @@ async def check_materials(
     """检查镜头组视频生成所需素材是否就绪（doc02 §5.9 工作台批量勾选前置）。
 
     返回 {missing_subjects:[...], missing_audio:[...], ready:bool}。
-    缺失主体/音频供前端标红提示，不阻断生成（缺失主体仅不进参考图）。
+    缺失主体/音频供前端标红提示；缺失参考音频可降级为模型原生声音，
+    因此不影响 ready，缺失视觉主体仍判定素材未就绪。
     资源级授权：按 script_id 校验剧本读权限。
     """
     group_result = await db.execute(
@@ -254,7 +255,7 @@ async def check_materials(
     return {
         "missing_subjects": aggregated.missing_subjects,
         "missing_audio": aggregated.missing_audio,
-        "ready": not aggregated.missing_subjects and not aggregated.missing_audio,
+        "ready": not aggregated.missing_subjects,
     }
 
 

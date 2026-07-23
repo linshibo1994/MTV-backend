@@ -1209,7 +1209,7 @@ interface ShotHierarchyOut {
 | --- | --- | --- | --- | --- |
 | `GET /v3api/video-generation/active-provider` | 登录 | 无 | `ActiveProviderOut` | 获取实际激活供应商和模型 |
 | `POST /v3api/video-generation/active-provider` | `is_admin=true` | `ActiveProviderUpdateIn` | `ActiveProviderOut` | 环境锁定模式下返回 `409` |
-| `GET /v3api/video-generation/check-materials` | READ | Query `script_id`、`shot_group_id` | `{missing_subjects,missing_audio,ready}` | `ready=false` 只提示，不阻断生成 |
+| `GET /v3api/video-generation/check-materials` | READ | Query `script_id`、`shot_group_id` | `{missing_subjects,missing_audio,ready}` | `missing_audio` 为原生声音兜底提示，不影响 `ready`；缺少视觉主体时 `ready=false` |
 | `POST /v3api/video-generation-jobs` | EDIT | Header `Idempotency-Key`；`VideoJobCreateIn` | `201 VideoJobOut` | 创建单个镜头组视频任务 |
 | `GET /v3api/video-generation-jobs` | READ | Query `script_id`、`episode_id?`、`limit=30` | `VideoJobListOut` | 创建时间倒序，含 `total` |
 | `GET /v3api/video-generation/{job_id}` | READ | 路径 ID | `VideoJobOut` | 精确状态轮询 |

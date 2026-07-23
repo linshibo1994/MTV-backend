@@ -574,7 +574,9 @@ class VolcengineVideoGenProvider:
                     "content": self._build_content(
                         prompt, image_urls, audio_urls, first_frame_url
                     ),
-                    "generate_audio": bool(audio_urls),
+                    # 参考音频是可选的声音约束，不应成为是否生成音轨的开关。
+                    # 没有参考音频时也让 Seedance 根据 Prompt 生成对白、环境音和音效。
+                    "generate_audio": True,
                     "return_last_frame": True,
                 }
                 if duration_seconds and duration_seconds > 0:

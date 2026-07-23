@@ -1372,7 +1372,15 @@ def test_volcengine_provider_builds_ark_content_with_private_media() -> None:
     ]
 
 
-def test_volcengine_provider_uses_ark_tasks_and_closes_client(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    "audio_urls",
+    [[], ["data:audio/wav;base64,YXVkaW8="]],
+    ids=["generated-audio", "reference-audio"],
+)
+def test_volcengine_provider_uses_ark_tasks_and_closes_client(
+    monkeypatch,
+    audio_urls: list[str],
+) -> None:
     async def scenario() -> None:
         from app.providers.video_gen_volcengine import VolcengineVideoGenProvider
 
@@ -1412,7 +1420,7 @@ def test_volcengine_provider_uses_ark_tasks_and_closes_client(monkeypatch) -> No
             "doubao-seedance-2-0-260128",
             "镜头提示词",
             ["data:image/png;base64,aW1hZ2U="],
-            ["data:audio/wav;base64,YXVkaW8="],
+            audio_urls,
             "data:image/jpeg;base64,ZnJhbWU=",
             lambda *args: notifications.append(args),
             duration_seconds=8,
@@ -1425,7 +1433,7 @@ def test_volcengine_provider_uses_ark_tasks_and_closes_client(monkeypatch) -> No
             "content": provider._build_content(
                 "镜头提示词",
                 ["data:image/png;base64,aW1hZ2U="],
-                ["data:audio/wav;base64,YXVkaW8="],
+                audio_urls,
                 "data:image/jpeg;base64,ZnJhbWU=",
             ),
             "duration": 8,
@@ -2013,6 +2021,52 @@ def test_check_materials_rejects_cross_script_before_aggregation(monkeypatch) ->
                 db=db,
                 user=seeded.user,
             )
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("missing_subjects", "expected_ready"),
+    [([], True), (["角色:阿明"], False)],
+)
+def test_check_materials_treats_missing_audio_as_optional_fallback(
+    monkeypatch,
+    missing_subjects: list[str],
+    expected_ready: bool,
+) -> None:
+    async def scenario() -> None:
+        from app.api.v1 import video_generation as api
+
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        db = _AsyncSessionAdapter(raw)
+        monkeypatch.setattr(
+            api,
+            "_load_and_check_script",
+            AsyncMock(return_value=seeded.script),
+        )
+        monkeypatch.setattr(
+            "app.services.reference_aggregator.aggregate_references",
+            AsyncMock(
+                return_value=SimpleNamespace(
+                    missing_subjects=missing_subjects,
+                    missing_audio=["阿明", "门响"],
+                )
+            ),
+        )
+
+        result = await api.check_materials(
+            shot_group_id=seeded.shot_group.shot_group_id,
+            script_id=seeded.script.id,
+            db=db,
+            user=seeded.user,
+        )
+
+        assert result == {
+            "missing_subjects": missing_subjects,
+            "missing_audio": ["阿明", "门响"],
+            "ready": expected_ready,
+        }
 
     asyncio.run(scenario())
 
