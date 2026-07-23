@@ -1,19 +1,29 @@
 """extract 阶段 — 主体提取（单集剧本文本 → 主体列表）。
 
 严格遵循 06 文档第 12.1 节 LLM-1 提示词骨架与输入输出契约。
-每集单独调用 LLM，逐集更新 current/total 进度。
+每集单独调用 LLM，并以有界并发执行；结果始终按集号稳定排序。
 提取结果（每集主体）写入 pipeline_stage.detail 作为 merge 阶段的输入。
 """
 
+import asyncio
+import logging
 from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.models.episode import Episode
+from app.models.pipeline_stage import PipelineStage
 from app.providers import get_llm_provider
 from app.schemas.pipeline_contracts import ExtractOutput, complete_json
-from app.services.pipeline import input_episode_is_current, set_stage
+from app.services.pipeline import (
+    commit_stage_progress,
+    input_episode_is_current,
+    set_stage,
+)
+
+logger = logging.getLogger(__name__)
 
 # ---- 提示词骨架（06 文档第 12.1 节）----
 _SYSTEM = (
@@ -46,6 +56,49 @@ _USER_TEMPLATE = """对每个主体, 生成:
   ]
 }}
 """
+
+
+def _recover_completed_episodes(
+    detail: object,
+    episode_snapshots: list[dict[str, Any]],
+    *,
+    input_version: int | None,
+    input_client_save_seq: int | None,
+) -> dict[tuple[int, str], dict[str, Any]]:
+    """从同一输入版本的检查点恢复已完成分集，避免 worker 重试时重复外呼。"""
+    if not isinstance(detail, dict):
+        return {}
+    if detail.get("input_version") != input_version:
+        return {}
+    if detail.get("input_client_save_seq") != input_client_save_seq:
+        return {}
+    checkpoint_episodes = detail.get("episodes")
+    if not isinstance(checkpoint_episodes, list):
+        return {}
+    current_by_key = {
+        (int(item["episode_no"]), str(item["episode_id"])): item
+        for item in episode_snapshots
+    }
+    recovered: dict[tuple[int, str], dict[str, Any]] = {}
+    for item in checkpoint_episodes:
+        if not isinstance(item, dict) or item.get("extract_status") != "succeeded":
+            continue
+        try:
+            key = (int(item["episode_no"]), str(item["episode_id"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+        snapshot = current_by_key.get(key)
+        subjects = item.get("subjects")
+        if snapshot is None or not isinstance(subjects, list):
+            continue
+        recovered[key] = {
+            "episode_id": snapshot["episode_id"],
+            "episode_no": snapshot["episode_no"],
+            "title": snapshot["title"],
+            "extract_status": "succeeded",
+            "subjects": subjects,
+        }
+    return recovered
 
 
 class _ExtractProviderAdapter:
@@ -96,6 +149,17 @@ async def run_extract(
     ):
         return {"episodes": []}
 
+    checkpoint_detail: object = None
+    if isinstance(db, AsyncSession):
+        checkpoint_detail = (
+            await db.execute(
+                select(PipelineStage.detail).where(
+                    PipelineStage.script_id == script_id,
+                    PipelineStage.stage == "extract",
+                )
+            )
+        ).scalar_one_or_none()
+
     query = select(Episode).where(Episode.script_id == script_id)
     if episode_id is not None:
         query = query.where(Episode.episode_id == episode_id)
@@ -103,56 +167,111 @@ async def run_extract(
     episodes = list(episodes_result.scalars().all())
     if episode_id is not None:
         episodes = [episode for episode in episodes if episode.episode_id == episode_id]
-    total = len(episodes)
+    episode_snapshots: list[dict[str, Any]] = [
+        {
+            "episode_id": episode.episode_id,
+            "episode_no": int(episode.episode_no),
+            "title": episode.title,
+            "script_text": str(episode.script_text or ""),
+        }
+        for episode in episodes
+    ]
+    # 模型调用期间不需要数据库；结束只读事务，避免长时间占用连接池。
+    if isinstance(db, AsyncSession):
+        await db.rollback()
+    total = len(episode_snapshots)
     provider = provider or get_llm_provider()
-    per_episode: list[dict] = []
-    for idx, episode in enumerate(episodes, start=1):
-        script_text = (episode.script_text or "").strip()
-        if not script_text:
-            per_episode.append(
-                {
-                    "episode_id": episode.episode_id,
-                    "episode_no": episode.episode_no,
-                    "title": episode.title,
-                    "extract_status": "succeeded",
-                    "subjects": [],
-                }
-            )
-        else:
-            expected_episode_no = int(episode.episode_no)
+    semaphore = asyncio.Semaphore(settings.pipeline_extract_concurrency)
+    progress_lock = asyncio.Lock()
+    completed = _recover_completed_episodes(
+        checkpoint_detail,
+        episode_snapshots,
+        input_version=input_version,
+        input_client_save_seq=input_client_save_seq,
+    )
+    publish_progress = isinstance(db, AsyncSession)
 
-            contract = await complete_json(
-                _ExtractProviderAdapter(provider, expected_episode_no),
-                _SYSTEM,
-                _USER_TEMPLATE.format(
-                    script_text=script_text, episode_no=episode.episode_no
-                ),
-                ExtractOutput,
-                durable_attempt=provider_attempt,
-            )
+    async def extract_episode(episode: dict[str, Any]) -> dict[str, Any]:
+        script_text = str(episode["script_text"]).strip()
+        if not script_text:
+            subjects: list[dict[str, Any]] = []
+        else:
+            expected_episode_no = int(episode["episode_no"])
+            async with semaphore:
+                contract = await complete_json(
+                    _ExtractProviderAdapter(provider, expected_episode_no),
+                    _SYSTEM,
+                    _USER_TEMPLATE.format(
+                        script_text=script_text,
+                        episode_no=expected_episode_no,
+                    ),
+                    ExtractOutput,
+                    durable_attempt=provider_attempt,
+                )
             subjects = [subject.model_dump() for subject in contract.subjects]
-            per_episode.append(
-                {
-                    "episode_id": episode.episode_id,
-                    "episode_no": episode.episode_no,
-                    "title": episode.title,
-                    "extract_status": "succeeded",
-                    "subjects": subjects,
-                }
-            )
-        await set_stage(
-            db,
-            script_id,
-            "extract",
-            status="running",
-            current=idx,
-            total=total,
-            detail={
-                "episodes": per_episode,
-                "input_version": input_version,
-                "input_client_save_seq": input_client_save_seq,
-            },
-        )
+        result = {
+            "episode_id": episode["episode_id"],
+            "episode_no": episode["episode_no"],
+            "title": episode["title"],
+            "extract_status": "succeeded",
+            "subjects": subjects,
+        }
+        if publish_progress:
+            async with progress_lock:
+                completed[(int(result["episode_no"]), str(result["episode_id"]))] = result
+                visible_episodes = [
+                    completed[key] for key in sorted(completed)
+                ]
+                try:
+                    await commit_stage_progress(
+                        script_id,
+                        "extract",
+                        status="running",
+                        current=len(visible_episodes),
+                        total=total,
+                        detail={
+                            "episodes": visible_episodes,
+                            "input_version": input_version,
+                            "input_client_save_seq": input_client_save_seq,
+                        },
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "extract 进度检查点写入失败: script_id=%s current=%s total=%s",
+                        script_id,
+                        len(visible_episodes),
+                        total,
+                        exc_info=True,
+                    )
+        return result
+
+    pending_snapshots = [
+        item
+        for item in episode_snapshots
+        if (int(item["episode_no"]), str(item["episode_id"])) not in completed
+    ]
+    newly_completed = await asyncio.gather(
+        *(extract_episode(episode) for episode in pending_snapshots)
+    )
+    for item in newly_completed:
+        completed[(int(item["episode_no"]), str(item["episode_id"]))] = item
+    per_episode = list(completed.values())
+    per_episode.sort(key=lambda item: (int(item["episode_no"]), str(item["episode_id"])))
+    # 权威业务事务只写一次完整结果；模型执行期间的可见进度已由独立短事务
+    # 检查点发布，避免在主事务中按集反复 flush。
+    await set_stage(
+        db,
+        script_id,
+        "extract",
+        status="running",
+        current=total,
+        total=total,
+        detail={
+            "episodes": per_episode,
+            "input_version": input_version,
+            "input_client_save_seq": input_client_save_seq,
+        },
+    )
     if not await input_episode_is_current(
         db,
         script_id,

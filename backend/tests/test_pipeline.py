@@ -704,19 +704,26 @@ def test_fake_provider_payloads_validate_all_five_pipeline_contracts() -> None:
     asyncio.run(validate_payloads())
 
 
-def test_invalid_prompt_and_sound_subject_are_not_visual_enrichment() -> None:
+def test_free_form_prompt_and_sound_subject_are_not_visual_enrichment() -> None:
+    contract = EnrichOutput.model_validate(
+        {
+            "schema_version": "pipeline.v1",
+            "resolved_prompts": {"final": "【形制描述】只有一段"},
+        }
+    )
+    assert contract.resolved_prompts.final == "【形制描述】只有一段"
     with pytest.raises(ValidationError):
         EnrichOutput.model_validate(
             {
                 "schema_version": "pipeline.v1",
-                "resolved_prompts": {"final": "【形制描述】只有一段"},
+                "resolved_prompts": {"final": " "},
             }
         )
     assert not should_enrich_subject("sound")
     assert should_enrich_subject("character")
 
 
-def test_enrich_contract_normalizes_numbered_prompt_and_rejects_invalid_sections() -> None:
+def test_enrich_contract_normalizes_legacy_numbering_and_accepts_free_sections() -> None:
     contract = EnrichOutput.model_validate(
         {
             "schema_version": "pipeline.v1",
@@ -724,21 +731,20 @@ def test_enrich_contract_normalizes_numbered_prompt_and_rejects_invalid_sections
         }
     )
     assert contract.resolved_prompts.final == _twelve_sections()
-    assert "不得添加 `1. `" in enrich._USER_TEMPLATE
 
-    invalid_prompts = [
+    free_prompts = [
         "\n".join(reversed(_twelve_sections().splitlines())),
         "\n".join(_twelve_sections().splitlines()[:-1]),
         _twelve_sections().replace("【材质钉死】有效内容", "【材质钉死】"),
     ]
-    for prompt in invalid_prompts:
-        with pytest.raises(ValidationError):
-            EnrichOutput.model_validate(
-                {
-                    "schema_version": "pipeline.v1",
-                    "resolved_prompts": {"final": prompt},
-                }
-            )
+    for prompt in free_prompts:
+        contract = EnrichOutput.model_validate(
+            {
+                "schema_version": "pipeline.v1",
+                "resolved_prompts": {"final": prompt},
+            }
+        )
+        assert contract.resolved_prompts.final
 
 
 def test_enrich_stage_persists_canonical_prompt_from_numbered_provider_output(monkeypatch) -> None:

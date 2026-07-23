@@ -22,15 +22,17 @@
 from fastapi import APIRouter, Depends, File, Query, UploadFile, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import noload
 
 from app.core.auth import get_current_user
 from app.core.config import settings
 from app.core.database import get_db
-from app.core.errors import ConflictError, ForbiddenError
+from app.core.errors import ConflictError, ForbiddenError, NotFoundError
 from app.core.ids import new_id
 from app.core.permissions import Action, check_script_access
 from app.crud import script as script_crud
 from app.models.episode import Episode
+from app.models.script import Script
 from app.models.user import User
 from app.providers.storage import get_storage
 from app.schemas.script import (
@@ -558,7 +560,15 @@ async def get_pipeline_status_endpoint(
     user: User = Depends(get_current_user),
 ) -> PipelineStatusOut:
     """5 阶段流水线状态 + running/failed/all_done。"""
-    script = await script_crud.get_script(db, script_id)
+    script = (
+        await db.execute(
+            select(Script)
+            .where(Script.id == script_id)
+            .options(noload("*"))
+        )
+    ).scalar_one_or_none()
+    if script is None:
+        raise NotFoundError("剧本不存在")
     await check_script_access(db, user, script, action=Action.READ)
 
     status = await get_pipeline_status(db, script_id)

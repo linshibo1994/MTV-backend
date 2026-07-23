@@ -1,20 +1,37 @@
 """上传剧本自动分析任务的运行级查询接口。"""
 
+from typing import Any
+
 from fastapi import APIRouter, Depends
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import noload
 
 from app.core.auth import get_current_user
 from app.core.database import get_db
 from app.core.errors import ConflictError, NotFoundError
 from app.core.permissions import Action, check_script_access
-from app.crud import script as script_crud
 from app.models.pipeline_job import PipelineJob
+from app.models.script import Script
 from app.models.user import User
 from app.schemas.script import AnalysisJobOut, AnalysisJobStageOut
 from app.services.pipeline import STAGE_ORDER
 
 router = APIRouter(prefix="/analysis-jobs", tags=["分析任务"])
+
+
+async def _load_access_script(db: AsyncSession, script_id: str) -> Script:
+    """只加载权限判断所需的 Script 本行，禁止默认 selectin 级联。"""
+    script = (
+        await db.execute(
+            select(Script)
+            .where(Script.id == script_id)
+            .options(noload("*"))
+        )
+    ).scalar_one_or_none()
+    if script is None:
+        raise NotFoundError("剧本不存在")
+    return script
 
 
 @router.get("/{analysis_job_id}", response_model=AnalysisJobOut)
@@ -24,39 +41,60 @@ async def get_analysis_job(
     user: User = Depends(get_current_user),
 ) -> AnalysisJobOut:
     """按运行 ID 查询上传分析任务，避免新运行覆盖旧任务的轮询视图。"""
-    jobs = list(
-        (
-            await db.execute(
-                select(PipelineJob)
-                .where(PipelineJob.run_id == analysis_job_id)
-                .order_by(PipelineJob.stage.asc(), PipelineJob.attempt.desc())
+    jobs = (
+        await db.execute(
+            select(
+                PipelineJob.script_id,
+                PipelineJob.episode_id,
+                PipelineJob.stage,
+                PipelineJob.status,
+                PipelineJob.attempt,
+                PipelineJob.error_type,
+                PipelineJob.created_at,
+                PipelineJob.updated_at,
+                PipelineJob.started_at,
+                PipelineJob.finished_at,
             )
+            .where(PipelineJob.run_id == analysis_job_id)
+            .order_by(PipelineJob.stage.asc(), PipelineJob.attempt.desc())
         )
-        .scalars()
-        .all()
-    )
+    ).all()
     if not jobs:
         raise NotFoundError("分析任务不存在")
     script_id = jobs[0].script_id
     if any(job.script_id != script_id for job in jobs):
         raise ConflictError("分析任务数据异常")
-    script = await script_crud.get_script(db, script_id)
+    script = await _load_access_script(db, script_id)
     await check_script_access(db, user, script, action=Action.READ)
 
-    latest: dict[str, PipelineJob] = {}
+    latest: dict[str, Any] = {}
     for job in jobs:
         current = latest.get(job.stage)
         if current is None or job.attempt > current.attempt:
             latest[job.stage] = job
-    stages = [
-        AnalysisJobStageOut(
-            stage=stage,
-            status=latest[stage].status,
-            error_type=latest[stage].error_type,
+    stages: list[AnalysisJobStageOut] = []
+    for stage in STAGE_ORDER:
+        if stage not in latest:
+            continue
+        job = latest[stage]
+        started_at = getattr(job, "started_at", None)
+        finished_at = getattr(job, "finished_at", None)
+        duration_ms = (
+            max(0, int((finished_at - started_at).total_seconds() * 1000))
+            if started_at is not None and finished_at is not None
+            else None
         )
-        for stage in STAGE_ORDER
-        if stage in latest
-    ]
+        stages.append(
+            AnalysisJobStageOut(
+                stage=stage,
+                status=job.status,
+                attempt=job.attempt,
+                error_type=job.error_type,
+                started_at=started_at,
+                finished_at=finished_at,
+                duration_ms=duration_ms,
+            )
+        )
     statuses = {stage.status for stage in stages}
     failed = next((stage for stage in stages if stage.status == "failed"), None)
     active = next((stage for stage in stages if stage.status in {"running", "ready"}), None)

@@ -73,10 +73,12 @@ async def _is_running(db: AsyncSession, script_id: str) -> bool:
     from app.models.pipeline_stage import PipelineStage
 
     result = await db.execute(
-        select(PipelineStage).where(
+        select(PipelineStage.id)
+        .where(
             PipelineStage.script_id == script_id,
             PipelineStage.status == "running",
         )
+        .limit(1)
     )
     return result.scalar_one_or_none() is not None
 
@@ -332,27 +334,43 @@ async def trigger_pipeline(
 
 
 async def get_pipeline_status(db: AsyncSession, script_id: str) -> dict:
-    """读取 5 阶段状态，计算 running/failed/all_done。
+    """用单次轻量列查询读取 5 阶段状态并计算聚合状态。
 
     skipped 视为非 done（被取代的链路不应让新链路误判 all_done）；
     但新链路触发会重置阶段为 pending→done，故旧链路的 skipped 不会残留。
     """
+    from app.models.pipeline_stage import PipelineStage
+
+    rows = (
+        await db.execute(
+            select(
+                PipelineStage.stage,
+                PipelineStage.status,
+                PipelineStage.detail,
+                PipelineStage.current,
+                PipelineStage.total,
+                PipelineStage.error,
+            ).where(PipelineStage.script_id == script_id)
+        )
+    ).all()
+    by_stage = {row.stage: row for row in rows}
     stages: list[dict] = []
     statuses: list[str] = []
     for stage in STAGE_ORDER:
-        row = await get_stage(db, script_id, stage)
+        row = by_stage.get(stage)
+        stage_status = row.status if row is not None else "pending"
         stages.append(
             {
                 "stage": stage,
                 "label": STAGE_LABELS.get(stage, stage),
-                "status": row.status,
-                "detail": row.detail,
-                "current": row.current,
-                "total": row.total,
-                "error": row.error,
+                "status": stage_status,
+                "detail": row.detail if row is not None else None,
+                "current": row.current if row is not None else None,
+                "total": row.total if row is not None else None,
+                "error": row.error if row is not None else None,
             }
         )
-        statuses.append(row.status)
+        statuses.append(stage_status)
 
     return {
         "stages": stages,

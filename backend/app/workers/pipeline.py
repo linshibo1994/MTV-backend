@@ -129,7 +129,13 @@ async def _mark_stage(
             "input_client_save_seq": input_client_save_seq,
         }
     elif status == "running":
+        previous_detail = row.detail or {}
+        same_input = (
+            previous_detail.get("input_version") == input_version
+            and previous_detail.get("input_client_save_seq") == input_client_save_seq
+        )
         row.detail = {
+            **(previous_detail if same_input else {}),
             "input_version": input_version,
             "input_client_save_seq": input_client_save_seq,
         }
@@ -150,9 +156,11 @@ async def _reset_owned_running_stage(
     if row.status != "running" or detail.get("input_version") != input_version:
         return False
     row.status = "pending"
-    row.detail = None
-    row.current = None
-    row.total = None
+    # extract/enrich 的明细是可恢复检查点；同一输入版本重试时保留，避免重复外呼。
+    if stage not in {"extract", "enrich"}:
+        row.detail = None
+        row.current = None
+        row.total = None
     row.error = None
     await db.flush()
     return True
@@ -446,7 +454,7 @@ async def finish_pipeline_job(
         "lease_token": None,
         "lease_until": None,
     }
-    if status in {"done", "failed", "skipped"}:
+    if status in {"ready", "done", "failed", "skipped"}:
         values["finished_at"] = datetime.now(UTC)
     if failure is not None:
         values.update(
@@ -655,7 +663,7 @@ async def finalize_pipeline_jobs(
         ):
             raise RuntimeError("pipeline input changed during settlement")
         row.status = "done"
-        row.finished_at = datetime.now(UTC)
+        row.finished_at = row.finished_at or datetime.now(UTC)
     await db.flush()
     return True
 

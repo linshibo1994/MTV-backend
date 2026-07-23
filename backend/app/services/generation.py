@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -56,6 +57,16 @@ from app.services.task_dispatch import enqueue_task
 _SINGLE_IDEMPOTENCY_NAMESPACE = "single:"
 _BATCH_JOB_IDEMPOTENCY_NAMESPACE = "batch-job:"
 _MAX_CLIENT_IDEMPOTENCY_KEY_LENGTH = 128
+_BATCH_GENERATION_GROUP_SIZE = 2
+_BATCH_GENERATION_GROUP_INTERVAL_SECONDS = 5
+
+
+def _batch_dispatch_available_at(batch_started_at: datetime, created_count: int) -> datetime:
+    """按供应商实测容量错峰发布批量生图任务。"""
+    group_index = created_count // _BATCH_GENERATION_GROUP_SIZE
+    return batch_started_at + timedelta(
+        seconds=group_index * _BATCH_GENERATION_GROUP_INTERVAL_SECONDS
+    )
 
 
 def _normalize_idempotency_key(value: str | None) -> str:
@@ -133,6 +144,7 @@ async def _create_one_job(
     aspect: str,
     count: int,
     commit: bool = True,
+    dispatch_available_at: datetime | None = None,
 ) -> GenerationJob:
     """创建单条生图任务并投递异步 worker（权限已由调用方校验）。
 
@@ -203,6 +215,7 @@ async def _create_one_job(
                 "subject_id": subject.id,
                 "input_version": input_version,
             },
+            available_at=dispatch_available_at,
         )
     if commit:
         await db.commit()
@@ -610,6 +623,7 @@ async def create_batch_generation_jobs(
     created_job_ids: list[str] = []
     skipped: list[str] = []
     failed: list[dict] = []
+    batch_started_at = datetime.now(UTC)
     for subject in subjects:
         # 声音类型不生图
         if subject.type == "sound":
@@ -658,6 +672,10 @@ async def create_batch_generation_jobs(
                 aspect=payload.aspect,
                 count=payload.count,
                 commit=False,
+                dispatch_available_at=_batch_dispatch_available_at(
+                    batch_started_at,
+                    len(created_job_ids),
+                ),
             )
             job_id = job.job_id
             created_job_ids.append(job_id)

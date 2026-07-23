@@ -1,17 +1,17 @@
 """parents 阶段 — 父主体归纳（子主体集合 → 父主体 + child_count）。
 
-严格遵循 06 文档第 12.4 节 LLM-4 提示词骨架与输入输出契约。
+默认按明确名称变体进行确定性归组；显式传入 provider 时保留模型归组。
 落库到 parent_subjects 表，并回写子主体 is_parent / parent_id。
 """
 
 import json
+import re
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.crud.script import replace_parent_subjects
 from app.models.subject import Subject
-from app.providers import get_llm_provider
 from app.schemas.pipeline_contracts import ParentsOutput, complete_json
 from app.services.pipeline import get_run_stage_output, input_episode_is_current, set_stage
 
@@ -39,6 +39,86 @@ _USER_TEMPLATE = """以下是去重后的子主体列表, 请将同类子主体 
   ]
 }}
 """
+
+_SCENE_VARIANT_SUFFIX = re.compile(
+    r"(?:[-—_·/\s]*(?:内|外))?[-—_·/\s]*(?:日|夜|晨|清晨|黎明|黄昏|傍晚)$"
+)
+_CHARACTER_VARIANT_TERMS = (
+    "幼年",
+    "童年",
+    "少年",
+    "青年",
+    "中年",
+    "老年",
+    "年轻",
+    "年迈",
+    "古装",
+    "现代",
+    "日常",
+    "正装",
+    "便装",
+    "睡衣",
+    "制服",
+    "战损",
+    "受伤",
+    "妆容",
+    "形态",
+    "状态",
+)
+_BRACKETED_SUFFIX = re.compile(
+    r"(?:（|\(|【|\[)(?P<variant>[^）)】\]]+)(?:）|\)|】|\])$"
+)
+_DELIMITED_SUFFIX = re.compile(r"[-—_·/]\s*(?P<variant>[^-—_·/]+)$")
+
+
+def _deterministic_parent_name(subject: Subject) -> str:
+    """仅折叠可明确识别的场景时段或角色形态，避免误合并不同实体。"""
+    name = subject.name.strip()
+    if subject.type == "scene":
+        normalized = _SCENE_VARIANT_SUFFIX.sub("", name).strip("-—_·/ ")
+        return normalized or name
+    if subject.type != "character":
+        return name
+
+    for pattern in (_BRACKETED_SUFFIX, _DELIMITED_SUFFIX):
+        match = pattern.search(name)
+        if match is None:
+            continue
+        variant = match.group("variant").strip()
+        if any(term in variant for term in _CHARACTER_VARIANT_TERMS):
+            normalized = name[: match.start()].strip("-—_·/ ")
+            return normalized or name
+    return name
+
+
+def _build_deterministic_parents(subjects: list[Subject]) -> list[dict]:
+    """构造稳定、同类型且 child_id 唯一的父主体分组。"""
+    groups: dict[tuple[str, str], list[Subject]] = {}
+    for subject in subjects:
+        parent_type = "background" if subject.type == "scene" else subject.type
+        parent_name = _deterministic_parent_name(subject)
+        groups.setdefault((parent_type, parent_name), []).append(subject)
+
+    parents: list[dict] = []
+    for (parent_type, parent_name), children in sorted(groups.items()):
+        ordered_children = sorted(children, key=lambda item: (item.name, item.id))
+        descriptions = list(
+            dict.fromkeys(
+                description
+                for child in ordered_children
+                if (description := (child.description or "").strip())
+            )
+        )
+        parents.append(
+            {
+                "name": parent_name,
+                "type": parent_type,
+                "description": "；".join(descriptions) or f"{parent_name}主体集合",
+                "child_count": len(ordered_children),
+                "child_ids": [child.id for child in ordered_children],
+            }
+        )
+    return parents
 
 
 async def run_parents(
@@ -83,28 +163,46 @@ async def run_parents(
             for item in merge_output.get("subjects", [])
         ]
 
-    # 构造 LLM 输入：子主体精简信息
-    merged_input = [
-        {
-            "subject_id": s.id,
-            "name": s.name,
-            "type": s.type,
-            "description": s.description or "",
-        }
-        for s in subjects
-    ]
-
-    provider = provider or get_llm_provider()
-    contract = await complete_json(
-        provider,
-        _SYSTEM,
-        _USER_TEMPLATE.format(
-            merged_subjects_json=json.dumps(merged_input, ensure_ascii=False)
-        ),
-        ParentsOutput,
-        durable_attempt=provider_attempt,
-    )
-    parents_data = [parent.model_dump() for parent in contract.parent_subjects]
+    if provider is None:
+        parents_data = _build_deterministic_parents(subjects)
+        grouping_mode = "deterministic"
+    else:
+        # 构造 LLM 输入：子主体精简信息。快照后释放只读事务，模型等待
+        # 期间不占用数据库连接。
+        subjects = [
+            Subject(
+                id=subject.id,
+                script_id=script_id,
+                name=subject.name,
+                type=subject.type,
+                description=subject.description,
+                episode_nos=list(subject.episode_nos or []),
+                is_active=True,
+            )
+            for subject in subjects
+        ]
+        merged_input = [
+            {
+                "subject_id": subject.id,
+                "name": subject.name,
+                "type": subject.type,
+                "description": subject.description or "",
+            }
+            for subject in subjects
+        ]
+        if isinstance(db, AsyncSession):
+            await db.rollback()
+        contract = await complete_json(
+            provider,
+            _SYSTEM,
+            _USER_TEMPLATE.format(
+                merged_subjects_json=json.dumps(merged_input, ensure_ascii=False)
+            ),
+            ParentsOutput,
+            durable_attempt=provider_attempt,
+        )
+        parents_data = [parent.model_dump() for parent in contract.parent_subjects]
+        grouping_mode = "model"
 
     child_ids = {subject.id for subject in subjects}
     child_types = {subject.id: subject.type for subject in subjects}
@@ -149,6 +247,7 @@ async def run_parents(
         status="running",
         detail={
             "count": len(parents_data),
+            "grouping_mode": grouping_mode,
             "input_version": input_version,
             "input_client_save_seq": input_client_save_seq,
         },
@@ -157,6 +256,7 @@ async def run_parents(
         return {
             "count": len(parents_data),
             "parent_subjects": parents_data,
+            "grouping_mode": grouping_mode,
             "input_version": input_version,
             "input_client_save_seq": input_client_save_seq,
         }

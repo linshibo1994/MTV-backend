@@ -1,7 +1,7 @@
 """merge 阶段 — 跨集主体合并（多集主体列表 → 去重子主体集合）。
 
-严格遵循 06 文档第 12.2 节 LLM-2 提示词骨架与输入输出契约。
-读取 extract 阶段写入的 detail，调用 LLM 合并后落库到 subjects 表。
+读取 extract 阶段写入的 detail，默认使用确定性去重基线；显式传入 provider
+时保留 LLM 补漏增强能力。最终结果落库到 subjects 表。
 """
 
 from typing import Any
@@ -15,7 +15,6 @@ from app.crud import asset as asset_crud
 from app.crud.script import replace_parent_subjects, replace_subjects
 from app.models.episode import Episode
 from app.models.subject import Subject
-from app.providers import get_llm_provider
 from app.schemas.pipeline_contracts import (
     MergeOutput,
     PipelineSubject,
@@ -249,6 +248,11 @@ async def _prepare_staged_subjects(
             )
             base_subject_version = int(subject.subject_version or 1)
             base_enrich_version = int(subject.enrich_version or 1)
+            prompt_changed = (
+                subject.name != item.get("name")
+                or subject.type != item.get("type")
+                or (subject.description or "") != (item.get("description") or "")
+            )
             item.update(
                 id=subject.id,
                 base_subject_version=base_subject_version,
@@ -256,7 +260,7 @@ async def _prepare_staged_subjects(
                 subject_version=base_subject_version + int(changed),
                 enrich_version=(
                     base_enrich_version + 1
-                    if item.get("type") != "sound"
+                    if item.get("type") != "sound" and prompt_changed
                     else base_enrich_version
                 ),
             )
@@ -317,97 +321,111 @@ async def run_merge(
     per_episodes = extract_detail.get("episodes", []) or []
 
     extract_baseline = _build_extract_baseline(per_episodes)
-    all_subjects = [
-        {
-            "name": subject["name"],
-            "type": subject["type"],
-            "description": subject["description"],
-            "episode_nos": subject["episode_nos"],
-        }
-        for subject in extract_baseline
-    ]
-
-    import json
-
-    episode_rows = list(
-        (
-            await db.execute(
-                select(Episode).where(Episode.script_id == script_id)
-            )
-        )
-        .scalars()
-        .all()
-    )
-    episode_text_by_no = {
-        int(episode.episode_no): str(episode.script_text or "")
-        for episode in episode_rows
-    }
-
-    provider = _MergeProviderAdapter(provider or get_llm_provider())
-    merge_mode = "model_enhanced"
+    merged_subjects = [dict(subject) for subject in extract_baseline]
+    merge_mode = "deterministic"
     fallback_reason: str | None = None
-    try:
-        contract = await complete_json(
-            provider,
-            _SYSTEM,
-            _USER_TEMPLATE.format(
-                multi_episode_subjects_json=json.dumps(all_subjects, ensure_ascii=False),
-                episodes_json=json.dumps(
-                    [
-                        {
-                            "episode_no": episode.episode_no,
-                            "script_text": episode.script_text or "",
-                        }
-                        for episode in episode_rows
-                    ],
-                    ensure_ascii=False,
-                ),
-            ),
-            MergeOutput,
-            durable_attempt=provider_attempt,
-        )
-    except (ProviderContractError, OSError) as exc:
-        # merge 不是基础主体的权威来源：供应商不可用或字段漂移时直接发布 extract 基线。
-        merged_subjects = [dict(subject) for subject in extract_baseline]
-        merge_mode = "extract_fallback"
-        fallback_reason = (
-            "provider_contract"
-            if getattr(exc, "error_type", None) == "provider_contract_error"
-            else "provider_transport"
-        )
-    else:
-        descriptions_by_key = {
-            (subject.type, subject.name): subject.description
-            for subject in contract.merged_subjects
-        }
-        merged_subjects = []
-        for subject in extract_baseline:
-            item = dict(subject)
-            item["description"] = descriptions_by_key.get(
-                (item["type"], item["name"]), item["description"]
-            )
-            merged_subjects.append(item)
+    # 默认快速路径不再将全剧本重复发送给模型。测试、诊断或显式增强调用
+    # 可传 provider opt-in，保留历史补漏能力与证据校验。
+    if provider is not None:
+        import json
 
-        existing_keys = {(subject["type"], subject["name"]) for subject in merged_subjects}
-        for raw_supplemental in provider.supplemental_subjects:
-            try:
-                supplemental = SupplementalSubject.model_validate(raw_supplemental)
-            except ValidationError:
-                continue
-            supplemental_key = (supplemental.type, supplemental.name)
-            if supplemental_key in existing_keys:
-                continue
-            evidence_episode_nos = {evidence.episode_no for evidence in supplemental.evidence}
-            if evidence_episode_nos != set(supplemental.episode_nos):
-                continue
-            if any(
-                not (script_text := episode_text_by_no.get(evidence.episode_no))
-                or evidence.quote not in script_text
-                for evidence in supplemental.evidence
-            ):
-                continue
-            merged_subjects.append(supplemental.model_dump(exclude={"evidence"}))
-            existing_keys.add(supplemental_key)
+        all_subjects = [
+            {
+                "name": subject["name"],
+                "type": subject["type"],
+                "description": subject["description"],
+                "episode_nos": subject["episode_nos"],
+            }
+            for subject in extract_baseline
+        ]
+        episode_rows = list(
+            (
+                await db.execute(
+                    select(Episode).where(Episode.script_id == script_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        episode_snapshots: list[dict[str, object]] = [
+            {
+                "episode_no": int(episode.episode_no),
+                "script_text": str(episode.script_text or ""),
+            }
+            for episode in episode_rows
+        ]
+        episode_text_by_no: dict[int, str] = {
+            int(episode.episode_no): str(episode.script_text or "")
+            for episode in episode_rows
+        }
+        if isinstance(db, AsyncSession):
+            await db.rollback()
+
+        model_provider = _MergeProviderAdapter(provider)
+        merge_mode = "model_enhanced"
+        try:
+            contract = await complete_json(
+                model_provider,
+                _SYSTEM,
+                _USER_TEMPLATE.format(
+                    multi_episode_subjects_json=json.dumps(
+                        all_subjects, ensure_ascii=False
+                    ),
+                    episodes_json=json.dumps(
+                        episode_snapshots,
+                        ensure_ascii=False,
+                    ),
+                ),
+                MergeOutput,
+                durable_attempt=provider_attempt,
+            )
+        except (ProviderContractError, OSError) as exc:
+            # merge 不是基础主体的权威来源：供应商不可用或字段漂移时发布 extract 基线。
+            merge_mode = "extract_fallback"
+            fallback_reason = (
+                "provider_contract"
+                if getattr(exc, "error_type", None) == "provider_contract_error"
+                else "provider_transport"
+            )
+        else:
+            descriptions_by_key = {
+                (subject.type, subject.name): subject.description
+                for subject in contract.merged_subjects
+            }
+            merged_subjects = []
+            for subject in extract_baseline:
+                item = dict(subject)
+                item["description"] = descriptions_by_key.get(
+                    (item["type"], item["name"]), item["description"]
+                )
+                merged_subjects.append(item)
+
+            existing_keys = {
+                (subject["type"], subject["name"]) for subject in merged_subjects
+            }
+            for raw_supplemental in model_provider.supplemental_subjects:
+                try:
+                    supplemental = SupplementalSubject.model_validate(raw_supplemental)
+                except ValidationError:
+                    continue
+                supplemental_key = (supplemental.type, supplemental.name)
+                if supplemental_key in existing_keys:
+                    continue
+                evidence_episode_nos = {
+                    evidence.episode_no for evidence in supplemental.evidence
+                }
+                if evidence_episode_nos != set(supplemental.episode_nos):
+                    continue
+                if any(
+                    not (script_text := episode_text_by_no.get(evidence.episode_no))
+                    or evidence.quote not in script_text
+                    for evidence in supplemental.evidence
+                ):
+                    continue
+                merged_subjects.append(
+                    supplemental.model_dump(exclude={"evidence"})
+                )
+                existing_keys.add(supplemental_key)
 
     if not await input_episode_is_current(
         db,

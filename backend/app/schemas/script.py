@@ -93,7 +93,11 @@ class AnalysisJobStageOut(BaseModel):
 
     stage: str
     status: str
+    attempt: int = 1
     error_type: str | None = None
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    duration_ms: int | None = None
 
 
 class AnalysisJobOut(BaseModel):

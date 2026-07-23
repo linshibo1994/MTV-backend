@@ -216,7 +216,11 @@ async def test_analysis_job_uses_latest_attempt_for_each_pipeline_stage(monkeypa
     )
     db = SimpleNamespace(execute=AsyncMock(return_value=_Rows(jobs)))
     script = SimpleNamespace(id="script-1")
-    monkeypatch.setattr(analysis_jobs.script_crud, "get_script", AsyncMock(return_value=script))
+    monkeypatch.setattr(
+        analysis_jobs,
+        "_load_access_script",
+        AsyncMock(return_value=script),
+    )
     monkeypatch.setattr(analysis_jobs, "check_script_access", AsyncMock())
 
     result = await analysis_jobs.get_analysis_job(

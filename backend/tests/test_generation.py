@@ -63,6 +63,19 @@ class _AsyncNested:
         return self.transaction.__exit__(exc_type, exc, tb)
 
 
+def test_batch_generation_dispatches_two_jobs_per_five_second_group() -> None:
+    started_at = datetime(2026, 7, 23, 3, 16, 27, tzinfo=UTC)
+
+    assert generation_service._batch_dispatch_available_at(started_at, 0) == started_at
+    assert generation_service._batch_dispatch_available_at(started_at, 1) == started_at
+    assert generation_service._batch_dispatch_available_at(started_at, 2) == started_at + timedelta(
+        seconds=5
+    )
+    assert generation_service._batch_dispatch_available_at(started_at, 29) == started_at + timedelta(
+        seconds=70
+    )
+
+
 class _AsyncSessionAdapter:
     def __init__(self, session: Session) -> None:
         self.session = session
@@ -548,46 +561,25 @@ def test_create_generation_job_requires_server_prompt_and_idempotent_outbox(monk
     asyncio.run(scenario())
 
 
-def test_enrich_prompt_requires_exact_ordered_unique_twelve_sections():
+def test_enrich_prompt_accepts_free_format_and_normalizes_legacy_numbering():
     assert generation_service._validate_twelve_section_prompt(_twelve_sections()) == _twelve_sections()
     assert (
         generation_service._validate_twelve_section_prompt(_numbered_twelve_sections())
         == _twelve_sections()
     )
-    duplicate = _twelve_sections().replace("【写实质感锚定】", "【形制描述】")
+    free_prompts = [
+        _twelve_sections().replace("【写实质感锚定】", "【形制描述】"),
+        "\n".join(reversed(_twelve_sections().splitlines())),
+        "\n".join(_twelve_sections().splitlines()[:-1]),
+        f"{_twelve_sections()}\n【额外段落】允许",
+        _numbered_twelve_sections().replace("2. 【材质钉死】", "3. 【材质钉死】"),
+        "模型生成的一段自由格式摄影提示词",
+    ]
+    for prompt in free_prompts:
+        assert generation_service._validate_twelve_section_prompt(prompt)
+
     with pytest.raises(ConflictError):
-        generation_service._validate_twelve_section_prompt(duplicate)
-    shuffled = "\n".join(reversed(_twelve_sections().splitlines()))
-    with pytest.raises(ConflictError):
-        generation_service._validate_twelve_section_prompt(shuffled)
-    missing = "\n".join(_twelve_sections().splitlines()[:-1])
-    with pytest.raises(ConflictError):
-        generation_service._validate_twelve_section_prompt(missing)
-    empty_body = "\n".join(
-        f"【{name}】  "
-        for name in [
-            "形制描述",
-            "材质钉死",
-            "使用痕迹",
-            "摆放姿态",
-            "反悬浮锁",
-            "时代锚定",
-            "画面构图",
-            "画风统一锁",
-            "三点柔光箱白底布光",
-            "反水印锁",
-            "文字渲染降级方案",
-            "写实质感锚定",
-        ]
-    )
-    with pytest.raises(ConflictError):
-        generation_service._validate_twelve_section_prompt(empty_body)
-    extra = f"{_twelve_sections()}\n【额外段落】不允许"
-    with pytest.raises(ConflictError):
-        generation_service._validate_twelve_section_prompt(extra)
-    wrong_number = _numbered_twelve_sections().replace("2. 【材质钉死】", "3. 【材质钉死】")
-    with pytest.raises(ConflictError):
-        generation_service._validate_twelve_section_prompt(wrong_number)
+        generation_service._validate_twelve_section_prompt("   ")
 
 
 def test_create_generation_job_accepts_and_normalizes_numbered_legacy_enrich_prompt(

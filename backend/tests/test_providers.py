@@ -503,6 +503,127 @@ async def test_bailian_qwen_image_2_uses_sync_multimodal_api(monkeypatch) -> Non
 
 
 @pytest.mark.asyncio
+async def test_bailian_image_provider_retries_429_with_backoff(monkeypatch) -> None:
+    from app.providers import image_gen_bailian
+    from app.providers.image_gen import ImageResult
+    from app.providers.image_gen_bailian import BailianImageGenProvider
+
+    monkeypatch.setattr(
+        image_gen_bailian,
+        "settings",
+        _settings(
+            image_gen_provider="bailian",
+            image_gen_api_key="image-key",
+            image_gen_base_url="https://dashscope.example",
+            image_gen_model="qwen-image-2.0",
+        ),
+    )
+
+    class Response:
+        def __init__(self, status_code: int, *, retry_after: str | None = None) -> None:
+            self.status_code = status_code
+            self.headers = {"Retry-After": retry_after} if retry_after else {}
+
+        @staticmethod
+        def json():
+            return {
+                "output": {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": [{"image": "https://oss.aliyuncs.com/result.png"}]
+                            }
+                        }
+                    ]
+                }
+            }
+
+    responses = [Response(429, retry_after="0.25"), Response(429), Response(200)]
+    post = AsyncMock(side_effect=responses)
+
+    class Client:
+        def __init__(self, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def post(self, *args, **kwargs):
+            return await post(*args, **kwargs)
+
+    sleep = AsyncMock()
+    monkeypatch.setattr(image_gen_bailian.httpx, "AsyncClient", Client)
+    monkeypatch.setattr(image_gen_bailian.asyncio, "sleep", sleep)
+    monkeypatch.setattr(image_gen_bailian.random, "uniform", lambda *_args: 0.0)
+    provider = BailianImageGenProvider()
+    monkeypatch.setattr(
+        provider,
+        "_download",
+        AsyncMock(return_value=ImageResult(data=b"image", mime_type="image/png")),
+    )
+
+    result = await provider.generate("一只纸飞机", "ignored", "2k", "1:1")
+
+    assert result[0].data == b"image"
+    assert post.await_count == 3
+    assert [call.args[0] for call in sleep.await_args_list] == [0.25, 2.0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [400, 503])
+async def test_bailian_image_provider_does_not_retry_other_errors(
+    monkeypatch, status_code: int
+) -> None:
+    from app.providers import image_gen_bailian
+    from app.providers.image_gen_bailian import BailianImageGenProvider
+
+    monkeypatch.setattr(
+        image_gen_bailian,
+        "settings",
+        _settings(
+            image_gen_provider="bailian",
+            image_gen_api_key="image-key",
+            image_gen_base_url="https://dashscope.example",
+            image_gen_model="qwen-image-2.0",
+        ),
+    )
+
+    class Response:
+        headers: dict[str, str] = {}
+
+        def __init__(self) -> None:
+            self.status_code = status_code
+
+    post = AsyncMock(return_value=Response())
+
+    class Client:
+        def __init__(self, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def post(self, *args, **kwargs):
+            return await post(*args, **kwargs)
+
+    sleep = AsyncMock()
+    monkeypatch.setattr(image_gen_bailian.httpx, "AsyncClient", Client)
+    monkeypatch.setattr(image_gen_bailian.asyncio, "sleep", sleep)
+
+    with pytest.raises(RuntimeError, match=f"status={status_code}"):
+        await BailianImageGenProvider().generate("一只纸飞机", "ignored", "2k", "1:1")
+
+    assert post.await_count == 1
+    sleep.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_openai_image_provider_uses_capability_config_and_closes_client(monkeypatch) -> None:
     import base64
 

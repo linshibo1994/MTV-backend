@@ -42,8 +42,9 @@ async def enqueue_task(
     job_id: str,
     attempt: int,
     payload: dict,
+    available_at: datetime | None = None,
 ) -> TaskDispatchOutbox:
-    """和业务写入处于同一事务；唯一键使重复触发幂等。"""
+    """和业务写入处于同一事务；可指定最早发布时间，唯一键使重复触发幂等。"""
     existing = await db.execute(
         select(TaskDispatchOutbox).where(
             TaskDispatchOutbox.task_type == task_type,
@@ -67,6 +68,7 @@ async def enqueue_task(
         attempt=attempt,
         payload=stable_payload,
         status="pending",
+        **({"available_at": available_at} if available_at is not None else {}),
     )
     try:
         # savepoint 使并发唯一键冲突不会回滚调用方的业务事务。
@@ -219,6 +221,14 @@ async def reconcile_pipeline_dispatches(
     """恢复过期/半截 DAG，以及 commit 后缺失 outbox 的 pipeline run。"""
     from sqlalchemy.orm import aliased, noload
 
+    class _RecordedPipelineFailure(RuntimeError):
+        """把持久化错误类型送入统一安全映射，禁止原始错误消息出站。"""
+
+        def __init__(self, error_type: str | None, retryable: bool | None) -> None:
+            super().__init__("pipeline failed")
+            self.error_type = error_type
+            self.retryable = retryable
+
     now = datetime.now(UTC)
     failed_leaf = aliased(PipelineJob)
     failed_leaf_exists = exists().where(
@@ -266,6 +276,8 @@ async def reconcile_pipeline_dispatches(
                 PipelineJob.attempt,
                 PipelineJob.lease_until,
                 PipelineJob.id,
+                PipelineJob.error_type,
+                PipelineJob.retryable,
             )
             .where(PipelineJob.run_id == job.run_id)
             .order_by(PipelineJob.attempt.asc())
@@ -284,7 +296,13 @@ async def reconcile_pipeline_dispatches(
 
         if terminal_failure:
             changed = False
-            failure = PipelineFailure.from_exception(RuntimeError("pipeline failed"))
+            failed_row = next(row for row in latest.values() if row.status == "failed")
+            failure = PipelineFailure.from_exception(
+                _RecordedPipelineFailure(
+                    failed_row.error_type,
+                    failed_row.retryable,
+                )
+            )
             failure_payload = failure.to_dict()
             finished_at = datetime.now(UTC)
             for row in latest.values():
@@ -303,6 +321,14 @@ async def reconcile_pipeline_dispatches(
                         pipeline_job.error_type = failure.error_type
                         pipeline_job.error_message = failure.error_message
                         pipeline_job.retryable = failure.retryable
+                    pipeline_job.finished_at = pipeline_job.finished_at or finished_at
+                    changed = True
+                elif row.status == "ready":
+                    # ready 表示叶子计算与私有输出已成功，只是在等待统一发布。
+                    # 兄弟叶失败不能把这一成功事实伪装成 skipped/internal_error。
+                    pipeline_job.error_type = None
+                    pipeline_job.error_message = None
+                    pipeline_job.retryable = None
                     pipeline_job.finished_at = pipeline_job.finished_at or finished_at
                     changed = True
                 elif row.status not in {"done", "skipped"}:
@@ -328,13 +354,17 @@ async def reconcile_pipeline_dispatches(
                 stage_input_client_save_seq = stage_detail.get("input_client_save_seq")
                 if (
                     pipeline_stage is not None
-                    and pipeline_stage.status in {"running", "failed"}
+                    and pipeline_stage.status in {"running", "ready", "failed", "done"}
                     and stage_input_version in {None, pipeline_job.input_version}
                     and stage_input_client_save_seq
                     in {None, pipeline_job.input_client_save_seq}
                 ):
-                    pipeline_stage.status = "failed"
-                    pipeline_stage.error = failure_payload
+                    if pipeline_job.status in {"done", "ready"}:
+                        pipeline_stage.status = pipeline_job.status
+                        pipeline_stage.error = None
+                    else:
+                        pipeline_stage.status = "failed"
+                        pipeline_stage.error = failure_payload
             if reservation is not None and reservation.status == "reserved":
                 await credits_release(
                     db,

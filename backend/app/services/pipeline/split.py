@@ -5,6 +5,7 @@
 """
 
 import logging
+import re
 from typing import Any, cast
 
 from sqlalchemy import select
@@ -18,6 +19,86 @@ from app.schemas.pipeline_contracts import SplitOutput, complete_json
 from app.services.pipeline import input_episode_is_current, set_stage
 
 logger = logging.getLogger(__name__)
+
+_EPISODE_HEADER = re.compile(
+    r"^[ \t]*(?:第[ \t]*)?"
+    r"(?P<number>\d{1,4}|[零〇一二三四五六七八九十百两]{1,8})"
+    r"[ \t]*集(?=$|\r|[ \t:：、.\-—])(?P<tail>[^\r\n]*)\r?$",
+    re.MULTILINE,
+)
+_CHINESE_DIGITS = {
+    "零": 0,
+    "〇": 0,
+    "一": 1,
+    "二": 2,
+    "两": 2,
+    "三": 3,
+    "四": 4,
+    "五": 5,
+    "六": 6,
+    "七": 7,
+    "八": 8,
+    "九": 9,
+}
+
+
+def _parse_episode_number(value: str) -> int | None:
+    """解析阿拉伯或常见中文集号；无法可靠解析时返回 ``None``。"""
+    if value.isdigit():
+        number = int(value)
+        return number if number > 0 else None
+    if all(char in _CHINESE_DIGITS for char in value):
+        number = int("".join(str(_CHINESE_DIGITS[char]) for char in value))
+        return number if number > 0 else None
+
+    total = 0
+    current = 0
+    units = {"十": 10, "百": 100}
+    for char in value:
+        digit = _CHINESE_DIGITS.get(char)
+        if digit is not None:
+            current = digit
+            continue
+        unit = units.get(char)
+        if unit is None:
+            return None
+        total += (current or 1) * unit
+        current = 0
+    number = total + current
+    return number if number > 0 else None
+
+
+def _split_by_explicit_episode_headers(script_text: str) -> list[dict] | None:
+    """按明确且连续的“第 N 集”行本地拆分，不能确认时交回模型。
+
+    至少识别两集，且集号必须从 1 连续递增。切片覆盖原文全部字符，
+    包括首个标题前的文档标题或说明，避免本地快速路径静默丢字。
+    """
+    matches = list(_EPISODE_HEADER.finditer(script_text))
+    if len(matches) < 2:
+        return None
+    numbers = [_parse_episode_number(match.group("number")) for match in matches]
+    if numbers != list(range(1, len(matches) + 1)):
+        return None
+
+    episodes: list[dict] = []
+    for index, match in enumerate(matches):
+        start = 0 if index == 0 else match.start()
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(script_text)
+        episode_text = script_text[start:end]
+        if not episode_text.strip():
+            return None
+        episode_no = index + 1
+        header = match.group(0).strip()
+        episodes.append(
+            {
+                "episode_no": episode_no,
+                "title": (header or f"第 {episode_no} 集")[:255],
+                "script_text": episode_text,
+            }
+        )
+    return episodes
+
 
 # ---- 提示词骨架（遵循 06 文档第 1 阶段语义）----
 _SYSTEM = (
@@ -66,16 +147,6 @@ async def run_split(
     ):
         return 0
     episode = await db.get(Episode, episode_id)
-    await set_stage(
-        db,
-        script_id,
-        "split",
-        status="running",
-        detail={
-            "input_version": input_version,
-            "input_client_save_seq": input_client_save_seq,
-        },
-    )
     script_text = (episode.script_text if episode else None) or ""
     existing_result = await db.execute(
         select(Episode)
@@ -89,6 +160,9 @@ async def run_split(
         if trigger_episode_no is not None and len(existing_episodes) > 1
         else "full_script"
     )
+    # 以上仅为只读快照；模型等待期间不占用数据库连接和事务。
+    if isinstance(db, AsyncSession):
+        await db.rollback()
 
     # 已经拆分为多集后，保存其中一集只应触发该剧本的重新分析，不能将单集正文
     # 再交给模型按“从第 1 集开始”拆分。否则模型常返回第 1 集，后续按触发集号
@@ -144,15 +218,18 @@ async def run_split(
             )
         return 0
 
-    provider = provider or get_llm_provider()
-    contract = await complete_json(
-        provider,
-        _SYSTEM,
-        _USER_TEMPLATE.format(script_text=script_text),
-        SplitOutput,
-        durable_attempt=provider_attempt,
-    )
-    episodes_data = [item.model_dump() for item in contract.episodes]
+    episodes_data = _split_by_explicit_episode_headers(script_text)
+    local_split = episodes_data is not None
+    if episodes_data is None:
+        provider = provider or get_llm_provider()
+        contract = await complete_json(
+            provider,
+            _SYSTEM,
+            _USER_TEMPLATE.format(script_text=script_text),
+            SplitOutput,
+            durable_attempt=provider_attempt,
+        )
+        episodes_data = [item.model_dump() for item in contract.episodes]
     # LLM 返回后再次检查用户是否已保存新版文本；过期任务不得覆盖任何分集。
     if not await input_episode_is_current(
         db,
@@ -163,6 +240,19 @@ async def run_split(
         lock=True,
     ):
         return 0
+
+    await set_stage(
+        db,
+        script_id,
+        "split",
+        status="running",
+        detail={
+            "mode": split_mode,
+            "split_strategy": "explicit_headers" if local_split else "model",
+            "input_version": input_version,
+            "input_client_save_seq": input_client_save_seq,
+        },
+    )
 
     # 按 (script_id, episode_no) upsert
     # 已有集采用带 WHERE episode_version=? 的原子更新，与 save_episode 乐观锁语义一致，
@@ -228,6 +318,7 @@ async def run_split(
         detail={
             "count": len(episodes_data),
             "mode": split_mode,
+            "split_strategy": "explicit_headers" if local_split else "model",
             "active_episode_nos": [
                 int(item["episode_no"]) for item in episodes_data if item.get("episode_no")
             ],

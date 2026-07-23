@@ -283,6 +283,30 @@ def test_outbox_real_transaction_reuses_stable_dispatch_and_publishes_once() -> 
     asyncio.run(scenario())
 
 
+def test_enqueue_task_persists_explicit_available_at() -> None:
+    async def scenario() -> None:
+        engine = create_engine("sqlite+pysqlite:///:memory:")
+        TaskDispatchOutbox.__table__.create(engine)
+        scheduled_at = datetime(2026, 7, 23, 3, 16, 32, tzinfo=UTC)
+        with Session(engine, expire_on_commit=False) as raw_session:
+            db = _AsyncSessionAdapter(raw_session)
+            row = await enqueue_task(
+                db,
+                task_type="generation.generate_images",
+                job_id="job-scheduled",
+                attempt=1,
+                payload={"job_id": "job-scheduled"},
+                available_at=scheduled_at,
+            )
+            await db.commit()
+
+            persisted = raw_session.get(TaskDispatchOutbox, row.id)
+            assert persisted is not None
+            assert persisted.available_at.replace(tzinfo=UTC) == scheduled_at
+
+    asyncio.run(scenario())
+
+
 class _SignatureTask:
     def __init__(self, name: str) -> None:
         self.name = name
@@ -572,6 +596,7 @@ def test_reconciler_republishes_stale_job_after_credit_release_rollback() -> Non
 def test_reconciler_releases_failed_run_and_closes_ready_leaf(monkeypatch) -> None:
     async def scenario() -> None:
         from app.models.base import Base
+        from app.models.pipeline_stage import PipelineStage
 
         engine = create_engine("sqlite+pysqlite:///:memory:")
         Base.metadata.create_all(engine)
@@ -608,6 +633,9 @@ def test_reconciler_releases_failed_run_and_closes_ready_leaf(monkeypatch) -> No
                     status="failed",
                     input_version=1,
                     attempt=1,
+                    error_type="provider_contract_error",
+                    error_message="供应商响应不符合约定",
+                    retryable=False,
                 )
             )
             db.add(
@@ -621,6 +649,23 @@ def test_reconciler_releases_failed_run_and_closes_ready_leaf(monkeypatch) -> No
                     status="ready",
                     input_version=1,
                     attempt=1,
+                )
+            )
+            db.add(
+                PipelineStage(
+                    id="stage-enrich-failed",
+                    script_id="script-1",
+                    stage="enrich",
+                    status="failed",
+                )
+            )
+            db.add(
+                PipelineStage(
+                    id="stage-parents-ready",
+                    script_id="script-1",
+                    stage="parents",
+                    status="running",
+                    detail={"count": 25, "input_version": 1},
                 )
             )
             await db.commit()
@@ -644,7 +689,18 @@ def test_reconciler_releases_failed_run_and_closes_ready_leaf(monkeypatch) -> No
                     PipelineJob.id == "job-parents-ready"
                 )
             ).scalar_one()
-            assert sibling_status == "skipped"
+            # ready 表示父主体计算和私有结果已成功；兄弟叶失败时保留成功事实。
+            assert sibling_status == "ready"
+            failed_stage = raw_session.get(PipelineStage, "stage-enrich-failed")
+            assert failed_stage.error == {
+                "error_type": "provider_contract_error",
+                "error_message": "供应商响应不符合约定",
+                "retryable": False,
+            }
+            completed_stage = raw_session.get(PipelineStage, "stage-parents-ready")
+            assert completed_stage.status == "ready"
+            assert completed_stage.error is None
+            assert completed_stage.detail["count"] == 25
             assert raw_session.get(TaskDispatchOutbox, "dispatch-failed").status == "published"
 
     asyncio.run(scenario())

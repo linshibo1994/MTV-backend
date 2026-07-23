@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 from urllib.parse import urlsplit
 
 import httpx
@@ -30,6 +31,9 @@ logger = logging.getLogger(__name__)
 
 _POLL_INTERVAL = 2.0
 _POLL_TIMEOUT = 300  # 5 分钟
+_RETRYABLE_SUBMIT_STATUSES = {429}
+_MAX_SUBMIT_ATTEMPTS = 5
+_MAX_RETRY_DELAY_SECONDS = 20.0
 
 # aspect -> 通义万相 size（宽*高，星号分隔）
 _ASPECT_TO_SIZE: dict[str, str] = {
@@ -70,6 +74,47 @@ def _extract_multimodal_urls(payload: dict) -> list[str]:
             if isinstance(candidate, str) and candidate:
                 urls.append(candidate)
     return urls
+
+
+def _retry_delay_seconds(response: httpx.Response, attempt: int) -> float:
+    """优先遵循 Retry-After，否则使用带抖动的指数退避。"""
+    headers = getattr(response, "headers", {}) or {}
+    retry_after = headers.get("Retry-After")
+    if retry_after:
+        try:
+            return min(max(float(retry_after), 0.0), _MAX_RETRY_DELAY_SECONDS)
+        except (TypeError, ValueError):
+            pass
+    base = min(2 ** max(attempt - 1, 0), _MAX_RETRY_DELAY_SECONDS)
+    return min(base + random.uniform(0.0, base * 0.25), _MAX_RETRY_DELAY_SECONDS)
+
+
+async def _post_with_transient_retry(
+    http: httpx.AsyncClient,
+    url: str,
+    *,
+    headers: dict[str, str],
+    body: dict,
+) -> httpx.Response:
+    """仅重试明确未受理的限流响应，避免非幂等请求因 5xx 重投而重复计费。"""
+    response: httpx.Response | None = None
+    for attempt in range(1, _MAX_SUBMIT_ATTEMPTS + 1):
+        response = await http.post(url, headers=headers, json=body)
+        if response.status_code not in _RETRYABLE_SUBMIT_STATUSES:
+            return response
+        if attempt >= _MAX_SUBMIT_ATTEMPTS:
+            return response
+        delay = _retry_delay_seconds(response, attempt)
+        logger.warning(
+            "百炼生图请求被临时拒绝 status=%d attempt=%d/%d，%.2f 秒后重试",
+            response.status_code,
+            attempt,
+            _MAX_SUBMIT_ATTEMPTS,
+            delay,
+        )
+        await asyncio.sleep(delay)
+    assert response is not None
+    return response
 
 
 class BailianImageGenProvider:
@@ -142,10 +187,11 @@ class BailianImageGenProvider:
                 "watermark": False,
             },
         }
-        submit = await http.post(
+        submit = await _post_with_transient_retry(
+            http,
             f"{base_url}/api/v1/services/aigc/multimodal-generation/generation",
             headers=headers,
-            json=body,
+            body=body,
         )
         if submit.status_code != 200:
             raise RuntimeError(f"百炼 Qwen Image 文生图失败 status={submit.status_code}")
@@ -181,10 +227,11 @@ class BailianImageGenProvider:
                 "watermark": False,
             },
         }
-        submit = await http.post(
+        submit = await _post_with_transient_retry(
+            http,
             f"{base_url}/api/v1/services/aigc/text2image/image-synthesis",
             headers=headers,
-            json=body,
+            body=body,
         )
         if submit.status_code != 200:
             raise RuntimeError(f"通义万相文生图提交失败 status={submit.status_code}")

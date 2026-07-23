@@ -1,6 +1,5 @@
 """流水线 LLM 输出的 Pydantic v2 合约。"""
 
-import re
 from collections.abc import Callable, Sequence
 from typing import Annotated, Literal
 
@@ -176,6 +175,10 @@ SubjectType = Literal["character", "scene", "prop", "sound"]
 ParentType = Literal["character", "background", "scene", "prop", "sound"]
 PipelineVersion = Literal["pipeline.v1"]
 NonEmptyText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+EnrichPromptText = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=32_000),
+]
 ShortNonEmptyText = Annotated[
     str,
     StringConstraints(strip_whitespace=True, min_length=1, max_length=255),
@@ -196,48 +199,29 @@ ENRICH_SECTION_LABELS = (
     "写实质感锚定",
 )
 
-_ENRICH_SECTION_HEADING = re.compile(
-    r"^(?:(?P<number>[1-9]\d*)\.\s*)?【(?P<label>[^】]+)】(?P<body>.*)$"
-)
-
 
 def normalize_enrich_prompt(prompt: str) -> str:
-    """校验并归一化 enrich 的十二段 prompt，兼容历史数字编号。"""
-    sections: list[tuple[int | None, str, str]] = []
-    current_number: int | None = None
-    current_label: str | None = None
-    current_body: list[str] = []
+    """宽松归一化 enrich prompt。
 
-    for line in prompt.splitlines():
+    下游真正需要的是一段非空的生图提示词，而不是固定标题的排版。这里仅做
+    首尾空白清理，并兼容移除历史 ``1. 【标题】`` 编号；不再因模型添加引导语、
+    缺少某个标题或调整段落顺序而拒绝整次结果。
+    """
+    lines: list[str] = []
+    for line in prompt.strip().splitlines():
         stripped = line.strip()
-        match = _ENRICH_SECTION_HEADING.fullmatch(stripped)
-        if match is not None:
-            if current_label is not None:
-                sections.append(
-                    (current_number, current_label, "\n".join(current_body).strip())
-                )
-            number = match.group("number")
-            current_number = int(number) if number is not None else None
-            current_label = match.group("label").strip()
-            current_body = [match.group("body").strip()]
-        elif current_label is not None:
-            current_body.append(line)
-        elif stripped:
-            raise ValueError("prompt 段落必须以【标题】或历史数字编号标题开头")
-
-    if current_label is not None:
-        sections.append((current_number, current_label, "\n".join(current_body).strip()))
-
-    labels = [label for _, label, _ in sections]
-    if labels != list(ENRICH_SECTION_LABELS):
-        raise ValueError("prompt 必须包含顺序固定且不重复的十二个段落")
-    for index, (number, label, body) in enumerate(sections, 1):
-        if number is not None and number != index:
-            raise ValueError(f"prompt 段落编号与顺序不一致：{label}")
-        if not body:
-            raise ValueError(f"prompt 段落内容为空：{label}")
-
-    return "\n".join(f"【{label}】{body}" for _, label, body in sections)
+        for index, label in enumerate(ENRICH_SECTION_LABELS, 1):
+            prefix = f"{index}. 【{label}】"
+            if stripped.startswith(prefix):
+                stripped = stripped.removeprefix(f"{index}. ").lstrip()
+                break
+        lines.append(stripped)
+    normalized = "\n".join(lines).strip()
+    if not normalized:
+        raise ValueError("enrich prompt 不能为空")
+    if len(normalized) > 32_000:
+        raise ValueError("enrich prompt 超过最大长度")
+    return normalized
 
 
 class StrictPipelineModel(BaseModel):
@@ -322,11 +306,11 @@ class MergeOutput(StrictPipelineModel):
 
 
 class ResolvedPrompts(StrictPipelineModel):
-    final: NonEmptyText
+    final: EnrichPromptText
 
     @field_validator("final")
     @classmethod
-    def contains_twelve_nonempty_ordered_sections(cls, value: str) -> str:
+    def normalize_prompt_whitespace(cls, value: str) -> str:
         return normalize_enrich_prompt(value)
 
 
