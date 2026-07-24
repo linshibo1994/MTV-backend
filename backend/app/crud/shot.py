@@ -15,7 +15,11 @@ from sqlalchemy.orm import selectinload
 from app.models.episode import Episode
 from app.models.scene import Scene
 from app.models.shot import Shot
-from app.models.shot_group import FINAL_SHOT_GROUP_UNIT_PREFIX, ShotGroup
+from app.models.shot_group import (
+    FINAL_SHOT_GROUP_UNIT_PREFIX,
+    ShotGroup,
+    shot_group_content_hash,
+)
 from app.models.video_generation_job import VideoGenerationJob
 from app.schemas.shot import (
     CoverOut,
@@ -131,6 +135,27 @@ def _group_sort_key(group: Any) -> tuple[int, int, str]:
     digits = "".join(ch for ch in (group.group_no or "") if ch.isdigit())
     numeric = int(digits) if digits else 0
     return getattr(group, "scene_no", 0), numeric, group.group_no
+
+
+def _job_matches_group_snapshot(
+    input_json: dict | None,
+    group: ShotGroup,
+    *,
+    finished_at: Any | None = None,
+) -> bool:
+    """历史成功任务仅在镜头组更新时间快照一致时仍代表当前成片。"""
+
+    if group.updated_at is None:
+        return False
+    version = (input_json or {}).get("shot_group_version") or {}
+    content_hash = version.get("shot_group_content_hash")
+    if content_hash:
+        return content_hash == shot_group_content_hash(group)
+    if version.get("shot_group_updated_at") == group.updated_at.isoformat():
+        return True
+    # 兼容上线前已完成的任务：末帧是在任务成功事务内写回，可能晚于创建快照；
+    # 只要镜头组最后更新时间不晚于任务完成时间，仍属于该成片。
+    return bool(finished_at is not None and group.updated_at <= finished_at)
 
 
 def _shot_to_out(shot: Shot) -> ShotOut:
@@ -351,12 +376,24 @@ async def get_video_workbench(
     succeeded_unit_ids: set[str] = set()
     if all_unit_ids:
         succ_result = await db.execute(
-            select(VideoGenerationJob.unit_id).where(
+            select(
+                VideoGenerationJob.unit_id,
+                VideoGenerationJob.input_json,
+                VideoGenerationJob.finished_at,
+            ).where(
                 VideoGenerationJob.unit_id.in_(all_unit_ids),
                 VideoGenerationJob.status == "succeeded",
             )
         )
-        succeeded_unit_ids = {row[0] for row in succ_result.all()}
+        group_by_unit = {group.unit_id: group for group in groups if group.unit_id}
+        for unit_id, input_json, finished_at in succ_result.all():
+            group = group_by_unit.get(unit_id)
+            if group is not None and _job_matches_group_snapshot(
+                input_json,
+                group,
+                finished_at=finished_at,
+            ):
+                succeeded_unit_ids.add(unit_id)
 
     # 按场景统计待生成镜头数: 累加无 succeeded 视频的镜头组内镜头数量
     pending_shot_count_by_scene: dict[int, int] = {}
@@ -393,6 +430,8 @@ async def get_video_workbench(
                     shot_nos=[s.shot_no for s in sorted_shots],
                     description_text=g.description_text,
                     reference_frames=_to_reference_frames(g.reference_frames),
+                    content_hash=shot_group_content_hash(g),
+                    updated_at=g.updated_at,
                 )
             )
         scene_list.append(

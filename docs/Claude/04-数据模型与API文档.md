@@ -409,12 +409,14 @@ video-workbench 视角额外字段：
 | unit_runtime_key | string | 运行时 key（如 `<runtime>:<scene_no>:group:<uuid>`） |
 | duration_seconds | int | 视频时长（秒） |
 | video_duration_seconds | int | 视频时长 |
-| materials | object | {character[], background[], prop[], other[]} 引用主体资产 |
-| audio_elements | string[] | 需配音角色 |
+| materials | object | `{character[], background[], prop[], other[]}` 引用主体资产；每项为 `{name, subject_id?, asset_entry_id?}` |
+| audio_elements | object[] | 音频主体引用；每项为 `{type, name, subject_id?, asset_entry_id?}` |
 | shot_ids | string[] | 组内镜头 ID |
 | shot_display_nos | int[] | 显示序号 |
 | shot_nos | string[] | 镜头号 |
 | description_text | string | 描述文本 |
+| content_hash | string(64) | 镜头组视频输入内容指纹；与视频任务组级快照比较结果是否仍有效 |
+| updated_at | string(ISO) | 镜头组更新时间；仅用于兼容没有内容指纹的历史视频任务 |
 
 **reference_frames**
 
@@ -439,6 +441,18 @@ video-workbench 视角额外字段：
 | expected_episode_version | int | 工作台当前分集版本，过期返回 409 |
 
 分镜生成先把小分镜保存在 `draft:` 暂存组中，供“分镜结果”列表展示。合并接口校验 ID 覆盖本集全部分镜，再按场景、LLM 叙事边界和原顺序自动创建多个 3～15 秒的 `group:` 正式组，原子重算时间轴、prompt、materials、audio_elements、时长和组号。成功后 `episode_version + 1` 并响应完整 `VideoWorkbenchOut`；它不创建 `VideoGenerationJob`、不扣积分，涉及的源组已有任意视频任务时拒绝修改。
+
+**ShotGroupUpdateIn**
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| expected_episode_version | int | 必填；工作台当前分集版本，过期返回 409 |
+| duration_seconds | int（3～15） | 可选；更新计划/视频时长并按比例重算组内镜头时间轴和 prompt 时间标签 |
+| prompt | string（1～32000） | 可选；文生视频提示词，去除首尾空白后不得为空 |
+| materials | object | 可选且不可为 null；四个素材分组，每组最多 100 项 |
+| audio_elements | object[] | 可选且不可为 null，最多 200 项；`type` 只能为 `character` 或 `sound` |
+
+除 `expected_episode_version` 外至少提交一个编辑字段。素材和音频项至少包含 `name`、`subject_id` 或 `asset_entry_id` 之一；服务端校验主体、资产、类型和剧本归属后补齐稳定引用。只有 `group:` 正式镜头组可编辑，存在 `starting/processing` 视频任务时返回 409。成功后返回完整 `VideoWorkbenchOut`；实际内容变化时 `episode_version + 1`，规范化后值相同则保持版本不变。视频任务只有在 `input_json.shot_group_version.shot_group_content_hash` 与当前镜头组 `content_hash` 一致时才是当前结果，`shot_group_updated_at/updated_at` 仅兼容没有内容指纹的历史任务，其他任务保留为历史记录。
 
 ### 1.16 Scene（场景，按背景聚合）
 
@@ -641,6 +655,7 @@ video-workbench 视角：
 | GET | `/shots/<script_id>/cover` | - | 视频项目封面（取自首个镜头首帧） |
 | GET | `/scripts/<sid>/episodes/<eid>/shot-hierarchy` | - | ShotHierarchy（场景->镜头组->镜头） |
 | POST | `/scripts/<sid>/episodes/<eid>/shot-groups/merge` | JSON `ShotGroupMergeIn` | 提交本集全部分镜并自动生成多个正式镜头组，返回 VideoWorkbench |
+| PATCH | `/scripts/<sid>/episodes/<eid>/shot-groups/<shot_group_id>` | JSON `ShotGroupUpdateIn` | 编辑正式镜头组的时长、prompt、素材或音频，返回完整 VideoWorkbench |
 | GET | `/shots/<sid>/episodes/<eid>/video-workbench` | - | VideoWorkbench（含 unit_id/unit_runtime_key/materials/audio_elements） |
 
 ### 2.7 video-generation（视频生成）

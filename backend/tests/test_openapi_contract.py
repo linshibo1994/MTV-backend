@@ -47,6 +47,10 @@ REQUIRED_OPERATIONS = {
         "POST",
         "/v3api/scripts/{script_id}/episodes/{episode_id}/shot-groups/merge",
     ),
+    (
+        "PATCH",
+        "/v3api/scripts/{script_id}/episodes/{episode_id}/shot-groups/{shot_group_id}",
+    ),
     ("GET", "/v3api/shots/{script_id}/episodes/{episode_id}/video-workbench"),
     ("GET", "/v3api/shots/{script_id}/cover"),
     ("POST", "/v3api/video-generation-jobs"),
@@ -96,6 +100,28 @@ def test_shot_group_merge_openapi_accepts_full_episode_shot_set() -> None:
     response = schema["paths"][
         "/v3api/scripts/{script_id}/episodes/{episode_id}/shot-groups/merge"
     ]["post"]["responses"]["200"]["content"]["application/json"]["schema"]
+    assert response["$ref"].endswith("/VideoWorkbenchOut")
+
+
+def test_shot_group_update_openapi_exposes_partial_edit_contract() -> None:
+    schema = app.openapi()
+    update = schema["components"]["schemas"]["ShotGroupUpdateIn"]
+    workbench_group = schema["components"]["schemas"]["ShotGroupWorkbenchOut"]
+
+    assert update["properties"]["duration_seconds"]["anyOf"][0] == {
+        "type": "integer",
+        "maximum": 15.0,
+        "minimum": 3.0,
+    }
+    assert workbench_group["properties"]["content_hash"] == {
+        "type": "string",
+        "maxLength": 64,
+        "minLength": 64,
+        "title": "Content Hash",
+    }
+    response = schema["paths"][
+        "/v3api/scripts/{script_id}/episodes/{episode_id}/shot-groups/{shot_group_id}"
+    ]["patch"]["responses"]["200"]["content"]["application/json"]["schema"]
     assert response["$ref"].endswith("/VideoWorkbenchOut")
 
 

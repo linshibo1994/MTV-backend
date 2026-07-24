@@ -34,7 +34,7 @@ from app.core.errors import BadRequestError, ConflictError, ForbiddenError
 from app.crud import video as video_crud
 from app.models.episode import Episode
 from app.models.script import Script
-from app.models.shot_group import ShotGroup
+from app.models.shot_group import ShotGroup, shot_group_content_hash
 from app.models.video_generation_job import VIDEO_IDEMPOTENCY_KEY_MAX_LENGTH
 from app.providers.registry import require_capability
 from app.providers.video_gen import (
@@ -221,6 +221,10 @@ async def create_video_job(
     if first_frame:
         # 持久化到当前组 reference_frames.first_frame
         await _persist_first_frame(db, shot_group, first_frame)
+    # 创建任务的组级版本快照必须来自所有镜头组变更落库之后；否则自动补首帧
+    # 会更新 updated_at，导致刚创建的任务立即被工作台判定为历史结果。
+    await db.flush()
+    await db.refresh(shot_group, attribute_names=["updated_at"])
 
     # 5. 取激活供应商配置，缺失兜底
     provider_cfg = await video_crud.get_active_provider(db, "all_reference")
@@ -266,6 +270,7 @@ async def create_video_job(
             "shot_group_updated_at": shot_group.updated_at.isoformat()
             if shot_group.updated_at is not None
             else None,
+            "shot_group_content_hash": shot_group_content_hash(shot_group),
         },
     }
 

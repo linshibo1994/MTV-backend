@@ -1,5 +1,8 @@
 """ShotGroup（镜头组）ORM 模型。"""
 
+import hashlib
+import json
+
 from sqlalchemy import CheckConstraint, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -9,6 +12,25 @@ from app.models.base import Base, TimestampMixin
 
 DRAFT_SHOT_GROUP_UNIT_PREFIX = "draft:"
 FINAL_SHOT_GROUP_UNIT_PREFIX = "group:"
+
+
+def shot_group_content_hash(group: "ShotGroup") -> str:
+    """只对会影响视频生成的可编辑字段生成稳定组级指纹。"""
+
+    payload = {
+        "audio_elements": group.audio_elements or {},
+        "duration_seconds": group.duration_seconds,
+        "materials": group.materials or {},
+        "prompt": group.prompt or "",
+        "video_duration_seconds": group.video_duration_seconds,
+    }
+    canonical = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 class ShotGroup(TimestampMixin, Base):

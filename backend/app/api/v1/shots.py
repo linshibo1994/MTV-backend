@@ -4,6 +4,7 @@
 - POST /scripts/<sid>/episodes/<eid>/generate-storyboard  触发 LLM 分镜生成 (异步)
 - GET  /scripts/<sid>/episodes/<eid>/shot-hierarchy      分镜层级 (场景->镜头组->镜头)
 - POST /scripts/<sid>/episodes/<eid>/shot-groups/merge   自动组合本集全部小分镜
+- PATCH /scripts/<sid>/episodes/<eid>/shot-groups/<gid>  编辑正式镜头组
 - GET  /shots/<sid>/episodes/<eid>/video-workbench        视频工作台 (含 unit_id/materials)
 - GET  /shots/<script_id>/cover                           视频项目封面 (首个镜头首帧)
 """
@@ -47,6 +48,7 @@ from app.schemas.shot import (
     CoverOut,
     GenerateStoryboardResponse,
     ShotGroupMergeIn,
+    ShotGroupUpdateIn,
     ShotHierarchyOut,
     StoryboardJobEditIn,
     StoryboardJobListOut,
@@ -55,6 +57,7 @@ from app.schemas.shot import (
 )
 from app.services.audit import best_effort_log as audit_log
 from app.services.credits import release, reserve
+from app.services.shot_group_edit import update_shot_group
 from app.services.shot_group_merge import merge_shots_into_group
 from app.services.task_dispatch import enqueue_task
 
@@ -597,6 +600,71 @@ async def merge_shot_group(
             "shot_group_ids": list(result.shot_group_ids),
             "removed_shot_group_ids": list(result.removed_shot_group_ids),
             "already_grouped": result.already_grouped,
+        },
+    )
+    workbench = await get_video_workbench(db, script_id, episode_id)
+    await db.commit()
+    return workbench
+
+
+@router.patch(
+    "/scripts/{script_id}/episodes/{episode_id}/shot-groups/{shot_group_id}",
+    response_model=VideoWorkbenchOut,
+    summary="编辑正式镜头组",
+    description=(
+        "部分更新合并后的正式镜头组时长、文生视频提示词、视觉素材或音频元素；"
+        "成功后递增分集版本并返回完整视频工作台。"
+    ),
+)
+async def edit_shot_group(
+    script_id: str,
+    episode_id: str,
+    shot_group_id: str,
+    payload: ShotGroupUpdateIn,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> VideoWorkbenchOut:
+    """编辑正式镜头组并返回前端可直接替换的完整工作台。"""
+
+    await _validate_script_episode(
+        db,
+        user,
+        script_id,
+        episode_id,
+        action=Action.EDIT,
+        expected_episode_version=payload.expected_episode_version,
+    )
+    fields_set = set(payload.model_fields_set)
+    result = await update_shot_group(
+        db,
+        script_id=script_id,
+        episode_id=episode_id,
+        shot_group_id=shot_group_id,
+        expected_episode_version=payload.expected_episode_version,
+        fields_set=fields_set,
+        duration_seconds=payload.duration_seconds,
+        prompt=payload.prompt,
+        materials=(
+            payload.materials.model_dump(exclude_none=True)
+            if payload.materials is not None
+            else None
+        ),
+        audio_elements=(
+            [item.model_dump(exclude_none=True) for item in payload.audio_elements]
+            if payload.audio_elements is not None
+            else None
+        ),
+    )
+    await audit_log(
+        db,
+        actor=user,
+        action="shot_group_update",
+        resource_type="shot_group",
+        resource_id=shot_group_id,
+        before={"episode_version": payload.expected_episode_version},
+        after={
+            "episode_version": result.episode_version,
+            "changed_fields": list(result.changed_fields),
         },
     )
     workbench = await get_video_workbench(db, script_id, episode_id)

@@ -7,9 +7,10 @@
 
 from __future__ import annotations
 
-from typing import Any
+from datetime import datetime
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 # ---------------------------------------------------------------------------
 # 基础出参
@@ -130,6 +131,8 @@ class ShotGroupWorkbenchOut(BaseModel):
     shot_nos: list[str] = Field(default_factory=list)
     description_text: str | None = None
     reference_frames: ReferenceFramesOut | None = None
+    content_hash: str = Field(min_length=64, max_length=64)
+    updated_at: datetime
 
 
 class SceneWorkbenchOut(BaseModel):
@@ -177,6 +180,95 @@ class ShotGroupMergeIn(BaseModel):
         if len(set(normalised)) != len(normalised):
             raise ValueError("shot_ids 必须是当前分集全部且唯一的镜头 ID")
         return normalised
+
+
+class ShotGroupMaterialItemIn(BaseModel):
+    """镜头组视觉素材引用；稳定 ID 由服务端校验并补齐。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str | None = Field(default=None, min_length=1, max_length=255)
+    subject_id: str | None = Field(default=None, min_length=1, max_length=36)
+    asset_entry_id: str | None = Field(default=None, min_length=1, max_length=36)
+
+    @model_validator(mode="after")
+    def require_identity(self) -> ShotGroupMaterialItemIn:
+        if not self.name and not self.subject_id and not self.asset_entry_id:
+            raise ValueError("素材至少需要 name、subject_id 或 asset_entry_id")
+        return self
+
+
+class ShotGroupMaterialsIn(BaseModel):
+    """镜头组视觉素材分组。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    character: list[ShotGroupMaterialItemIn] = Field(default_factory=list, max_length=100)
+    background: list[ShotGroupMaterialItemIn] = Field(default_factory=list, max_length=100)
+    prop: list[ShotGroupMaterialItemIn] = Field(default_factory=list, max_length=100)
+    other: list[ShotGroupMaterialItemIn] = Field(default_factory=list, max_length=100)
+
+
+class ShotGroupAudioElementIn(BaseModel):
+    """镜头组音频主体引用。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["character", "sound"]
+    name: str | None = Field(default=None, min_length=1, max_length=255)
+    subject_id: str | None = Field(default=None, min_length=1, max_length=36)
+    asset_entry_id: str | None = Field(default=None, min_length=1, max_length=36)
+
+    @model_validator(mode="after")
+    def require_identity(self) -> ShotGroupAudioElementIn:
+        if not self.name and not self.subject_id and not self.asset_entry_id:
+            raise ValueError("音频元素至少需要 name、subject_id 或 asset_entry_id")
+        return self
+
+
+class ShotGroupUpdateIn(BaseModel):
+    """编辑正式镜头组；除乐观锁版本外至少提交一个可编辑字段。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    expected_episode_version: int = Field(..., ge=1)
+    duration_seconds: int | None = Field(default=None, ge=3, le=15)
+    prompt: str | None = Field(default=None, min_length=1, max_length=32000)
+    materials: ShotGroupMaterialsIn | None = None
+    audio_elements: list[ShotGroupAudioElementIn] | None = Field(
+        default=None,
+        max_length=200,
+    )
+
+    @field_validator("prompt")
+    @classmethod
+    def validate_prompt(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        if not value:
+            raise ValueError("prompt 不得为空")
+        return value
+
+    @model_validator(mode="after")
+    def require_edit_field(self) -> ShotGroupUpdateIn:
+        editable_fields = {
+            "duration_seconds",
+            "prompt",
+            "materials",
+            "audio_elements",
+        }
+        if not (self.model_fields_set & editable_fields):
+            raise ValueError("至少提交一个镜头组编辑字段")
+        if "duration_seconds" in self.model_fields_set and self.duration_seconds is None:
+            raise ValueError("duration_seconds 不得为 null")
+        if "prompt" in self.model_fields_set and self.prompt is None:
+            raise ValueError("prompt 不得为 null")
+        if "materials" in self.model_fields_set and self.materials is None:
+            raise ValueError("materials 不得为 null")
+        if "audio_elements" in self.model_fields_set and self.audio_elements is None:
+            raise ValueError("audio_elements 不得为 null")
+        return self
 
 
 # ---------------------------------------------------------------------------
@@ -260,6 +352,10 @@ __all__ = [
     "SceneWorkbenchOut",
     "VideoWorkbenchOut",
     "ShotGroupMergeIn",
+    "ShotGroupMaterialItemIn",
+    "ShotGroupMaterialsIn",
+    "ShotGroupAudioElementIn",
+    "ShotGroupUpdateIn",
     "CoverOut",
     "GenerateStoryboardResponse",
     "StoryboardStatusOut",

@@ -103,7 +103,7 @@
 49. `GET /v3api/generation-jobs/{job_id}` - 查询图片生成任务状态
 50. `POST /v3api/generation-jobs/{job_id}/cancel` - 取消图片生成任务
 
-#### 分镜、镜头与视频工作台（11）
+#### 分镜、镜头与视频工作台（12）
 
 51. `POST /v3api/scripts/{script_id}/episodes/{episode_id}/generate-storyboard` - 创建分镜生成任务
 52. `POST /v3api/scripts/{script_id}/episodes/{episode_id}/storyboard/{job_id}/cancel` - 取消分镜任务
@@ -114,40 +114,45 @@
 57. `GET /v3api/scripts/{script_id}/episodes/{episode_id}/storyboard-status` - 查询最新分镜状态
 58. `GET /v3api/scripts/{script_id}/episodes/{episode_id}/shot-hierarchy` - 查询镜头层级
 59. `POST /v3api/scripts/{script_id}/episodes/{episode_id}/shot-groups/merge` - 将本集全部小分镜自动组合为正式镜头组
-60. `GET /v3api/shots/{script_id}/episodes/{episode_id}/video-workbench` - 获取视频工作台
-61. `GET /v3api/shots/{script_id}/cover` - 获取剧本封面
+60. `PATCH /v3api/scripts/{script_id}/episodes/{episode_id}/shot-groups/{shot_group_id}` - 编辑正式镜头组
+61. `GET /v3api/shots/{script_id}/episodes/{episode_id}/video-workbench` - 获取视频工作台
+62. `GET /v3api/shots/{script_id}/cover` - 获取剧本封面
 
 #### 视频供应商与视频生成（8）
 
-62. `GET /v3api/video-generation/active-provider` - 查询当前视频供应商
-63. `POST /v3api/video-generation/active-provider` - 更新当前视频供应商
-64. `GET /v3api/video-generation/check-materials` - 检查镜头组素材完整性
-65. `POST /v3api/video-generation-jobs` - 创建单个镜头组视频任务
-66. `GET /v3api/video-generation-jobs` - 查询视频任务列表
-67. `GET /v3api/video-generation/{job_id}` - 查询指定视频任务
-68. `POST /v3api/video-generation/{job_id}/cancel` - 取消视频任务
-69. `POST /v3api/video-generation-jobs/batch` - 批量创建视频任务
+63. `GET /v3api/video-generation/active-provider` - 查询当前视频供应商
+64. `POST /v3api/video-generation/active-provider` - 更新当前视频供应商
+65. `GET /v3api/video-generation/check-materials` - 检查镜头组素材完整性
+66. `POST /v3api/video-generation-jobs` - 创建单个镜头组视频任务
+67. `GET /v3api/video-generation-jobs` - 查询视频任务列表
+68. `GET /v3api/video-generation/{job_id}` - 查询指定视频任务
+69. `POST /v3api/video-generation/{job_id}/cancel` - 取消视频任务
+70. `POST /v3api/video-generation-jobs/batch` - 批量创建视频任务
 
 #### 视频时间线与最终合成（9）
 
-70. `GET /v3api/video-timeline-arrangements` - 获取时间线
-71. `POST /v3api/video-timeline-arrangements` - 向时间线添加片段
-72. `PATCH /v3api/video-timeline-arrangements/{arrangement_id}` - 修改时间线片段
-73. `DELETE /v3api/video-timeline-arrangements/{arrangement_id}` - 删除时间线片段
-74. `PUT /v3api/video-timeline-arrangements/reorder` - 重排时间线片段
-75. `POST /v3api/video-timeline-arrangements/render` - 创建最终视频合成任务
-76. `GET /v3api/video-timeline-arrangements/render/{job_id}` - 查询合成任务状态
-77. `POST /v3api/video-timeline-arrangements/render/{job_id}/cancel` - 取消合成任务
-78. `POST /v3api/video-timeline-arrangements/render/{job_id}/retry` - 重试合成任务
+71. `GET /v3api/video-timeline-arrangements` - 获取时间线
+72. `POST /v3api/video-timeline-arrangements` - 向时间线添加片段
+73. `PATCH /v3api/video-timeline-arrangements/{arrangement_id}` - 修改时间线片段
+74. `DELETE /v3api/video-timeline-arrangements/{arrangement_id}` - 删除时间线片段
+75. `PUT /v3api/video-timeline-arrangements/reorder` - 重排时间线片段
+76. `POST /v3api/video-timeline-arrangements/render` - 创建最终视频合成任务
+77. `GET /v3api/video-timeline-arrangements/render/{job_id}` - 查询合成任务状态
+78. `POST /v3api/video-timeline-arrangements/render/{job_id}/cancel` - 取消合成任务
+79. `POST /v3api/video-timeline-arrangements/render/{job_id}/retry` - 重试合成任务
 
 #### 媒体上传、播放与下载（2）
 
-79. `GET /api/x/cctv/zhihui/flow-app/{storage_key:path}` - 通过鉴权代理读取媒体
-80. `POST /api/x/cctv/zhihui/flow-app/upload_images/{mid}/{filename}` - 上传图片素材
+80. `GET /api/x/cctv/zhihui/flow-app/{storage_key:path}` - 通过鉴权代理读取媒体
+81. `POST /api/x/cctv/zhihui/flow-app/upload_images/{mid}/{filename}` - 上传图片素材
 
 ## 2026-07-22 镜头组合并接口
 
 新增同步结构编辑接口：前端提交本集分镜生成结果中的全部镜头 ID，后端按场景、叙事连续性和 3～15 秒规则自动生成多个正式镜头组；不触发视频生成或积分扣费。详细契约见第 11 节。
+
+## 2026-07-24 镜头组编辑接口
+
+新增正式镜头组部分更新接口：可持久化修改时长、文生视频提示词、视觉素材和音频元素；成功后返回新版本完整工作台。详细契约见第 11 节。
 
 ## 2026-07-19 本轮接口更新清单
 
@@ -1071,6 +1076,7 @@ interface BatchJobOut {
 | `GET /v3api/scripts/{script_id}/episodes/{episode_id}/storyboard-status` | READ | 路径 ID | 最新 `StoryboardStatusOut` |
 | `GET /v3api/scripts/{script_id}/episodes/{episode_id}/shot-hierarchy` | READ | 路径 ID | `ShotHierarchyOut` |
 | `POST /v3api/scripts/{script_id}/episodes/{episode_id}/shot-groups/merge` | EDIT | `ShotGroupMergeIn` | 完整 `VideoWorkbenchOut` |
+| `PATCH /v3api/scripts/{script_id}/episodes/{episode_id}/shot-groups/{shot_group_id}` | EDIT | `ShotGroupUpdateIn` | 完整 `VideoWorkbenchOut` |
 | `GET /v3api/shots/{script_id}/episodes/{episode_id}/video-workbench` | READ | 路径 ID | `VideoWorkbenchOut` |
 | `GET /v3api/shots/{script_id}/cover` | READ | 路径 ID | `CoverOut` |
 
@@ -1097,6 +1103,42 @@ Idempotency-Key: <uuid>
 成功响应是 `episode_version` 已递增的完整 `VideoWorkbenchOut`，前端应直接替换当前工作台状态。合并只创建可生成视频的工作台单元：此时 `GET /video-generation-jobs` 允许为空；用户点击单个或批量“生成视频”后才创建付费异步任务。已完成组合后，以当前版本重复提交同一全集 ID 会无副作用返回现有工作台。
 
 漏传本集任一镜头或时长无法合法分区返回 `400`；镜头属于其他剧本/分集返回 `403`；ID 不存在返回 `404`；版本过期、活动分镜任务、草稿/正式状态混杂或源组已有视频任务返回 `409`；空数组、重复 ID、超过 1000 项或字段非法返回 `422`。草稿镜头组不能调用素材检查或视频生成接口，会返回 `409`“请先完成镜头组合并”。
+
+镜头组编辑请求示例：
+
+```json
+{
+  "expected_episode_version": 4,
+  "duration_seconds": 8,
+  "prompt": "【镜头1:0s～4s】……\n【镜头2:4s～8s】……",
+  "materials": {
+    "character": [
+      {
+        "name": "老姜",
+        "subject_id": "<subject_id>",
+        "asset_entry_id": "<approved_image_entry_id>"
+      }
+    ],
+    "background": [],
+    "prop": [],
+    "other": []
+  },
+  "audio_elements": [
+    {
+      "type": "character",
+      "name": "老姜",
+      "subject_id": "<subject_id>",
+      "asset_entry_id": "<approved_audio_entry_id>"
+    }
+  ]
+}
+```
+
+`expected_episode_version` 必填且不小于 1；此外至少提交 `duration_seconds`、`prompt`、`materials`、`audio_elements` 之一。`duration_seconds` 为 3～15 秒；`prompt` 去除首尾空白后长度为 1～32000。`materials` 不可为 null，分为 `character/background/prop/other`，每组最多 100 项；`audio_elements` 不可为 null，最多 200 项，`type` 只能为 `character|sound`。素材或音频项至少包含 `name`、`subject_id`、`asset_entry_id` 之一，前端应优先提交稳定 ID；服务端会校验其剧本归属、主体类型、资产类型和审核状态，并在响应中补齐可解析的稳定引用。
+
+只有 `unit_id=group:<shot_group_id>` 的正式组可编辑。存在 `starting/processing` 视频任务时返回 409；历史 `succeeded/failed/canceled` 任务保留。某个视频任务只有在 `input_json.shot_group_version.shot_group_content_hash` 与当前镜头组 `content_hash` 一致时，才代表该组当前输入；`shot_group_updated_at/updated_at` 仅兼容没有内容指纹的历史任务。不能仅按全局 `episode_version/input_version` 判定，否则编辑一个组会错误地让同集其他组结果失效。更新时长会按原比例把整数秒重新分配给组内镜头，每个镜头至少 1 秒，并同步 `duration_seconds`、`video_duration_seconds`、镜头起止时间、`shot_line` 和 prompt 中已有的时间标签；目标时长小于镜头数返回 400。
+
+成功响应是 `episode_version` 已递增的完整 `VideoWorkbenchOut`，前端必须直接替换当前分集工作台并使用新版本发起后续编辑。常见错误：语义或素材解析失败为 400，跨资源为 403，资源不存在为 404，版本冲突、草稿组或活动视频任务为 409，字段格式错误为 422。
 
 ### 11.2 分镜任务字段
 
@@ -1196,8 +1238,12 @@ interface ShotHierarchyOut {
 | `shot_ids` / `shot_display_nos` / `shot_nos` | 组内镜头引用 |
 | `description_text` | 聚合描述 |
 | `reference_frames` | 首帧/尾帧/参考帧 |
+| `content_hash` | 镜头组视频输入内容指纹，用于识别当前组的视频结果 |
+| `updated_at` | 镜头组更新时间，仅兼容没有内容指纹的历史任务 |
 
 `materials` 的 `character`、`background`、`prop`、`other` 均为数组，每项 `{name, subject_id, asset_entry_id}`，后两字段可空。
+
+工作台按镜头组快照识别当前结果：优先比较镜头组 `content_hash` 与视频任务 `input_json.shot_group_version.shot_group_content_hash`；不一致的任务仅保留为历史记录。`updated_at/shot_group_updated_at` 只用于兼容旧任务，`episode_version` 仍用于编辑乐观锁，不用于跨组判断视频是否过期。
 
 `CoverOut`：`script_id`、`cover`、`mime_type`；`cover` 是首个镜头首帧 storage key，可能为空。
 
@@ -1315,7 +1361,7 @@ interface VideoJobBatchOut {
 
 与图片任务不同，视频任务的 `input_json`、`output_json` 是 JSON 对象，不是 JSON 字符串。
 
-`input_json` 常见字段：`model`、`prompt`、`reference_images`、`reference_image_names`、`reference_audios`、`reference_audio_names`、`reference_videos`、`reference_video_names`、`first_frame`、`missing_subjects`、`missing_audio`、`duration_seconds`、`shot_group_version`。
+`input_json` 常见字段：`model`、`prompt`、`reference_images`、`reference_image_names`、`reference_audios`、`reference_audio_names`、`reference_videos`、`reference_video_names`、`first_frame`、`missing_subjects`、`missing_audio`、`duration_seconds`、`shot_group_version`。其中 `shot_group_version.shot_group_content_hash` 是创建任务时的镜头组内容指纹，用于和工作台组 `content_hash` 比较结果是否仍有效；`shot_group_updated_at` 仅用于兼容旧任务。
 
 成功 `output_json` 常见字段：
 
