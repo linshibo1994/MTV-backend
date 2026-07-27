@@ -2035,7 +2035,42 @@ def test_video_task_wrapper_never_returns_raw_internal_error(monkeypatch) -> Non
     assert marked == []
 
 
-def test_worker_frame_failure_rolls_back_settle_releases_and_deletes_video() -> None:
+@pytest.mark.asyncio
+async def test_update_last_frame_logs_ffmpeg_diagnostics(monkeypatch, caplog) -> None:
+    from app.providers import storage as storage_module
+    from app.workers import video_generation as worker
+
+    class Storage:
+        pass
+
+    async def download_file(_storage, _storage_key: str, _local_path: str) -> None:
+        return None
+
+    def fake_subprocess_run(command, **_kwargs):
+        if command[0] == "ffprobe":
+            return SimpleNamespace(stdout="15.0", returncode=0, stderr="")
+        return SimpleNamespace(
+            returncode=1,
+            stderr=b"Invalid data found when processing input",
+        )
+
+    monkeypatch.setattr(storage_module, "get_storage", Storage)
+    monkeypatch.setattr(worker, "_download_storage_file", download_file)
+    monkeypatch.setattr(worker.subprocess, "run", fake_subprocess_run)
+
+    with pytest.raises(RuntimeError, match="frame_extraction_failed"):
+        await worker._update_last_frame(
+            SimpleNamespace(),
+            "group:sg-10",
+            "generate_images/video/test.mp4",
+            "attempt-1",
+        )
+
+    assert "ffmpeg_frame_extraction_failed returncode=1" in caplog.text
+    assert "Invalid data found when processing input" in caplog.text
+
+
+def test_worker_frame_failure_keeps_video_and_settles_reservation() -> None:
     async def scenario() -> None:
         _, raw = _make_db()
         seeded = _seed(raw)
@@ -2078,13 +2113,15 @@ def test_worker_frame_failure_rolls_back_settle_releases_and_deletes_video() -> 
         refreshed = raw.get(VideoGenerationJob, job_id)
         reservation = raw.get(CreditReservation, "reservation-frame-failure")
         account = raw.get(CreditAccount, "account-1")
-        assert refreshed.status == "failed"
-        assert refreshed.error_type == "frame_extraction_failed"
-        assert refreshed.error_message == "frame_extraction_failed"
-        assert reservation.status == "released"
+        assert refreshed.status == "succeeded"
+        assert refreshed.output_json["video_storage_key"] == (
+            "generate_images/video/job-frame-failure.mp4"
+        )
+        assert refreshed.error_type is None
+        assert refreshed.error_message is None
+        assert reservation.status == "captured"
         assert account.frozen_points == 0
-        assert account.balance_points == 5000
-        assert deleted == ["generate_images/video/job-frame-failure.mp4"]
+        assert deleted == []
 
     asyncio.run(scenario())
 

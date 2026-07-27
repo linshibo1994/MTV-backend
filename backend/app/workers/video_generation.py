@@ -1717,74 +1717,81 @@ async def run_video_generation_once(
             raise
         except Exception as exc:
             failed_frame_key = getattr(exc, "last_frame_storage_key", None)
-            failed_frame_cleanup_state = getattr(
-                exc,
-                "last_frame_cleanup_state",
-                None,
-            )
-            if isinstance(failed_frame_key, str):
-                last_frame_storage_key = failed_frame_key
-            rolled_back = await _best_effort_rollback(
-                db,
-                job_id=job_id,
-                stage="frame_extraction",
-            )
-            if rolled_back:
-                video_cleaned = await _delete_generated_output(
-                    video_storage_key,
-                    storage=storage,
+            if not isinstance(failed_frame_key, str):
+                # 末帧是镜头衔接的辅助素材，视频对象已成功生成时不能因提帧失败
+                # 而丢弃视频或释放已结算积分。下一镜缺少首帧时会按既有逻辑降级生成。
+                logger.warning(
+                    "视频末帧提取失败，保留已生成视频 job_id=%s unit_id=%s",
+                    job_id,
+                    unit_id,
+                    exc_info=True,
                 )
-                if not video_cleaned:
-                    schedule_kwargs: dict[str, Any] = {
-                        "job_id": job_id,
-                        "script_id": script_id,
-                        "shot_group_id": shot_group_id,
-                        "storage_attempt_id": storage_attempt_id,
-                        "video_storage_key": video_storage_key,
-                        "last_frame_storage_key": None,
-                    }
-                    if provider_task_id is not None:
-                        schedule_kwargs["provider_task_id"] = provider_task_id
-                    scheduled = await _schedule_video_attempt_cleanup(**schedule_kwargs)
-                    if not scheduled:
-                        raise RuntimeError("video_attempt_cleanup_unavailable")
             else:
-                video_cleanup_state = await _cleanup_or_schedule_video_attempt_outputs(
-                    job_id=job_id,
-                    script_id=script_id,
-                    shot_group_id=shot_group_id,
-                    storage_attempt_id=storage_attempt_id,
-                    video_storage_key=video_storage_key,
-                    last_frame_storage_key=None,
-                    provider_task_id=provider_task_id,
-                    storage=storage,
+                # 已上传末帧但更新引用失败时，必须沿用失败闭环，防止产生无法归属的对象。
+                failed_frame_cleanup_state = getattr(
+                    exc,
+                    "last_frame_cleanup_state",
+                    None,
                 )
-                if video_cleanup_state is True:
-                    return
-            if (
-                last_frame_storage_key is not None
-                and failed_frame_cleanup_state is None
-            ):
-                await _cleanup_or_schedule_video_attempt_outputs(
+                last_frame_storage_key = failed_frame_key
+                rolled_back = await _best_effort_rollback(
+                    db,
                     job_id=job_id,
-                    script_id=script_id,
-                    shot_group_id=shot_group_id,
-                    storage_attempt_id=storage_attempt_id,
-                    video_storage_key=None,
-                    last_frame_storage_key=last_frame_storage_key,
-                    provider_task_id=provider_task_id,
-                    storage=storage,
+                    stage="frame_extraction",
                 )
-            await _fail_video_with_release(
-                db,
-                job_id,
-                claim.lease_token,
-                reservation_id,
-                actor_user_id=actor_user_id,
-                error_type="frame_extraction_failed",
-                retryable=False,
-            )
-            return
+                if rolled_back:
+                    video_cleaned = await _delete_generated_output(
+                        video_storage_key,
+                        storage=storage,
+                    )
+                    if not video_cleaned:
+                        schedule_kwargs: dict[str, Any] = {
+                            "job_id": job_id,
+                            "script_id": script_id,
+                            "shot_group_id": shot_group_id,
+                            "storage_attempt_id": storage_attempt_id,
+                            "video_storage_key": video_storage_key,
+                            "last_frame_storage_key": None,
+                        }
+                        if provider_task_id is not None:
+                            schedule_kwargs["provider_task_id"] = provider_task_id
+                        scheduled = await _schedule_video_attempt_cleanup(**schedule_kwargs)
+                        if not scheduled:
+                            raise RuntimeError("video_attempt_cleanup_unavailable")
+                else:
+                    video_cleanup_state = await _cleanup_or_schedule_video_attempt_outputs(
+                        job_id=job_id,
+                        script_id=script_id,
+                        shot_group_id=shot_group_id,
+                        storage_attempt_id=storage_attempt_id,
+                        video_storage_key=video_storage_key,
+                        last_frame_storage_key=None,
+                        provider_task_id=provider_task_id,
+                        storage=storage,
+                    )
+                    if video_cleanup_state is True:
+                        return
+                if failed_frame_cleanup_state is None:
+                    await _cleanup_or_schedule_video_attempt_outputs(
+                        job_id=job_id,
+                        script_id=script_id,
+                        shot_group_id=shot_group_id,
+                        storage_attempt_id=storage_attempt_id,
+                        video_storage_key=None,
+                        last_frame_storage_key=last_frame_storage_key,
+                        provider_task_id=provider_task_id,
+                        storage=storage,
+                    )
+                await _fail_video_with_release(
+                    db,
+                    job_id,
+                    claim.lease_token,
+                    reservation_id,
+                    actor_user_id=actor_user_id,
+                    error_type="frame_extraction_failed",
+                    retryable=False,
+                )
+                return
         finished = await video_crud.finish_video_job(
             db,
             job_id,
@@ -3484,6 +3491,14 @@ async def _update_last_frame(
     frame_tmp = video_tmp.replace(".mp4", "_lastframe.png")
 
     frame_storage_key: str | None = None
+
+    def _subprocess_stderr(result: Any) -> str:
+        """截断并规范化命令错误输出，避免日志被异常媒体内容淹没。"""
+        stderr = getattr(result, "stderr", b"")
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode("utf-8", errors="replace")
+        return str(stderr).strip()[-1000:]
+
     try:
         await _download_storage_file(storage, video_storage_key, video_tmp)
         # 取末尾帧：先探测时长，再 seek 到末尾前 0.1s
@@ -3495,6 +3510,12 @@ async def _update_last_frame(
             ],
             capture_output=True, text=True, timeout=30,
         )
+        probe_returncode = int(getattr(probe, "returncode", 0))
+        if probe_returncode != 0:
+            raise RuntimeError(
+                "ffprobe_failed "
+                f"returncode={probe_returncode} stderr={_subprocess_stderr(probe)}"
+            )
         duration = 0.0
         try:
             duration = float(probe.stdout.strip() or 0)
@@ -3502,15 +3523,24 @@ async def _update_last_frame(
             duration = 0.0
         seek = max(0.0, duration - 0.1)
 
-        subprocess.run(
+        frame_result = subprocess.run(
             [
                 "ffmpeg", "-y", "-ss", str(seek), "-i", video_tmp,
                 "-frames:v", "1", frame_tmp,
             ],
             capture_output=True, timeout=60,
         )
+        frame_returncode = int(getattr(frame_result, "returncode", 0))
+        if frame_returncode != 0:
+            raise RuntimeError(
+                "ffmpeg_frame_extraction_failed "
+                f"returncode={frame_returncode} stderr={_subprocess_stderr(frame_result)}"
+            )
         if not os.path.exists(frame_tmp):
-            raise RuntimeError("frame_extraction_failed")
+            raise RuntimeError(
+                "ffmpeg_frame_output_missing "
+                f"duration={duration:.3f} seek={seek:.3f}"
+            )
         frame_size = os.path.getsize(frame_tmp)
         if frame_size <= 0:
             raise RuntimeError("frame_extraction_failed")
