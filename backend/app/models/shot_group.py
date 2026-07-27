@@ -65,6 +65,8 @@ class ShotGroup(TimestampMixin, Base):
     prompt: Mapped[str] = mapped_column(Text, nullable=False)
     # {first_frame, last_frame, reference_frame}
     reference_frames: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    # 最终汇聚到视频任务的参考图审核快照；reference_hash 与每张图 sha256 绑定。
+    reference_image_audit: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
     duration_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
     video_duration_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # {character[], background[], prop[], other[]}
@@ -97,6 +99,7 @@ class ShotGroup(TimestampMixin, Base):
         kwargs.setdefault("duration_seconds", 3)
         kwargs.setdefault("description_text", "")
         kwargs.setdefault("reference_frames", {})
+        kwargs.setdefault("reference_image_audit", {})
         kwargs.setdefault("materials", {"character": [], "background": [], "prop": [], "other": []})
         kwargs.setdefault("audio_elements", {"characters": [], "sounds": []})
         super().__init__(**kwargs)

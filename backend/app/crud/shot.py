@@ -26,6 +26,7 @@ from app.schemas.shot import (
     MaterialItemOut,
     MaterialsOut,
     ReferenceFramesOut,
+    ReferenceImageAuditOut,
     SceneHierarchyOut,
     SceneWorkbenchOut,
     ShotGroupHierarchyOut,
@@ -33,6 +34,12 @@ from app.schemas.shot import (
     ShotHierarchyOut,
     ShotOut,
     VideoWorkbenchOut,
+)
+from app.services.reference_aggregator import aggregate_references
+from app.services.reference_image_audit import (
+    current_audit_state,
+    include_first_frame,
+    public_audit_state,
 )
 
 # ---------------------------------------------------------------------------
@@ -411,6 +418,11 @@ async def get_video_workbench(
         workbench_groups: list[ShotGroupWorkbenchOut] = []
         for g in groups_by_scene.get(scene.scene_no, []):
             sorted_shots = sorted(g.shots, key=lambda s: s.display_no)
+            references = await aggregate_references(db, g.shot_group_id)
+            from app.services.video_generation import _resolve_first_frame
+
+            include_first_frame(references, await _resolve_first_frame(db, g))
+            audit_state = current_audit_state(g.reference_image_audit, references)
             workbench_groups.append(
                 ShotGroupWorkbenchOut(
                     shot_group_id=g.shot_group_id,
@@ -430,6 +442,7 @@ async def get_video_workbench(
                     shot_nos=[s.shot_no for s in sorted_shots],
                     description_text=g.description_text,
                     reference_frames=_to_reference_frames(g.reference_frames),
+                    reference_image_audit=ReferenceImageAuditOut(**public_audit_state(audit_state)),
                     content_hash=shot_group_content_hash(g),
                     updated_at=g.updated_at,
                 )

@@ -10,6 +10,8 @@
 router 已在 app/api/router.py 挂载到 /v3api 前缀下。
 """
 
+from datetime import UTC, datetime
+
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -24,10 +26,11 @@ from app.models.script import Script
 from app.models.shot_group import ShotGroup
 from app.models.user import User
 from app.models.video_generation_job import VIDEO_IDEMPOTENCY_KEY_MAX_LENGTH
-from app.providers.registry import require_capability
 from app.schemas.video import (
     ActiveProviderOut,
     ActiveProviderUpdateIn,
+    ReferenceImageAuditIn,
+    ReferenceImageAuditOut,
     VideoJobBatchCreateIn,
     VideoJobBatchOut,
     VideoJobCreateIn,
@@ -36,6 +39,8 @@ from app.schemas.video import (
     VideoJobOut,
 )
 from app.services.audit import best_effort_log as audit_log
+from app.services.reference_aggregator import AggregatedReferences
+from app.services.runtime_models import resolve_env_video_model, resolve_video_model
 
 router = APIRouter()
 
@@ -51,17 +56,11 @@ def _derive_batch_idempotency_keys(prefix: str, count: int) -> list[str]:
 
 def _effective_env_video_provider() -> ActiveProviderOut:
     """返回环境配置实际用于创建视频任务的规范化 Provider 与模型。"""
-    provider_key = require_capability(settings.video_gen_provider, "video")
-    fallback_models = {
-        "volcengine": settings.seedance_model,
-        "bailian": settings.dashscope_video_model,
-        "openai": settings.openai_video_model,
-        "gemini": settings.google_video_model,
-    }
+    runtime_model = resolve_env_video_model(settings)
     return ActiveProviderOut(
-        provider_key=provider_key,
+        provider_key=runtime_model.provider,
         job_type="all_reference",
-        model=settings.video_gen_model or fallback_models[provider_key],
+        model=runtime_model.model,
     )
 
 
@@ -133,6 +132,111 @@ async def create_video_generation_job(
         prompt=body.prompt,
     )
     return VideoJobOut.model_validate(job)
+
+
+async def _current_reference_image_audit_state(
+    db: AsyncSession, group: ShotGroup
+) -> tuple[AggregatedReferences, dict]:
+    """与视频创建共用最终参考图解析：主体图 + 当前链式首帧。"""
+    from app.services.reference_aggregator import aggregate_references
+    from app.services.reference_image_audit import current_audit_state, include_first_frame
+    from app.services.video_generation import _resolve_first_frame
+
+    references = await aggregate_references(db, group.shot_group_id)
+    include_first_frame(references, await _resolve_first_frame(db, group))
+    return references, current_audit_state(group.reference_image_audit, references)
+
+
+@router.get(
+    "/video-generation/reference-image-audit",
+    response_model=ReferenceImageAuditOut,
+    summary="获取视频参考图审核状态",
+)
+async def get_video_reference_image_audit(
+    script_id: str = Query(..., description="剧本 ID"),
+    episode_id: str = Query(..., description="分集 ID"),
+    shot_group_id: str = Query(..., description="镜头组 ID"),
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> ReferenceImageAuditOut:
+    await _load_and_check_script(db, user, script_id, require_write=False)
+    group = (
+        await db.execute(
+            select(ShotGroup).where(
+                ShotGroup.shot_group_id == shot_group_id,
+                ShotGroup.script_id == script_id,
+                ShotGroup.episode_id == episode_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if group is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="镜头组不存在或不属于当前分集")
+    from app.services.reference_image_audit import audit_not_required_state, public_audit_state
+
+    references, audit_state = await _current_reference_image_audit_state(db, group)
+    if not (await resolve_video_model(db, settings)).reference_image_audit_required:
+        audit_state = audit_not_required_state(references)
+    return ReferenceImageAuditOut(shot_group_id=group.shot_group_id, **public_audit_state(audit_state))
+
+
+@router.post(
+    "/video-generation/reference-image-audit",
+    response_model=ReferenceImageAuditOut,
+    summary="审核视频生成参考图",
+)
+async def audit_video_reference_images(
+    body: ReferenceImageAuditIn,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> ReferenceImageAuditOut:
+    """手动审核最终会提交给视频模型的全部参考图。
+
+    审核快照保存到镜头组，并由当前参考图清单的指纹绑定；素材或首帧变化后，工作台
+    自动显示 pending，创建视频任务也会再次强制校验，不能复用陈旧的通过结果。
+    """
+    await _load_and_check_script(db, user, body.script_id, require_write=True)
+    result = await db.execute(
+        select(ShotGroup)
+        .where(
+            ShotGroup.shot_group_id == body.shot_group_id,
+            ShotGroup.script_id == body.script_id,
+            ShotGroup.episode_id == body.episode_id,
+        )
+        .with_for_update()
+    )
+    group = result.scalar_one_or_none()
+    if group is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="镜头组不存在或不属于当前分集")
+
+    from app.services.reference_image_audit import (
+        audit_not_required_state,
+        audit_references,
+        public_audit_state,
+    )
+
+    references, current_state = await _current_reference_image_audit_state(db, group)
+    if not (await resolve_video_model(db, settings)).reference_image_audit_required:
+        return ReferenceImageAuditOut(
+            shot_group_id=group.shot_group_id,
+            **public_audit_state(audit_not_required_state(references)),
+        )
+    if group.unit_id != f"group:{group.shot_group_id}":
+        raise ConflictError("请先完成镜头组合并，再审核参考图")
+    try:
+        audit_state = await audit_references(references)
+    except RuntimeError as exc:
+        # 失败是可观察且可重试的状态，绝不降级为通过；不暴露 SDK/上游响应细节。
+        current_state.update({
+            "status": "failed",
+            "audited_at": datetime.now(UTC).isoformat(),
+            "message": "参考图审核服务暂不可用，请稍后重试",
+        })
+        group.reference_image_audit = current_state
+        await db.commit()
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="参考图审核服务暂不可用，请检查审核配置后重试") from exc
+    group.reference_image_audit = audit_state
+    await db.commit()
+    return ReferenceImageAuditOut(shot_group_id=group.shot_group_id, **public_audit_state(audit_state))
 
 
 @router.get(

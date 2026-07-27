@@ -1406,6 +1406,7 @@ async def _fail_video_with_release(
     actor_user_id: str | None,
     error_type: str,
     retryable: bool,
+    error_message: str | None = None,
     output_json: dict[str, Any] | None = None,
     metrics: dict[str, Any] | None = None,
 ) -> None:
@@ -1432,6 +1433,11 @@ async def _fail_video_with_release(
                 await db.rollback()
                 return
     final_error_type = "financial_cleanup" if release_failed or error_type == "financial_cleanup" else error_type
+    final_error_message = (
+        error_message
+        if error_message and final_error_type == error_type
+        else _safe_error_message(final_error_type)
+    )
     finished = await video_crud.finish_video_job(
         db,
         job_id,
@@ -1440,7 +1446,7 @@ async def _fail_video_with_release(
         output_json=output_json,
         metrics=metrics,
         error_type=final_error_type,
-        error_message=_safe_error_message(final_error_type),
+        error_message=final_error_message,
         retryable=retryable or release_failed or final_error_type == "financial_cleanup",
     )
     if finished:
@@ -1903,11 +1909,19 @@ async def run_video_generation_once(
             getattr(provider, "provider_key", "")
             or job_provider_key
         )
-        evidence = {
+        evidence: dict[str, Any] = {
             "state": "submit_rejected",
             "provider_key": provider_key,
             "attempt": claim.attempt,
         }
+        if diagnostics:
+            evidence["diagnostics"] = diagnostics
+        # 仅透传已白名单验证的供应商错误码；SDK 原始内容可能反射提示词、媒体 URL 或凭据。
+        status_code = diagnostics.get("status_code")
+        public_error_message = str(
+            diagnostics.get("code")
+            or (f"ProviderHttp{status_code}" if isinstance(status_code, int) else "provider_submit_rejected")
+        )
         logger.warning(
             "视频远端提交被明确拒绝 job_id=%s provider_key=%s attempt=%s "
             "status_code=%s code=%s param=%s provider_error_type=%s request_id=%s",
@@ -1931,6 +1945,7 @@ async def run_video_generation_once(
                 job_id,
                 claim.lease_token,
                 "provider_submit_rejected",
+                error_message=public_error_message,
                 output_json=terminal_state,
                 metrics=terminal_state,
             )
@@ -1939,6 +1954,7 @@ async def run_video_generation_once(
                 job_id,
                 claim.lease_token,
                 "provider_submit_rejected",
+                error_message=public_error_message,
                 output_json=terminal_state,
                 metrics=terminal_state,
             )
@@ -2631,6 +2647,7 @@ async def _mark_failed_and_release_once(
     lease_token: str,
     error_type: str,
     *,
+    error_message: str | None = None,
     output_json: dict[str, Any] | None = None,
     metrics: dict[str, Any] | None = None,
 ) -> None:
@@ -2676,6 +2693,7 @@ async def _mark_failed_and_release_once(
         actor_user_id=job.owner_user_id,
         error_type=error_type,
         retryable=False,
+        error_message=error_message,
         output_json=output_json,
         metrics=metrics,
     )
@@ -2686,6 +2704,7 @@ async def _mark_failed_and_release(
     lease_token: str,
     error_type: str,
     *,
+    error_message: str | None = None,
     output_json: dict[str, Any] | None = None,
     metrics: dict[str, Any] | None = None,
 ) -> None:
@@ -2698,6 +2717,7 @@ async def _mark_failed_and_release(
             job_id,
             lease_token,
             error_type,
+            error_message=error_message,
             output_json=output_json,
             metrics=metrics,
         )

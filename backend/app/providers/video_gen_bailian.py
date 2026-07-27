@@ -42,6 +42,7 @@ from app.providers.video_gen import (
     raise_if_video_cancel_requested,
     raise_if_video_cancel_requested_before_submit,
     raise_video_submission_uncertain,
+    sanitize_video_submit_rejection_diagnostics,
     unsupported_video_cancellation,
 )
 
@@ -52,11 +53,25 @@ _POLL_TIMEOUT = 600  # 10 分钟
 _BAILIAN_RESULT_DOWNLOAD_HOSTS = frozenset(
     {
         "dashscope-result.oss-cn-hangzhou.aliyuncs.com",
+        "dashscope-result-sh.oss-accelerate.aliyuncs.com",
     }
 )
 
-# 图生视频模型前缀（input 用 img_url）；其余视为文生视频（input 用 prompt）
-_I2V_PREFIXES = ("wanx2.1-i2v", "wan2.2-i2v", "wan2.5-i2v", "wan2.6-i2v", "wanx2.1-kf2v")
+# 2.7 使用新版 media 协议，早期 I2V 模型使用 img_url 协议。
+_WAN27_I2V_PREFIX = "wan2.7-i2v"
+_LEGACY_I2V_PREFIXES = (
+    "wanx2.1-i2v",
+    "wan2.2-i2v",
+    "wan2.5-i2v",
+    "wan2.6-i2v",
+    "wanx2.1-kf2v",
+)
+_WAN26_FLASH_PREFIX = "wan2.6-i2v-flash"
+_WAN26_FLASH_DURATIONS = frozenset({5, 10})
+_HAPPYHORSE_I2V_MODELS = frozenset({"happyhorse-1.0-i2v", "happyhorse-1.1-i2v"})
+_HAPPYHORSE_I2V_MIN_DURATION = 3
+_HAPPYHORSE_I2V_MAX_DURATION = 15
+_HAPPYHORSE_MAX_CHINESE_PROMPT_LENGTH = 2500
 
 
 class BailianVideoGenProvider:
@@ -139,6 +154,7 @@ class BailianVideoGenProvider:
 
         _notify("submitting", "正在提交视频生成任务", 10)
         base_url = self._base_url()
+        api_root = self._api_root(base_url)
         api_key = self._api_key()
         headers = {
             "Authorization": f"Bearer {api_key}",
@@ -165,7 +181,7 @@ class BailianVideoGenProvider:
                 )
                 async def _submit_video():
                     return await http.post(
-                        f"{base_url}/api/v1/services/aigc/video-generation/video-synthesis",
+                        f"{api_root}/services/aigc/video-generation/video-synthesis",
                         headers=headers,
                         json=body,
                     )
@@ -177,7 +193,9 @@ class BailianVideoGenProvider:
                 )
                 if submit.status_code != 200:
                     if 400 <= submit.status_code < 500 and submit.status_code != 408:
-                        raise VideoGenerationSubmitRejected()
+                        raise VideoGenerationSubmitRejected(
+                            diagnostics=self._submit_rejection_diagnostics(submit)
+                        )
                     await raise_video_submission_uncertain(
                         request.on_submission_uncertain
                     )
@@ -204,7 +222,7 @@ class BailianVideoGenProvider:
 
             video_url = await self._poll(
                 http,
-                base_url,
+                api_root,
                 api_key,
                 task_id,
                 _notify,
@@ -245,32 +263,106 @@ class BailianVideoGenProvider:
         model: str,
         _notify,
     ) -> dict:
-        """构造文生/图生视频请求体；图生视频时预编码首帧/参考图为 data URL。"""
-        input_obj: dict = {"prompt": (request.prompt or "")[:800]}
-        is_i2v = model.lower().startswith(_I2V_PREFIXES)
-        img_storage = None
-        if is_i2v:
-            img_storage = request.first_frame or (
-                request.reference_images[0].get("storage_key")
-                if request.reference_images
-                else None
+        """按模型能力构造百炼文生/图生视频请求体。"""
+        normalized_model = model.lower()
+        prompt_limit = (
+            _HAPPYHORSE_MAX_CHINESE_PROMPT_LENGTH
+            if normalized_model in _HAPPYHORSE_I2V_MODELS
+            else 800
+        )
+        input_obj: dict = {"prompt": (request.prompt or "")[:prompt_limit]}
+        if (
+            normalized_model.startswith(_WAN26_FLASH_PREFIX)
+            and request.duration_seconds not in _WAN26_FLASH_DURATIONS
+        ):
+            raise VideoGenerationSubmitRejected(
+                diagnostics={"code": "Wan26DurationMustBe5Or10"}
             )
-            if img_storage:
-                _notify("encoding", "正在编码参考图", 12)
-                input_obj["img_url"] = await self._encode_single(img_storage)
-            elif not request.prompt:
-                raise RuntimeError("图生视频需提供参考图（reference_images 或 first_frame）")
+        if normalized_model in _HAPPYHORSE_I2V_MODELS and request.duration_seconds is not None and not (
+            _HAPPYHORSE_I2V_MIN_DURATION
+            <= request.duration_seconds
+            <= _HAPPYHORSE_I2V_MAX_DURATION
+        ):
+            raise VideoGenerationSubmitRejected(
+                diagnostics={"code": "HappyHorseDurationMustBe3To15"}
+            )
+        image_ref = self._first_image_ref(request)
+        if normalized_model.startswith(_WAN27_I2V_PREFIX):
+            if image_ref is None:
+                raise RuntimeError("Wan 2.7 图生视频需提供首帧参考图")
+            _notify("encoding", "正在编码首帧参考图", 12)
+            media = [
+                {
+                    "type": "first_frame",
+                    "url": await self._encode_reference(image_ref, "image/png"),
+                }
+            ]
+            audio_ref = request.reference_audios[0] if request.reference_audios else None
+            if audio_ref is not None:
+                media.append(
+                    {
+                        "type": "driving_audio",
+                        "url": await self._encode_reference(audio_ref, "audio/mpeg"),
+                    }
+                )
+            input_obj["media"] = media
+        elif normalized_model.startswith(_LEGACY_I2V_PREFIXES):
+            if image_ref is None:
+                raise RuntimeError("图生视频需提供首帧参考图")
+            _notify("encoding", "正在编码首帧参考图", 12)
+            input_obj["img_url"] = await self._encode_reference(image_ref, "image/png")
+            audio_ref = request.reference_audios[0] if request.reference_audios else None
+            if audio_ref is not None and normalized_model.startswith(("wan2.5-i2v", "wan2.6-i2v")):
+                input_obj["audio_url"] = await self._encode_reference(audio_ref, "audio/mpeg")
+        elif normalized_model in _HAPPYHORSE_I2V_MODELS:
+            if image_ref is None:
+                raise RuntimeError("HappyHorse 图生视频需提供首帧参考图")
+            _notify("encoding", "正在编码首帧参考图", 12)
+            input_obj["media"] = [
+                {
+                    "type": "first_frame",
+                    "url": await self._encode_reference(image_ref, "image/png"),
+                }
+            ]
+            happyhorse_parameters: dict = {
+                "resolution": "1080P",
+                "watermark": False,
+            }
+            if request.duration_seconds is not None:
+                happyhorse_parameters["duration"] = request.duration_seconds
+            return {"model": model, "input": input_obj, "parameters": happyhorse_parameters}
         parameters: dict = {
             "prompt_extend": True,
             "watermark": False,
         }
+        if normalized_model.startswith(_WAN26_FLASH_PREFIX):
+            parameters["shot_type"] = "multi"
         if request.duration_seconds and request.duration_seconds > 0:
-            # wanx2.1 固定 5 秒，仅记录期望值；新模型支持 2-15s
-            parameters["duration"] = request.duration_seconds
+            if not normalized_model.startswith(("wanx2.1-", "wan2.2-")):
+                parameters["duration"] = request.duration_seconds
         return {"model": model, "input": input_obj, "parameters": parameters}
 
-    async def _encode_single(self, storage_key: str) -> str:
-        """读取首帧/参考图并编码为 data URL（百炼 img_url 支持 data:image base64）。"""
+    @staticmethod
+    def _first_image_ref(request: VideoGenerationRequest) -> dict | None:
+        if request.first_frame:
+            return {"storage_key": request.first_frame, "mime_type": "image/png"}
+        for reference in request.reference_images:
+            if isinstance(reference, dict) and isinstance(reference.get("storage_key"), str):
+                return reference
+        return None
+
+    async def _encode_reference(self, reference: dict, default_mime_type: str) -> str:
+        """读取单个媒体参考并按其真实 MIME 类型编码为 data URL。"""
+        storage_key = reference.get("storage_key")
+        if not isinstance(storage_key, str) or not storage_key:
+            raise RuntimeError("参考素材缺少 storage_key")
+        mime_type = reference.get("mime_type")
+        if not isinstance(mime_type, str) or "/" not in mime_type:
+            mime_type = default_mime_type
+        return await self._encode_single(storage_key, mime_type)
+
+    async def _encode_single(self, storage_key: str, mime_type: str = "image/png") -> str:
+        """读取媒体并编码为百炼接受的 data URL。"""
         from app.providers.storage import get_storage
         from app.providers.streaming_io import read_storage_bytes_limited
 
@@ -281,12 +373,12 @@ class BailianVideoGenProvider:
             too_large_error="reference_image_too_large",
         )
         b64 = base64.b64encode(data).decode("ascii")
-        return f"data:image/png;base64,{b64}"
+        return f"data:{mime_type};base64,{b64}"
 
     async def _poll(
         self,
         http: httpx.AsyncClient,
-        base_url: str,
+        api_root: str,
         api_key: str,
         task_id: str,
         _notify,
@@ -306,7 +398,7 @@ class BailianVideoGenProvider:
                 self.cancel,
             )
             resp = await http.get(
-                f"{base_url}/api/v1/tasks/{task_id}", headers=poll_headers
+                f"{api_root}/tasks/{task_id}", headers=poll_headers
             )
             await raise_if_video_cancel_requested(
                 cancel_requested,
@@ -399,8 +491,31 @@ class BailianVideoGenProvider:
             settings.is_explicitly_configured("video_gen_base_url")
             and settings.video_gen_base_url
         ):
-            return settings.video_gen_base_url.rstrip("/")
+            configured = settings.video_gen_base_url.rstrip("/")
+            # 百炼 OpenAI 兼容地址只供 LLM 使用；视频必须走原生 DashScope REST。
+            if configured.endswith("/compatible-mode/v1"):
+                return configured.removesuffix("/compatible-mode/v1")
+            return configured
         return settings.dashscope_base_url.rstrip("/")
+
+    @staticmethod
+    def _api_root(base_url: str) -> str:
+        """兼容配置根域名与已包含 /api/v1 的百炼视频地址。"""
+        normalized = base_url.rstrip("/")
+        return normalized if normalized.endswith("/api/v1") else f"{normalized}/api/v1"
+
+    @staticmethod
+    def _submit_rejection_diagnostics(response: httpx.Response | object) -> dict[str, int | str]:
+        """提取可公开的百炼 4xx 诊断，禁止回传原始 message/body。"""
+        raw: dict[str, object] = {"status_code": getattr(response, "status_code", None)}
+        try:
+            payload = response.json()  # type: ignore[union-attr]
+        except Exception:  # noqa: BLE001 - 诊断解析失败不影响明确拒绝分类
+            payload = None
+        if isinstance(payload, dict):
+            for field_name in ("code", "param", "type", "request_id"):
+                raw[field_name] = payload.get(field_name)
+        return sanitize_video_submit_rejection_diagnostics(raw)
 
     async def _store_video_file(
         self,

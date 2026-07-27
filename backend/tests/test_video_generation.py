@@ -257,6 +257,29 @@ def _seed(raw: Session) -> SimpleNamespace:
         model="doubao-seedance-2-0-260128",
         is_active=True,
     )
+    # 该夹具的既有视频创建用例关注生成编排，不覆盖人工审核流程；显式构造一份
+    # 与最终输入（含上一组尾帧）绑定的已通过审核快照。
+    from app.services.reference_aggregator import AggregatedReferences
+    from app.services.reference_image_audit import include_first_frame, reference_image_hash
+
+    audit_references = AggregatedReferences(
+        reference_images=[
+            {
+                "kind": "storage",
+                "storage_key": image.storage_key.lstrip("/"),
+                "mime_type": image.mime_type,
+                "size_bytes": image.size_bytes,
+                "sha256": image.sha256,
+            }
+        ]
+    )
+    include_first_frame(audit_references, previous_g2.reference_frames["last_frame"])
+    current.reference_image_audit = {
+        "status": "approved",
+        "reference_hash": reference_image_hash(audit_references),
+        "image_count": len(audit_references.reference_images),
+        "results": [],
+    }
     raw.add_all([
         user,
         script,
@@ -326,6 +349,76 @@ def _add_worker_job(
     raw.add_all([reservation, job])
     raw.commit()
     return job
+
+
+def test_create_video_job_blocks_when_reference_image_audit_is_pending() -> None:
+    async def scenario() -> None:
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        seeded.shot_group.reference_image_audit = {}
+        raw.commit()
+        db = _AsyncSessionAdapter(raw)
+
+        from app.services.video_generation import create_video_job
+
+        with pytest.raises(ConflictError, match="尚未审核"):
+            await create_video_job(
+                db,
+                script_id=seeded.script.id,
+                episode_id=seeded.episode.episode_id,
+                shot_group_id=seeded.shot_group.shot_group_id,
+                user_id=seeded.user.user_id,
+                idempotency_key="audit-pending",
+            )
+        assert raw.scalar(select(VideoGenerationJob)) is None
+
+    asyncio.run(scenario())
+
+
+def test_create_video_job_skips_reference_image_audit_for_database_bailian(monkeypatch) -> None:
+    """实际激活供应商为百炼时，即使存在参考图也不能套用火山审核门禁。"""
+    async def scenario() -> None:
+        from app.core.config import Settings
+        from app.services import video_generation
+
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        provider = raw.scalar(select(VideoProviderConfig).where(VideoProviderConfig.is_active.is_(True)))
+        provider.provider_key = "bailian"
+        provider.model = "wan2.6-i2v"
+        seeded.shot_group.reference_image_audit = {}
+        raw.commit()
+        db = _AsyncSessionAdapter(raw)
+
+        async def fake_enqueue(db, **kwargs):
+            row = TaskDispatchOutbox(
+                id="dispatch-bailian",
+                task_type=kwargs["task_type"],
+                job_id=kwargs["job_id"],
+                attempt=kwargs["attempt"],
+                payload={**kwargs["payload"], "dispatch_id": "dispatch-bailian"},
+                status="pending",
+            )
+            db.add(row)
+            return row
+
+        monkeypatch.setattr(video_generation, "settings", Settings(_env_file=None))
+        monkeypatch.setattr(video_generation, "_credits_reserve", None)
+        monkeypatch.setattr(video_generation, "enqueue_task", fake_enqueue)
+
+        job = await video_generation.create_video_job(
+            db,
+            script_id=seeded.script.id,
+            episode_id=seeded.episode.episode_id,
+            shot_group_id=seeded.shot_group.shot_group_id,
+            user_id=seeded.user.user_id,
+            idempotency_key="bailian-skips-audit",
+        )
+
+        assert job.provider_key == "bailian"
+        assert job.input_json["reference_image_audit"]["status"] == "not_required"
+
+    asyncio.run(scenario())
 
 
 def test_video_job_model_declares_reliable_state_and_constraints() -> None:

@@ -58,6 +58,7 @@ REQUIRED_OPERATIONS = {
     ("GET", "/v3api/video-generation/{job_id}"),
     ("GET", "/v3api/video-generation/active-provider"),
     ("POST", "/v3api/video-generation/active-provider"),
+    ("GET", "/v3api/runtime-models"),
     ("GET", "/v3api/video-timeline-arrangements"),
     ("POST", "/v3api/video-timeline-arrangements"),
     ("PATCH", "/v3api/video-timeline-arrangements/{arrangement_id}"),

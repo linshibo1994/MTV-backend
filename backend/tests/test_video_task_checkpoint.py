@@ -2892,7 +2892,7 @@ async def test_submit_rejected_logs_only_safe_diagnostics_and_releases_credit(
     # 模拟 typed error 在构造后被不可信 Provider 篡改，worker 必须重新校验。
     rejection.diagnostics = {
         "status_code": 400,
-        "code": "InvalidParameter",
+        "code": "InputImageSensitiveContentDetected.PrivacyInformation",
         "param": ["duration", private_object],
         "type": private_unicode,
         "request_id": "req-safe-123",
@@ -2935,19 +2935,32 @@ async def test_submit_rejected_logs_only_safe_diagnostics_and_releases_credit(
     assert reservation is not None
     assert saved.status == "failed"
     assert saved.error_type == "provider_submit_rejected"
+    assert saved.error_message == "InputImageSensitiveContentDetected.PrivacyInformation"
     assert saved.retryable is False
     assert reservation.status == "released"
     assert (saved.output_json or {})["provider_submission"] == {
         "state": "submit_rejected",
         "provider_key": "modelsai",
         "attempt": 1,
+        "diagnostics": {
+            "status_code": 400,
+            "code": "InputImageSensitiveContentDetected.PrivacyInformation",
+            "request_id": "req-safe-123",
+        },
     }
     assert (saved.metrics or {})["provider_submission"] == (
         saved.output_json or {}
     )["provider_submission"]
     public = VideoJobOut.model_validate(saved)
-    assert "diagnostics" not in (public.output_json or {})["provider_submission"]
-    assert "diagnostics" not in (public.metrics or {})["provider_submission"]
+    assert public.error_message == "InputImageSensitiveContentDetected.PrivacyInformation"
+    assert (public.output_json or {})["provider_submission"]["diagnostics"] == {
+        "status_code": 400,
+        "code": "InputImageSensitiveContentDetected.PrivacyInformation",
+        "request_id": "req-safe-123",
+    }
+    assert (public.metrics or {})["provider_submission"]["diagnostics"] == (
+        public.output_json or {}
+    )["provider_submission"]["diagnostics"]
 
     records = [
         record
@@ -2957,10 +2970,10 @@ async def test_submit_rejected_logs_only_safe_diagnostics_and_releases_credit(
     assert len(records) == 1
     assert getattr(records[0], "provider_diagnostics") == {
         "status_code": 400,
-        "code": "InvalidParameter",
+        "code": "InputImageSensitiveContentDetected.PrivacyInformation",
         "request_id": "req-safe-123",
     }
-    assert "code=InvalidParameter" in caplog.text
+    assert "code=InputImageSensitiveContentDetected.PrivacyInformation" in caplog.text
     assert "request_id=req-safe-123" in caplog.text
     for sentinel in (
         private_message,

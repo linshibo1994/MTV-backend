@@ -49,6 +49,16 @@ class ReferenceFramesOut(BaseModel):
     reference_frame: str | None = None
 
 
+class ReferenceImageAuditOut(BaseModel):
+    """镜头组最终参考图的火山审核状态。"""
+
+    status: Literal["pending", "approved", "rejected", "review", "not_required", "failed"]
+    image_count: int = 0
+    audited_at: datetime | None = None
+    results: list[dict[str, Any]] = Field(default_factory=list)
+    message: str | None = None
+
+
 class MaterialItemOut(BaseModel):
     """素材主体引用，兼容旧字符串输入在 CRUD 层归一化。"""
 
@@ -131,6 +141,7 @@ class ShotGroupWorkbenchOut(BaseModel):
     shot_nos: list[str] = Field(default_factory=list)
     description_text: str | None = None
     reference_frames: ReferenceFramesOut | None = None
+    reference_image_audit: ReferenceImageAuditOut
     content_hash: str = Field(min_length=64, max_length=64)
     updated_at: datetime
 

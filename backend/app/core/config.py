@@ -72,6 +72,15 @@ class Settings(BaseSettings):
     volcengine_access_key: str = ""
     volcengine_secret_key: str = ""
     volcengine_region: str = "cn-north-1"
+    # veImageX 单图审核（视频生成参考图预检）。使用独立 ImageX AK/SK，绝不复用
+    # 方舟视频 API Key；审核失败或配置缺失时默认阻断生成。
+    volc_image_audit_enabled: bool = True
+    volc_imagex_access_key: str = ""
+    volc_imagex_secret_key: str = ""
+    volc_imagex_service_id: str = ""
+    # 仅用于部署独立的、允许 veImageX 拉取的审核下载服务；本地鉴权媒体代理
+    # 的相对 URL 不会自动拼接为公网地址，必须提供真正的 HTTPS 预签名 URL。
+    volc_image_audit_public_base_url: str = ""
     # 火山方舟 Ark 大模型专用 API Key（Bearer Token 鉴权，Seedance 2.0 视频用）
     volcengine_api_key: str = ""
     volcengine_ark_base_url: str = "https://ark.cn-beijing.volces.com/api/v3"

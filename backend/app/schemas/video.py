@@ -74,6 +74,25 @@ class VideoJobCreateIn(BaseModel):
     )
 
 
+class ReferenceImageAuditIn(BaseModel):
+    """手动触发一个镜头组最终参考图审核。"""
+
+    script_id: str
+    episode_id: str
+    shot_group_id: str
+
+
+class ReferenceImageAuditOut(BaseModel):
+    """参考图审核结果；参考图内容变更后旧结果会自动变为 pending。"""
+
+    shot_group_id: str
+    status: Literal["pending", "approved", "rejected", "review", "not_required", "failed"]
+    image_count: int = 0
+    audited_at: datetime | None = None
+    results: list[dict[str, Any]] = Field(default_factory=list)
+    message: str | None = None
+
+
 class VideoJobBatchCreateIn(BaseModel):
     """批量创建视频生成任务入参 — 多个 shot_group_id（doc02 §5.9 工作台批量生成）。"""
 

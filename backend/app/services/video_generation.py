@@ -36,13 +36,18 @@ from app.models.episode import Episode
 from app.models.script import Script
 from app.models.shot_group import ShotGroup, shot_group_content_hash
 from app.models.video_generation_job import VIDEO_IDEMPOTENCY_KEY_MAX_LENGTH
-from app.providers.registry import require_capability
 from app.providers.video_gen import (
     VideoCancellationOutcome,
     VideoCancellationResult,
     get_video_provider,
 )
 from app.services.reference_aggregator import aggregate_references
+from app.services.reference_image_audit import (
+    audit_not_required_state,
+    ensure_references_approved,
+    include_first_frame,
+)
+from app.services.runtime_models import resolve_video_model
 from app.services.task_dispatch import cancel_outbox_task, enqueue_task
 from app.services.video_remote_cancellation import (
     merge_pending_provider_cancellation,
@@ -221,31 +226,23 @@ async def create_video_job(
     if first_frame:
         # 持久化到当前组 reference_frames.first_frame
         await _persist_first_frame(db, shot_group, first_frame)
+    # 任一实际传给视频模型的图片都必须绑定当前审核快照；首帧也在其中。
+    include_first_frame(aggregated, first_frame)
+
+    # 5. 取实际激活供应商配置。审核要求由规范化后的实际供应商决定：只有
+    # 火山 Seedance 才调用 veImageX；百炼等供应商不展示也不强制该审核流程。
+    runtime_video_model = await resolve_video_model(db, settings)
+    if runtime_video_model.reference_image_audit_required:
+        audit_state = ensure_references_approved(shot_group.reference_image_audit, aggregated)
+    else:
+        audit_state = audit_not_required_state(aggregated)
     # 创建任务的组级版本快照必须来自所有镜头组变更落库之后；否则自动补首帧
     # 会更新 updated_at，导致刚创建的任务立即被工作台判定为历史结果。
     await db.flush()
     await db.refresh(shot_group, attribute_names=["updated_at"])
 
-    # 5. 取激活供应商配置，缺失兜底
-    provider_cfg = await video_crud.get_active_provider(db, "all_reference")
-    provider_key: str
-    if settings.video_provider_selection_mode == "env":
-        # env 模式下部署级环境变量是权威配置，不再被数据库历史 active 行覆盖。
-        canonical_provider = require_capability(settings.video_gen_provider, "video")
-        fallback_models = {
-            "volcengine": settings.seedance_model,
-            "bailian": settings.dashscope_video_model,
-            "openai": settings.openai_video_model,
-            "gemini": settings.google_video_model,
-        }
-        provider_key = canonical_provider
-        model = settings.video_gen_model or fallback_models[canonical_provider]
-    elif provider_cfg is None:
-        provider_key = settings.video_default_provider
-        model = settings.video_gen_model or settings.seedance_model
-    else:
-        provider_key = provider_cfg.provider_key
-        model = provider_cfg.model
+    provider_key = runtime_video_model.task_provider_key
+    model = runtime_video_model.model
 
     # 6. 构造 input_json 并落库任务
     # prompt 兜底：约束锁9条属上游 enrich/分镜产物，video 模块仅透传；但上游漏写
@@ -261,6 +258,7 @@ async def create_video_job(
         "reference_video_names": [],
         # 首帧参考（上一组尾帧，链式衔接；传给 provider 作首帧约束）
         "first_frame": first_frame,
+        "reference_image_audit": audit_state,
         # 未通过审核的主体名/角色（供 [检查素材] 接口标红）
         "missing_subjects": aggregated.missing_subjects,
         "missing_audio": aggregated.missing_audio,
