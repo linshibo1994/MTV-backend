@@ -6,10 +6,23 @@ RUN apt-get update \
 
 WORKDIR /app
 
-# 将依赖安装在不受开发目录挂载影响的位置，运行时直接加载本地源码。
+# 将依赖安装在不受开发目录挂载影响的位置。生产镜像默认安装 S3
+# 可选依赖；测试/开发镜像可通过构建参数跳过，缩短本地构建时间。
 ENV UV_PROJECT_ENVIRONMENT=/opt/venv
 COPY pyproject.toml uv.lock ./
-RUN uv sync --frozen --no-dev --no-install-project
+ARG INSTALL_S3=true
+RUN if [ "$INSTALL_S3" = "true" ]; then \
+        uv sync --frozen --no-dev --extra s3 --no-install-project; \
+    else \
+        uv sync --frozen --no-dev --no-install-project; \
+    fi
+
+# 生产部署不依赖宿主机源码挂载；.dockerignore 会排除真实 .env 与本地媒体。
+COPY alembic ./alembic
+COPY app ./app
+COPY alembic.ini ./
 
 ENV PATH="/opt/venv/bin:${PATH}" \
     PYTHONUNBUFFERED=1
+
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

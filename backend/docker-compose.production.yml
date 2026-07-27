@@ -1,0 +1,44 @@
+# 生产服务器编排：数据库、Redis、对象存储均为外部受管服务。
+# 由 scripts/deploy-production.sh 使用，真实密钥只保留在服务器环境文件中。
+x-app-common: &app-common
+  image: ${MTV_PRODUCTION_IMAGE:-mtv-backend:production}
+  build:
+    context: .
+    dockerfile: Dockerfile
+    args:
+      INSTALL_S3: "true"
+  working_dir: /app
+  env_file:
+    - ${MTV_ENV_FILE:?请由部署脚本设置 MTV_ENV_FILE 为生产环境文件绝对路径}
+  environment:
+    APP_HOST: 0.0.0.0
+    APP_PORT: 8000
+    PYTHONUNBUFFERED: "1"
+  init: true
+  restart: unless-stopped
+
+services:
+  migrate:
+    <<: *app-common
+    command: alembic upgrade head
+    restart: "no"
+
+  api:
+    <<: *app-common
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --proxy-headers --forwarded-allow-ips=*
+    ports:
+      - "127.0.0.1:${MTV_PRODUCTION_API_PORT:-8000}:8000"
+
+  celery-worker:
+    <<: *app-common
+    command: celery -A app.workers.celery_app worker -l info --concurrency=${MTV_PRODUCTION_WORKER_CONCURRENCY:-2} --max-tasks-per-child=${MTV_PRODUCTION_MAX_TASKS_PER_CHILD:-100}
+    stop_grace_period: 16m
+
+  celery-beat:
+    <<: *app-common
+    command: celery -A app.workers.celery_app beat -l info --schedule /var/lib/mtv/celerybeat-schedule
+    volumes:
+      - production_beat_schedule:/var/lib/mtv
+
+volumes:
+  production_beat_schedule:

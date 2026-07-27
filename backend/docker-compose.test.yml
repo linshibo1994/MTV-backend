@@ -1,0 +1,89 @@
+# 测试服务器编排：自带 PostgreSQL、Redis，并把媒体持久化到宿主机目录。
+# 由 scripts/deploy-test.sh 使用；不要替换本地开发 docker-compose.yml。
+x-app-common: &app-common
+  image: ${MTV_TEST_IMAGE:-mtv-backend:test}
+  build:
+    context: .
+    dockerfile: Dockerfile
+    args:
+      INSTALL_S3: "false"
+  working_dir: /app
+  env_file:
+    - ${MTV_ENV_FILE:-./deploy/test.env}
+  environment:
+    APP_ENV: test
+    APP_HOST: 0.0.0.0
+    APP_PORT: 8000
+    DATABASE_URL: postgresql+asyncpg://mtv_test:mtv_test@postgres:5432/mtv_test
+    DATABASE_SYNC_URL: postgresql+psycopg2://mtv_test:mtv_test@postgres:5432/mtv_test
+    REDIS_URL: redis://redis:6379/0
+    CELERY_BROKER_URL: redis://redis:6379/1
+    CELERY_RESULT_BACKEND: redis://redis:6379/2
+    SESSION_SECRET: test-only-session-secret-at-least-32-chars
+    STORAGE_DRIVER: local
+    STORAGE_ROOT: /data/storage
+  init: true
+  restart: unless-stopped
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: mtv_test
+      POSTGRES_PASSWORD: mtv_test
+      POSTGRES_DB: mtv_test
+    volumes:
+      - test_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mtv_test -d mtv_test"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - test_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  migrate:
+    <<: *app-common
+    command: alembic upgrade head
+    restart: "no"
+
+  api:
+    <<: *app-common
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    ports:
+      - "${MTV_TEST_API_BIND_ADDRESS:-0.0.0.0}:${MTV_TEST_API_PORT:-8000}:8000"
+    volumes:
+      - ${MTV_TEST_STORAGE_DIR:-/srv/mtv-test/storage}:/data/storage
+
+  celery-worker:
+    <<: *app-common
+    command: celery -A app.workers.celery_app worker -l info --concurrency=${MTV_TEST_WORKER_CONCURRENCY:-2}
+    stop_grace_period: 16m
+    volumes:
+      - ${MTV_TEST_STORAGE_DIR:-/srv/mtv-test/storage}:/data/storage
+
+  celery-beat:
+    <<: *app-common
+    command: celery -A app.workers.celery_app beat -l info --schedule /var/lib/mtv/celerybeat-schedule
+    volumes:
+      - test_beat_schedule:/var/lib/mtv
+
+volumes:
+  test_postgres_data:
+  test_redis_data:
+  test_beat_schedule:
