@@ -28,6 +28,7 @@ def test_prod_rejects_default_session_secret(app_env: str) -> None:
         Settings(
             app_env=app_env,
             session_secret="dev-only-change-me",
+            cors_origins=[TRUSTED_ORIGIN],
             _env_file=None,
         )
 
@@ -36,7 +37,12 @@ def test_prod_rejects_default_session_secret(app_env: str) -> None:
 @pytest.mark.parametrize("secret", ["", "   ", "x" * 31])
 def test_prod_rejects_short_or_blank_session_secret(app_env: str, secret: str) -> None:
     with pytest.raises(ValidationError, match="SESSION_SECRET"):
-        Settings(app_env=app_env, session_secret=secret, _env_file=None)
+        Settings(
+            app_env=app_env,
+            session_secret=secret,
+            cors_origins=[TRUSTED_ORIGIN],
+            _env_file=None,
+        )
 
 
 @pytest.mark.parametrize("app_env", PRODUCTION_ENVIRONMENTS)
@@ -50,7 +56,12 @@ def test_prod_rejects_short_or_blank_session_secret(app_env: str, secret: str) -
 )
 def test_prod_rejects_low_strength_session_secret(app_env: str, secret: str) -> None:
     with pytest.raises(ValidationError, match="SESSION_SECRET"):
-        Settings(app_env=app_env, session_secret=secret, _env_file=None)
+        Settings(
+            app_env=app_env,
+            session_secret=secret,
+            cors_origins=[TRUSTED_ORIGIN],
+            _env_file=None,
+        )
 
 
 @pytest.mark.parametrize("app_env", PRODUCTION_ENVIRONMENTS)
@@ -58,6 +69,7 @@ def test_prod_accepts_strong_session_secret(app_env: str) -> None:
     configured = Settings(
         app_env=app_env,
         session_secret=STRONG_SESSION_SECRET,
+        cors_origins=[TRUSTED_ORIGIN],
         _env_file=None,
     )
 
@@ -143,6 +155,7 @@ def test_production_alias_enables_secure_session_cookie(monkeypatch) -> None:
     configured = Settings(
         app_env="production",
         session_secret=STRONG_SESSION_SECRET,
+        cors_origins=[TRUSTED_ORIGIN],
         _env_file=None,
     )
     monkeypatch.setattr(main, "settings", configured)
@@ -162,7 +175,6 @@ def test_production_alias_enables_secure_session_cookie(monkeypatch) -> None:
     [
         [],
         [""],
-        ["*"],
         ["null"],
         ["file:///tmp/flowapp"],
         ["ftp://trusted.example"],
@@ -174,11 +186,32 @@ def test_production_alias_enables_secure_session_cookie(monkeypatch) -> None:
         ["https://trusted.example:invalid"],
     ],
 )
-def test_cors_rejects_missing_or_wildcard_trusted_origins(
+def test_cors_rejects_missing_or_invalid_trusted_origins(
     origins: list[str],
 ) -> None:
     with pytest.raises(ValidationError, match="CORS_ORIGINS"):
         Settings(cors_origins=origins, _env_file=None)
+
+
+def test_cors_allows_wildcard_in_non_production() -> None:
+    configured = Settings(
+        app_env="dev",
+        cors_origins=["*"],
+        _env_file=None,
+    )
+
+    assert configured.cors_origins == ["*"]
+    assert configured.cors_allow_credentials is False
+
+
+def test_cors_rejects_wildcard_in_production() -> None:
+    with pytest.raises(ValidationError, match="CORS_ORIGINS"):
+        Settings(
+            app_env="prod",
+            session_secret=STRONG_SESSION_SECRET,
+            cors_origins=["*"],
+            _env_file=None,
+        )
 
 
 def test_cors_strips_whitespace_and_normalizes_root_trailing_slash() -> None:
@@ -220,6 +253,37 @@ async def test_cors_preflight_uses_configured_origin(monkeypatch) -> None:
     assert response.headers["access-control-allow-credentials"] == "true"
     assert "GET" in response.headers["access-control-allow-methods"]
     assert "content-type" in response.headers["access-control-allow-headers"].lower()
+
+
+async def test_cors_preflight_allows_any_origin_without_credentials(monkeypatch) -> None:
+    from app import main
+
+    configured = Settings(
+        app_env="dev",
+        session_secret=STRONG_SESSION_SECRET,
+        cors_origins=["*"],
+        cors_methods=["GET"],
+        cors_headers=["Content-Type"],
+        _env_file=None,
+    )
+    monkeypatch.setattr(main, "settings", configured)
+    app = main.create_app()
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as test_client:
+        response = await test_client.options(
+            "/v3api/health",
+            headers={
+                "Origin": "http://localhost:4173",
+                "Access-Control-Request-Method": "GET",
+                "Access-Control-Request-Headers": "Content-Type",
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "*"
+    assert "access-control-allow-credentials" not in response.headers
 
 
 async def test_cors_preflight_honors_custom_settings(monkeypatch) -> None:

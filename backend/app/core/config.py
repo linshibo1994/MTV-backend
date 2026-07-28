@@ -19,9 +19,7 @@ class Settings(BaseSettings):
     app_env: Literal["dev", "test", "prod", "production"] = "dev"
     app_host: str = "0.0.0.0"
     app_port: int = 8000
-    cors_origins: list[str] = Field(
-        default_factory=lambda: ["http://localhost:3000", "http://localhost:5173"]
-    )
+    cors_origins: list[str] = Field(default_factory=lambda: ["*"])
     cors_methods: list[str] = Field(
         default_factory=lambda: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
     )
@@ -281,7 +279,10 @@ class Settings(BaseSettings):
             raise ValueError("CORS_ORIGINS 必须配置至少一个可信来源")
 
         try:
-            self.cors_origins = [_normalize_cors_origin(origin) for origin in self.cors_origins]
+            self.cors_origins = [
+                _normalize_cors_origin(origin, allow_wildcard=not self.is_prod)
+                for origin in self.cors_origins
+            ]
         except ValueError as exc:
             raise ValueError(f"CORS_ORIGINS 必须配置合法的 http/https origin：{exc}") from exc
 
@@ -326,15 +327,24 @@ class Settings(BaseSettings):
     def is_dev(self) -> bool:
         return self.app_env == "dev"
 
+    @property
+    def cors_allow_credentials(self) -> bool:
+        """通配符来源不能与浏览器凭据模式同时使用。"""
+        return "*" not in self.cors_origins
+
     def is_explicitly_configured(self, field_name: str) -> bool:
         """判断字段是否来自环境变量或 Settings 显式入参，而不是类默认值。"""
         return field_name in self._explicit_fields
 
 
-def _normalize_cors_origin(origin: str) -> str:
+def _normalize_cors_origin(origin: str, *, allow_wildcard: bool) -> str:
     value = origin.strip()
-    if not value or value == "*" or value.lower() == "null":
-        raise ValueError("不能留空、使用通配符或使用 null")
+    if not value or value.lower() == "null":
+        raise ValueError("不能留空或使用 null")
+    if value == "*":
+        if allow_wildcard:
+            return value
+        raise ValueError("生产环境不能使用通配符")
 
     try:
         parsed = urlsplit(value)

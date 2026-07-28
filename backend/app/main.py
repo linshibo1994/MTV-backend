@@ -39,18 +39,20 @@ class CORSFastAPI(FastAPI):
         cors_origins: list[str],
         cors_methods: list[str],
         cors_headers: list[str],
+        cors_allow_credentials: bool,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
         self._cors_origins = cors_origins
         self._cors_methods = cors_methods
         self._cors_headers = cors_headers
+        self._cors_allow_credentials = cors_allow_credentials
 
     def build_middleware_stack(self) -> ASGIApp:
         return CORSMiddleware(
             app=super().build_middleware_stack(),
             allow_origins=self._cors_origins,
-            allow_credentials=True,
+            allow_credentials=self._cors_allow_credentials,
             allow_methods=self._cors_methods,
             allow_headers=self._cors_headers,
         )
@@ -67,6 +69,7 @@ def create_app() -> FastAPI:
         cors_origins=settings.cors_origins,
         cors_methods=settings.cors_methods,
         cors_headers=settings.cors_headers,
+        cors_allow_credentials=settings.cors_allow_credentials,
         title="智绘 Flow App 后端",
         version="0.1.0",
         docs_url="/v3api/docs",
