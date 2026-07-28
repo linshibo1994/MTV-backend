@@ -38,6 +38,5 @@ test-results/
 playwright-report/
 junit.xml
 
-# 原始探索证据可能包含账号展示、积分、业务文本和内部 Prompt，仅保留在本地。
-/docs/exploration/
-/docs/Claude/exploration/
+# 项目文档仅保留在本地，不纳入版本控制。
+/docs/
