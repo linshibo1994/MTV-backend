@@ -7,9 +7,11 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
 import json
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Literal, Protocol
@@ -19,7 +21,7 @@ import httpx
 
 from app.core.config import settings
 from app.core.errors import ConflictError
-from app.providers.storage import get_storage
+from app.providers.storage import get_storage, validate_key_prefix
 from app.services.reference_aggregator import AggregatedReferences
 
 ReferenceAuditStatus = Literal["pending", "approved", "rejected", "review", "not_required", "failed"]
@@ -27,6 +29,10 @@ _AUDIT_DIMENSIONS = [
     "porn", "sexy", "sensitive1", "sensitive2", "forbidden", "uncomfortable", "badpicture", "underage"
 ]
 _AUDIT_TEXT_DIMENSIONS = ["charillegal", "defraud"]
+_AUDIT_TOKEN_VERSION = 1
+_AUDIT_TOKEN_MAX_TTL_SECONDS = 600
+_AUDIT_TOKEN_CLOCK_SKEW_SECONDS = 30
+_AUDIT_TOKEN_KEY_CONTEXT = b"mtv-reference-image-audit-download-v1"
 
 
 @dataclass(frozen=True)
@@ -210,7 +216,7 @@ async def audit_references(
     for image in references.reference_images:
         storage_key = str(image["storage_key"])
         decision = await provider.audit(
-            image_url=_public_image_url(storage_key),
+            image_url=await _public_image_url(storage_key),
             data_id=f"{digest}:{image.get('sha256', '')}",
         )
         results.append({
@@ -240,16 +246,134 @@ def ensure_references_approved(stored: dict | None, references: AggregatedRefere
     return state
 
 
-def _public_image_url(storage_key: str) -> str:
-    url = get_storage().signed_url(storage_key, expires_seconds=600)
-    if not url:
+def reference_image_audit_failure_message(error: RuntimeError) -> str:
+    """将内部失败码转换为不含密钥、对象键或上游响应的用户提示。"""
+    if str(error) == "reference_image_audit_public_url_unconfigured":
+        return (
+            "本地存储未配置公网 HTTPS 审核地址，"
+            "请联系管理员配置 VOLC_IMAGE_AUDIT_PUBLIC_BASE_URL"
+        )
+    return "参考图审核服务暂不可用，请稍后重试"
+
+
+async def _public_image_url(storage_key: str) -> str:
+    url = await get_storage().external_read_url(
+        storage_key,
+        expires_seconds=_AUDIT_TOKEN_MAX_TTL_SECONDS,
+    )
+    if url:
+        parsed = urlsplit(url)
+        if parsed.scheme == "https" and parsed.netloc:
+            return url
         raise RuntimeError("reference_image_audit_url_unavailable")
-    parsed = urlsplit(url)
-    if parsed.scheme == "https" and parsed.netloc:
-        return url
-    # LocalStorageProvider 返回的是受鉴权保护的站内相对地址，不能伪装成公网 URL
-    # 交给第三方；生产必须让存储层返回真实 HTTPS 预签名 URL 或专用下载通道。
-    raise RuntimeError("reference_image_audit_url_unavailable")
+
+    if settings.volc_image_audit_public_base_url:
+        token = create_reference_image_audit_token(
+            storage_key,
+            expires_seconds=_AUDIT_TOKEN_MAX_TTL_SECONDS,
+        )
+        endpoint = (
+            f"{settings.volc_image_audit_public_base_url.rstrip('/')}"
+            f"{settings.media_proxy_prefix.rstrip('/')}/_reference-image-audit"
+        )
+        return f"{endpoint}?{urlencode({'token': token})}"
+
+    # 本地存储不提供外部 URL，只能通过配置明确的短期审核代理回源。
+    raise RuntimeError("reference_image_audit_public_url_unconfigured")
+
+
+def create_reference_image_audit_token(
+    storage_key: str,
+    *,
+    expires_seconds: int = _AUDIT_TOKEN_MAX_TTL_SECONDS,
+    now: int | None = None,
+) -> str:
+    """签发仅用于第三方参考图拉取的短期 HMAC 令牌。"""
+    if not 1 <= expires_seconds <= _AUDIT_TOKEN_MAX_TTL_SECONDS:
+        raise ValueError("reference_image_audit_token_ttl_invalid")
+    key = validate_key_prefix(storage_key)
+    issued_at = int(time.time()) if now is None else int(now)
+    payload = json.dumps(
+        {
+            "exp": issued_at + expires_seconds,
+            "key": key,
+            "v": _AUDIT_TOKEN_VERSION,
+        },
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    encoded_payload = _urlsafe_b64encode(payload)
+    signature = hmac.new(
+        _reference_image_audit_signing_key(),
+        encoded_payload.encode(),
+        hashlib.sha256,
+    ).digest()
+    return f"{encoded_payload}.{_urlsafe_b64encode(signature)}"
+
+
+def verify_reference_image_audit_token(
+    token: str,
+    *,
+    now: int | None = None,
+) -> str:
+    """校验短期审核令牌并返回逻辑对象键；所有失败使用同一错误。"""
+    try:
+        if not token or len(token) > 4096:
+            raise ValueError
+        encoded_payload, encoded_signature = token.split(".", 1)
+        supplied_signature = _urlsafe_b64decode(encoded_signature)
+        expected_signature = hmac.new(
+            _reference_image_audit_signing_key(),
+            encoded_payload.encode(),
+            hashlib.sha256,
+        ).digest()
+        if not hmac.compare_digest(supplied_signature, expected_signature):
+            raise ValueError
+        raw = json.loads(_urlsafe_b64decode(encoded_payload))
+        if not isinstance(raw, dict) or set(raw) != {"exp", "key", "v"}:
+            raise ValueError
+        if raw["v"] != _AUDIT_TOKEN_VERSION or type(raw["exp"]) is not int:
+            raise ValueError
+        current = int(time.time()) if now is None else int(now)
+        expires_at = raw["exp"]
+        if (
+            expires_at <= current
+            or expires_at
+            > current
+            + _AUDIT_TOKEN_MAX_TTL_SECONDS
+            + _AUDIT_TOKEN_CLOCK_SKEW_SECONDS
+        ):
+            raise ValueError
+        if not isinstance(raw["key"], str):
+            raise ValueError
+        return validate_key_prefix(raw["key"])
+    except (TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        raise ValueError("reference_image_audit_token_invalid") from None
+
+
+def _reference_image_audit_signing_key() -> bytes:
+    return hmac.new(
+        settings.session_secret.encode(),
+        _AUDIT_TOKEN_KEY_CONTEXT,
+        hashlib.sha256,
+    ).digest()
+
+
+def _urlsafe_b64encode(value: bytes) -> str:
+    return base64.urlsafe_b64encode(value).rstrip(b"=").decode()
+
+
+def _urlsafe_b64decode(value: str) -> bytes:
+    padding = "=" * (-len(value) % 4)
+    decoded = base64.b64decode(
+        f"{value}{padding}",
+        altchars=b"-_",
+        validate=True,
+    )
+    if _urlsafe_b64encode(decoded) != value:
+        raise ValueError
+    return decoded
 
 
 def _signed_headers(

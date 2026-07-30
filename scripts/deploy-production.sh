@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# 生产服务器一键部署：只使用外部 PostgreSQL、Redis 与私有 S3 桶。
+# 生产服务器一键部署：只使用外部 PostgreSQL、Redis 与 S3/MeiZi 公共存储。
 # 默认读取 /etc/mtv/production.env；该文件必须由运维或密钥管理系统预先创建。
 
 set -euo pipefail
@@ -81,7 +81,7 @@ validate_production_env() {
         APP_ENV SESSION_SECRET CORS_ORIGINS \
         DATABASE_URL DATABASE_SYNC_URL \
         REDIS_URL CELERY_BROKER_URL CELERY_RESULT_BACKEND \
-        STORAGE_DRIVER S3_ACCESS_KEY S3_SECRET_KEY S3_BUCKET S3_REGION; do
+        STORAGE_DRIVER; do
         require_env_value "$key"
     done
 
@@ -92,10 +92,60 @@ validate_production_env() {
         echo "生产部署要求 APP_ENV=prod 或 production。" >&2
         exit 1
     }
-    [[ "$storage_driver" == "s3" ]] || {
-        echo "生产部署要求 STORAGE_DRIVER=s3，禁止挂载服务器本地媒体目录。" >&2
-        exit 1
-    }
+    case "$storage_driver" in
+        s3)
+            for key in S3_ACCESS_KEY S3_SECRET_KEY S3_BUCKET S3_REGION; do
+                require_env_value "$key"
+            done
+            ;;
+        meizi)
+            for key in \
+                MEIZI_BASE_URL MEIZI_LEGACY_LOCAL_FALLBACK MEIZI_UPLOAD_USER_NAME \
+                MEIZI_UPLOAD_TENANT_ID MEIZI_UPLOAD_GROUP_ID MEIZI_UPLOAD_SOURCE \
+                MEIZI_UPLOAD_SALT MEIZI_FRONT_TENANT_ID MEIZI_FRONT_GROUP_ID \
+                MEIZI_FRONT_SOURCE MEIZI_FRONT_SALT \
+                MEIZI_LIB_TYPE_FILE MEIZI_LIB_TYPE_IMAGE \
+                MEIZI_LIB_TYPE_VIDEO MEIZI_LIB_TYPE_AUDIO \
+                VOLC_IMAGE_AUDIT_PUBLIC_BASE_URL \
+                MEIZI_DELETE_CANARY_CONFIRMED; do
+                require_env_value "$key"
+            done
+            [[ "$(read_env_value MEIZI_DELETE_CANARY_CONFIRMED)" == "true" ]] || {
+                echo "启用 MeiZi 前必须完成真实上传、HTTPS 读取和 shiftDelete canary，并设置 MEIZI_DELETE_CANARY_CONFIRMED=true。" >&2
+                exit 1
+            }
+            local legacy_fallback
+            legacy_fallback="$(read_env_value MEIZI_LEGACY_LOCAL_FALLBACK)"
+            [[ "$legacy_fallback" == "true" || "$legacy_fallback" == "false" ]] || {
+                echo "MEIZI_LEGACY_LOCAL_FALLBACK 必须是 true 或 false。" >&2
+                exit 1
+            }
+            if [[ "$legacy_fallback" == "true" ]]; then
+                local storage_root legacy_host_path
+                require_env_value STORAGE_ROOT
+                require_env_value MTV_LEGACY_STORAGE_HOST_PATH
+                storage_root="$(read_env_value STORAGE_ROOT)"
+                legacy_host_path="$(read_env_value MTV_LEGACY_STORAGE_HOST_PATH)"
+                [[ "$storage_root" == "/var/lib/mtv/storage" ]] || {
+                    echo "启用存量回退时 STORAGE_ROOT 必须为 /var/lib/mtv/storage。" >&2
+                    exit 1
+                }
+                [[ "$legacy_host_path" == /* && "$legacy_host_path" != "/" ]] || {
+                    echo "MTV_LEGACY_STORAGE_HOST_PATH 必须是非根目录的绝对路径。" >&2
+                    exit 1
+                }
+                [[ -d "$legacy_host_path" && -r "$legacy_host_path" \
+                    && -w "$legacy_host_path" && -x "$legacy_host_path" ]] || {
+                    echo "MeiZi 存量目录不存在或当前部署用户不可读写：$legacy_host_path" >&2
+                    exit 1
+                }
+            fi
+            ;;
+        *)
+            echo "生产部署要求 STORAGE_DRIVER=s3 或 meizi，禁止使用服务器本地媒体目录。" >&2
+            exit 1
+            ;;
+    esac
     [[ ${#session_secret} -ge 32 ]] || {
         echo "SESSION_SECRET 至少需要 32 个字符。" >&2
         exit 1
@@ -119,27 +169,31 @@ compose() {
 }
 
 check_container_configuration() {
-    compose run --rm --no-deps --entrypoint python migrate -c '
+    compose run --rm --no-deps --entrypoint python api -c '
 from app.core.config import settings
 from app.providers.storage import get_storage
 assert settings.is_prod, "APP_ENV 必须是生产环境"
-assert settings.storage_driver == "s3", "生产环境必须使用 S3"
+assert settings.storage_driver in {"s3", "meizi"}, "生产环境必须使用 S3 或 MeiZi"
 get_storage()
 print("生产容器配置校验通过")
 '
 }
 
 check_external_dependencies() {
-    compose run --rm --no-deps --entrypoint python migrate -c '
+    compose run --rm --no-deps --entrypoint python api -c '
 import asyncio
-import boto3
 import asyncpg
 from redis.asyncio import from_url
 
 from app.core.config import settings
 
 async def main() -> None:
-    connection = await asyncpg.connect(settings.database_url, timeout=10)
+    database_url = settings.database_url.replace(
+        "postgresql+asyncpg://",
+        "postgresql://",
+        1,
+    )
+    connection = await asyncpg.connect(database_url, timeout=10)
     try:
         assert await connection.fetchval("SELECT 1") == 1
     finally:
@@ -149,15 +203,89 @@ async def main() -> None:
         assert await redis.ping()
     finally:
         await redis.aclose()
-    client = boto3.client(
-        "s3",
-        endpoint_url=settings.s3_endpoint or None,
-        aws_access_key_id=settings.s3_access_key,
-        aws_secret_access_key=settings.s3_secret_key,
-        region_name=settings.s3_region or None,
-    )
-    await asyncio.to_thread(client.head_bucket, Bucket=settings.s3_bucket)
-    print("外部 PostgreSQL、Redis 与 S3 连通性校验通过")
+    if settings.storage_driver == "s3":
+        import boto3
+
+        client = boto3.client(
+            "s3",
+            endpoint_url=settings.s3_endpoint or None,
+            aws_access_key_id=settings.s3_access_key,
+            aws_secret_access_key=settings.s3_secret_key,
+            region_name=settings.s3_region or None,
+        )
+        await asyncio.to_thread(client.head_bucket, Bucket=settings.s3_bucket)
+        storage_name = "S3"
+    else:
+        import httpx
+
+        from app.providers.safe_http_transport import build_safe_async_http_transport
+
+        async with httpx.AsyncClient(
+            timeout=10,
+            follow_redirects=False,
+            trust_env=False,
+            transport=build_safe_async_http_transport(),
+        ) as http:
+            response = await http.get(settings.meizi_base_url)
+            assert 100 <= response.status_code <= 599
+        storage_name = "MeiZi"
+    print(f"外部 PostgreSQL、Redis 与 {storage_name} 连通性校验通过")
+
+asyncio.run(main())
+'
+}
+
+check_meizi_mapping_namespace() {
+    [[ "$(read_env_value STORAGE_DRIVER)" == "meizi" ]] || return 0
+    compose run --rm --no-deps --entrypoint python api -c '
+import asyncio
+
+from sqlalchemy import func, select
+
+from app.core.config import settings
+from app.core.database import async_session_factory
+from app.models.meizi_storage_object import MeiziStorageObject
+from app.providers.storage_meizi import meizi_delete_namespace
+
+async def main() -> None:
+    expected = meizi_delete_namespace(settings)
+    async with async_session_factory() as session:
+        mismatch_count = int(
+            (
+                await session.execute(
+                    select(func.count())
+                    .select_from(MeiziStorageObject)
+                    .where(
+                        MeiziStorageObject.status.in_(
+                            ("uploading", "active", "deleting")
+                        ),
+                        MeiziStorageObject.delete_namespace != expected,
+                    )
+                )
+            ).scalar_one()
+        )
+    if mismatch_count:
+        raise RuntimeError(
+            "存在无法由当前 MeiZi endpoint/frontupload 身份安全删除的映射："
+            f"{mismatch_count} 条；禁止自动认领，请按迁移手册核验来源"
+        )
+    print("MeiZi 删除身份命名空间校验通过")
+
+asyncio.run(main())
+'
+}
+
+run_meizi_delete_canary() {
+    [[ "$(read_env_value STORAGE_DRIVER)" == "meizi" ]] || return 0
+    compose run --rm --no-deps --entrypoint python api -c '
+import asyncio
+
+from app.providers.storage_meizi import run_meizi_storage_canary
+
+async def main() -> None:
+    result = await run_meizi_storage_canary()
+    size_bytes = result["size_bytes"]
+    print(f"MeiZi 真实上传、HTTPS 读取与删除 canary 通过：{size_bytes} bytes")
 
 asyncio.run(main())
 '
@@ -200,7 +328,7 @@ validate() {
 
 deploy() {
     validate
-    echo "构建生产镜像（包含 S3 依赖）…"
+    echo "构建生产镜像（支持所选公共对象存储）…"
     compose build
     check_container_configuration
     check_external_dependencies
@@ -209,6 +337,8 @@ deploy() {
     compose stop api celery-worker celery-beat || true
     echo "执行一次性数据库迁移…"
     compose run --rm --no-deps migrate
+    check_meizi_mapping_namespace
+    run_meizi_delete_canary
     echo "启动新版 API、worker 与唯一 beat…"
     compose up -d --remove-orphans api celery-worker celery-beat
     wait_for_api

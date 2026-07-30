@@ -64,6 +64,7 @@ def test_celery_loader_registers_all_primary_business_tasks() -> None:
         "timeline.render.reconcile_stale",
         "timeline.render.financial_cleanup",
         "app.workers.media_storage.recover_media_storage_jobs",
+        "app.workers.media_storage.reconcile_meizi_storage_objects",
     } <= set(celery_app.tasks)
 
 
@@ -101,6 +102,12 @@ def test_video_recovery_and_financial_cleanup_are_scheduled() -> None:
     )
     assert schedule["video-stale-reconcile"]["schedule"] > 0
     assert schedule["video-financial-cleanup"]["schedule"] > 0
+
+
+def test_meizi_storage_cleanup_is_scheduled() -> None:
+    schedule = celery_app.conf.beat_schedule["reconcile-meizi-storage-objects"]
+    assert schedule["task"] == "app.workers.media_storage.reconcile_meizi_storage_objects"
+    assert schedule["schedule"] > 0
 
 
 @pytest.mark.parametrize(

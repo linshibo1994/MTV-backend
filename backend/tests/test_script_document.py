@@ -184,6 +184,55 @@ async def test_upload_endpoint_rejects_existing_episodes_and_does_not_store(monk
     storage.delete.assert_not_awaited()
 
 
+async def test_upload_endpoint_persists_cleanup_when_remote_delete_fails(monkeypatch) -> None:
+    document = StagedScriptDocument(
+        original_filename="完整剧本.txt",
+        suffix=".txt",
+        content_type="text/plain",
+        size_bytes=12,
+        sha256="a" * 64,
+        script_text="第一幕：相遇",
+        temp_path="/tmp/already-cleaned-script.txt",
+    )
+    storage = SimpleNamespace(
+        put_file=AsyncMock(),
+        delete=AsyncMock(side_effect=RuntimeError("remote-delete-failed")),
+    )
+    script = SimpleNamespace(id="script-1", owner_user_id="user-1")
+    db = SimpleNamespace(
+        execute=AsyncMock(return_value=_Result(None)),
+        add=lambda _: None,
+        flush=AsyncMock(side_effect=RuntimeError("db-write-failed")),
+        commit=AsyncMock(),
+        rollback=AsyncMock(),
+    )
+    enqueue_delete = AsyncMock()
+    monkeypatch.setattr(scripts.script_crud, "get_script", AsyncMock(return_value=script))
+    monkeypatch.setattr(scripts.script_crud, "get_script_for_update", AsyncMock(return_value=script))
+    monkeypatch.setattr(scripts, "check_script_access", AsyncMock())
+    monkeypatch.setattr(scripts, "stage_script_document", AsyncMock(return_value=document))
+    monkeypatch.setattr(scripts, "cleanup_staged_script_document", lambda _: None)
+    monkeypatch.setattr(scripts, "get_storage", lambda: storage)
+    monkeypatch.setattr(scripts.media_storage_jobs, "enqueue_delete", enqueue_delete)
+
+    with pytest.raises(RuntimeError, match="db-write-failed"):
+        await scripts.upload_and_split_script(
+            "script-1",
+            UploadFile(BytesIO(b"ignored"), filename="完整剧本.txt"),
+            True,
+            db,
+            SimpleNamespace(user_id="user-1"),
+        )
+
+    storage.put_file.assert_awaited_once()
+    storage.delete.assert_awaited_once()
+    enqueue_delete.assert_awaited_once()
+    assert enqueue_delete.await_args.kwargs["source_key"].startswith(
+        "upload_scripts/script-1/"
+    )
+    db.commit.assert_awaited_once()
+
+
 async def test_analysis_job_uses_latest_attempt_for_each_pipeline_stage(monkeypatch) -> None:
     now = datetime.now(UTC)
     jobs = [

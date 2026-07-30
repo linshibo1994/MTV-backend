@@ -88,6 +88,35 @@ def require_public_ip(value: str) -> str:
     return address.compressed
 
 
+async def resolve_public_ips(
+    host: str,
+    port: int,
+    *,
+    resolver: HostResolver | None = None,
+    timeout: float | None = None,
+) -> tuple[str, ...]:
+    """解析主机并要求全部 DNS 结果都是公网 IP。"""
+    try:
+        literal = ipaddress.ip_address(host)
+    except ValueError:
+        resolve = resolver or _resolve_host
+        try:
+            if timeout is None:
+                resolved = await resolve(host, port)
+            else:
+                with anyio.fail_after(timeout):
+                    resolved = await resolve(host, port)
+        except (OSError, TimeoutError, httpcore.ConnectError) as exc:
+            raise ValueError("video_url_not_allowed") from exc
+    else:
+        resolved = [literal.compressed]
+
+    candidates = tuple(dict.fromkeys(require_public_ip(value) for value in resolved))
+    if not candidates:
+        raise ValueError("video_url_not_allowed")
+    return candidates
+
+
 class SafeAsyncNetworkBackend(httpcore.AsyncNetworkBackend):
     """解析、校验并直连 IP，消除校验与连接之间的 DNS 竞态。"""
 

@@ -34,13 +34,21 @@ class S3StorageProvider:
             region_name=settings.s3_region or None,
         )
 
-    def signed_url(self, key: str, *, expires_seconds: int = 300) -> str:
+    async def signed_url(self, key: str, *, expires_seconds: int = 300) -> str:
         rel = validate_key_prefix(key)
         return self._client.generate_presigned_url(
             "get_object",
             Params={"Bucket": self._bucket, "Key": rel},
             ExpiresIn=expires_seconds,
         )
+
+    async def external_read_url(
+        self,
+        key: str,
+        *,
+        expires_seconds: int = 300,
+    ) -> str:
+        return await self.signed_url(key, expires_seconds=expires_seconds)
 
     async def put(self, key: str, data: bytes) -> str:
         rel = validate_key_prefix(key)

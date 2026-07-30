@@ -135,18 +135,33 @@ async def _seed_job_dependencies(connection: asyncpg.Connection) -> None:
         ON CONFLICT (episode_id) DO NOTHING
         """
     )
+    has_reference_image_audit = bool(
+        await connection.fetchval(
+            """
+            SELECT EXISTS (
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name = 'shot_groups'
+                  AND column_name = 'reference_image_audit'
+            )
+            """
+        )
+    )
+    audit_column = ", reference_image_audit" if has_reference_image_audit else ""
+    audit_value = ", '{}'::jsonb" if has_reference_image_audit else ""
     await connection.execute(
-        """
+        f"""
         INSERT INTO shot_groups (
             shot_group_id, script_id, episode_id, scene_no, group_index, group_no,
             prompt, reference_frames, duration_seconds, materials, audio_elements,
-            description_text, unit_id, unit_runtime_key
+            description_text, unit_id, unit_runtime_key{audit_column}
         )
         VALUES (
             'gemini-migration-group', 'gemini-migration-script',
-            'gemini-migration-episode', 1, 1, 'G1', '迁移测试', '{}'::jsonb, 3,
-            '{}'::jsonb, '{}'::jsonb, '', 'group:gemini-migration-group',
-            'gemini-migration-episode:1:group:gemini-migration-group'
+            'gemini-migration-episode', 1, 1, 'G1', '迁移测试', '{{}}'::jsonb, 3,
+            '{{}}'::jsonb, '{{}}'::jsonb, '', 'group:gemini-migration-group',
+            'gemini-migration-episode:1:group:gemini-migration-group'{audit_value}
         )
         ON CONFLICT (shot_group_id) DO NOTHING
         """

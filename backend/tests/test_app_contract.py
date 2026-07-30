@@ -87,6 +87,43 @@ def test_dev_allows_default_session_secret() -> None:
 
 
 @pytest.mark.parametrize(
+    "public_base_url",
+    [
+        "http://api.example.com",
+        "http://localhost:8000",
+        "https://localhost:8000",
+        "https://api.localhost",
+        "https://127.0.0.1",
+        "https://10.0.0.1",
+        "https://169.254.169.254",
+        "https://[::1]",
+        "https://[fd00::1]",
+        "https://user:password@api.example.com",
+        "https://api.example.com/v3api",
+        "https://api.example.com?token=value",
+        "https://api.example.com#fragment",
+    ],
+)
+def test_reference_image_audit_public_base_url_requires_https_origin(
+    public_base_url: str,
+) -> None:
+    with pytest.raises(ValidationError, match="VOLC_IMAGE_AUDIT_PUBLIC_BASE_URL"):
+        Settings(
+            volc_image_audit_public_base_url=public_base_url,
+            _env_file=None,
+        )
+
+
+def test_reference_image_audit_public_base_url_normalizes_https_origin() -> None:
+    configured = Settings(
+        volc_image_audit_public_base_url="https://api.example.com/",
+        _env_file=None,
+    )
+
+    assert configured.volc_image_audit_public_base_url == "https://api.example.com"
+
+
+@pytest.mark.parametrize(
     ("provider", "provider_settings", "expected_model", "expected_base_url"),
     [
         (

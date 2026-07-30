@@ -3,6 +3,7 @@
 import asyncio
 import hashlib
 import os
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import pytest
@@ -1081,5 +1082,49 @@ def test_enqueue_storage_deletes_closes_promote_graph_before_side_effects(
                 assert delete_keys == {final_a, intermediate_b, source_c, branch_d}
             assert len(delete_rows) == len(delete_keys)
             assert len({row.idempotency_key for row in delete_rows}) == len(delete_rows)
+
+    asyncio.run(scenario())
+
+
+def test_enqueue_storage_deletes_reactivates_canceled_lifecycle_delete() -> None:
+    async def scenario() -> None:
+        engine = create_engine("sqlite+pysqlite:///:memory:")
+        Base.metadata.create_all(engine)
+        with Session(engine, expire_on_commit=False) as raw:
+            storage_key = "generate_images/reactivate/canceled.png"
+            digest = hashlib.sha256(storage_key.encode("utf-8")).hexdigest()
+            canceled = MediaStorageJob(
+                id="delete-reactivate-canceled",
+                idempotency_key=f"lifecycle-delete:{digest}",
+                job_type="delete",
+                source_key=storage_key,
+                status="canceled",
+                attempt=3,
+                last_error_type="StorageReferenceExists",
+                last_error_message="媒体仍被引用",
+                completed_at=datetime.now(UTC),
+            )
+            raw.add(canceled)
+            raw.commit()
+
+            await enqueue_storage_deletes(
+                _AsyncSessionAdapter(raw),
+                {storage_key},
+                exclusions=StorageReferenceExclusions(),
+            )
+            raw.commit()
+            raw.refresh(canceled)
+
+            delete_rows = list(
+                raw.scalars(
+                    select(MediaStorageJob).where(MediaStorageJob.job_type == "delete")
+                )
+            )
+            assert [row.id for row in delete_rows] == [canceled.id]
+            assert canceled.status == "pending"
+            assert canceled.attempt == 0
+            assert canceled.last_error_type is None
+            assert canceled.last_error_message is None
+            assert canceled.completed_at is None
 
     asyncio.run(scenario())

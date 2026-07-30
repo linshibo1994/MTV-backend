@@ -52,6 +52,7 @@ from app.providers.storage import (
     validate_key_prefix,
 )
 from app.services import media_storage_jobs
+from app.services.reference_image_audit import verify_reference_image_audit_token
 
 router = APIRouter(tags=["媒体代理"])
 logger = logging.getLogger(__name__)
@@ -674,6 +675,36 @@ async def _authorize_by_storage_key(
         await _authorize_upload_media_key(db, rel, user, require_write)
         return
     await _authorize_script(db, material.script_id, user, require_write)
+
+
+@router.get("/_reference-image-audit", include_in_schema=False)
+async def get_reference_image_for_audit(token: str) -> StreamingResponse:
+    """供 veImageX 使用的短期只读图片代理，不接受会话替代令牌。"""
+    try:
+        key = verify_reference_image_audit_token(token)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="媒体资源不存在") from None
+
+    media_type = _EXT_MIME.get(os.path.splitext(key)[1].lower())
+    if media_type is None or not media_type.startswith("image/"):
+        raise HTTPException(status_code=404, detail="媒体资源不存在")
+
+    storage = get_storage()
+    if not await storage.exists(key):
+        raise HTTPException(status_code=404, detail="媒体资源不存在")
+    total = await storage.get_size(key)
+    if total <= 0 or total > settings.max_upload_bytes:
+        raise HTTPException(status_code=404, detail="媒体资源不存在")
+
+    return StreamingResponse(
+        storage.iter_chunks(key, chunk_size=65536, start=0, end=None),
+        media_type=media_type,
+        headers={
+            "Cache-Control": "private, no-store",
+            "Content-Length": str(total),
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
 @router.get("/{storage_key:path}")

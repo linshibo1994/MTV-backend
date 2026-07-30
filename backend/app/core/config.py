@@ -7,7 +7,7 @@ from math import log2
 from typing import Literal
 from urllib.parse import urlsplit
 
-from pydantic import Field, PrivateAttr, model_validator
+from pydantic import Field, PrivateAttr, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -48,13 +48,46 @@ class Settings(BaseSettings):
     tgw_l7_route_cookie: str = "flowapp-tgw"
 
     # 存储
-    storage_driver: Literal["local", "s3"] = "local"
+    storage_driver: Literal["local", "s3", "meizi"] = "local"
     storage_root: str = "./storage"
     s3_endpoint: str = ""
     s3_access_key: str = ""
     s3_secret_key: str = ""
     s3_bucket: str = "flowapp"
     s3_region: str = "us-east-1"
+    # 公司公共媒资中心。业务服务不持有 OSS AK/SK，仅使用 MeiZi 签发的临时上传凭证。
+    meizi_base_url: str = ""
+    # 切换 MeiZi 后仅为“尚无远端映射”的历史对象保留本地读/删兼容；
+    # 所有新 put/put_file 仍强制上传 MeiZi，完成存量迁移后可关闭。
+    meizi_legacy_local_fallback: bool = False
+    meizi_upload_user_name: str = ""
+    meizi_upload_tenant_id: int = 0
+    meizi_upload_group_id: int = 0
+    meizi_upload_source: int = 0
+    # Java TokenRequest 将上传盐硬编码在源码；Python 改为 SecretStr 环境注入。
+    meizi_upload_salt: SecretStr = SecretStr("")
+    # info/shiftDelete 使用 frontupload 身份，不能与上传身份混为一套配置。
+    meizi_front_user_name: str = ""
+    meizi_front_tenant_id: int = 0
+    meizi_front_group_id: int = 0
+    meizi_front_source: int = 0
+    meizi_front_salt: SecretStr = SecretStr("")
+    # 为空时接受任意通过公网 DNS/IP 校验的 HTTPS 主机；生产可进一步收窄。
+    meizi_upload_allowed_hosts: list[str] = Field(default_factory=list)
+    meizi_public_url_allowed_hosts: list[str] = Field(default_factory=list)
+    meizi_lib_type_file: int = 704
+    meizi_lib_type_image: int = 703
+    meizi_lib_type_video: int = 701
+    meizi_lib_type_audio: int = 702
+    meizi_connect_timeout_seconds: float = Field(default=30.0, gt=0, le=120)
+    meizi_read_timeout_seconds: float = Field(default=600.0, gt=0, le=1800)
+    meizi_write_timeout_seconds: float = Field(default=600.0, gt=0, le=1800)
+    meizi_processing_poll_attempts: int = Field(default=10, ge=1, le=60)
+    meizi_processing_poll_interval_seconds: float = Field(default=2.0, ge=0, le=30)
+    # uploadToken 身份已落库但进程中断，或远端删除暂时失败时，后台任务会在
+    # 该静默窗口后重新领取并删除；默认一小时高于单次上传/处理超时。
+    meizi_cleanup_stale_seconds: int = Field(default=3600, ge=60, le=86400)
+    meizi_cleanup_batch_size: int = Field(default=20, ge=1, le=200)
 
     # OpenAI (旧字段，保留作新能力配置为空时的回退)
     openai_api_key: str = ""
@@ -286,6 +319,24 @@ class Settings(BaseSettings):
         except ValueError as exc:
             raise ValueError(f"CORS_ORIGINS 必须配置合法的 http/https origin：{exc}") from exc
 
+        audit_public_origin = self.volc_image_audit_public_base_url.strip()
+        if audit_public_origin:
+            try:
+                normalized_audit_origin = _normalize_cors_origin(
+                    audit_public_origin,
+                    allow_wildcard=False,
+                )
+                parsed_audit_origin = urlsplit(normalized_audit_origin)
+                if parsed_audit_origin.scheme != "https":
+                    raise ValueError("必须使用 HTTPS")
+                if _is_non_public_origin_host(parsed_audit_origin.hostname or ""):
+                    raise ValueError("必须使用公网主机")
+            except ValueError as exc:
+                raise ValueError(
+                    f"VOLC_IMAGE_AUDIT_PUBLIC_BASE_URL 配置不安全：{exc}"
+                ) from exc
+            self.volc_image_audit_public_base_url = normalized_audit_origin
+
         for field_name in (
             "text_llm_base_url",
             "chat_llm_base_url",
@@ -293,6 +344,7 @@ class Settings(BaseSettings):
             "video_gen_base_url",
             "dashscope_base_url",
             "anthropic_base_url",
+            "meizi_base_url",
         ):
             value = getattr(self, field_name).strip()
             if not value:
@@ -306,6 +358,57 @@ class Settings(BaseSettings):
                 env_name = field_name.upper()
                 raise ValueError(f"{env_name} 配置不安全：{exc}") from exc
             setattr(self, field_name, normalized)
+
+        if self.storage_driver == "meizi":
+            missing = [
+                field_name.upper()
+                for field_name in ("meizi_base_url", "meizi_upload_user_name")
+                if not str(getattr(self, field_name)).strip()
+            ]
+            if not self.meizi_upload_salt.get_secret_value().strip():
+                missing.append("MEIZI_UPLOAD_SALT")
+            if not self.meizi_front_salt.get_secret_value().strip():
+                missing.append("MEIZI_FRONT_SALT")
+            if missing:
+                raise ValueError(f"MeiZi 存储配置缺失：{', '.join(missing)}")
+            if urlsplit(self.meizi_base_url).scheme != "https":
+                raise ValueError("MEIZI_BASE_URL 必须使用 HTTPS")
+            positive_fields = (
+                "meizi_upload_tenant_id",
+                "meizi_upload_group_id",
+                "meizi_upload_source",
+                "meizi_front_tenant_id",
+                "meizi_front_source",
+                "meizi_lib_type_file",
+                "meizi_lib_type_image",
+                "meizi_lib_type_video",
+                "meizi_lib_type_audio",
+            )
+            invalid = [
+                field_name.upper()
+                for field_name in positive_fields
+                if int(getattr(self, field_name)) <= 0
+            ]
+            if self.meizi_front_group_id < 0:
+                invalid.append("MEIZI_FRONT_GROUP_ID")
+            if invalid:
+                raise ValueError(f"MeiZi 存储配置必须为正整数：{', '.join(invalid)}")
+            lib_types = (
+                self.meizi_lib_type_file,
+                self.meizi_lib_type_image,
+                self.meizi_lib_type_video,
+                self.meizi_lib_type_audio,
+            )
+            if len(set(lib_types)) != len(lib_types):
+                raise ValueError("MEIZI_LIB_TYPE_* 必须互不相同")
+            self.meizi_upload_allowed_hosts = _normalize_host_allowlist(
+                self.meizi_upload_allowed_hosts,
+                field_name="MEIZI_UPLOAD_ALLOWED_HOSTS",
+            )
+            self.meizi_public_url_allowed_hosts = _normalize_host_allowlist(
+                self.meizi_public_url_allowed_hosts,
+                field_name="MEIZI_PUBLIC_URL_ALLOWED_HOSTS",
+            )
 
         if self.is_prod:
             secret = self.session_secret.strip()
@@ -407,6 +510,41 @@ def _is_local_development_host(hostname: str) -> bool:
         return ipaddress.ip_address(host).is_loopback
     except ValueError:
         return False
+
+
+def _is_non_public_origin_host(hostname: str) -> bool:
+    """拒绝 localhost 及不具备公网路由属性的 IP 字面量。"""
+    host = hostname.rstrip(".").lower()
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    try:
+        return not ipaddress.ip_address(host).is_global
+    except ValueError:
+        return False
+
+
+def _normalize_host_allowlist(values: list[str], *, field_name: str) -> list[str]:
+    """规范化可选的出站主机白名单，禁止端口、路径和通配符。"""
+    normalized: list[str] = []
+    for raw in values:
+        value = raw.strip().rstrip(".").lower()
+        if (
+            not value
+            or "*" in value
+            or "/" in value
+            or "\\" in value
+            or ":" in value
+            or any(char.isspace() for char in value)
+        ):
+            raise ValueError(f"{field_name} 包含非法主机")
+        try:
+            ascii_host = value.encode("idna").decode("ascii")
+        except UnicodeError as exc:
+            raise ValueError(f"{field_name} 包含非法主机") from exc
+        if len(ascii_host) > 253:
+            raise ValueError(f"{field_name} 包含非法主机")
+        normalized.append(ascii_host)
+    return list(dict.fromkeys(normalized))
 
 
 def _is_low_strength_secret(secret: str) -> bool:

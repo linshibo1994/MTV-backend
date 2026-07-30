@@ -4,7 +4,7 @@ generate_images_task(job_id) 流程：
 1. 读 input_json.resolved_prompts.final（回退 input_json.prompt）作为生图 prompt
 2. 解析 script_id（job.script_id 优先，兜底从 material.script_id 查询）
 3. get_image_provider(model).generate() 调用对应供应商生成图片（可生成多张选一）
-4. 本地存储 (/generate_images/<mid>/<id>.png) + 计算 sha256
+4. 通过 StorageProvider 持久化 (/generate_images/<mid>/<id>.png) + 计算 sha256
 5. 全部生成成功后统一调 crud.asset.add_candidate 创建候选资产（补全 script_id/kind 位置参数）
 6. 更新 subject.review_status=pending（候选待审，驱动 NotDesigned->CandidateReady 状态迁移）
 7. 更新 job.output_json.imageOutputs[] / primaryImageIndex

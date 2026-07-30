@@ -495,6 +495,20 @@ async def delete_subject(
     await acquire_storage_reference_barrier(db)
     entries_q = select(AssetEntry).where(AssetEntry.subject_id == subject.id)
     entries = list((await db.execute(entries_q)).scalars().all())
+    entry_ids = [entry.id for entry in entries]
+    external_refs: list[AssetEntry] = []
+    if entry_ids:
+        external_refs = list(
+            (
+                await db.execute(
+                    select(AssetEntry)
+                    .where(
+                        AssetEntry.superseded_by_id.in_(entry_ids),
+                        AssetEntry.subject_id != subject.id,
+                    )
+                )
+            ).scalars().all()
+        )
 
     generation_jobs: list[GenerationJob] = []
     if not parent_delete_prepared:
@@ -553,6 +567,9 @@ async def delete_subject(
         for entry in entries:
             collect_storage_keys(entry.storage_key, candidate_keys)
             asset_ids_by_key[entry.storage_key] = entry.id
+        for entry in external_refs:
+            collect_storage_keys(entry.storage_key, candidate_keys)
+            asset_ids_by_key[entry.storage_key] = entry.id
         for job in generation_jobs:
             collect_storage_keys(job.output_json, candidate_keys)
             collect_storage_keys(job.metrics, candidate_keys)
@@ -563,7 +580,10 @@ async def delete_subject(
             upload_ids_by_key[upload.final_storage_key] = upload.id
 
         exclusions = StorageReferenceExclusions(
-            asset_entry_ids={entry.id for entry in entries},
+            asset_entry_ids={
+                entry.id
+                for entry in (*entries, *external_refs)
+            },
             media_upload_ids={upload.id for upload in uploads},
             generation_job_ids={job.job_id for job in generation_jobs},
         )
@@ -606,23 +626,11 @@ async def delete_subject(
     # Subject.image_entry_id 和 AssetEntry.superseded_by_id 都会阻断条目删除。
     # parent_id 指向 ParentSubject，不是 Subject 自引用，不能误清理其他主体。
     parent = await db.get(ParentSubject, subject.parent_id) if subject.parent_id else None
-    entry_ids = [entry.id for entry in entries]
     subject.image_entry_id = None
     for entry in entries:
         entry.superseded_by_id = None
-    if entry_ids:
-        external_refs = list(
-            (
-                await db.execute(
-                    select(AssetEntry).where(
-                        AssetEntry.superseded_by_id.in_(entry_ids),
-                        AssetEntry.subject_id != subject.id,
-                    )
-                )
-            ).scalars().all()
-        )
-        for entry in external_refs:
-            entry.set_status("deleted")
+    for entry in external_refs:
+        entry.set_status("deleted")
     await db.flush()
 
     for entry in entries:

@@ -80,8 +80,13 @@ async def enqueue_job(
     expected_size_bytes: int | None = None,
     available_at: datetime | None = None,
     max_attempts: int = _DEFAULT_MAX_ATTEMPTS,
+    reactivate_canceled: bool = False,
 ) -> MediaStorageJob:
-    """幂等写入媒体存储任务。"""
+    """幂等写入媒体存储任务。
+
+    ``canceled`` 可能表示永久撤销，也可能表示引用暂时阻止删除。只有已经重新完成
+    引用判定的调用方才可显式请求复活，避免通用补偿误改业务终态。
+    """
     validate_key_prefix(source_key)
     if job_type not in {"delete", "promote"}:
         raise ValueError("job_type 必须是 delete 或 promote")
@@ -125,6 +130,24 @@ async def enqueue_job(
         if payload != requested:
             raise ConflictError("媒体存储幂等键对应的任务载荷不一致")
 
+    def _reactivate_canceled_delete(existing: MediaStorageJob) -> bool:
+        if (
+            not reactivate_canceled
+            or job_type != "delete"
+            or existing.status != "canceled"
+        ):
+            return False
+        existing.status = "pending"
+        existing.attempt = 0
+        existing.available_at = available_at or _now_like(existing.created_at)
+        existing.lease_owner = None
+        existing.lease_token = None
+        existing.lease_until = None
+        existing.last_error_type = None
+        existing.last_error_message = None
+        existing.completed_at = None
+        return True
+
     existing = (
         await db.execute(
             select(MediaStorageJob).where(
@@ -134,6 +157,8 @@ async def enqueue_job(
     ).scalar_one_or_none()
     if existing is not None:
         _assert_same_payload(existing)
+        if _reactivate_canceled_delete(existing):
+            await db.flush()
         return existing
 
     row = MediaStorageJob(
@@ -170,6 +195,8 @@ async def enqueue_job(
         if existing is None:
             raise
         _assert_same_payload(existing)
+        if _reactivate_canceled_delete(existing):
+            await db.flush()
         return existing
 
 
@@ -208,6 +235,7 @@ async def enqueue_delete(
     upload_id: str | None = None,
     available_at: datetime | None = None,
     max_attempts: int = _DEFAULT_MAX_ATTEMPTS,
+    reactivate_canceled: bool = False,
 ) -> MediaStorageJob:
     return await enqueue_job(
         db,
@@ -218,6 +246,7 @@ async def enqueue_delete(
         upload_id=upload_id,
         available_at=available_at,
         max_attempts=max_attempts,
+        reactivate_canceled=reactivate_canceled,
     )
 
 

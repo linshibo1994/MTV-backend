@@ -335,28 +335,43 @@ async def _seed_runtime_rows(connection: asyncpg.Connection) -> None:
             ('foreign-episode', 'foreign-script', 1, '其他分集', 1, 1, 0)
         """
     )
+    has_reference_image_audit = bool(
+        await connection.fetchval(
+            """
+            SELECT EXISTS (
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name = 'shot_groups'
+                  AND column_name = 'reference_image_audit'
+            )
+            """
+        )
+    )
+    audit_column = ", reference_image_audit" if has_reference_image_audit else ""
+    audit_value = ", '{}'::jsonb" if has_reference_image_audit else ""
     await connection.execute(
-        """
+        f"""
         INSERT INTO shot_groups (
             shot_group_id, script_id, episode_id, scene_no, group_index, group_no,
             prompt, reference_frames, duration_seconds, materials, audio_elements,
-            description_text, unit_id, unit_runtime_key
+            description_text, unit_id, unit_runtime_key{audit_column}
         )
         VALUES
             (
                 'idem-group-a', 'idem-script', 'idem-episode', 1, 1, 'G1',
-                '镜头 A', '{}'::jsonb, 3, '{}'::jsonb, '{}'::jsonb, '',
-                'group:idem-group-a', 'idem-episode:1:group:idem-group-a'
+                '镜头 A', '{{}}'::jsonb, 3, '{{}}'::jsonb, '{{}}'::jsonb, '',
+                'group:idem-group-a', 'idem-episode:1:group:idem-group-a'{audit_value}
             ),
             (
                 'idem-group-b', 'idem-script', 'idem-episode', 1, 2, 'G2',
-                '镜头 B', '{}'::jsonb, 3, '{}'::jsonb, '{}'::jsonb, '',
-                'group:idem-group-b', 'idem-episode:1:group:idem-group-b'
+                '镜头 B', '{{}}'::jsonb, 3, '{{}}'::jsonb, '{{}}'::jsonb, '',
+                'group:idem-group-b', 'idem-episode:1:group:idem-group-b'{audit_value}
             ),
             (
                 'foreign-group', 'foreign-script', 'foreign-episode', 1, 1, 'G1',
-                '其他镜头', '{}'::jsonb, 3, '{}'::jsonb, '{}'::jsonb, '',
-                'group:foreign-group', 'foreign-episode:1:group:foreign-group'
+                '其他镜头', '{{}}'::jsonb, 3, '{{}}'::jsonb, '{{}}'::jsonb, '',
+                'group:foreign-group', 'foreign-episode:1:group:foreign-group'{audit_value}
             )
         """
     )

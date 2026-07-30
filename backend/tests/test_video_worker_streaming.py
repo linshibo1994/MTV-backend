@@ -109,6 +109,54 @@ async def test_last_frame_streams_video_and_keeps_small_image_put(monkeypatch, t
     assert not any(tmp_path.iterdir())
 
 
+async def test_last_frame_replacement_keeps_same_group_reference_visible_to_cleanup(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from app.services import storage_references
+    from app.workers import video_generation as worker
+
+    class Storage:
+        async def iter_chunks(self, _key, *, chunk_size, start, end):
+            del chunk_size, start, end
+            yield b"video"
+
+        async def put(self, key: str, _data: bytes) -> str:
+            return key
+
+        async def delete(self, _key: str) -> None:
+            return None
+
+    class DB(_FakeDB):
+        async def flush(self) -> None:
+            return None
+
+    old_key = "/generate_images/video/frames/old_last.png"
+    shot_group = SimpleNamespace(
+        reference_frames={
+            "first_frame": old_key,
+            "last_frame": old_key,
+        }
+    )
+    enqueue = AsyncMock()
+    monkeypatch.setattr("app.providers.storage.get_storage", lambda: Storage())
+    monkeypatch.setattr(storage_references, "enqueue_storage_deletes", enqueue)
+    _install_fake_ffmpeg(monkeypatch, worker, tmp_path, b"video")
+
+    result = await worker._update_last_frame(
+        DB(shot_group),
+        "group:replace-group",
+        "generate_images/video/source.mp4",
+        "0123456789abcdef",
+    )
+
+    assert shot_group.reference_frames["last_frame"] == result
+    assert shot_group.reference_frames["first_frame"] == old_key
+    enqueue.assert_awaited_once()
+    assert enqueue.await_args.args[1] == {old_key}
+    assert enqueue.await_args.kwargs["exclusions"].shot_group_ids == set()
+
+
 async def test_last_frame_stream_failure_removes_partial_local_video(monkeypatch, tmp_path) -> None:
     from app.workers import video_generation as worker
 

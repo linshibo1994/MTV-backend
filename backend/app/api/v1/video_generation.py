@@ -10,6 +10,7 @@
 router 已在 app/api/router.py 挂载到 /v3api 前缀下。
 """
 
+import logging
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
@@ -43,6 +44,7 @@ from app.services.reference_aggregator import AggregatedReferences
 from app.services.runtime_models import resolve_env_video_model, resolve_video_model
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 def _derive_batch_idempotency_keys(prefix: str, count: int) -> list[str]:
@@ -212,6 +214,7 @@ async def audit_video_reference_images(
         audit_not_required_state,
         audit_references,
         public_audit_state,
+        reference_image_audit_failure_message,
     )
 
     references, current_state = await _current_reference_image_audit_state(db, group)
@@ -226,14 +229,28 @@ async def audit_video_reference_images(
         audit_state = await audit_references(references)
     except RuntimeError as exc:
         # 失败是可观察且可重试的状态，绝不降级为通过；不暴露 SDK/上游响应细节。
+        failure_message = reference_image_audit_failure_message(exc)
+        error_code = (
+            str(exc)
+            if str(exc).startswith("reference_image_audit_")
+            else "reference_image_audit_unexpected"
+        )
+        logger.warning(
+            "reference_image_audit_failed code=%s shot_group_id=%s",
+            error_code,
+            group.shot_group_id,
+        )
         current_state.update({
             "status": "failed",
             "audited_at": datetime.now(UTC).isoformat(),
-            "message": "参考图审核服务暂不可用，请稍后重试",
+            "message": failure_message,
         })
         group.reference_image_audit = current_state
         await db.commit()
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="参考图审核服务暂不可用，请检查审核配置后重试") from exc
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=failure_message,
+        ) from exc
     group.reference_image_audit = audit_state
     await db.commit()
     return ReferenceImageAuditOut(shot_group_id=group.shot_group_id, **public_audit_state(audit_state))

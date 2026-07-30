@@ -493,6 +493,8 @@ async def enqueue_storage_deletes(
             source_key=key,
             asset_id=normalized_asset_ids.get(key),
             upload_id=normalized_upload_ids.get(key),
+            # 本函数刚完成全引用复核，允许复活此前因引用存在而取消的固定幂等任务。
+            reactivate_canceled=True,
         )
 
 

@@ -1231,6 +1231,7 @@ async def test_media_upload_migration_empty_database_round_trip(
 ) -> None:
     url = migration_database.url
     _run_alembic(url, "upgrade", "head")
+    head_revision = await _database_revision(url)
     primary_error: BaseException | None = None
     try:
         _run_alembic(url, "downgrade", "base")
@@ -1242,7 +1243,7 @@ async def test_media_upload_migration_empty_database_round_trip(
             await connection.close()
 
         _run_alembic(url, "upgrade", "head")
-        assert await _database_revision(url) == _MEDIA_REVISION
+        assert await _database_revision(url) == head_revision
         _run_alembic(url, "check")
     except BaseException as error:
         primary_error = error
@@ -1254,8 +1255,10 @@ async def test_media_upload_migration_empty_database_round_trip(
         isolation_errors.append(error)
     try:
         actual_revision = await _database_revision(url)
-        if actual_revision != _MEDIA_REVISION:
-            raise AssertionError(f"空库往返测试结束版本应为 {_MEDIA_REVISION}，实际为 {actual_revision}")
+        if actual_revision != head_revision:
+            raise AssertionError(
+                f"空库往返测试结束版本应为 {head_revision}，实际为 {actual_revision}"
+            )
     except BaseException as error:
         isolation_errors.append(error)
     _raise_isolation_failures(primary_error, isolation_errors)

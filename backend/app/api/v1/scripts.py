@@ -19,6 +19,8 @@
   - 资源级授权: 改 URL id 时服务端重新校验归属（permissions.check_script_access）
 """
 
+import logging
+
 from fastapi import APIRouter, Depends, File, Query, UploadFile, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -59,6 +61,7 @@ from app.schemas.script import (
     ScriptUploadOut,
     SubjectCatalogStateOut,
 )
+from app.services import media_storage_jobs
 from app.services.audit import best_effort_log as audit_log
 from app.services.pipeline import get_stage
 from app.services.pipeline.catalog import get_subject_catalog_state
@@ -66,6 +69,7 @@ from app.services.pipeline.orchestrator import get_pipeline_status, trigger_pipe
 from app.services.script_document import cleanup_staged_script_document, stage_script_document
 
 router = APIRouter(prefix="/scripts", tags=["scripts"])
+logger = logging.getLogger(__name__)
 
 
 # --------------------------------------------------------------------------- #
@@ -210,8 +214,22 @@ async def upload_and_split_script(
         if stored:
             try:
                 await storage.delete(storage_key)
-            except Exception:
-                pass
+            except Exception:  # noqa: BLE001 - 远端删除失败必须转为持久补偿
+                try:
+                    await db.rollback()
+                    await media_storage_jobs.enqueue_delete(
+                        db,
+                        idempotency_key=f"script-upload-cleanup:{storage_key}",
+                        source_key=storage_key,
+                    )
+                    await db.commit()
+                except Exception:
+                    await db.rollback()
+                    logger.error(
+                        "剧本文档上传回滚清理无法持久化 storage_key=%s",
+                        storage_key,
+                        exc_info=True,
+                    )
         raise
     finally:
         cleanup_staged_script_document(document)

@@ -24,9 +24,81 @@ def test_storage_signed_url_uses_expires_seconds_keyword(tmp_path) -> None:
     assert "expires_in" not in local_parameters
 
     provider = LocalStorageProvider(str(tmp_path))
-    assert provider.signed_url(
-        "upload_images/material-1/image.png", expires_seconds=60
+    assert asyncio.run(
+        provider.signed_url(
+            "upload_images/material-1/image.png",
+            expires_seconds=60,
+        )
     ).endswith("/upload_images/material-1/image.png")
+
+
+def test_local_external_read_url_is_unavailable(tmp_path) -> None:
+    protocol_parameters = inspect.signature(StorageProvider.external_read_url).parameters
+    local_parameters = inspect.signature(LocalStorageProvider.external_read_url).parameters
+
+    assert "expires_seconds" in protocol_parameters
+    assert "expires_seconds" in local_parameters
+    provider = LocalStorageProvider(str(tmp_path))
+    assert (
+        asyncio.run(
+            provider.external_read_url(
+                "upload_images/material-1/image.png",
+                expires_seconds=60,
+            )
+        )
+        is None
+    )
+
+
+def test_s3_external_read_url_preserves_presigned_url_expiry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _ClientError(Exception):
+        pass
+
+    boto3_module = ModuleType("boto3")
+    boto3_module.client = lambda *_args, **_kwargs: None  # type: ignore[attr-defined]
+    botocore_module = ModuleType("botocore")
+    botocore_client_module = ModuleType("botocore.client")
+    botocore_client_module.BaseClient = object  # type: ignore[attr-defined]
+    botocore_exceptions_module = ModuleType("botocore.exceptions")
+    botocore_exceptions_module.ClientError = _ClientError  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "boto3", boto3_module)
+    monkeypatch.setitem(sys.modules, "botocore", botocore_module)
+    monkeypatch.setitem(sys.modules, "botocore.client", botocore_client_module)
+    monkeypatch.setitem(sys.modules, "botocore.exceptions", botocore_exceptions_module)
+    monkeypatch.delitem(sys.modules, "app.providers.storage_s3", raising=False)
+
+    S3StorageProvider = importlib.import_module(
+        "app.providers.storage_s3"
+    ).S3StorageProvider
+
+    class _PresignClient:
+        def generate_presigned_url(
+            self,
+            operation: str,
+            *,
+            Params: dict,
+            ExpiresIn: int,
+        ) -> str:
+            assert operation == "get_object"
+            assert Params == {
+                "Bucket": "test-bucket",
+                "Key": "generate_images/material-1/image.png",
+            }
+            assert ExpiresIn == 600
+            return "https://storage.example.com/presigned-image"
+
+    provider = object.__new__(S3StorageProvider)
+    provider._bucket = "test-bucket"
+    provider._client = _PresignClient()
+
+    assert asyncio.run(
+        provider.external_read_url(
+            "generate_images/material-1/image.png",
+            expires_seconds=600,
+        )
+    ) == "https://storage.example.com/presigned-image"
 
 
 def test_media_range_rejects_multiple_ranges() -> None:

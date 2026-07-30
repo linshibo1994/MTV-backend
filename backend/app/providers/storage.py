@@ -87,8 +87,17 @@ class StorageProvider(Protocol):
         """对象是否存在。"""
         ...
 
-    def signed_url(self, key: str, *, expires_seconds: int = 300) -> str | None:
+    async def signed_url(self, key: str, *, expires_seconds: int = 300) -> str | None:
         """返回短期访问 URL；不支持直签时返回受控代理 URL 或 None。"""
+        ...
+
+    async def external_read_url(
+        self,
+        key: str,
+        *,
+        expires_seconds: int = 300,
+    ) -> str | None:
+        """返回供可信外部处理器直接读取的绝对 HTTPS URL。"""
         ...
 
     async def get_size(self, key: str) -> int:
@@ -151,6 +160,7 @@ def get_storage() -> StorageProvider:
 
     - ``local``: 本地文件系统 (开发默认)
     - ``s3``: S3 兼容 (MinIO/COS)，依赖或配置缺失时 fail closed
+    - ``meizi``: 公司 MeiZi 媒资中心，逻辑 key 通过数据库映射到公共 OSS
     """
     global _storage_singleton
     if _storage_singleton is not None:
@@ -164,6 +174,15 @@ def get_storage() -> StorageProvider:
             return _storage_singleton
         except ImportError as exc:
             raise RuntimeError("S3 存储不可用：缺少依赖") from exc
+
+    if settings.storage_driver == "meizi":
+        from app.providers.storage_meizi import MeiziStorageProvider
+
+        _storage_singleton = MeiziStorageProvider()
+        return _storage_singleton
+
+    if settings.storage_driver != "local":
+        raise RuntimeError(f"未知存储驱动：{settings.storage_driver}")
 
     from app.providers.storage_local import LocalStorageProvider
 

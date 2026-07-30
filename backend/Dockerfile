@@ -6,8 +6,8 @@ RUN apt-get update \
 
 WORKDIR /app
 
-# 将依赖安装在不受开发目录挂载影响的位置。生产镜像默认安装 S3
-# 可选依赖；测试/开发镜像可通过构建参数跳过，缩短本地构建时间。
+# 将依赖安装在不受开发目录挂载影响的位置。MeiZi 使用主依赖 httpx；
+# 只有同时需要 S3 时才安装 boto3 可选依赖。
 ENV UV_PROJECT_ENVIRONMENT=/opt/venv
 COPY pyproject.toml uv.lock ./
 ARG INSTALL_S3=true

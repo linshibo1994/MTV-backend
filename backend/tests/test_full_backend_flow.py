@@ -51,6 +51,8 @@ from app.services.pipeline.extract import run_extract
 from app.services.pipeline.merge import run_merge
 from app.services.pipeline.parents import run_parents
 from app.services.pipeline.split import run_split
+from app.services.reference_aggregator import aggregate_references
+from app.services.reference_image_audit import reference_image_hash
 from app.services.shot_group_merge import merge_shots_into_groups
 from app.services.task_dispatch import dispatch_outbox_batch
 from app.workers import timeline_render as timeline_worker
@@ -648,6 +650,13 @@ async def test_full_backend_flow_reaches_succeeded_render_job(monkeypatch, tmp_p
         await db.execute(select(ShotGroup).where(ShotGroup.episode_id == episode_id))
     ).scalar_one()
     assert shot_group.unit_id == f"group:{shot_group.shot_group_id}"
+    aggregated = await aggregate_references(db, shot_group.shot_group_id)
+    shot_group.reference_image_audit = {
+        "status": "approved",
+        "reference_hash": reference_image_hash(aggregated),
+        "results": [],
+    }
+    await db.commit()
 
     monkeypatch.setattr(video_generation_service.settings, "video_provider_selection_mode", "database")
     video_job = await video_generation_service.create_video_job(

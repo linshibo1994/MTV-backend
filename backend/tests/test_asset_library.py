@@ -1459,7 +1459,9 @@ def test_get_subject_for_update_refreshes_stale_identity_map(tmp_path):
     asyncio.run(scenario())
 
 
-def test_delete_subject_clears_external_superseded_references_before_asset_delete():
+def test_delete_subject_clears_external_superseded_references_before_asset_delete(
+    monkeypatch,
+):
     async def scenario() -> None:
         engine = create_engine("sqlite+pysqlite:///:memory:")
 
@@ -1485,7 +1487,7 @@ def test_delete_subject_clears_external_superseded_references_before_asset_delet
                 script_id="script-1",
                 subject_id="subject-2",
                 kind="image",
-                storage_key="generated/history",
+                storage_key="generate_images/history/history.png",
                 mime_type="image/png",
                 size_bytes=1,
                 source="generate_images",
@@ -1498,6 +1500,26 @@ def test_delete_subject_clears_external_superseded_references_before_asset_delet
             subject.image_entry_id = deleted_asset.id
             raw.commit()
 
+            decision = SimpleNamespace(
+                candidate_keys=frozenset(
+                    {
+                        "generate_images/history/history.png",
+                        deleted_asset.storage_key,
+                    }
+                ),
+                protected_keys=frozenset(),
+            )
+            enqueue_deletes = AsyncMock()
+            monkeypatch.setattr(
+                asset_crud,
+                "decide_storage_key_deletes",
+                AsyncMock(return_value=decision),
+            )
+            monkeypatch.setattr(
+                asset_crud,
+                "enqueue_storage_deletes",
+                enqueue_deletes,
+            )
             await asset_crud.delete_subject(_AsyncSessionAdapter(raw), subject)
             raw.commit()
 
@@ -1505,6 +1527,11 @@ def test_delete_subject_clears_external_superseded_references_before_asset_delet
             history = verify.get(AssetEntry, "history-image")
             assert history.superseded_by_id is None
             assert history.status == "deleted"
+        enqueue_deletes.assert_awaited_once()
+        assert (
+            "generate_images/history/history.png"
+            in enqueue_deletes.await_args.args[1]
+        )
 
     asyncio.run(scenario())
 
@@ -2867,9 +2894,9 @@ def test_storage_provider_exposes_signed_url_and_local_uses_proxy_contract(monke
     provider = LocalStorageProvider(root=str(tmp_path))
 
     assert isinstance(provider, StorageProvider)
-    assert provider.signed_url("/upload_images/material-1/a.png").endswith(
-        "/api/x/cctv/zhihui/flow-app/upload_images/material-1/a.png"
-    )
+    assert asyncio.run(
+        provider.signed_url("/upload_images/material-1/a.png")
+    ).endswith("/api/x/cctv/zhihui/flow-app/upload_images/material-1/a.png")
 
 
 def test_s3_driver_without_dependency_fails_closed(monkeypatch):

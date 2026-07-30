@@ -43,9 +43,20 @@ class LocalStorageProvider:
             raise ValueError("非法 storage_key") from exc
         return str(full)
 
-    def signed_url(self, key: str, *, expires_seconds: int = 300) -> str:
+    async def signed_url(self, key: str, *, expires_seconds: int = 300) -> str:
+        del expires_seconds
         rel = validate_key_prefix(key)
         return f"{settings.media_proxy_prefix.rstrip('/')}/{rel}"
+
+    async def external_read_url(
+        self,
+        key: str,
+        *,
+        expires_seconds: int = 300,
+    ) -> None:
+        validate_key_prefix(key)
+        del expires_seconds
+        return None
 
     async def put(self, key: str, data: bytes) -> str:
         full = self._full_path(key)

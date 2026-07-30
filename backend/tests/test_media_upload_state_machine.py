@@ -846,14 +846,16 @@ def test_reference_writer_cancels_pending_delete_and_fresh_intent_converges() ->
 
             asset.set_status("deleted")
             raw.commit()
-            replacement = await media_storage_jobs.enqueue_delete(
+            reactivated = await media_storage_jobs.enqueue_delete(
                 db,
-                idempotency_key="delete-effect-reference-replacement",
+                idempotency_key=job.idempotency_key,
                 source_key=storage_key,
                 asset_id=asset.id,
                 available_at=datetime.now(UTC) - timedelta(seconds=1),
+                reactivate_canceled=True,
             )
             raw.commit()
+            assert reactivated.id == job.id
 
             converged = await media_storage_worker.process_due_jobs(
                 db,
@@ -863,15 +865,13 @@ def test_reference_writer_cancels_pending_delete_and_fresh_intent_converges() ->
             )
             raw.refresh(job)
             assert converged == {
-                "succeeded": [replacement.id],
+                "succeeded": [job.id],
                 "retried": [],
                 "failed": [],
                 "canceled": [],
             }
-            raw.refresh(replacement)
-            assert job.status == "canceled"
-            assert replacement.status == "succeeded"
-            assert replacement.attempt == 1
+            assert job.status == "succeeded"
+            assert job.attempt == 1
             assert storage.deleted == [storage_key]
 
     asyncio.run(scenario())
@@ -1655,6 +1655,53 @@ def test_recover_media_storage_jobs_returns_canceled_bucket(
         "failed": ["job-failed"],
         "canceled": ["job-canceled"],
     }
+
+
+def test_reconcile_meizi_storage_objects_skips_other_storage_drivers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(media_storage_worker, "get_storage", lambda: SimpleNamespace())
+    monkeypatch.setattr(
+        media_storage_worker,
+        "run_worker_async",
+        lambda coroutine: asyncio.run(coroutine),
+    )
+
+    assert media_storage_worker.reconcile_meizi_storage_objects.run(limit=7) == {
+        "skipped": True,
+        "claimed": 0,
+        "deleted": 0,
+        "failed": 0,
+    }
+
+
+def test_reconcile_meizi_storage_objects_delegates_to_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: list[int | None] = []
+
+    async def _reconcile(*, limit: int | None) -> dict[str, int]:
+        observed.append(limit)
+        return {"claimed": 3, "deleted": 2, "failed": 1}
+
+    monkeypatch.setattr(
+        media_storage_worker,
+        "get_storage",
+        lambda: SimpleNamespace(reconcile_stale_deletions=_reconcile),
+    )
+    monkeypatch.setattr(
+        media_storage_worker,
+        "run_worker_async",
+        lambda coroutine: asyncio.run(coroutine),
+    )
+
+    assert media_storage_worker.reconcile_meizi_storage_objects.run(limit=7) == {
+        "skipped": False,
+        "claimed": 3,
+        "deleted": 2,
+        "failed": 1,
+    }
+    assert observed == [7]
 
 
 @pytest.mark.parametrize("entrypoint", ["api", "worker"])

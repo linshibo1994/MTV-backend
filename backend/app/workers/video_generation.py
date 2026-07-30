@@ -3582,8 +3582,27 @@ async def _update_last_frame(
         if shot_group is None:
             raise RuntimeError("frame_extraction_failed")
         ref_frames = dict(shot_group.reference_frames or {})
+        previous_last_frame = ref_frames.get("last_frame")
         ref_frames["last_frame"] = frame_storage_key
         shot_group.reference_frames = ref_frames
+        if (
+            isinstance(previous_last_frame, str)
+            and previous_last_frame
+            and previous_last_frame != frame_storage_key
+        ):
+            from app.services.storage_references import (
+                StorageReferenceExclusions,
+                enqueue_storage_deletes,
+            )
+
+            # flush 后旧 last_frame 已从该行移除；继续扫描当前 ShotGroup，避免漏掉
+            # first_frame/materials/audio_elements 等字段对同一 key 的其他引用。
+            await db.flush()
+            await enqueue_storage_deletes(
+                db,
+                {previous_last_frame},
+                exclusions=StorageReferenceExclusions(),
+            )
     except Exception as exc:  # noqa: BLE001 - 已落盘帧必须消解归属
         wrapped = RuntimeError("frame_extraction_failed")
         setattr(wrapped, "last_frame_storage_key", frame_storage_key)
