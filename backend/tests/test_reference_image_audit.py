@@ -244,12 +244,12 @@ async def test_reference_audit_config_error_returns_actionable_detail(
     assert "reference_image_audit_public_url_unconfigured" in caplog.text
 
 
-async def test_meizi_reference_audit_uses_public_url_without_proxy_base(
+async def test_object_storage_reference_audit_uses_external_read_url_without_proxy_base(
     monkeypatch,
 ) -> None:
-    expected_url = "https://cdn.example.com/media/image.png?token=opaque"
+    expected_url = "https://flowapp.oss-cn-shanghai.aliyuncs.com/media/image.png?token=opaque"
 
-    class _MeiziStorage:
+    class _ObjectStorage:
         async def external_read_url(
             self,
             key: str,
@@ -261,7 +261,7 @@ async def test_meizi_reference_audit_uses_public_url_without_proxy_base(
             return expected_url
 
         async def signed_url(self, *_args, **_kwargs) -> str:
-            raise AssertionError("MeiZi 公网 URL 不应经过 signed_url")
+            raise AssertionError("外部审核 URL 不应重复经过 signed_url")
 
     monkeypatch.setattr(
         reference_image_audit_module.settings,
@@ -271,7 +271,7 @@ async def test_meizi_reference_audit_uses_public_url_without_proxy_base(
     monkeypatch.setattr(
         reference_image_audit_module,
         "get_storage",
-        lambda: _MeiziStorage(),
+        lambda: _ObjectStorage(),
     )
 
     url = await reference_image_audit_module._public_image_url(
@@ -281,13 +281,13 @@ async def test_meizi_reference_audit_uses_public_url_without_proxy_base(
     assert url == expected_url
 
 
-async def test_audit_references_passes_meizi_url_only_to_audit_provider(
+async def test_audit_references_passes_external_url_only_to_audit_provider(
     monkeypatch,
 ) -> None:
-    expected_url = "https://cdn.example.com/media/image.png?token=opaque"
+    expected_url = "https://flowapp.oss-cn-shanghai.aliyuncs.com/media/image.png?token=opaque"
     received_urls: list[str] = []
 
-    class _MeiziStorage:
+    class _ObjectStorage:
         async def external_read_url(
             self,
             key: str,
@@ -318,7 +318,7 @@ async def test_audit_references_passes_meizi_url_only_to_audit_provider(
     monkeypatch.setattr(
         reference_image_audit_module,
         "get_storage",
-        lambda: _MeiziStorage(),
+        lambda: _ObjectStorage(),
     )
 
     state = await audit_references(_references(), provider=_AuditProvider())

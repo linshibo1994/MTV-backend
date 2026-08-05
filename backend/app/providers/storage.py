@@ -14,7 +14,7 @@ from typing import Protocol, runtime_checkable
 
 from app.core.config import settings
 
-# storage_key 允许的前缀白名单（防 S3 模式下越权拼接任意 key）
+# storage_key 允许的前缀白名单（防对象存储模式下越权拼接任意 key）
 # - generate_images/<mid>/<id>.png    AI 生成图/视频
 # - upload_images/<mid>/<id>.<ext>     用户上传图/视频/音频
 # - generate_outputs/<script_id>/...  生成产物（时间线合成最终视频等，按 script_id 鉴权）
@@ -130,7 +130,7 @@ def normalize_key(key: str) -> str:
 def validate_key_prefix(key: str) -> str:
     """校验 storage_key 必须以允许的前缀开头，返回规范化后的 key。
 
-    防止 S3 模式下绕过目录穿越防护拼接任意 key 下载他人资源。
+    防止对象存储模式下绕过目录穿越防护拼接任意 key 下载他人资源。
     """
     rel = normalize_key(key)
     parts = rel.split("/")
@@ -159,27 +159,20 @@ def get_storage() -> StorageProvider:
     """按 settings.storage_driver 返回存储提供者单例。
 
     - ``local``: 本地文件系统 (开发默认)
-    - ``s3``: S3 兼容 (MinIO/COS)，依赖或配置缺失时 fail closed
-    - ``meizi``: 公司 MeiZi 媒资中心，逻辑 key 通过数据库映射到公共 OSS
+    - ``oss``: 阿里云 OSS 官方 V2 SDK，依赖或配置缺失时 fail closed
     """
     global _storage_singleton
     if _storage_singleton is not None:
         return _storage_singleton
 
-    if settings.storage_driver == "s3":
+    if settings.storage_driver == "oss":
         try:
-            from app.providers.storage_s3 import S3StorageProvider
+            from app.providers.storage_oss import AliyunOSSStorageProvider
 
-            _storage_singleton = S3StorageProvider()
+            _storage_singleton = AliyunOSSStorageProvider()
             return _storage_singleton
         except ImportError as exc:
-            raise RuntimeError("S3 存储不可用：缺少依赖") from exc
-
-    if settings.storage_driver == "meizi":
-        from app.providers.storage_meizi import MeiziStorageProvider
-
-        _storage_singleton = MeiziStorageProvider()
-        return _storage_singleton
+            raise RuntimeError("阿里云 OSS 存储不可用：缺少依赖") from exc
 
     if settings.storage_driver != "local":
         raise RuntimeError(f"未知存储驱动：{settings.storage_driver}")

@@ -1,4 +1,4 @@
-# 生产服务器编排：数据库、Redis、对象存储均为外部受管服务。
+# 单机生产服务器编排：应用、PostgreSQL 与 Redis 均运行在同一 Docker 网络。
 # 由 scripts/deploy-production.sh 使用，真实密钥只保留在服务器环境文件中。
 x-app-common: &app-common
   image: ${MTV_PRODUCTION_IMAGE:-mtv-backend:production}
@@ -6,7 +6,7 @@ x-app-common: &app-common
     context: .
     dockerfile: Dockerfile
     args:
-      INSTALL_S3: ${MTV_INSTALL_S3:-true}
+      INSTALL_ALIYUN_OSS: ${MTV_INSTALL_ALIYUN_OSS:-true}
   working_dir: /app
   env_file:
     - ${MTV_ENV_FILE:?请由部署脚本设置 MTV_ENV_FILE 为生产环境文件绝对路径}
@@ -16,8 +16,53 @@ x-app-common: &app-common
     PYTHONUNBUFFERED: "1"
   init: true
   restart: unless-stopped
+  depends_on: &app-infrastructure-dependencies
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
 
 services:
+  postgres:
+    image: ${MTV_POSTGRES_IMAGE:-postgres:16-alpine}
+    environment:
+      POSTGRES_USER: ${MTV_POSTGRES_USER:?请在生产环境文件设置 MTV_POSTGRES_USER}
+      POSTGRES_PASSWORD: ${MTV_POSTGRES_PASSWORD:?请在生产环境文件设置 MTV_POSTGRES_PASSWORD}
+      POSTGRES_DB: ${MTV_POSTGRES_DB:?请在生产环境文件设置 MTV_POSTGRES_DB}
+    volumes:
+      - type: bind
+        source: ${MTV_POSTGRES_DATA_DIR:?请在生产环境文件设置 MTV_POSTGRES_DATA_DIR}
+        target: /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready --username=\"$$POSTGRES_USER\" --dbname=\"$$POSTGRES_DB\""]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+
+  redis:
+    image: ${MTV_REDIS_IMAGE:-redis:7-alpine}
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --requirepass
+      - ${MTV_REDIS_PASSWORD:?请在生产环境文件设置 MTV_REDIS_PASSWORD}
+    environment:
+      REDIS_PASSWORD: ${MTV_REDIS_PASSWORD:?请在生产环境文件设置 MTV_REDIS_PASSWORD}
+    volumes:
+      - type: bind
+        source: ${MTV_REDIS_DATA_DIR:?请在生产环境文件设置 MTV_REDIS_DATA_DIR}
+        target: /data
+    healthcheck:
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$$REDIS_PASSWORD\" redis-cli ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    restart: unless-stopped
+
   migrate:
     <<: *app-common
     command: alembic upgrade head

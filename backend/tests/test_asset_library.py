@@ -2899,13 +2899,13 @@ def test_storage_provider_exposes_signed_url_and_local_uses_proxy_contract(monke
     ).endswith("/api/x/cctv/zhihui/flow-app/upload_images/material-1/a.png")
 
 
-def test_s3_driver_without_dependency_fails_closed(monkeypatch):
+def test_unknown_storage_driver_fails_closed(monkeypatch):
     from app.providers import storage
 
-    monkeypatch.setattr(storage.settings, "storage_driver", "s3")
+    monkeypatch.setattr(storage.settings, "storage_driver", "unknown")
     monkeypatch.setattr(storage, "_storage_singleton", None)
 
-    with pytest.raises(RuntimeError, match="S3 存储不可用"):
+    with pytest.raises(RuntimeError, match="未知存储驱动"):
         storage.get_storage()
 
 

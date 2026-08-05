@@ -1,6 +1,7 @@
 """应用配置 — 通过环境变量注入，默认值与 .env.example 对齐。"""
 
 import ipaddress
+import re
 from collections import Counter
 from functools import lru_cache
 from math import log2
@@ -48,46 +49,14 @@ class Settings(BaseSettings):
     tgw_l7_route_cookie: str = "flowapp-tgw"
 
     # 存储
-    storage_driver: Literal["local", "s3", "meizi"] = "local"
+    storage_driver: Literal["local", "oss"] = "local"
     storage_root: str = "./storage"
-    s3_endpoint: str = ""
-    s3_access_key: str = ""
-    s3_secret_key: str = ""
-    s3_bucket: str = "flowapp"
-    s3_region: str = "us-east-1"
-    # 公司公共媒资中心。业务服务不持有 OSS AK/SK，仅使用 MeiZi 签发的临时上传凭证。
-    meizi_base_url: str = ""
-    # 切换 MeiZi 后仅为“尚无远端映射”的历史对象保留本地读/删兼容；
-    # 所有新 put/put_file 仍强制上传 MeiZi，完成存量迁移后可关闭。
-    meizi_legacy_local_fallback: bool = False
-    meizi_upload_user_name: str = ""
-    meizi_upload_tenant_id: int = 0
-    meizi_upload_group_id: int = 0
-    meizi_upload_source: int = 0
-    # Java TokenRequest 将上传盐硬编码在源码；Python 改为 SecretStr 环境注入。
-    meizi_upload_salt: SecretStr = SecretStr("")
-    # info/shiftDelete 使用 frontupload 身份，不能与上传身份混为一套配置。
-    meizi_front_user_name: str = ""
-    meizi_front_tenant_id: int = 0
-    meizi_front_group_id: int = 0
-    meizi_front_source: int = 0
-    meizi_front_salt: SecretStr = SecretStr("")
-    # 为空时接受任意通过公网 DNS/IP 校验的 HTTPS 主机；生产可进一步收窄。
-    meizi_upload_allowed_hosts: list[str] = Field(default_factory=list)
-    meizi_public_url_allowed_hosts: list[str] = Field(default_factory=list)
-    meizi_lib_type_file: int = 704
-    meizi_lib_type_image: int = 703
-    meizi_lib_type_video: int = 701
-    meizi_lib_type_audio: int = 702
-    meizi_connect_timeout_seconds: float = Field(default=30.0, gt=0, le=120)
-    meizi_read_timeout_seconds: float = Field(default=600.0, gt=0, le=1800)
-    meizi_write_timeout_seconds: float = Field(default=600.0, gt=0, le=1800)
-    meizi_processing_poll_attempts: int = Field(default=10, ge=1, le=60)
-    meizi_processing_poll_interval_seconds: float = Field(default=2.0, ge=0, le=30)
-    # uploadToken 身份已落库但进程中断，或远端删除暂时失败时，后台任务会在
-    # 该静默窗口后重新领取并删除；默认一小时高于单次上传/处理超时。
-    meizi_cleanup_stale_seconds: int = Field(default=3600, ge=60, le=86400)
-    meizi_cleanup_batch_size: int = Field(default=20, ge=1, le=200)
+    # 阿里云 OSS 直连使用官方 V2 SDK；AK/SK 仅允许通过运行时环境注入。
+    aliyun_oss_endpoint: str = ""
+    aliyun_oss_access_key_id: SecretStr = SecretStr("")
+    aliyun_oss_access_key_secret: SecretStr = SecretStr("")
+    aliyun_oss_bucket: str = "flowapp"
+    aliyun_oss_region: str = ""
 
     # OpenAI (旧字段，保留作新能力配置为空时的回退)
     openai_api_key: str = ""
@@ -344,7 +313,6 @@ class Settings(BaseSettings):
             "video_gen_base_url",
             "dashscope_base_url",
             "anthropic_base_url",
-            "meizi_base_url",
         ):
             value = getattr(self, field_name).strip()
             if not value:
@@ -359,56 +327,42 @@ class Settings(BaseSettings):
                 raise ValueError(f"{env_name} 配置不安全：{exc}") from exc
             setattr(self, field_name, normalized)
 
-        if self.storage_driver == "meizi":
+        if self.storage_driver == "oss":
+            access_key_id = self.aliyun_oss_access_key_id.get_secret_value().strip()
+            access_key_secret = self.aliyun_oss_access_key_secret.get_secret_value().strip()
             missing = [
-                field_name.upper()
-                for field_name in ("meizi_base_url", "meizi_upload_user_name")
-                if not str(getattr(self, field_name)).strip()
+                field_name
+                for field_name, value in (
+                    ("ALIYUN_OSS_ENDPOINT", self.aliyun_oss_endpoint),
+                    ("ALIYUN_OSS_ACCESS_KEY_ID", access_key_id),
+                    ("ALIYUN_OSS_ACCESS_KEY_SECRET", access_key_secret),
+                    ("ALIYUN_OSS_BUCKET", self.aliyun_oss_bucket),
+                    ("ALIYUN_OSS_REGION", self.aliyun_oss_region),
+                )
+                if not str(value).strip()
             ]
-            if not self.meizi_upload_salt.get_secret_value().strip():
-                missing.append("MEIZI_UPLOAD_SALT")
-            if not self.meizi_front_salt.get_secret_value().strip():
-                missing.append("MEIZI_FRONT_SALT")
             if missing:
-                raise ValueError(f"MeiZi 存储配置缺失：{', '.join(missing)}")
-            if urlsplit(self.meizi_base_url).scheme != "https":
-                raise ValueError("MEIZI_BASE_URL 必须使用 HTTPS")
-            positive_fields = (
-                "meizi_upload_tenant_id",
-                "meizi_upload_group_id",
-                "meizi_upload_source",
-                "meizi_front_tenant_id",
-                "meizi_front_source",
-                "meizi_lib_type_file",
-                "meizi_lib_type_image",
-                "meizi_lib_type_video",
-                "meizi_lib_type_audio",
-            )
-            invalid = [
-                field_name.upper()
-                for field_name in positive_fields
-                if int(getattr(self, field_name)) <= 0
-            ]
-            if self.meizi_front_group_id < 0:
-                invalid.append("MEIZI_FRONT_GROUP_ID")
-            if invalid:
-                raise ValueError(f"MeiZi 存储配置必须为正整数：{', '.join(invalid)}")
-            lib_types = (
-                self.meizi_lib_type_file,
-                self.meizi_lib_type_image,
-                self.meizi_lib_type_video,
-                self.meizi_lib_type_audio,
-            )
-            if len(set(lib_types)) != len(lib_types):
-                raise ValueError("MEIZI_LIB_TYPE_* 必须互不相同")
-            self.meizi_upload_allowed_hosts = _normalize_host_allowlist(
-                self.meizi_upload_allowed_hosts,
-                field_name="MEIZI_UPLOAD_ALLOWED_HOSTS",
-            )
-            self.meizi_public_url_allowed_hosts = _normalize_host_allowlist(
-                self.meizi_public_url_allowed_hosts,
-                field_name="MEIZI_PUBLIC_URL_ALLOWED_HOSTS",
-            )
+                raise ValueError(f"阿里云 OSS 配置缺失：{', '.join(missing)}")
+
+            region = self.aliyun_oss_region.strip().lower()
+            bucket = self.aliyun_oss_bucket.strip()
+            try:
+                endpoint = _normalize_aliyun_oss_endpoint(
+                    self.aliyun_oss_endpoint,
+                    region=region,
+                )
+            except ValueError as exc:
+                raise ValueError(f"ALIYUN_OSS_ENDPOINT 配置不安全：{exc}") from exc
+            if not _ALIYUN_OSS_REGION_PATTERN.fullmatch(region):
+                raise ValueError("ALIYUN_OSS_REGION 格式无效")
+            if not _ALIYUN_OSS_BUCKET_PATTERN.fullmatch(bucket):
+                raise ValueError("ALIYUN_OSS_BUCKET 必须是 3-63 位小写字母、数字或连字符")
+
+            self.aliyun_oss_endpoint = endpoint
+            self.aliyun_oss_region = region
+            self.aliyun_oss_bucket = bucket
+            self.aliyun_oss_access_key_id = SecretStr(access_key_id)
+            self.aliyun_oss_access_key_secret = SecretStr(access_key_secret)
 
         if self.is_prod:
             secret = self.session_secret.strip()
@@ -502,6 +456,50 @@ def _normalize_provider_base_url(value: str, *, allow_local_http: bool) -> str:
     return parsed._replace(scheme=scheme).geturl().rstrip("/")
 
 
+_ALIYUN_OSS_BUCKET_PATTERN = re.compile(r"[a-z0-9][a-z0-9-]{1,61}[a-z0-9]")
+_ALIYUN_OSS_REGION_PATTERN = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)+")
+_ALIYUN_OSS_GLOBAL_ENDPOINTS = {"oss-accelerate", "oss-accelerate-overseas"}
+
+
+def _normalize_aliyun_oss_endpoint(value: str, *, region: str) -> str:
+    """只接受可供外部审核服务读取签名 URL 的阿里云 OSS 公网端点。"""
+    try:
+        parsed = urlsplit(value.strip())
+        hostname = (parsed.hostname or "").rstrip(".").lower()
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("URL 格式无效") from exc
+
+    if (
+        parsed.scheme.lower() != "https"
+        or not parsed.netloc
+        or not hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in {None, 443}
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("必须是无用户信息、查询、片段和非根路径的 HTTPS URL")
+    if not hostname.startswith("oss-") or not hostname.endswith(".aliyuncs.com"):
+        raise ValueError("必须使用阿里云 OSS 官方公网 Endpoint")
+
+    endpoint_name = hostname.removesuffix(".aliyuncs.com")
+    if endpoint_name.endswith("-internal"):
+        raise ValueError("当前外部读取链路不支持内网 Endpoint")
+    if endpoint_name not in _ALIYUN_OSS_GLOBAL_ENDPOINTS and endpoint_name != f"oss-{region}":
+        raise ValueError("Endpoint 与 ALIYUN_OSS_REGION 不匹配")
+
+    return parsed._replace(
+        scheme="https",
+        netloc=hostname if port is None else f"{hostname}:{port}",
+        path="",
+        query="",
+        fragment="",
+    ).geturl()
+
+
 def _is_local_development_host(hostname: str) -> bool:
     host = hostname.rstrip(".").lower()
     if host == "localhost" or host.endswith(".localhost"):
@@ -521,30 +519,6 @@ def _is_non_public_origin_host(hostname: str) -> bool:
         return not ipaddress.ip_address(host).is_global
     except ValueError:
         return False
-
-
-def _normalize_host_allowlist(values: list[str], *, field_name: str) -> list[str]:
-    """规范化可选的出站主机白名单，禁止端口、路径和通配符。"""
-    normalized: list[str] = []
-    for raw in values:
-        value = raw.strip().rstrip(".").lower()
-        if (
-            not value
-            or "*" in value
-            or "/" in value
-            or "\\" in value
-            or ":" in value
-            or any(char.isspace() for char in value)
-        ):
-            raise ValueError(f"{field_name} 包含非法主机")
-        try:
-            ascii_host = value.encode("idna").decode("ascii")
-        except UnicodeError as exc:
-            raise ValueError(f"{field_name} 包含非法主机") from exc
-        if len(ascii_host) > 253:
-            raise ValueError(f"{field_name} 包含非法主机")
-        normalized.append(ascii_host)
-    return list(dict.fromkeys(normalized))
 
 
 def _is_low_strength_secret(secret: str) -> bool:

@@ -6,13 +6,12 @@ RUN apt-get update \
 
 WORKDIR /app
 
-# 将依赖安装在不受开发目录挂载影响的位置。MeiZi 使用主依赖 httpx；
-# 只有同时需要 S3 时才安装 boto3 可选依赖。
+# 将依赖安装在不受开发目录挂载影响的位置；阿里云 OSS SDK 按镜像用途选装。
 ENV UV_PROJECT_ENVIRONMENT=/opt/venv
 COPY pyproject.toml uv.lock ./
-ARG INSTALL_S3=true
-RUN if [ "$INSTALL_S3" = "true" ]; then \
-        uv sync --frozen --no-dev --extra s3 --no-install-project; \
+ARG INSTALL_ALIYUN_OSS=true
+RUN if [ "$INSTALL_ALIYUN_OSS" = "true" ]; then \
+        uv sync --frozen --no-dev --extra aliyun-oss --no-install-project; \
     else \
         uv sync --frozen --no-dev --no-install-project; \
     fi

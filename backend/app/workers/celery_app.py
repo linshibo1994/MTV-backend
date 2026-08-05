@@ -94,10 +94,6 @@ app.conf.update(
             "task": "app.workers.media_storage.recover_media_storage_jobs",
             "schedule": 60.0,
         },
-        "reconcile-meizi-storage-objects": {
-            "task": "app.workers.media_storage.reconcile_meizi_storage_objects",
-            "schedule": 300.0,
-        },
     },
 )
 

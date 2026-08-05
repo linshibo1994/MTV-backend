@@ -6,7 +6,7 @@ x-app-common: &app-common
     context: .
     dockerfile: Dockerfile
     args:
-      INSTALL_S3: "false"
+      INSTALL_ALIYUN_OSS: "false"
   working_dir: /app
   env_file:
     - ${MTV_ENV_FILE:-./deploy/test.env}

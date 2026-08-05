@@ -2,6 +2,7 @@
 
 import asyncio
 from logging.config import fileConfig
+from typing import Any
 
 from sqlalchemy import pool
 from sqlalchemy.engine import Connection
@@ -22,6 +23,22 @@ if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
 target_metadata = Base.metadata
+_LEGACY_TABLES_EXCLUDED_FROM_AUTOGENERATE = frozenset({"meizi_storage_objects"})
+
+
+def include_object(
+    _object: Any,
+    name: str | None,
+    type_: str,
+    reflected: bool,
+    _compare_to: Any,
+) -> bool:
+    """保留尚待数据确认的遗留表，避免 autogenerate 意外生成 DROP TABLE。"""
+    return not (
+        reflected
+        and type_ == "table"
+        and name in _LEGACY_TABLES_EXCLUDED_FROM_AUTOGENERATE
+    )
 
 
 def run_migrations_offline() -> None:
@@ -32,6 +49,7 @@ def run_migrations_offline() -> None:
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
         compare_type=True,
+        include_object=include_object,
     )
     with context.begin_transaction():
         context.run_migrations()
@@ -39,7 +57,12 @@ def run_migrations_offline() -> None:
 
 def do_run_migrations(connection: Connection) -> None:
     connection = connection.execution_options(**{STORAGE_REFERENCE_GUARD_BYPASS: True})
-    context.configure(connection=connection, target_metadata=target_metadata, compare_type=True)
+    context.configure(
+        connection=connection,
+        target_metadata=target_metadata,
+        compare_type=True,
+        include_object=include_object,
+    )
     with context.begin_transaction():
         context.run_migrations()
 

@@ -204,24 +204,3 @@ def recover_media_storage_jobs(limit: int = 20) -> dict:
             "failed": [],
             "canceled": [],
         }
-
-
-@app.task(name="app.workers.media_storage.reconcile_meizi_storage_objects")
-def reconcile_meizi_storage_objects(limit: int | None = None) -> dict[str, int | bool]:
-    """定期重试 MeiZi 中断上传及删除失败对象；其他存储驱动安全跳过。"""
-
-    async def _run() -> dict[str, int | bool]:
-        storage = get_storage()
-        reconcile = getattr(storage, "reconcile_stale_deletions", None)
-        if reconcile is None:
-            return {"skipped": True, "claimed": 0, "deleted": 0, "failed": 0}
-        result = await reconcile(limit=limit)
-        return {"skipped": False, **result}
-
-    try:
-        return run_worker_async(_run())
-    except (SoftTimeLimitExceeded, TimeLimitExceeded):
-        raise
-    except Exception:
-        logger.exception("MeiZi 媒资孤儿清理任务失败")
-        return {"skipped": False, "claimed": 0, "deleted": 0, "failed": 0}

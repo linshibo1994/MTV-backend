@@ -6,6 +6,7 @@
 .env.*
 !.env.example
 !.env.*.example
+dist/
 .venv/
 venv/
 env/

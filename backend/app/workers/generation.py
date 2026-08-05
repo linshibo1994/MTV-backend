@@ -14,7 +14,7 @@ generate_images_task(job_id) 流程：
 说明：
 - Celery 任务体内通过 worker 持久事件循环执行异步主体，复用 async DB session 与 async provider。
 - 存储统一经 app.providers.storage.get_storage() 抽象（与 video_generation/timeline_render 一致），
-  支持 local / s3 两种 driver，S3 模式下生成图正确写入对象存储、media 代理经同一 provider 读取。
+  支持 local / oss driver，OSS 模式下生成图和 media 代理使用同一 provider。
 - 积分 actual 按实际成功张数差异化结算：actual = settings.price_image_gen *
   len(image_outputs)，Provider 少图时不对未生成图片收费。
   后续接入 provider 返回的真实计费字段时，用真实值替换 actual。
@@ -1074,7 +1074,7 @@ async def _persist_image(material_id: str, data: bytes) -> tuple[str, str]:
 
     storage_key 形如 /generate_images/<mid>/<file_id>.png，与 sapi 代理路径一致。
     统一走 get_storage() 抽象（与 video_generation/timeline_render worker 一致），
-    local 写本地磁盘、s3 写对象存储，S3 模式下 media 代理经同一 provider 读取不会 404。
+    local 写本地磁盘，oss 写对象存储；media 代理经同一 provider 读取不会 404。
     """
     file_id = new_id()
     storage_key = f"/generate_images/{material_id}/{file_id}.png"
