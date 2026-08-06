@@ -473,6 +473,159 @@ def test_create_generation_job_uses_client_prompt_without_valid_enrich(monkeypat
     asyncio.run(scenario())
 
 
+def test_create_generation_job_applies_explicit_style_once_and_preserves_hash_contract(monkeypatch):
+    async def scenario() -> None:
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        db = _AsyncSessionAdapter(raw)
+        monkeypatch.setattr(generation_service, "enqueue_task", AsyncMock())
+
+        style = generation_service.find_style("comic-book")
+        assert style is not None
+        expected_final, expected_negative = generation_service.apply_style(
+            "comic-book", "a reporter holding a phone", "image"
+        )
+        job = await generation_service.create_generation_job(
+            db,
+            user=seeded.user,
+            payload=_create_payload(
+                prompt="a reporter holding a phone",
+                style_id="comic-book",
+            ),
+            idempotency_key="explicit-comic-style",
+        )
+
+        assert job.input_json["resolved_prompts"]["final"] == expected_final
+        assert job.input_json["negative_prompt"] == expected_negative
+        assert job.input_json["style_id"] == "comic-book"
+        assert expected_final.count(str(style["prompt_template"]).split("{prompt}", 1)[0]) == 1
+        expected_hash_payload = {
+            "material_id": seeded.material.id,
+            "script_id": seeded.script.id,
+            "subject_id": seeded.subject.id,
+            "model": "banana-2",
+            "size": "2k",
+            "aspect": "16:9",
+            "count": 2,
+            "prompt": "a reporter holding a phone",
+            "resolved_prompt": "a reporter holding a phone",
+            "style_id": "comic-book",
+            "input_version": seeded.episode.episode_version,
+            "input_client_save_seq": 0,
+            "episode_snapshot": {
+                1: {
+                    "episode_id": seeded.episode.episode_id,
+                    "episode_version": seeded.episode.episode_version,
+                    "client_save_seq": 0,
+                }
+            },
+            "subject_version": 1,
+            "enrich_version": 1,
+        }
+        assert job.request_hash == generation_service._request_hash(expected_hash_payload)
+
+        monkeypatch.setattr(generation_service, "find_style", lambda _style_id: None)
+        replay = await generation_service.create_generation_job(
+            db,
+            user=seeded.user,
+            payload=_create_payload(
+                prompt="a reporter holding a phone",
+                style_id="comic-book",
+            ),
+            idempotency_key="explicit-comic-style",
+        )
+        assert replay.job_id == job.job_id
+
+    asyncio.run(scenario())
+
+
+def test_create_generation_job_infers_exact_prewrapped_style_without_duplicate(monkeypatch):
+    async def scenario() -> None:
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        db = _AsyncSessionAdapter(raw)
+        monkeypatch.setattr(generation_service, "enqueue_task", AsyncMock())
+
+        wrapped_prompt, expected_negative = generation_service.apply_style(
+            "comic-book", "a reporter holding a phone", "image"
+        )
+        job = await generation_service.create_generation_job(
+            db,
+            user=seeded.user,
+            payload=_create_payload(prompt=wrapped_prompt),
+            idempotency_key="inferred-comic-style",
+        )
+
+        assert job.input_json["resolved_prompts"]["final"] == wrapped_prompt
+        assert job.input_json["negative_prompt"] == expected_negative
+        assert job.input_json["style_id"] == "comic-book"
+
+        near_match = f"{wrapped_prompt} extra text"
+        unmatched = await generation_service.create_generation_job(
+            db,
+            user=seeded.user,
+            payload=_create_payload(prompt=near_match),
+            idempotency_key="not-an-exact-style-wrapper",
+        )
+        assert unmatched.input_json["resolved_prompts"]["final"] == near_match
+        assert unmatched.input_json["negative_prompt"] == ""
+        assert unmatched.input_json["style_id"] is None
+
+    asyncio.run(scenario())
+
+
+def test_inferred_style_requires_a_unique_exact_template_match(monkeypatch):
+    style = generation_service.find_style("comic-book")
+    assert style is not None
+    wrapped_prompt, _ = generation_service.apply_style("comic-book", "subject", "image")
+    duplicate = {**style, "id": "duplicate-comic"}
+    monkeypatch.setattr(generation_service, "get_styles", lambda target: [style, duplicate])
+
+    assert generation_service._resolve_image_prompt(wrapped_prompt, None) == (
+        wrapped_prompt,
+        "",
+        None,
+    )
+
+
+def test_create_generation_job_rejects_unknown_and_non_image_styles(monkeypatch):
+    async def scenario() -> None:
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        db = _AsyncSessionAdapter(raw)
+
+        with pytest.raises(BadRequestError, match="未知风格") as unknown:
+            await generation_service.create_generation_job(
+                db,
+                user=seeded.user,
+                payload=_create_payload(prompt="prompt", style_id="missing-style"),
+                idempotency_key="unknown-style",
+            )
+        assert unknown.value.status_code == 400
+
+        monkeypatch.setattr(
+            generation_service,
+            "find_style",
+            lambda style_id: {
+                "id": style_id,
+                "target": ["video"],
+                "prompt_template": "video style, {prompt}",
+                "negative_prompt": "still image",
+            },
+        )
+        with pytest.raises(BadRequestError, match="不支持图片生成") as unsupported:
+            await generation_service.create_generation_job(
+                db,
+                user=seeded.user,
+                payload=_create_payload(prompt="prompt", style_id="video-only"),
+                idempotency_key="unsupported-image-style",
+            )
+        assert unsupported.value.status_code == 400
+        assert raw.scalars(select(GenerationJob)).all() == []
+
+    asyncio.run(scenario())
+
+
 def test_create_generation_job_same_idempotency_key_rejects_changed_client_prompt(
     monkeypatch,
 ):
@@ -1585,6 +1738,74 @@ def test_provider_result_validation_accepts_partial_and_rejects_invalid_counts_a
         )
     with pytest.raises(RuntimeError):
         asyncio.run(image_result_from_url("http://127.0.0.1/private.png"))
+
+
+def test_generation_worker_forwards_negative_prompt_to_provider() -> None:
+    async def scenario() -> None:
+        provider = SimpleNamespace(generate=AsyncMock(return_value=[]))
+
+        result = await generation_worker._provider_generate_with_heartbeat(
+            provider,
+            prompt="styled positive prompt",
+            negative_prompt="photorealistic, watermark",
+            model="qwen-image",
+            size="2k",
+            aspect="16:9",
+            count=1,
+            job_id="job-style-forward",
+            lease_token="lease-style-forward",
+        )
+
+        assert result == []
+        provider.generate.assert_awaited_once_with(
+            prompt="styled positive prompt",
+            negative_prompt="photorealistic, watermark",
+            model="qwen-image",
+            size="2k",
+            aspect="16:9",
+            count=1,
+        )
+
+        legacy_provider = SimpleNamespace(generate=AsyncMock(return_value=[]))
+        await generation_worker._provider_generate_with_heartbeat(
+            legacy_provider,
+            prompt="plain prompt",
+            negative_prompt="",
+            model="qwen-image",
+            size="2k",
+            aspect="16:9",
+            count=1,
+            job_id="job-legacy-forward",
+            lease_token="lease-legacy-forward",
+        )
+        legacy_provider.generate.assert_awaited_once_with(
+            prompt="plain prompt",
+            model="qwen-image",
+            size="2k",
+            aspect="16:9",
+            count=1,
+        )
+
+    asyncio.run(scenario())
+
+
+def test_generation_worker_recovers_negative_prompt_for_queued_legacy_jobs() -> None:
+    wrapped_prompt, expected_negative = generation_service.apply_style(
+        "comic-book", "a reporter holding a phone", "image"
+    )
+
+    assert generation_worker._resolve_job_prompts(
+        {"style_id": "comic-book"}, "an unwrapped prompt"
+    ) == generation_service.apply_style("comic-book", "an unwrapped prompt", "image")
+    assert generation_worker._resolve_job_prompts({}, wrapped_prompt) == (
+        wrapped_prompt,
+        expected_negative,
+    )
+    assert generation_worker._resolve_job_prompts({}, "plain prompt") == ("plain prompt", "")
+    assert generation_worker._resolve_job_prompts(
+        {"style_id": "comic-book", "negative_prompt": ""},
+        "an unwrapped prompt",
+    ) == ("an unwrapped prompt", "")
 
 
 @pytest.mark.parametrize(("provider_count", "expected_actual"), [(2, 20), (1, 10)])

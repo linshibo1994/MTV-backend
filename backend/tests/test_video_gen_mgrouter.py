@@ -64,9 +64,16 @@ def _request(
 
 
 class _Response:
-    def __init__(self, status_code: int, payload: object) -> None:
+    def __init__(
+        self,
+        status_code: int,
+        payload: object,
+        *,
+        headers: dict[str, str] | None = None,
+    ) -> None:
         self.status_code = status_code
         self._payload = payload
+        self.headers = headers or {}
 
     def json(self):
         if isinstance(self._payload, BaseException):
@@ -222,6 +229,62 @@ async def test_mgrouter_first_frame_excludes_reference_images(monkeypatch) -> No
 
 
 @pytest.mark.asyncio
+async def test_mgrouter_reference_image_prefers_external_read_url(monkeypatch) -> None:
+    _patch_settings(monkeypatch)
+    storage = SimpleNamespace(
+        external_read_url=AsyncMock(
+            return_value="https://storage.example/images/character.png?signature=test"
+        )
+    )
+    monkeypatch.setattr("app.providers.storage.get_storage", lambda: storage)
+
+    body, sensitive_values = await MgrouterVideoGenProvider()._build_request_body(
+        _request(
+            reference_images=[
+                {"storage_key": "references/character.png", "mime_type": "image/png"}
+            ]
+        ),
+        "AICC-Doubao-Seedance-2.0",
+    )
+
+    image_url = "https://storage.example/images/character.png?signature=test"
+    assert body["content"][1] == {
+        "type": "image_url",
+        "image_url": {"url": image_url},
+        "role": "reference_image",
+    }
+    assert image_url in sensitive_values
+    storage.external_read_url.assert_awaited_once_with(
+        "references/character.png",
+        expires_seconds=900,
+    )
+
+
+@pytest.mark.asyncio
+async def test_mgrouter_reference_image_falls_back_to_data_url_without_external_url(monkeypatch) -> None:
+    _patch_settings(monkeypatch)
+    storage = SimpleNamespace(
+        external_read_url=AsyncMock(return_value=None),
+        get_size=AsyncMock(return_value=3),
+        get=AsyncMock(return_value=b"png"),
+    )
+    monkeypatch.setattr("app.providers.storage.get_storage", lambda: storage)
+
+    image_url = await MgrouterVideoGenProvider()._encode_storage_image(
+        "references/character.png",
+        "image/png",
+    )
+
+    assert image_url == "data:image/png;base64,cG5n"
+    storage.external_read_url.assert_awaited_once_with(
+        "references/character.png",
+        expires_seconds=900,
+    )
+    storage.get_size.assert_awaited_once_with("references/character.png")
+    storage.get.assert_awaited_once_with("references/character.png")
+
+
+@pytest.mark.asyncio
 async def test_mgrouter_reference_audio_uses_external_read_url(monkeypatch) -> None:
     _patch_settings(monkeypatch)
     storage = SimpleNamespace(
@@ -320,6 +383,106 @@ async def test_mgrouter_submit_4xx_is_explicit_rejection_with_safe_diagnostics(
     assert private_message not in repr(exc_info.value.diagnostics)
     before_submit.assert_awaited_once()
     on_uncertain.assert_not_awaited()
+    assert client.closed is True
+
+
+@pytest.mark.asyncio
+async def test_mgrouter_submit_4xx_keeps_nested_safe_diagnostics_and_header_request_id(
+    monkeypatch,
+) -> None:
+    _patch_settings(monkeypatch)
+    client = _HttpClient(
+        post_responses=[
+            _Response(
+                400,
+                {
+                    "error": {
+                        "code": "RequestTooLarge",
+                        "param": "content",
+                        "message": "不得持久化的供应商错误正文",
+                    },
+                    "detail": {"type": "invalid_request"},
+                },
+                headers={
+                    "content-type": "application/problem+json; charset=utf-8",
+                    "x-request-id": "request-header-1",
+                },
+            )
+        ]
+    )
+    provider = MgrouterVideoGenProvider()
+    monkeypatch.setattr(provider, "_build_client", lambda **_kwargs: client)
+
+    with pytest.raises(VideoGenerationSubmitRejected) as exc_info:
+        await provider.generate(_request())
+
+    assert exc_info.value.diagnostics == {
+        "status_code": 400,
+        "content_type": "application/problem+json",
+        "code": "RequestTooLarge",
+        "param": "content",
+        "type": "invalid_request",
+        "request_id": "request-header-1",
+    }
+    assert "不得持久化的供应商错误正文" not in repr(exc_info.value.diagnostics)
+    assert client.closed is True
+
+
+@pytest.mark.asyncio
+async def test_mgrouter_submit_4xx_keeps_safe_non_json_metadata(
+    monkeypatch,
+) -> None:
+    _patch_settings(monkeypatch)
+    client = _HttpClient(
+        post_responses=[
+            _Response(
+                400,
+                ValueError("not json"),
+                headers={
+                    "content-type": "text/html; charset=utf-8",
+                    "request-id": "request-header-2",
+                },
+            )
+        ]
+    )
+    provider = MgrouterVideoGenProvider()
+    monkeypatch.setattr(provider, "_build_client", lambda **_kwargs: client)
+
+    with pytest.raises(VideoGenerationSubmitRejected) as exc_info:
+        await provider.generate(_request())
+
+    assert exc_info.value.diagnostics == {
+        "status_code": 400,
+        "content_type": "text/html",
+        "request_id": "request-header-2",
+    }
+    assert client.closed is True
+
+
+@pytest.mark.asyncio
+async def test_mgrouter_submit_4xx_redacts_reflected_sensitive_value(monkeypatch) -> None:
+    _patch_settings(monkeypatch)
+    client = _HttpClient(
+        post_responses=[
+            _Response(
+                400,
+                {"error": {"code": "test-mgrouter-key", "param": "content"}},
+                headers={"content-type": "application/json"},
+            )
+        ]
+    )
+    provider = MgrouterVideoGenProvider()
+    monkeypatch.setattr(provider, "_build_client", lambda **_kwargs: client)
+
+    with pytest.raises(VideoGenerationSubmitRejected) as exc_info:
+        await provider.generate(_request())
+
+    assert exc_info.value.diagnostics == {
+        "status_code": 400,
+        "content_type": "application/json",
+        "param": "content",
+    }
+    assert "test-mgrouter-key" not in repr(exc_info.value.diagnostics)
     assert client.closed is True
 
 

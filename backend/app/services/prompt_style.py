@@ -160,8 +160,8 @@ STYLE_CATALOG: list[dict] = [
 ]
 
 
-_IMAGE_OPTIMIZE_SYSTEM = """你是一名专业摄影指导和视觉提示词设计师。请把用户输入扩展为可直接用于图像生成的高质量 prompt。
-补充主体的稳定外观特征、环境与构图、镜头景别、光线方向与质感、色彩和视觉风格；不得改变用户明确指定的核心主体、关系或情节。
+_IMAGE_OPTIMIZE_SYSTEM = """你是一名专业视觉导演和图像提示词设计师。请把用户输入扩展为可直接用于图像生成的高质量 prompt。
+补充主体的稳定外观特征、环境与构图、镜头景别、光线方向与质感、色彩和视觉风格；视觉风格必须服从用户选择的目标风格，不得自行加入冲突的摄影、插画或渲染语汇；不得改变用户明确指定的核心主体、关系或情节。
 输出必须是一段 80-150 个英文单词的 prompt。输入中形如 {{var}} 的占位符必须逐字保留，不得翻译、改写、删除或拆分。输入中形如 @数字 的主体引用标记必须逐字保留，不得翻译、改写或删除。
 输出格式约束：禁止解释，禁止使用 Markdown 代码块，禁止添加标题或 Prompt: 等前缀，只输出优化后的 prompt 文本。"""
 
@@ -223,7 +223,17 @@ async def optimize_prompt(
     if target not in {"image", "video"}:
         raise ValueError("target 必须为 image 或 video")
 
+    style = find_style(style_id) if style_id else None
+    if style is not None and target not in style["target"]:
+        style = None
+
     system = _IMAGE_OPTIMIZE_SYSTEM if target == "image" else _VIDEO_OPTIMIZE_SYSTEM
+    if style is not None:
+        style_direction = str(style["prompt_template"]).replace("{prompt}", "主体与场景描述")
+        system = (
+            f"{system}\n目标风格：{style['name_zh']}。扩写内容必须符合以下视觉方向："
+            f"{style_direction}。禁止加入这些冲突特征：{style['negative_prompt']}。"
+        )
     user_message = (
         f"请优化以下{target}生成提示词：\n{raw_prompt}"
         if raw_prompt
@@ -249,9 +259,6 @@ async def optimize_prompt(
             getattr(exc, "error_type", type(exc).__name__),
         )
 
-    style = find_style(style_id) if style_id else None
-    if style is not None and target not in style["target"]:
-        style = None
     resolved_style_id = str(style["id"]) if style is not None else None
     positive, negative = apply_style(resolved_style_id or "", optimized_prompt, target)
     return {

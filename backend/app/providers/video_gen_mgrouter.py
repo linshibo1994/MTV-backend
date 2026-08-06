@@ -231,7 +231,10 @@ class MgrouterVideoGenProvider:
                 if not 200 <= response.status_code < 300:
                     if 400 <= response.status_code < 500 and response.status_code != 408:
                         raise VideoGenerationSubmitRejected(
-                            diagnostics=self._submit_rejection_diagnostics(response)
+                            diagnostics=self._submit_rejection_diagnostics(
+                                response,
+                                sensitive_values=(self._api_key(), *sensitive_values),
+                            )
                         )
                     await raise_video_submission_uncertain(request.on_submission_uncertain)
                 try:
@@ -444,11 +447,34 @@ class MgrouterVideoGenProvider:
         )
 
     async def _encode_storage_image(self, storage_key: str, mime_type: str) -> str:
+        """优先给 MGRouter 提供短期 HTTPS URL，无法直读时回退为 data URL。"""
+
         from app.providers.storage import get_storage
         from app.providers.streaming_io import read_storage_bytes_limited
 
+        storage = get_storage()
+        try:
+            url = await storage.external_read_url(
+                storage_key,
+                expires_seconds=_REFERENCE_URL_EXPIRY_SECONDS,
+            )
+        except Exception as exc:  # noqa: BLE001 - 本地存储等后端可安全回退 data URL
+            logger.warning(
+                "MGRouter 参考图片外部读取 URL 生成失败，回退 data URL error_type=%s",
+                type(exc).__name__,
+            )
+        else:
+            if isinstance(url, str) and url.strip():
+                value = url.strip()
+                try:
+                    self._validate_external_reference_url(value)
+                except ProviderConfigurationError:
+                    logger.warning("MGRouter 参考图片外部读取 URL 不安全，回退 data URL")
+                else:
+                    return value
+
         data = await read_storage_bytes_limited(
-            get_storage(),
+            storage,
             storage_key,
             too_large_error="reference_image_too_large",
         )
@@ -712,16 +738,43 @@ class MgrouterVideoGenProvider:
         return payload
 
     @staticmethod
-    def _submit_rejection_diagnostics(response: httpx.Response) -> dict[str, int | str]:
+    def _submit_rejection_diagnostics(
+        response: httpx.Response,
+        *,
+        sensitive_values: tuple[str, ...] = (),
+    ) -> dict[str, int | str]:
+        """保留可定位 4xx 的白名单元数据，绝不读取响应正文。"""
+
         raw: dict[str, object] = {"status_code": response.status_code}
+        content_type = response.headers.get("content-type")
+        if isinstance(content_type, str):
+            raw["content_type"] = content_type
         try:
             payload = response.json()
         except Exception:  # noqa: BLE001 - 诊断失败不改变明确拒绝分类
             payload = None
         if isinstance(payload, Mapping):
+            diagnostic_sources: list[Mapping] = [payload]
+            for field_name in ("error", "detail"):
+                nested = payload.get(field_name)
+                if isinstance(nested, Mapping):
+                    diagnostic_sources.append(nested)
             for field_name in ("code", "param", "type", "request_id"):
-                raw[field_name] = payload.get(field_name)
-        return sanitize_video_submit_rejection_diagnostics(raw)
+                for source in diagnostic_sources:
+                    value = source.get(field_name)
+                    if value is not None:
+                        raw[field_name] = value
+                        break
+        if not raw.get("request_id"):
+            for header_name in ("x-request-id", "request-id"):
+                request_id = response.headers.get(header_name)
+                if isinstance(request_id, str) and request_id:
+                    raw["request_id"] = request_id
+                    break
+        return sanitize_video_submit_rejection_diagnostics(
+            raw,
+            sensitive_values=sensitive_values,
+        )
 
     @staticmethod
     def _safe_usage(value: object) -> dict[str, int]:

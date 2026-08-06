@@ -1931,11 +1931,12 @@ async def run_video_generation_once(
         )
         logger.warning(
             "视频远端提交被明确拒绝 job_id=%s provider_key=%s attempt=%s "
-            "status_code=%s code=%s param=%s provider_error_type=%s request_id=%s",
+            "status_code=%s content_type=%s code=%s param=%s provider_error_type=%s request_id=%s",
             job_id,
             provider_key,
             claim.attempt,
             diagnostics.get("status_code", ""),
+            diagnostics.get("content_type", ""),
             diagnostics.get("code", ""),
             diagnostics.get("param", ""),
             diagnostics.get("type", ""),

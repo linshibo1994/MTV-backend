@@ -15,7 +15,7 @@ from typing import Literal
 from openai import AsyncOpenAI
 
 from app.core.config import settings
-from app.providers.image_gen import ImageResult
+from app.providers.image_gen import ImageResult, prompt_with_negative_constraints
 from app.providers.registry import ProviderConfigurationError
 
 OpenAIImageSize = Literal[
@@ -48,7 +48,13 @@ class OpenAIImageGenProvider:
     """
 
     async def generate(
-        self, prompt: str, model: str, size: str, aspect: str, count: int = 1
+        self,
+        prompt: str,
+        model: str,
+        size: str,
+        aspect: str,
+        count: int = 1,
+        negative_prompt: str | None = None,
     ) -> list[ImageResult]:
         api_key = (
             settings.image_gen_api_key
@@ -78,10 +84,11 @@ class OpenAIImageGenProvider:
         client = AsyncOpenAI(api_key=api_key, base_url=base_url)
         openai_size = _map_size(size, aspect)
         n = max(count, 1)
+        effective_prompt = prompt_with_negative_constraints(prompt, negative_prompt)
         try:
             resp = await client.images.generate(
                 model=use_model,
-                prompt=prompt,
+                prompt=effective_prompt,
                 size=openai_size,
                 n=n,
             )

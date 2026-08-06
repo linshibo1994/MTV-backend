@@ -11,7 +11,7 @@ from google import genai
 from google.genai import types as gtypes
 
 from app.core.config import settings
-from app.providers.image_gen import ImageResult
+from app.providers.image_gen import ImageResult, prompt_with_negative_constraints
 from app.providers.registry import ProviderConfigurationError
 
 
@@ -74,7 +74,13 @@ class GoogleImageGenProvider:
         raise RuntimeError("Nano Banana 返回内容中未找到图片数据 (inline_data)")
 
     async def generate(
-        self, prompt: str, model: str, size: str, aspect: str, count: int = 1
+        self,
+        prompt: str,
+        model: str,
+        size: str,
+        aspect: str,
+        count: int = 1,
+        negative_prompt: str | None = None,
     ) -> list[ImageResult]:
         normalized_size = (size or "1k").strip().upper()
         if normalized_size not in {"1K", "2K", "4K"}:
@@ -113,13 +119,14 @@ class GoogleImageGenProvider:
         )
 
         client = genai.Client(api_key=api_key, http_options=http_options)
+        effective_prompt = prompt_with_negative_constraints(prompt, negative_prompt)
         # Nano Banana 单次仅返回一张，count>1 时循环调用
         results: list[ImageResult] = []
         try:
             for _ in range(max(count, 1)):
                 data = await self._generate_one(
                     client,
-                    prompt,
+                    effective_prompt,
                     aspect,
                     normalized_size,
                     use_model,

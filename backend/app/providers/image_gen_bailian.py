@@ -121,7 +121,13 @@ class BailianImageGenProvider:
     """阿里百炼通义万相文生图实现（httpx 直连，零额外依赖）。"""
 
     async def generate(
-        self, prompt: str, model: str, size: str, aspect: str, count: int = 1
+        self,
+        prompt: str,
+        model: str,
+        size: str,
+        aspect: str,
+        count: int = 1,
+        negative_prompt: str | None = None,
     ) -> list[ImageResult]:
         api_key = (
             settings.image_gen_api_key
@@ -152,11 +158,25 @@ class BailianImageGenProvider:
         async with httpx.AsyncClient(timeout=60.0) as http:
             if _uses_sync_multimodal_api(use_model):
                 urls = await self._generate_sync_multimodal(
-                    http, base_url, api_key, prompt, use_model, wanx_size, n
+                    http,
+                    base_url,
+                    api_key,
+                    prompt,
+                    use_model,
+                    wanx_size,
+                    n,
+                    negative_prompt,
                 )
             else:
                 urls = await self._generate_legacy_async(
-                    http, base_url, api_key, prompt, use_model, wanx_size, n
+                    http,
+                    base_url,
+                    api_key,
+                    prompt,
+                    use_model,
+                    wanx_size,
+                    n,
+                    negative_prompt,
                 )
             if len(urls) < n:
                 logger.warning("百炼返回图片数 %d 少于请求 %d", len(urls), n)
@@ -171,21 +191,25 @@ class BailianImageGenProvider:
         model: str,
         size: str,
         count: int,
+        negative_prompt: str | None,
     ) -> list[str]:
         """调用 Qwen Image 2.0 同步多模态生成接口。"""
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         }
+        parameters: dict[str, object] = {
+            "size": size,
+            "n": count,
+            "prompt_extend": True,
+            "watermark": False,
+        }
+        if normalized_negative_prompt := (negative_prompt or "").strip():
+            parameters["negative_prompt"] = normalized_negative_prompt
         body = {
             "model": model,
             "input": {"messages": [{"role": "user", "content": [{"text": prompt}]}]},
-            "parameters": {
-                "size": size,
-                "n": count,
-                "prompt_extend": True,
-                "watermark": False,
-            },
+            "parameters": parameters,
         }
         submit = await _post_with_transient_retry(
             http,
@@ -209,6 +233,7 @@ class BailianImageGenProvider:
         model: str,
         size: str,
         count: int,
+        negative_prompt: str | None,
     ) -> list[str]:
         """调用通义万相兼容模型的异步任务接口。"""
 
@@ -217,9 +242,12 @@ class BailianImageGenProvider:
             "Content-Type": "application/json",
             "X-DashScope-Async": "enable",
         }
+        input_payload = {"prompt": prompt}
+        if normalized_negative_prompt := (negative_prompt or "").strip():
+            input_payload["negative_prompt"] = normalized_negative_prompt
         body = {
             "model": model,
-            "input": {"prompt": prompt},
+            "input": input_payload,
             "parameters": {
                 "size": size,
                 "n": count,

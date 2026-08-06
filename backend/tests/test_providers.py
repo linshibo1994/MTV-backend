@@ -421,12 +421,21 @@ async def test_google_image_provider_uses_capability_key_url_and_model(monkeypat
 
     monkeypatch.setattr(image_gen_google.genai, "Client", Client)
 
-    result = await GoogleImageGenProvider().generate("prompt", "", "2k", "16:9")
+    result = await GoogleImageGenProvider().generate(
+        "prompt",
+        "",
+        "2k",
+        "16:9",
+        negative_prompt="photorealistic",
+    )
 
     assert result[0].data == b"image-bytes"
     assert calls["client"]["api_key"] == "image-key"
     assert calls["client"]["http_options"].base_url == "https://gemini-gateway.example"
     assert calls["generate"]["model"] == "gemini-image-custom"
+    assert calls["generate"]["contents"] == (
+        "prompt\n\nDo not include in the generated image: photorealistic"
+    )
     image_config = calls["generate"]["config"].image_config
     assert image_config.aspect_ratio == "16:9"
     assert image_config.image_size == "2K"
@@ -507,17 +516,87 @@ async def test_bailian_qwen_image_2_uses_sync_multimodal_api(monkeypatch) -> Non
     download = AsyncMock(return_value=ImageResult(data=b"image", mime_type="image/png"))
     monkeypatch.setattr(provider, "_download", download)
 
-    result = await provider.generate("一只纸飞机", "ignored", "2k", "1:1")
+    result = await provider.generate(
+        "一只纸飞机",
+        "ignored",
+        "2k",
+        "1:1",
+        negative_prompt="写实摄影",
+    )
 
     assert result[0].data == b"image"
     assert calls["post"]["url"].endswith("/api/v1/services/aigc/multimodal-generation/generation")
     assert "X-DashScope-Async" not in calls["post"]["headers"]
     assert calls["post"]["json"]["input"]["messages"][0]["content"] == [{"text": "一只纸飞机"}]
     assert calls["post"]["json"]["parameters"]["size"] == "1024*1024"
+    assert calls["post"]["json"]["parameters"]["negative_prompt"] == "写实摄影"
     download.assert_awaited_once_with(
         "https://oss.aliyuncs.com/result.png",
         base_url="https://dashscope.example",
     )
+
+
+@pytest.mark.asyncio
+async def test_bailian_qwen_image_legacy_passes_negative_prompt(monkeypatch) -> None:
+    from app.providers import image_gen_bailian
+    from app.providers.image_gen import ImageResult
+    from app.providers.image_gen_bailian import BailianImageGenProvider
+
+    configured = _settings(
+        image_gen_provider="bailian",
+        image_gen_api_key="image-key",
+        image_gen_base_url="https://dashscope.example",
+        image_gen_model="qwen-image",
+    )
+    monkeypatch.setattr(image_gen_bailian, "settings", configured)
+    calls: dict = {}
+
+    class Response:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"output": {"task_id": "task-1"}}
+
+    class Client:
+        def __init__(self, **kwargs):
+            calls["client"] = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def post(self, url, *, headers, json):
+            calls["post"] = {"url": url, "headers": headers, "json": json}
+            return Response()
+
+    monkeypatch.setattr(image_gen_bailian.httpx, "AsyncClient", Client)
+    provider = BailianImageGenProvider()
+    monkeypatch.setattr(
+        provider,
+        "_poll",
+        AsyncMock(return_value=["https://oss.aliyuncs.com/result.png"]),
+    )
+    monkeypatch.setattr(
+        provider,
+        "_download",
+        AsyncMock(return_value=ImageResult(data=b"image", mime_type="image/png")),
+    )
+
+    result = await provider.generate(
+        "一只纸飞机",
+        "ignored",
+        "2k",
+        "1:1",
+        negative_prompt="写实摄影",
+    )
+
+    assert result[0].data == b"image"
+    assert calls["post"]["url"].endswith("/api/v1/services/aigc/text2image/image-synthesis")
+    assert calls["post"]["headers"]["X-DashScope-Async"] == "enable"
+    assert calls["post"]["json"]["input"]["negative_prompt"] == "写实摄影"
 
 
 @pytest.mark.asyncio
@@ -676,7 +755,13 @@ async def test_openai_image_provider_uses_capability_config_and_closes_client(mo
 
     monkeypatch.setattr(image_gen_openai, "AsyncOpenAI", _client_factory)
 
-    result = await OpenAIImageGenProvider().generate("prompt", "ignored", "2k", "16:9")
+    result = await OpenAIImageGenProvider().generate(
+        "prompt",
+        "ignored",
+        "2k",
+        "16:9",
+        negative_prompt="photorealistic",
+    )
 
     assert result[0].data == b"openai-image"
     assert calls["client"] == {
@@ -684,6 +769,9 @@ async def test_openai_image_provider_uses_capability_config_and_closes_client(mo
         "base_url": "https://openai-gateway.example/v1",
     }
     assert calls["generate"]["model"] == "gpt-image-2"
+    assert calls["generate"]["prompt"] == (
+        "prompt\n\nDo not include in the generated image: photorealistic"
+    )
     client_holder["client"].close.assert_awaited_once()
 
 

@@ -28,6 +28,14 @@ _VIDEO_CLIENT_CLOSE_TIMEOUT = 2.0
 _VIDEO_CLIENT_CLOSE_ORPHANS: set[asyncio.Task[object]] = set()
 _VIDEO_CLIENT_CLOSE_ORPHANS_LOCK = threading.Lock()
 _VIDEO_SUBMIT_DIAGNOSTIC_TEXT_FIELDS = ("code", "param", "type", "request_id")
+_VIDEO_SUBMIT_DIAGNOSTIC_CONTENT_TYPES = frozenset(
+    {
+        "application/json",
+        "application/problem+json",
+        "text/html",
+        "text/plain",
+    }
+)
 _VIDEO_SUBMIT_DIAGNOSTIC_TOKEN = re.compile(
     r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z",
     re.ASCII,
@@ -36,8 +44,10 @@ _VIDEO_SUBMIT_DIAGNOSTIC_TOKEN = re.compile(
 
 def sanitize_video_submit_rejection_diagnostics(
     value: object,
+    *,
+    sensitive_values: tuple[str, ...] = (),
 ) -> dict[str, int | str]:
-    """仅接受固定 JSON 标量与短 ASCII token；其他输入一律丢弃。"""
+    """仅接受白名单诊断字段，且绝不保留供应商原始错误文本。"""
 
     if type(value) is not dict:
         return {}
@@ -46,8 +56,16 @@ def sanitize_video_submit_rejection_diagnostics(
     status_code = raw.get("status_code")
     if type(status_code) is int and 400 <= status_code < 500 and status_code != 408:
         diagnostics["status_code"] = status_code
+    content_type = raw.get("content_type")
+    if type(content_type) is str:
+        normalized_content_type = content_type.split(";", 1)[0].strip().lower()
+        if normalized_content_type in _VIDEO_SUBMIT_DIAGNOSTIC_CONTENT_TYPES:
+            diagnostics["content_type"] = normalized_content_type
     for field_name in _VIDEO_SUBMIT_DIAGNOSTIC_TEXT_FIELDS:
-        field_value = raw.get(field_name)
+        field_value = _replace_video_submit_sensitive_values(
+            raw.get(field_name),
+            sensitive_values=sensitive_values,
+        )
         if type(field_value) is str and _VIDEO_SUBMIT_DIAGNOSTIC_TOKEN.fullmatch(field_value):
             diagnostics[field_name] = field_value
     return diagnostics

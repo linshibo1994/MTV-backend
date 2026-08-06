@@ -52,6 +52,7 @@ from app.schemas.generation import BatchCreateJobIn, CreateJobIn
 from app.schemas.pipeline_contracts import normalize_enrich_prompt
 from app.services.credits import reserve
 from app.services.pipeline.enrich import build_base_prompt
+from app.services.prompt_style import apply_style, find_style, get_styles
 from app.services.task_dispatch import enqueue_task
 
 _SINGLE_IDEMPOTENCY_NAMESPACE = "single:"
@@ -76,6 +77,54 @@ def _normalize_idempotency_key(value: str | None) -> str:
     if len(normalized) > _MAX_CLIENT_IDEMPOTENCY_KEY_LENGTH:
         raise BadRequestError("Idempotency-Key 过长")
     return normalized
+
+
+def _validate_image_style(style_id: str | None) -> dict | None:
+    """校验显式风格，并返回可用于图片生成的风格定义。"""
+    if style_id is None:
+        return None
+    style = find_style(style_id)
+    if style is None:
+        raise BadRequestError(f"未知风格: {style_id}")
+    if "image" not in style["target"]:
+        raise BadRequestError(f"风格不支持图片生成: {style_id}")
+    return style
+
+
+def _is_style_template_applied(prompt: str, style: dict) -> bool:
+    """仅按模板固定边界识别已包裹 prompt，避免用模糊关键词误判。"""
+    template = str(style["prompt_template"])
+    if "{prompt}" not in template:
+        suffix = f", {template}"
+        return prompt.endswith(suffix) and bool(prompt[: -len(suffix)].strip())
+
+    prefix, suffix = template.split("{prompt}", 1)
+    if not prefix and not suffix:
+        return False
+    if not prompt.startswith(prefix) or not prompt.endswith(suffix):
+        return False
+    end = len(prompt) - len(suffix) if suffix else len(prompt)
+    return bool(prompt[len(prefix) : end].strip())
+
+
+def _resolve_image_prompt(prompt: str, explicit_style: dict | None) -> tuple[str, str, str | None]:
+    """解析并应用一次图片风格；兼容前端只提交完整风格 prompt 的情况。"""
+    style = explicit_style
+    if style is None:
+        matches = [
+            candidate
+            for candidate in get_styles("image")
+            if _is_style_template_applied(prompt, candidate)
+        ]
+        style = matches[0] if len(matches) == 1 else None
+    if style is None:
+        return prompt, "", None
+
+    style_id = str(style["id"])
+    if _is_style_template_applied(prompt, style):
+        return prompt, str(style["negative_prompt"]), style_id
+    positive_prompt, negative_prompt = apply_style(style_id, prompt, "image")
+    return positive_prompt, negative_prompt, style_id
 
 
 async def _load_material_script(
@@ -134,6 +183,7 @@ async def _create_one_job(
     idempotency_key: str,
     prompt: str,
     resolved_prompt: str,
+    negative_prompt: str,
     style_id: str | None,
     input_version: int,
     input_client_save_seq: int | None,
@@ -155,6 +205,7 @@ async def _create_one_job(
     input_json: dict = {
         "prompt": prompt,
         "resolved_prompts": {"final": resolved_prompt or prompt},
+        "negative_prompt": negative_prompt,
         "style_id": style_id,
         "model": model,
         "size": size,
@@ -505,6 +556,11 @@ async def create_generation_job(
             raise ConflictError("Idempotency-Key 已用于不同请求")
         return existing
 
+    explicit_style = _validate_image_style(payload.style_id)
+    resolved_prompt, negative_prompt, resolved_style_id = _resolve_image_prompt(
+        resolved_prompt, explicit_style
+    )
+
     # 3. 查用户积分账户
     account = await _load_credit_account(db, user)
 
@@ -520,7 +576,8 @@ async def create_generation_job(
             idempotency_key=idempotency_key,
             prompt=prompt,
             resolved_prompt=resolved_prompt,
-            style_id=payload.style_id,
+            negative_prompt=negative_prompt,
+            style_id=resolved_style_id,
             input_version=input_version,
             input_client_save_seq=input_client_save_seq,
             episode_id=episode_id,
@@ -576,6 +633,7 @@ async def create_batch_generation_jobs(
         if existing_batch.request_hash != batch_hash:
             raise ConflictError("Idempotency-Key 已用于不同请求")
         return await _load_batch_manifest(db, existing_batch)
+    explicit_style = _validate_image_style(payload.style_id)
     account = await _load_credit_account(db, user)
 
     # 确定目标主体集合
@@ -659,6 +717,9 @@ async def create_batch_generation_jobs(
                     int(subject.subject_version or 1),
                     int(subject.enrich_version or 1),
                 )
+            resolved_prompt, negative_prompt, resolved_style_id = _resolve_image_prompt(
+                resolved_prompt, explicit_style
+            )
             job = await _create_one_job(
                 db,
                 user=user,
@@ -669,7 +730,8 @@ async def create_batch_generation_jobs(
                 idempotency_key=f"{_BATCH_JOB_IDEMPOTENCY_NAMESPACE}{batch.id}:{subject.id}",
                 prompt=prompt,
                 resolved_prompt=resolved_prompt,
-                style_id=payload.style_id,
+                negative_prompt=negative_prompt,
+                style_id=resolved_style_id,
                 input_version=input_version,
                 input_client_save_seq=input_client_save_seq,
                 episode_id=episode_id,

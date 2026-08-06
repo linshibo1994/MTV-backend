@@ -99,6 +99,27 @@ async def test_optimize_prompt_success() -> None:
 
 
 @pytest.mark.asyncio
+async def test_optimize_prompt_includes_selected_style_context() -> None:
+    provider = SimpleNamespace(
+        chat=AsyncMock(return_value="an inked reporter holding a phone in a dynamic panel")
+    )
+
+    result = await optimize_prompt(
+        "a reporter holding a phone",
+        "comic-book",
+        "image",
+        provider=provider,
+    )
+
+    system = provider.chat.await_args.kwargs["system"]
+    assert "目标风格：美漫" in system
+    assert "dynamic American comic-book panel" in system
+    assert "禁止加入这些冲突特征：photorealistic" in system
+    assert result["optimized_prompt"].startswith("dynamic American comic-book panel")
+    assert result["negative_prompt"].startswith("photorealistic")
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "provider_output",
     [
@@ -172,6 +193,7 @@ def test_sanitize_input_json_exposes_style_id() -> None:
         {
             "prompt": "raw",
             "resolved_prompts": {"final": "resolved"},
+            "negative_prompt": "internal negative prompt",
             "style_id": "cinematic",
             "reservation_id": "internal-secret",
         }
@@ -207,6 +229,11 @@ async def test_generation_jobs_persist_style_id_and_include_it_in_idempotency(
     )
 
     assert single.input_json["style_id"] == "cinematic"
+    expected_single_prompt, expected_single_negative = apply_style(
+        "cinematic", "single prompt", "image"
+    )
+    assert single.input_json["resolved_prompts"]["final"] == expected_single_prompt
+    assert single.input_json["negative_prompt"] == expected_single_negative
     with pytest.raises(ConflictError):
         await generation_service.create_generation_job(
             db,
@@ -231,6 +258,27 @@ async def test_generation_jobs_persist_style_id_and_include_it_in_idempotency(
     assert skipped == []
     assert failed == []
     assert created[0].input_json["style_id"] == "anime"
+    expected_batch_prompt, expected_batch_negative = apply_style(
+        "anime", "batch prompt", "image"
+    )
+    assert created[0].input_json["resolved_prompts"]["final"] == expected_batch_prompt
+    assert created[0].input_json["negative_prompt"] == expected_batch_negative
+
+    original_find_style = generation_service.find_style
+    monkeypatch.setattr(generation_service, "find_style", lambda _style_id: None)
+    replayed, replayed_skipped, replayed_failed = (
+        await generation_service.create_batch_generation_jobs(
+            db,
+            user=seeded.user,
+            payload=batch_payload,
+            idempotency_key="style-batch",
+        )
+    )
+    assert [job.job_id for job in replayed] == [job.job_id for job in created]
+    assert replayed_skipped == skipped
+    assert replayed_failed == failed
+    monkeypatch.setattr(generation_service, "find_style", original_find_style)
+
     with pytest.raises(ConflictError):
         await generation_service.create_batch_generation_jobs(
             db,
@@ -398,7 +446,6 @@ async def test_optimize_rate_limit(client) -> None:
             "original_prompt": raw_prompt,
         }
 
-    monkeypatch_target = "app.api.v1.prompt_styles.optimize_prompt"
     import app.api.v1.prompt_styles as _api_module  # noqa: F811
 
     original = _api_module.optimize_prompt

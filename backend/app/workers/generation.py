@@ -54,7 +54,9 @@ from app.providers.registry import ProviderError
 from app.providers.storage import get_storage
 from app.services.credits import release as credits_release
 from app.services.credits import settle as credits_settle
+from app.services.generation import _resolve_image_prompt
 from app.services.media_storage_jobs import enqueue_delete
+from app.services.prompt_style import find_style
 from app.services.task_dispatch import cancel_outbox_task
 from app.workers.async_runtime import run_worker_async
 from app.workers.celery_app import celery_app
@@ -88,6 +90,22 @@ def _generation_error_type(exc: Exception) -> str:
     if isinstance(exc, ProviderError):
         return "provider_configuration_error"
     return "provider_or_storage_error"
+
+
+def _resolve_job_prompts(input_json: dict[str, Any], prompt: str) -> tuple[str, str]:
+    """读取任务提示词，并为部署前已排队的旧任务做只读回退解析。"""
+    if "negative_prompt" in input_json:
+        stored = input_json.get("negative_prompt")
+        return prompt, stored if isinstance(stored, str) else ""
+
+    explicit_style = None
+    style_id = input_json.get("style_id")
+    if isinstance(style_id, str):
+        candidate = find_style(style_id)
+        if candidate is not None and "image" in candidate["target"]:
+            explicit_style = candidate
+    positive_prompt, negative_prompt, _ = _resolve_image_prompt(prompt, explicit_style)
+    return positive_prompt, negative_prompt
 
 
 @dataclass(frozen=True)
@@ -392,6 +410,7 @@ async def _provider_generate_with_heartbeat(
     provider: Any,
     *,
     prompt: str,
+    negative_prompt: str,
     model: str,
     size: str,
     aspect: str,
@@ -401,8 +420,17 @@ async def _provider_generate_with_heartbeat(
     heartbeat_interval: float = 60.0,
 ) -> list[Any]:
     lost = asyncio.Event()
+    generate_kwargs = {
+        "prompt": prompt,
+        "model": model,
+        "size": size,
+        "aspect": aspect,
+        "count": count,
+    }
+    if negative_prompt:
+        generate_kwargs["negative_prompt"] = negative_prompt
     provider_task = asyncio.create_task(
-        provider.generate(prompt=prompt, model=model, size=size, aspect=aspect, count=count)
+        provider.generate(**generate_kwargs)
     )
 
     async def heartbeat_loop() -> None:
@@ -690,6 +718,7 @@ async def run_generation_once(
         return
 
     prompt = (input_json.get("resolved_prompts") or {}).get("final") or input_json.get("prompt") or ""
+    prompt, negative_prompt = _resolve_job_prompts(input_json, prompt)
     model = input_json.get("model", "banana-2")
     size = input_json.get("size", "2k")
     aspect = input_json.get("aspect", "16:9")
@@ -720,6 +749,7 @@ async def run_generation_once(
         raw_results = await _provider_generate_with_heartbeat(
             provider,
             prompt=prompt,
+            negative_prompt=negative_prompt,
             model=model,
             size=size,
             aspect=aspect,

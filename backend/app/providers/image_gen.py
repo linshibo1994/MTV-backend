@@ -1,7 +1,7 @@
 """文生图 Provider 抽象与工厂路由。
 
 ImageGenProvider 协议统一文生图调用入口：
-generate(prompt, model, size, aspect, count) -> list[ImageResult]。
+generate(prompt, model, size, aspect, count, negative_prompt) -> list[ImageResult]。
 
 get_image_provider(model) 路由策略（.env 主导 + model 别名向后兼容）：
   1. model 为已知别名 -> 对应厂商：
@@ -34,10 +34,24 @@ class ImageGenProvider(Protocol):
     """
 
     async def generate(
-        self, prompt: str, model: str, size: str, aspect: str, count: int = 1
+        self,
+        prompt: str,
+        model: str,
+        size: str,
+        aspect: str,
+        count: int = 1,
+        negative_prompt: str | None = None,
     ) -> list[ImageResult]:
-        """根据 prompt/尺寸/比例生成 count 张图片，返回图片结果列表。"""
+        """根据正反向提示词、尺寸和比例生成 count 张图片。"""
         ...
+
+
+def prompt_with_negative_constraints(prompt: str, negative_prompt: str | None) -> str:
+    """为没有原生反向提示词参数的供应商构造等价文本约束。"""
+    normalized = (negative_prompt or "").strip()
+    if not normalized:
+        return prompt
+    return f"{prompt.rstrip()}\n\nDo not include in the generated image: {normalized}"
 
 
 def _provider_for_model(model: str) -> str | None:
