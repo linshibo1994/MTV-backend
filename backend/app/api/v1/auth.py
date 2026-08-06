@@ -129,7 +129,7 @@ async def login(
         httponly=False,
         samesite="lax",
         max_age=settings.session_max_age,
-        secure=settings.is_prod,
+        secure=settings.session_cookie_secure_enabled,
     )
 
     # 登录成功审计（08§1.4 step7）

@@ -275,18 +275,20 @@ check_env_permissions() {
 }
 
 validate_production_env() {
-    local app_env storage_driver session_secret
+    local app_env storage_driver session_secret session_cookie_secure
     for key in \
-        APP_ENV SESSION_SECRET CORS_ORIGINS \
+        APP_ENV SESSION_SECRET SESSION_COOKIE_SECURE CORS_ORIGINS \
         DATABASE_URL DATABASE_SYNC_URL \
         REDIS_URL CELERY_BROKER_URL CELERY_RESULT_BACKEND \
-        STORAGE_DRIVER; do
+        STORAGE_DRIVER MTV_BOOTSTRAP_ADMIN_USERNAME \
+        MTV_BOOTSTRAP_ADMIN_PASSWORD; do
         require_env_value "$key"
     done
 
     app_env="$(read_env_value APP_ENV)"
     storage_driver="$(read_env_value STORAGE_DRIVER)"
     session_secret="$(read_env_value SESSION_SECRET)"
+    session_cookie_secure="$(read_env_value SESSION_COOKIE_SECURE)"
     [[ "$app_env" == "prod" || "$app_env" == "production" ]] || {
         echo "生产部署要求 APP_ENV=prod 或 production。" >&2
         exit 1
@@ -324,6 +326,10 @@ validate_production_env() {
     esac
     [[ ${#session_secret} -ge 32 ]] || {
         echo "SESSION_SECRET 至少需要 32 个字符。" >&2
+        exit 1
+    }
+    [[ "$session_cookie_secure" == "true" || "$session_cookie_secure" == "false" ]] || {
+        echo "SESSION_COOKIE_SECURE 只能是 true 或 false。" >&2
         exit 1
     }
     validate_single_host_stack_env
@@ -555,6 +561,76 @@ asyncio.run(main())
 '
 }
 
+bootstrap_default_admin() {
+    compose run --rm --no-deps --entrypoint python api -c '
+import asyncio
+import os
+
+import asyncpg
+
+from app.core.config import settings
+from app.core.ids import new_id
+from app.core.security import hash_password
+
+USERNAME = os.environ["MTV_BOOTSTRAP_ADMIN_USERNAME"]
+PASSWORD = os.environ["MTV_BOOTSTRAP_ADMIN_PASSWORD"]
+
+if not 1 <= len(USERNAME) <= 128:
+    raise RuntimeError("默认管理员用户名长度必须为 1 到 128 个字符")
+if not 1 <= len(PASSWORD) <= 256:
+    raise RuntimeError("默认管理员密码长度必须为 1 到 256 个字符")
+
+async def main() -> None:
+    database_url = settings.database_url.replace(
+        "postgresql+asyncpg://",
+        "postgresql://",
+        1,
+    )
+    connection = await asyncpg.connect(database_url, timeout=10)
+    try:
+        existing = await connection.fetchrow(
+            "SELECT enabled, is_admin FROM users WHERE username = $1",
+            USERNAME,
+        )
+        if existing is not None:
+            print(f"管理员账号已存在，保留现有密码和状态：{USERNAME}")
+            return
+
+        inserted = await connection.fetchval(
+            """
+            INSERT INTO users (
+                user_id,
+                username,
+                password_hash,
+                enabled,
+                is_admin,
+                account_type,
+                org_id,
+                department_id,
+                can_manage_accounts,
+                management_scope
+            )
+            VALUES ($1, $2, $3, TRUE, TRUE, $4, NULL, NULL, FALSE, $5)
+            ON CONFLICT (username) DO NOTHING
+            RETURNING user_id
+            """,
+            new_id(),
+            USERNAME,
+            hash_password(PASSWORD),
+            "personal",
+            "none",
+        )
+        if inserted is None:
+            print(f"管理员账号已由其他部署进程创建：{USERNAME}")
+        else:
+            print(f"已创建默认管理员账号：{USERNAME}")
+    finally:
+        await connection.close()
+
+asyncio.run(main())
+'
+}
+
 wait_for_api() {
     local attempt
     for attempt in {1..30}; do
@@ -651,6 +727,7 @@ deploy() {
 
     echo "执行一次性数据库迁移…"
     compose run --rm --no-deps migrate
+    bootstrap_default_admin
     run_local_storage_canary
     echo "启动新版 API、worker 与唯一 beat…"
     compose up -d --no-build --remove-orphans api celery-worker celery-beat

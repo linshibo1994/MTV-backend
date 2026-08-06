@@ -132,6 +132,7 @@ async def create_video_generation_job(
         user_id=user.user_id,
         idempotency_key=idempotency_key,
         prompt=body.prompt,
+        style_id=body.style_id,
     )
     return VideoJobOut.model_validate(job)
 
@@ -429,6 +430,7 @@ async def batch_create_video_generation_jobs(
                 user_id=user.user_id,
                 idempotency_key=key,
                 prompt=(body.prompts or {}).get(sg_id),
+                style_id=body.style_id,
             )
             success.append(VideoJobOut.model_validate(job))
         except HTTPException as exc:
@@ -479,7 +481,7 @@ async def set_active_provider(
 ) -> ActiveProviderOut:
     """切换激活视频供应商 — 仅管理员可操作。
 
-    支持豆包别名 jianyu/modelsai、阿里百炼 bailian、OpenAI Sora 与 Gemini Veo。
+    支持豆包别名 jianyu/modelsai、mgrouter AICC、阿里百炼 bailian、OpenAI Sora 与 Gemini Veo。
     """
     if not user.is_admin:
         raise ForbiddenError("仅管理员可切换视频供应商")

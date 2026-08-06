@@ -84,7 +84,7 @@ def create_app() -> FastAPI:
         session_cookie=settings.session_cookie_name,
         max_age=settings.session_max_age,
         same_site="lax",
-        https_only=settings.is_prod,
+        https_only=settings.session_cookie_secure_enabled,
     )
     # 媒体代理是必需能力，导入或依赖损坏时应阻止应用带着残缺路由启动。
     app.include_router(media.router, prefix=settings.media_proxy_prefix, tags=["媒体代理"])

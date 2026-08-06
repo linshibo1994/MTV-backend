@@ -72,6 +72,7 @@ class VideoJobCreateIn(BaseModel):
         None,
         description="客户端可编辑的视频提示词；缺省时兼容旧客户端并回退镜头组 prompt",
     )
+    style_id: str | None = Field(None, description="风格 ID")
 
 
 class ReferenceImageAuditIn(BaseModel):
@@ -105,14 +106,15 @@ class VideoJobBatchCreateIn(BaseModel):
         None,
         description="每个镜头组的客户端可编辑视频提示词，键为 shot_group_id",
     )
+    style_id: str | None = Field(None, description="风格 ID")
 
 
 class ActiveProviderUpdateIn(BaseModel):
     """切换视频供应商（管理员）入参。"""
 
-    provider_key: Literal["jianyu", "modelsai", "bailian", "openai", "gemini"] = Field(
-        ..., description="供应商 key"
-    )
+    provider_key: Literal[
+        "jianyu", "modelsai", "bailian", "openai", "gemini", "mgrouter"
+    ] = Field(..., description="供应商 key")
     job_type: str = Field(default="all_reference", description="任务类型，默认 all_reference")
 
 

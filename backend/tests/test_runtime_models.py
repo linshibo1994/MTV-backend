@@ -5,7 +5,12 @@ from unittest.mock import ANY, AsyncMock
 
 import pytest
 
-from app.services.runtime_models import RuntimeModel, RuntimeVideoModel, resolve_video_model
+from app.services.runtime_models import (
+    RuntimeModel,
+    RuntimeVideoModel,
+    resolve_env_video_model,
+    resolve_video_model,
+)
 
 
 @pytest.mark.asyncio
@@ -56,6 +61,27 @@ async def test_resolve_video_model_skips_audit_for_bailian(monkeypatch) -> None:
     assert resolved.provider == "bailian"
     assert resolved.model == "wan2.6-i2v"
     assert resolved.reference_image_audit_required is False
+
+
+def test_resolve_env_video_model_normalizes_aicc_without_volcengine_audit() -> None:
+    from app.core.config import Settings
+
+    configured = Settings(
+        _env_file=None,
+        video_provider_selection_mode="env",
+        video_gen_provider="aicc",
+        mgrouter_api_key="test-key",
+        video_gen_model="",
+    )
+
+    resolved = resolve_env_video_model(configured)
+
+    assert resolved == RuntimeVideoModel(
+        provider="mgrouter",
+        model="AICC-Doubao-Seedance-2.0",
+        reference_image_audit_required=False,
+        task_provider_key="mgrouter",
+    )
 
 
 @pytest.mark.asyncio

@@ -29,7 +29,7 @@ INSTALLED_RELEASE=""
 
 ALLOWED_BUSINESS_ENV_KEYS="
 CORS_ORIGINS CORS_METHODS CORS_HEADERS
-SESSION_COOKIE_NAME SESSION_MAX_AGE TGW_L7_ROUTE_COOKIE
+SESSION_COOKIE_NAME SESSION_MAX_AGE SESSION_COOKIE_SECURE TGW_L7_ROUTE_COOKIE
 ALIYUN_OSS_ENDPOINT ALIYUN_OSS_ACCESS_KEY_ID ALIYUN_OSS_ACCESS_KEY_SECRET
 ALIYUN_OSS_BUCKET ALIYUN_OSS_REGION
 OPENAI_API_KEY OPENAI_LLM_MODEL OPENAI_IMAGE_MODEL OPENAI_VIDEO_MODEL
@@ -81,7 +81,7 @@ usage() {
   ./local.sh stop              停止服务，保留数据库、Redis 与 OSS 数据
   ./local.sh log [行数]        持续查看 API、worker、beat 后端日志
 
-本地首次构建若 CORS 仍为通配符，脚本会要求输入生产前端 Origin。
+生产默认禁用跨域；跨源前端可通过 MTV_PRODUCTION_CORS_ORIGINS 显式配置。
 服务器默认从 local.sh 所在目录选择最新的 mtv-offline-*.tar.gz。
 EOF
 }
@@ -297,41 +297,15 @@ cors_needs_replacement() {
 }
 
 select_production_cors() {
-    local generated_env="$1"
-    local state_file="$SCRIPT_DIR/.runtime/production-build.env"
-    local cors="${MTV_PRODUCTION_CORS_ORIGINS:-}"
-    local input=""
-    local persist_cors="false"
-
-    if [[ -z "$cors" ]]; then
-        cors="$(read_env_value "$generated_env" CORS_ORIGINS)"
-    fi
-    if cors_needs_replacement "$cors" && [[ -f "$state_file" ]]; then
-        cors="$(read_env_value "$state_file" CORS_ORIGINS)"
-    fi
-
-    if cors_needs_replacement "$cors"; then
-        if [[ -t 0 ]]; then
-            echo "当前 CORS_ORIGINS 不能用于生产。"
-            read -r -p "请输入生产前端 Origin（例如 https://app.your-domain.com）：" input
-            cors="$input"
-            persist_cors="true"
-        else
-            die "CORS_ORIGINS 仍是通配符或占位值。请先设置 MTV_PRODUCTION_CORS_ORIGINS='[\"https://你的前端域名\"]' 再执行 build。"
-        fi
-    fi
+    local cors="${MTV_PRODUCTION_CORS_ORIGINS:-[]}"
 
     [[ "$cors" != *$'\n'* && "$cors" != *$'\r'* ]] || die "CORS_ORIGINS 不能包含换行。"
     cors="$(normalize_cors_value "$cors")" || die "生产前端 Origin 格式无效。"
+    case "$cors" in
+        \[*\]) ;;
+        *) die "MTV_PRODUCTION_CORS_ORIGINS 必须是合法 Origin 或 JSON 数组，Origin 不能包含路径。" ;;
+    esac
     cors_needs_replacement "$cors" && die "CORS_ORIGINS 不能使用通配符、本机地址或占位域名。"
-
-    if [[ "$persist_cors" == "true" ]]; then
-        TEMP_FILE="${state_file}.tmp.$$"
-        printf 'CORS_ORIGINS=%s\n' "$cors" > "$TEMP_FILE"
-        chmod 600 "$TEMP_FILE"
-        mv -f -- "$TEMP_FILE" "$state_file"
-        TEMP_FILE=""
-    fi
     PRODUCTION_CORS="$cors"
 }
 
@@ -339,11 +313,16 @@ write_forced_production_env() {
     local target_file="$1"
     local version="$2"
     local backend_image="$3"
-    local postgres_password redis_password session_secret
+    local postgres_password redis_password session_secret session_cookie_secure
 
     postgres_password="$(read_env_value "$LOCAL_SECRET_FILE" MTV_POSTGRES_PASSWORD)"
     redis_password="$(read_env_value "$LOCAL_SECRET_FILE" MTV_REDIS_PASSWORD)"
     session_secret="$(read_env_value "$LOCAL_SECRET_FILE" SESSION_SECRET)"
+    session_cookie_secure="${MTV_SESSION_COOKIE_SECURE:-false}"
+    case "$session_cookie_secure" in
+        true|false) ;;
+        *) die "MTV_SESSION_COOKIE_SECURE 只能是 true 或 false。" ;;
+    esac
 
     {
         echo "# 由 local.sh build 生成；包含真实密钥，禁止提交 Git 或公开传输。"
@@ -352,12 +331,15 @@ write_forced_production_env() {
         echo "APP_PORT=8000"
         printf 'CORS_ORIGINS=%s\n' "$PRODUCTION_CORS"
         printf 'SESSION_SECRET=%s\n' "$session_secret"
+        printf 'SESSION_COOKIE_SECURE=%s\n' "$session_cookie_secure"
         echo "STORAGE_DRIVER=oss"
         echo "STORAGE_ROOT=/var/lib/mtv/storage"
         echo "MTV_ALLOW_LOCAL_STORAGE=false"
         echo "MTV_INSTALL_ALIYUN_OSS=true"
         echo "ALIYUN_OSS_DATA_MIGRATION_CONFIRMED=true"
         echo "ALIYUN_OSS_CANARY_CONFIRMED=true"
+        echo "MTV_BOOTSTRAP_ADMIN_USERNAME=admin"
+        echo "MTV_BOOTSTRAP_ADMIN_PASSWORD=admin"
         echo "MTV_LEGACY_STORAGE_HOST_PATH=/opt/mtv/data/storage"
         echo "MTV_POSTGRES_USER=mtv_app"
         printf 'MTV_POSTGRES_PASSWORD=%s\n' "$postgres_password"
@@ -394,9 +376,10 @@ validate_generated_env_basics() {
     local key cors
 
     for key in \
-        APP_ENV SESSION_SECRET CORS_ORIGINS STORAGE_DRIVER \
+        APP_ENV SESSION_SECRET SESSION_COOKIE_SECURE CORS_ORIGINS STORAGE_DRIVER \
         ALIYUN_OSS_ENDPOINT ALIYUN_OSS_ACCESS_KEY_ID ALIYUN_OSS_ACCESS_KEY_SECRET \
         ALIYUN_OSS_BUCKET ALIYUN_OSS_REGION \
+        MTV_BOOTSTRAP_ADMIN_USERNAME MTV_BOOTSTRAP_ADMIN_PASSWORD \
         MTV_POSTGRES_USER MTV_POSTGRES_PASSWORD MTV_POSTGRES_DB \
         DATABASE_URL DATABASE_SYNC_URL MTV_REDIS_PASSWORD \
         REDIS_URL CELERY_BROKER_URL CELERY_RESULT_BACKEND; do
@@ -405,6 +388,10 @@ validate_generated_env_basics() {
 
     [[ "$(read_env_value "$env_file" APP_ENV)" == "production" ]] || die "build 必须生成 APP_ENV=production。"
     [[ "$(read_env_value "$env_file" STORAGE_DRIVER)" == "oss" ]] || die "build 只允许生成 STORAGE_DRIVER=oss。"
+    case "$(read_env_value "$env_file" SESSION_COOKIE_SECURE)" in
+        true|false) ;;
+        *) die "SESSION_COOKIE_SECURE 必须是 true 或 false。" ;;
+    esac
     cors="$(read_env_value "$env_file" CORS_ORIGINS)"
     cors_needs_replacement "$cors" && die "CORS_ORIGINS 不符合生产要求。"
 
@@ -446,6 +433,7 @@ import sys
 
 try:
     from pydantic import ValidationError
+    from pydantic_settings import SettingsError
     from app.core.config import settings
     from app.providers.storage import get_storage
 
@@ -453,6 +441,9 @@ try:
     assert settings.storage_driver == "oss"
     get_storage()
     import alibabacloud_oss_v2  # noqa: F401
+except SettingsError as exc:
+    print(f"生产配置解析失败：{exc}", file=sys.stderr)
+    raise SystemExit(1) from None
 except ValidationError as exc:
     for error in exc.errors(include_input=False, include_url=False):
         location = ".".join(str(part) for part in error.get("loc", ())) or "Settings"
@@ -528,7 +519,7 @@ build_bundle() {
     merge_env_file "$production_env" "$local_env"
 
     ensure_local_deploy_secrets
-    select_production_cors "$production_env"
+    select_production_cors
     write_forced_production_env "$forced_env" "$version" "$backend_image"
     merge_env_file "$production_env" "$forced_env"
     chmod 600 "$production_env"
@@ -587,16 +578,8 @@ build_bundle() {
     chmod 600 "$release_root/manifest.env"
     write_manifest "$release_root"
 
-    if [[ "$(uname -s)" == "Darwin" ]] && command -v xattr >/dev/null 2>&1; then
-        find "$release_root" -exec xattr -c {} \;
-    fi
-
     TEMP_ARCHIVE="$dist_dir/.${release_name}.tar.gz.tmp.$$"
-    if tar --help 2>&1 | grep -q -- '--no-xattrs'; then
-        COPYFILE_DISABLE=1 tar --no-xattrs -czf "$TEMP_ARCHIVE" -C "$TEMP_DIR" "$release_name"
-    else
-        COPYFILE_DISABLE=1 tar -czf "$TEMP_ARCHIVE" -C "$TEMP_DIR" "$release_name"
-    fi
+    COPYFILE_DISABLE=1 tar --no-xattrs -czf "$TEMP_ARCHIVE" -C "$TEMP_DIR" "$release_name"
     chmod 600 "$TEMP_ARCHIVE"
     mv -f -- "$TEMP_ARCHIVE" "$archive"
     TEMP_ARCHIVE=""
@@ -856,8 +839,8 @@ prepare_runtime_env() {
     local config_dir="$SERVER_ROOT/config"
     local selected="$config_dir/.stable-values.$$"
     local old_runtime_exists="false"
-    local stable_keys="SESSION_SECRET"
-    local key
+    local stable_keys=""
+    local key existing_session_secret
 
     mkdir -p -m 700 -- "$config_dir"
     TEMP_FILE="$config_dir/.production.env.tmp.$$"
@@ -874,6 +857,12 @@ prepare_runtime_env() {
 
     if [[ -f "$RUNTIME_ENV_FILE" ]]; then
         old_runtime_exists="true"
+        existing_session_secret="$(read_env_value "$RUNTIME_ENV_FILE" SESSION_SECRET)"
+        if [[ "$existing_session_secret" =~ ^[0-9a-f]{64}$ ]]; then
+            stable_keys="SESSION_SECRET"
+        else
+            echo "旧 SESSION_SECRET 不是有效强随机密钥，改用新发布包中的密钥。"
+        fi
         if [[ -f "$SERVER_ROOT/data/postgres/PG_VERSION" ]]; then
             for key in MTV_POSTGRES_USER MTV_POSTGRES_PASSWORD MTV_POSTGRES_DB DATABASE_URL DATABASE_SYNC_URL; do
                 require_env_value "$RUNTIME_ENV_FILE" "$key"
@@ -897,7 +886,7 @@ prepare_runtime_env() {
     chmod 600 "$RUNTIME_ENV_FILE"
 
     if [[ "$old_runtime_exists" == "true" ]]; then
-        echo "已更新生产配置，并自动保留既有数据库、Redis 与会话所需密钥。"
+        echo "已更新生产配置，并保留可安全复用的既有基础设施凭据。"
     else
         echo "已安装生产配置：$RUNTIME_ENV_FILE"
     fi

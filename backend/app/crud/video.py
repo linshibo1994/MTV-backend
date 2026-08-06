@@ -640,6 +640,7 @@ async def ensure_provider_configs(db: AsyncSession) -> None:
         "bailian": settings.dashscope_video_model,
         "openai": settings.openai_video_model,
         "gemini": settings.google_video_model,
+        "mgrouter": settings.mgrouter_video_model,
     }
     for key, model in provider_models.items():
         existing = await get_provider_by_key(db, key, "all_reference")

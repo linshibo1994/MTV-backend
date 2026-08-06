@@ -54,6 +54,8 @@ def test_registry_normalizes_vendor_aliases_and_rejects_wrong_capability() -> No
     assert normalize_provider("Claude-Code") == "anthropic"
     assert normalize_provider("dashscope") == "bailian"
     assert normalize_provider("veo") == "gemini"
+    assert normalize_provider("AICC") == "mgrouter"
+    assert normalize_provider("mg-router") == "mgrouter"
     assert normalize_provider("custom") == "openai_compatible"
     assert require_capability("deepseek", "chat") == "deepseek"
     with pytest.raises(UnsupportedCapabilityError, match="不支持 image"):
@@ -119,6 +121,19 @@ def test_video_capability_falls_back_to_selected_vendor_legacy_config() -> None:
     assert configured.video_gen_api_key == "dashscope-key"
     assert configured.video_gen_base_url == "https://dashscope.example"
     assert configured.video_gen_model == "wan-custom"
+
+
+def test_mgrouter_video_capability_uses_dedicated_fallbacks() -> None:
+    configured = _settings(
+        video_gen_provider="aicc",
+        mgrouter_api_key="mgrouter-key",
+        mgrouter_base_url="https://gateway.example/api/v3/",
+        mgrouter_video_model="AICC-Seedance-Test",
+    )
+
+    assert configured.video_gen_api_key == "mgrouter-key"
+    assert configured.video_gen_base_url == "https://gateway.example/api/v3"
+    assert configured.video_gen_model == "AICC-Seedance-Test"
 
 
 def test_image_factory_explicit_env_provider_wins_over_model_alias(monkeypatch) -> None:
@@ -359,6 +374,7 @@ def test_video_factory_routes_gemini_and_rejects_unknown_vendor(monkeypatch) -> 
     from app.providers.registry import UnsupportedProviderError
     from app.providers.video_gen import get_video_provider
     from app.providers.video_gen_google import GoogleVideoGenProvider
+    from app.providers.video_gen_mgrouter import MgrouterVideoGenProvider
     from app.providers.video_gen_volcengine import VolcengineVideoGenProvider
 
     monkeypatch.setattr(config, "settings", _settings())
@@ -367,6 +383,8 @@ def test_video_factory_routes_gemini_and_rejects_unknown_vendor(monkeypatch) -> 
         assert isinstance(get_video_provider(alias), GoogleVideoGenProvider)
     for alias in ("volcengine", "doubao", "jianyu", "modelsai"):
         assert isinstance(get_video_provider(alias), VolcengineVideoGenProvider)
+    for alias in ("mgrouter", "mg-router", "aicc", "aicc-seedance"):
+        assert isinstance(get_video_provider(alias), MgrouterVideoGenProvider)
     with pytest.raises(UnsupportedProviderError, match="unknown-vendor"):
         get_video_provider("unknown-vendor")
 

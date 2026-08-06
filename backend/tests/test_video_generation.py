@@ -1748,6 +1748,7 @@ def test_video_provider_seed_includes_all_routable_vendors(monkeypatch) -> None:
                 dashscope_video_model="wan-test",
                 openai_video_model="sora-test",
                 google_video_model="veo-google-test",
+                mgrouter_video_model="AICC-Seedance-Test",
                 video_default_provider="modelsai",
             ),
         )
@@ -1765,9 +1766,12 @@ def test_video_provider_seed_includes_all_routable_vendors(monkeypatch) -> None:
             "bailian",
             "openai",
             "gemini",
+            "mgrouter",
         }
         gemini = next(row for row in rows if row.provider_key == "gemini")
         assert gemini.model == "veo-google-test"
+        mgrouter = next(row for row in rows if row.provider_key == "mgrouter")
+        assert mgrouter.model == "AICC-Seedance-Test"
         assert sum(row.is_active for row in rows) == 1
 
     asyncio.run(scenario())
@@ -4277,6 +4281,7 @@ async def test_video_batch_rejects_derived_idempotency_overflow_before_creation(
         ("sora", "", "openai", "sora-env-test"),
         ("google", "", "gemini", "veo-env-test"),
         ("google", "explicit-video-model", "gemini", "explicit-video-model"),
+        ("aicc", "", "mgrouter", "aicc-env-test"),
     ],
 )
 async def test_active_provider_env_mode_get_returns_effective_config_without_db(
@@ -4301,6 +4306,7 @@ async def test_active_provider_env_mode_get_returns_effective_config_without_db(
         dashscope_video_model="wan-env-test",
         openai_video_model="sora-env-test",
         google_video_model="veo-env-test",
+        mgrouter_video_model="aicc-env-test",
     )
     get_database_provider = AsyncMock(
         return_value=SimpleNamespace(
@@ -4436,6 +4442,35 @@ def test_active_provider_switch_seeds_gemini_for_existing_database(monkeypatch) 
     asyncio.run(scenario())
 
 
+def test_active_provider_switch_seeds_mgrouter_for_existing_database(monkeypatch) -> None:
+    async def scenario() -> None:
+        from app.api.v1 import video_generation as api
+        from app.schemas.video import ActiveProviderUpdateIn
+
+        monkeypatch.setattr(api.settings, "video_provider_selection_mode", "database")
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        db = _AsyncSessionAdapter(raw)
+        monkeypatch.setattr(api, "audit_log", AsyncMock())
+
+        out = await api.set_active_provider(
+            body=ActiveProviderUpdateIn(provider_key="mgrouter"),
+            db=db,
+            user=SimpleNamespace(user_id=seeded.user.user_id, is_admin=True),
+        )
+
+        assert out.provider_key == "mgrouter"
+        assert out.model == "AICC-Doubao-Seedance-2.0"
+        assert raw.scalar(
+            select(VideoProviderConfig).where(
+                VideoProviderConfig.provider_key == "mgrouter",
+                VideoProviderConfig.is_active.is_(True),
+            )
+        ) is not None
+
+    asyncio.run(scenario())
+
+
 def test_video_provider_and_job_type_constraints_are_declared() -> None:
     job_checks = {
         constraint.name: str(constraint.sqltext)
@@ -4453,6 +4488,8 @@ def test_video_provider_and_job_type_constraints_are_declared() -> None:
     assert "ck_video_provider_configs_job_type" in provider_checks
     assert "'gemini'" in job_checks["ck_video_jobs_provider_key"]
     assert "'gemini'" in provider_checks["ck_video_provider_configs_provider_key"]
+    assert "'mgrouter'" in job_checks["ck_video_jobs_provider_key"]
+    assert "'mgrouter'" in provider_checks["ck_video_provider_configs_provider_key"]
 
 
 def test_active_provider_schema_accepts_canonical_gemini() -> None:
@@ -4461,6 +4498,14 @@ def test_active_provider_schema_accepts_canonical_gemini() -> None:
     payload = ActiveProviderUpdateIn(provider_key="gemini")
 
     assert payload.provider_key == "gemini"
+
+
+def test_active_provider_schema_accepts_canonical_mgrouter() -> None:
+    from app.schemas.video import ActiveProviderUpdateIn
+
+    payload = ActiveProviderUpdateIn(provider_key="mgrouter")
+
+    assert payload.provider_key == "mgrouter"
 
 
 @pytest.mark.parametrize("alias", ["google", "gemini", "veo"])

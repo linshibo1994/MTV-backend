@@ -50,6 +50,7 @@ class CreateJobIn(BaseModel):
         None,
         description="客户端可编辑的最终生图提示词；缺省时兼容旧客户端并回退服务端 enrich",
     )
+    style_id: str | None = Field(None, description="风格 ID")
     model: ImageModelName = Field("banana-2", description="生图模型")
     size: str = Field("2k", description="尺寸，如 2k")
     aspect: str = Field("16:9", description="比例，如 16:9")
@@ -73,6 +74,7 @@ class BatchCreateJobIn(BaseModel):
         None,
         description="每个主体的客户端可编辑最终生图提示词，键为 subject_id",
     )
+    style_id: str | None = Field(None, description="风格 ID")
     model: ImageModelName = Field("banana-2", description="生图模型")
     size: str = Field("2k", description="尺寸，如 2k")
     aspect: str = Field("16:9", description="比例，如 16:9")

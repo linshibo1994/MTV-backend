@@ -68,6 +68,11 @@ def resolve_env_video_model(configured_settings: Any | None = None) -> RuntimeVi
         "bailian": configured_settings.dashscope_video_model,
         "openai": configured_settings.openai_video_model,
         "gemini": configured_settings.google_video_model,
+        "mgrouter": getattr(
+            configured_settings,
+            "mgrouter_video_model",
+            "AICC-Doubao-Seedance-2.0",
+        ),
     }
     return RuntimeVideoModel(
         provider=provider,

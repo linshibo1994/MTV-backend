@@ -83,6 +83,7 @@ async def create_video_job(
     user_id: str,
     idempotency_key: str | None = None,
     prompt: str | None = None,
+    style_id: str | None = None,
 ) -> "VideoGenerationJob":
     """创建视频生成任务 — 幂等去重 → 汇聚参考图/音频 → 首帧衔接 → 落库 → reserve 积分 → 投递 worker。
 
@@ -94,6 +95,7 @@ async def create_video_job(
         user_id: 触发用户（积分扣减归属，按 user owner 维度账户）。
         idempotency_key: 可选幂等键（来自 Idempotency-Key 头）。
         prompt: 客户端显式视频提示词；缺省时回退镜头组 prompt。
+        style_id: 客户端选择的风格 ID，仅记录并参与幂等判断。
 
     Returns:
         VideoGenerationJob ORM 对象（重复创建时返回已存在任务）。
@@ -121,6 +123,8 @@ async def create_video_job(
     # 缺省时保持历史 hash 结构，兼容部署中的旧客户端和旧幂等绑定。
     if client_prompt is not None:
         request_payload["prompt"] = client_prompt
+    if style_id is not None:
+        request_payload["style_id"] = style_id
     request_hash = _request_hash(request_payload)
 
     # 1. 幂等去重（doc 08 §4.2）
@@ -202,9 +206,12 @@ async def create_video_job(
 
     active_job = await video_crud.find_active_job_by_unit(db, unit_id)
     if active_job is not None:
-        active_prompt = (active_job.input_json or {}).get("prompt")
+        active_input = active_job.input_json or {}
+        active_prompt = active_input.get("prompt")
         if client_prompt is not None and active_prompt != prompt_text:
             raise ConflictError("该镜头组已有使用不同提示词的生成任务，请等待完成或取消后重试")
+        if style_id is not None and active_input.get("style_id") != style_id:
+            raise ConflictError("该镜头组已有使用不同风格的生成任务，请等待完成或取消后重试")
         logger.info(
             "视频生成任务活动单元复用 job_id=%s unit_id=%s",
             active_job.job_id,
@@ -250,6 +257,7 @@ async def create_video_job(
     input_json = {
         "model": model,
         "prompt": prompt_text,
+        "style_id": style_id,
         "reference_images": aggregated.reference_images,
         "reference_image_names": aggregated.reference_image_names,
         "reference_audios": aggregated.reference_audios,

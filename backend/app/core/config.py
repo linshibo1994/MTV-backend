@@ -46,6 +46,8 @@ class Settings(BaseSettings):
     session_secret: str = "dev-only-change-me"
     session_cookie_name: str = "flowapp_session"
     session_max_age: int = 86400
+    # 留空时按环境决定；测试内网 HTTP 可显式设置为 false。
+    session_cookie_secure: bool | None = None
     tgw_l7_route_cookie: str = "flowapp-tgw"
 
     # 存储
@@ -85,6 +87,16 @@ class Settings(BaseSettings):
     volcengine_api_key: str = ""
     volcengine_ark_base_url: str = "https://ark.cn-beijing.volces.com/api/v3"
     seedance_model: str = "doubao-seedance-2-0-260128"
+    # mgrouter AICC Seedance（火山内容生成兼容协议）
+    mgrouter_api_key: str = ""
+    mgrouter_base_url: str = "https://mgrouter.com/api/v3"
+    mgrouter_video_model: str = "AICC-Doubao-Seedance-2.0"
+    mgrouter_resolution: Literal["480p", "720p", "1080p"] = "720p"
+    mgrouter_ratio: Literal[
+        "adaptive", "21:9", "16:9", "4:3", "1:1", "3:4", "9:16"
+    ] = "adaptive"
+    mgrouter_generate_audio: bool = True
+    mgrouter_watermark: bool = False
     video_default_provider: str = "modelsai"
 
     # ===== 统一能力×厂商适配层（每个能力独立配置厂商 URL+Key） =====
@@ -110,7 +122,7 @@ class Settings(BaseSettings):
     image_gen_api_key: str = ""
     image_gen_model: str = ""
 
-    # 视频生成 —— volcengine | bailian | openai | gemini
+    # 视频生成 —— volcengine | bailian | openai | gemini | mgrouter
     # database 保持历史后台切换；env 让 VIDEO_GEN_* 成为权威配置。
     video_provider_selection_mode: Literal["database", "env"] = "database"
     video_gen_provider: str = "volcengine"
@@ -263,6 +275,21 @@ class Settings(BaseSettings):
                 self.google_video_model,
                 "",
             ),
+            "mgrouter": (
+                self.mgrouter_api_key,
+                self.mgrouter_video_model,
+                self.mgrouter_base_url,
+            ),
+            "mg-router": (
+                self.mgrouter_api_key,
+                self.mgrouter_video_model,
+                self.mgrouter_base_url,
+            ),
+            "aicc": (
+                self.mgrouter_api_key,
+                self.mgrouter_video_model,
+                self.mgrouter_base_url,
+            ),
         }
         video_default = video_defaults.get(self.video_gen_provider)
         if video_default is not None:
@@ -277,9 +304,6 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_security_settings(self) -> "Settings":
-        if not self.cors_origins:
-            raise ValueError("CORS_ORIGINS 必须配置至少一个可信来源")
-
         try:
             self.cors_origins = [
                 _normalize_cors_origin(origin, allow_wildcard=not self.is_prod)
@@ -311,6 +335,7 @@ class Settings(BaseSettings):
             "chat_llm_base_url",
             "image_gen_base_url",
             "video_gen_base_url",
+            "mgrouter_base_url",
             "dashscope_base_url",
             "anthropic_base_url",
         ):
@@ -385,9 +410,16 @@ class Settings(BaseSettings):
         return self.app_env == "dev"
 
     @property
+    def session_cookie_secure_enabled(self) -> bool:
+        """会话 Cookie 是否附加 Secure 属性。"""
+        if self.session_cookie_secure is not None:
+            return self.session_cookie_secure
+        return self.is_prod
+
+    @property
     def cors_allow_credentials(self) -> bool:
-        """通配符来源不能与浏览器凭据模式同时使用。"""
-        return "*" not in self.cors_origins
+        """空列表禁用跨域；通配符来源不能携带浏览器凭据。"""
+        return bool(self.cors_origins) and "*" not in self.cors_origins
 
     def is_explicitly_configured(self, field_name: str) -> bool:
         """判断字段是否来自环境变量或 Settings 显式入参，而不是类默认值。"""

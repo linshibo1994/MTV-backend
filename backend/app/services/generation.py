@@ -134,6 +134,7 @@ async def _create_one_job(
     idempotency_key: str,
     prompt: str,
     resolved_prompt: str,
+    style_id: str | None,
     input_version: int,
     input_client_save_seq: int | None,
     episode_id: str | None,
@@ -154,6 +155,7 @@ async def _create_one_job(
     input_json: dict = {
         "prompt": prompt,
         "resolved_prompts": {"final": resolved_prompt or prompt},
+        "style_id": style_id,
         "model": model,
         "size": size,
         "aspect": aspect,
@@ -494,6 +496,8 @@ async def create_generation_job(
         "subject_version": int(subject.subject_version or 1),
         "enrich_version": int(subject.enrich_version or 1),
     }
+    if payload.style_id is not None:
+        request_payload["style_id"] = payload.style_id
     req_hash = _request_hash(request_payload)
     existing = await _find_idempotent_job(db, user.user_id, idempotency_key)
     if existing is not None:
@@ -516,6 +520,7 @@ async def create_generation_job(
             idempotency_key=idempotency_key,
             prompt=prompt,
             resolved_prompt=resolved_prompt,
+            style_id=payload.style_id,
             input_version=input_version,
             input_client_save_seq=input_client_save_seq,
             episode_id=episode_id,
@@ -563,6 +568,8 @@ async def create_batch_generation_jobs(
         "aspect": payload.aspect,
         "count": payload.count,
     }
+    if payload.style_id is not None:
+        batch_payload["style_id"] = payload.style_id
     batch_hash = _request_hash(batch_payload)
     existing_batch = await _find_batch_request(db, user.user_id, idempotency_key)
     if existing_batch is not None:
@@ -662,6 +669,7 @@ async def create_batch_generation_jobs(
                 idempotency_key=f"{_BATCH_JOB_IDEMPOTENCY_NAMESPACE}{batch.id}:{subject.id}",
                 prompt=prompt,
                 resolved_prompt=resolved_prompt,
+                style_id=payload.style_id,
                 input_version=input_version,
                 input_client_save_seq=input_client_save_seq,
                 episode_id=episode_id,

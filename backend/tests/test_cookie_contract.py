@@ -68,7 +68,7 @@ async def test_login_sets_non_identifying_tgw_cookie_with_required_attributes(
     assert f"Max-Age={settings.session_max_age}" in cookie
     assert "SameSite=lax" in cookie
     assert "HttpOnly" not in cookie
-    assert ("Secure" in cookie) is settings.is_prod
+    assert ("Secure" in cookie) is settings.session_cookie_secure_enabled
 
 
 async def test_logout_deletes_session_and_tgw_cookies() -> None:

@@ -16,6 +16,7 @@ from app.api.v1 import (
     materials,
     pipeline_runs,
     project_members,
+    prompt_styles,
     runtime_models,
     scripts,
     shots,
@@ -55,6 +56,8 @@ api_router.include_router(shots.router, tags=["分镜"])
 api_router.include_router(video_generation.router, tags=["视频生成"])
 # 当前部署实际使用的模型配置（不暴露密钥和服务地址）。
 api_router.include_router(runtime_models.router, tags=["运行时配置"])
+# 提示词风格目录与优化（router 内部包含两个独立完整路径）。
+api_router.include_router(prompt_styles.router, tags=["提示词风格"])
 # T9 时间线 (router 内部路由含 /video-timeline-arrangements* 全路径)
 api_router.include_router(timeline.router, tags=["时间线"])
 # T10 媒体代理在 app.main 中单独挂载到 settings.media_proxy_prefix
