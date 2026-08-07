@@ -23,7 +23,13 @@ from app.models.materials import Materials
 from app.models.parent_subject import ParentSubject
 from app.models.script import Script
 from app.models.subject import Subject
-from app.schemas.materials import CanvasDeltaIn, CanvasNodeOut, NodeUpsertIn
+from app.schemas.materials import (
+    CHARACTER_SHEET_MARKER,
+    CanvasDeltaIn,
+    CanvasNodeOut,
+    NodeUpsertIn,
+    build_subject_prompt,
+)
 
 
 @compiles(JSONB, "sqlite")
@@ -212,6 +218,28 @@ def test_node_schema_rejects_unknown_type_and_builds_prompt_from_subject_data():
 
     assert "主体名称：主角" in materials_crud.build_prompt_from_node_data(node.data)
     assert node.data["imageOutputs"][0]["assetId"] == "image-1"
+
+
+def test_subject_design_prompt_uses_type_specific_detailed_templates():
+    character = build_subject_prompt(
+        "老农",
+        "character",
+        "老年男性，满脸皱纹，戴草帽，穿粗布衣，手拿烙饼",
+    )
+    scene = build_subject_prompt("旧院落", "scene", "二十世纪末中国北方农村院落")
+    prop = build_subject_prompt("烙饼", "prop", "表面焦黄、边缘不规则的手工烙饼")
+
+    assert CHARACTER_SHEET_MARKER in character
+    assert "正面、标准侧面、背面三幅等比例全身视图" in character
+    assert "3:4" not in character
+    assert "瞬时动作只作为身份线索" in character
+    assert "不套用统一九头身" in character
+    assert "【2 空间布局】" in scene
+    assert "单张 16:9 横版场景设定图" in scene
+    assert CHARACTER_SHEET_MARKER not in scene
+    assert "【5 多视图构图】" in prop
+    assert "人物、手部" in prop
+    assert "【2 面容与视线约束】" not in prop
 
 
 @pytest.mark.asyncio

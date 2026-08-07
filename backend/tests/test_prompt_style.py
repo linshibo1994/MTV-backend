@@ -9,6 +9,10 @@ from pydantic import ValidationError
 from app.api.v1.generation_jobs import _sanitize_input_json
 from app.core.errors import ConflictError
 from app.schemas.generation import BatchCreateJobIn, CreateJobIn
+from app.schemas.materials import (
+    SUBJECT_DESIGN_PROMPT_MARKER,
+    build_subject_prompt,
+)
 from app.schemas.prompt_style import PromptOptimizeIn
 from app.schemas.video import VideoJobBatchCreateIn, VideoJobCreateIn
 from app.services import prompt_style
@@ -51,6 +55,25 @@ def test_apply_style_unknown_id() -> None:
         "original prompt",
         "",
     )
+
+
+def test_apply_style_uses_asset_safe_cyberpunk_direction_for_subject_design() -> None:
+    raw_prompt = build_subject_prompt(
+        "老农",
+        "character",
+        "中国乡村老年男性，穿历史时期粗布衣，使用纯净白底设定图",
+    )
+
+    positive, negative = apply_style("cyberpunk", raw_prompt, "image")
+
+    assert raw_prompt in positive
+    assert "cyberpunk visual-development asset sheet" in positive
+    assert "dense cyberpunk world" not in positive
+    assert "preserve every required view" in positive
+    assert "clean empty background" not in negative
+    assert "historical costume" not in negative
+    assert "pastoral daylight" not in negative
+    assert "low detail" in negative
 
 
 @pytest.mark.asyncio
@@ -116,6 +139,30 @@ async def test_optimize_prompt_includes_selected_style_context() -> None:
     assert "dynamic American comic-book panel" in system
     assert "禁止加入这些冲突特征：photorealistic" in system
     assert result["optimized_prompt"].startswith("dynamic American comic-book panel")
+    assert result["negative_prompt"].startswith("photorealistic")
+
+
+@pytest.mark.asyncio
+async def test_optimize_subject_design_prompt_preserves_full_contract() -> None:
+    raw_prompt = build_subject_prompt(
+        "老农",
+        "character",
+        "老年男性，满脸皱纹，戴草帽，穿粗布衣，手拿烙饼",
+    )
+    provider = SimpleNamespace(chat=AsyncMock(return_value="不应调用供应商"))
+
+    result = await optimize_prompt(
+        raw_prompt,
+        "anime",
+        "image",
+        provider=provider,
+    )
+
+    provider.chat.assert_not_awaited()
+    assert SUBJECT_DESIGN_PROMPT_MARKER in result["optimized_prompt"]
+    assert raw_prompt in result["optimized_prompt"]
+    assert "【6 道具与物理关系】" in result["optimized_prompt"]
+    assert "真人摄影写实" not in raw_prompt
     assert result["negative_prompt"].startswith("photorealistic")
 
 
@@ -232,6 +279,14 @@ async def test_generation_jobs_persist_style_id_and_include_it_in_idempotency(
     expected_single_prompt, expected_single_negative = apply_style(
         "cinematic", "single prompt", "image"
     )
+    expected_single_prompt, expected_single_negative = (
+        generation_service._apply_character_sheet_constraints(
+            expected_single_prompt,
+            expected_single_negative,
+            "character",
+            "16:9",
+        )
+    )
     assert single.input_json["resolved_prompts"]["final"] == expected_single_prompt
     assert single.input_json["negative_prompt"] == expected_single_negative
     with pytest.raises(ConflictError):
@@ -261,8 +316,17 @@ async def test_generation_jobs_persist_style_id_and_include_it_in_idempotency(
     expected_batch_prompt, expected_batch_negative = apply_style(
         "anime", "batch prompt", "image"
     )
+    expected_batch_prompt, expected_batch_negative = (
+        generation_service._apply_character_sheet_constraints(
+            expected_batch_prompt,
+            expected_batch_negative,
+            "character",
+            "3:4",
+        )
+    )
     assert created[0].input_json["resolved_prompts"]["final"] == expected_batch_prompt
     assert created[0].input_json["negative_prompt"] == expected_batch_negative
+    assert created[0].input_json["aspect"] == "3:4"
 
     original_find_style = generation_service.find_style
     monkeypatch.setattr(generation_service, "find_style", lambda _style_id: None)

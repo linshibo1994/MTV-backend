@@ -30,6 +30,10 @@ from app.schemas.asset import (
     review_status_label,
     subject_type_label,
 )
+from app.schemas.materials import (
+    SUBJECT_DESIGN_PROMPT_TEMPLATE_VERSION,
+    build_subject_prompt,
+)
 from app.services.cover import generate_svg_cover
 from app.services.storage_references import (
     StorageReferenceExclusions,
@@ -269,6 +273,7 @@ async def update_subject(
 ) -> Subject:
     """部分更新主体；人工修改名称/描述时默认锁定并递增版本。"""
     current_version = int(subject.subject_version or 1)
+    current_enrich_version = int(subject.enrich_version or 1)
     if (
         expected_subject_version is not None
         and current_version != expected_subject_version
@@ -324,11 +329,20 @@ async def update_subject(
         and getattr(subject, key) != value
         for key, value in data.items()
     )
+    should_bump_enrich_version = any(
+        key in {"name", "description", "type"}
+        and value is not None
+        and hasattr(subject, key)
+        and getattr(subject, key) != value
+        for key, value in data.items()
+    )
     for key, value in data.items():
         if value is not None and hasattr(subject, key):
             setattr(subject, key, value)
     if should_bump_version:
         subject.subject_version = current_version + 1
+    if should_bump_enrich_version:
+        subject.enrich_version = current_enrich_version + 1
     await db.flush()
     return subject
 
@@ -473,6 +487,7 @@ async def resolve_subject_suggestion(
         else:
             raise ConflictError("差异建议字段无效")
         subject.subject_version = current_version + 1
+        subject.enrich_version = int(subject.enrich_version or 1) + 1
         suggestion.status = "accepted"
     elif action == "ignore":
         suggestion.status = "ignored"
@@ -827,9 +842,36 @@ async def get_episode_id_map(
     契约 02§3.2.3 / 04§1.7 要求 SubjectAssetOut 含 episodes/episode_ids/episode_nos
     三字段；episode_nos 由主体 JSONB 直接给出，episode_ids 需按集号反查分集表。
     """
-    q = select(Episode).where(Episode.script_id == script_id)
-    rows = list((await db.execute(q)).scalars().all())
-    return {r.episode_no: r.episode_id for r in rows}
+    episode_map, _ = await get_episode_context_maps(db, script_id)
+    return episode_map
+
+
+async def get_episode_context_maps(
+    db: AsyncSession,
+    script_id: str,
+) -> tuple[dict[int, str], dict[int, dict[str, object]]]:
+    """一次查询返回主体序列化映射与 enrich 版本快照，避免重复加载分集 ORM。"""
+    rows = (
+        await db.execute(
+            select(
+                Episode.episode_no,
+                Episode.episode_id,
+                Episode.episode_version,
+                Episode.client_save_seq,
+            ).where(Episode.script_id == script_id)
+        )
+    ).all()
+    episode_map: dict[int, str] = {}
+    snapshot_by_no: dict[int, dict[str, object]] = {}
+    for episode_no, episode_id, episode_version, client_save_seq in rows:
+        normalized_no = int(episode_no)
+        episode_map[normalized_no] = episode_id
+        snapshot_by_no[normalized_no] = {
+            "episode_id": episode_id,
+            "episode_version": int(episode_version or 1),
+            "client_save_seq": int(client_save_seq or 0),
+        }
+    return episode_map, snapshot_by_no
 
 
 # =====================================================================
@@ -919,6 +961,7 @@ def serialize_subject(
 
     raw_type = subject.type
     norm_type = normalize_subject_type(raw_type)
+    is_visual_subject = raw_type != "sound"
 
     parent_name: str | None = None
     if subject.parent_subject is not None:
@@ -938,6 +981,20 @@ def serialize_subject(
         subject_type=norm_type,
         subject_type_label=subject_type_label(norm_type),
         subject_description=subject.description,
+        design_prompt=(
+            build_subject_prompt(subject.name, raw_type, subject.description or "")
+            if is_visual_subject
+            else None
+        ),
+        design_prompt_source="template_fallback" if is_visual_subject else None,
+        design_prompt_version=(
+            int(getattr(subject, "enrich_version", 1) or 1)
+            if is_visual_subject
+            else None
+        ),
+        design_prompt_template_version=(
+            SUBJECT_DESIGN_PROMPT_TEMPLATE_VERSION if is_visual_subject else None
+        ),
         name_locked=bool(getattr(subject, "name_locked", False)),
         description_locked=bool(getattr(subject, "description_locked", False)),
         subject_version=int(getattr(subject, "subject_version", 1) or 1),

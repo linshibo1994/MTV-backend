@@ -99,6 +99,10 @@ class SubjectAssetOut(BaseModel):
     subject_type: str  # 统一为 background（scene 归一）
     subject_type_label: str  # 中文标签，background -> "场景"
     subject_description: str | None = None
+    design_prompt: str | None = None
+    design_prompt_source: str | None = None
+    design_prompt_version: int | None = None
+    design_prompt_template_version: int | None = None
     name_locked: bool = False
     description_locked: bool = False
     subject_version: int = 1

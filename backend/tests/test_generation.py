@@ -245,6 +245,19 @@ def _create_payload(**overrides) -> CreateJobIn:
     return CreateJobIn(**data)
 
 
+def _expected_character_sheet(
+    prompt: str,
+    negative_prompt: str = "",
+    aspect: str = "16:9",
+) -> tuple[str, str]:
+    return generation_service._apply_character_sheet_constraints(
+        prompt,
+        negative_prompt,
+        "character",
+        aspect,
+    )
+
+
 @pytest.fixture(autouse=True)
 def _no_real_permissions(monkeypatch):
     async def allow(*args, **kwargs):
@@ -382,6 +395,8 @@ def test_generation_schema_accepts_optional_trimmed_prompt_with_length_limit():
         subject_id="subject-1",
     )
     assert without_prompt.prompt is None
+    assert without_prompt.aspect == "auto"
+    assert BatchCreateJobIn(material_id="material-1").aspect == "auto"
 
     with_prompt = CreateJobIn(
         material_id="material-1",
@@ -402,6 +417,70 @@ def test_generation_schema_accepts_optional_trimmed_prompt_with_length_limit():
                 subject_id="subject-1",
                 prompt=invalid_prompt,
             )
+
+
+def test_character_sheet_constraints_are_complete_idempotent_and_character_only():
+    prompt, negative_prompt = _expected_character_sheet(
+        "原始提示词",
+        "已有负面提示",
+        "3:4",
+    )
+
+    for required in (
+        "单张 3:4 比例",
+        "左侧约占 45%",
+        "人物头肩大图",
+        "右侧约占 55%",
+        "恰好依次展示正面、标准侧面、背面三幅等比例全身视图",
+        "身份、脸部、发型、服装和体型完全一致",
+        "无遮挡、无裁切",
+        "浅色纯背景",
+        "文字、标签、水印、边框、分栏线或额外人物",
+    ):
+        assert required in prompt
+    assert prompt.count(generation_service._CHARACTER_SHEET_MARKER) == 1
+    assert negative_prompt.startswith("已有负面提示, ")
+    assert generation_service._CHARACTER_SHEET_NEGATIVE_PROMPT in negative_prompt
+    assert generation_service._apply_character_sheet_constraints(
+        prompt,
+        negative_prompt,
+        "character",
+        "3:4",
+    ) == (prompt, negative_prompt)
+    assert generation_service._apply_character_sheet_constraints(
+        "场景提示词",
+        "场景负面提示",
+        "scene",
+        "16:9",
+    ) == ("场景提示词", "场景负面提示")
+
+    landscape_prompt, _ = _expected_character_sheet("横版人物提示词", aspect="16:9")
+    assert "单张 16:9 比例" in landscape_prompt
+    assert "单张 3:4 比例" not in landscape_prompt
+
+    frontend_prompt = "原始提示词\n【人物设定图构图硬约束】前端可见约束"
+    server_prompt, _ = _expected_character_sheet(frontend_prompt, aspect="3:4")
+    assert frontend_prompt in server_prompt
+    assert server_prompt.count(generation_service._CHARACTER_SHEET_MARKER) == 1
+
+
+@pytest.mark.parametrize(
+    ("aspect", "subject_type", "expected"),
+    [
+        ("auto", "character", "3:4"),
+        ("AUTO", "character", "3:4"),
+        ("auto", "scene", "16:9"),
+        ("auto", "prop", "16:9"),
+        ("1:1", "character", "1:1"),
+        ("16:9", "character", "16:9"),
+    ],
+)
+def test_auto_aspect_resolves_by_subject_type_and_keeps_explicit_ratio(
+    aspect: str,
+    subject_type: str,
+    expected: str,
+) -> None:
+    assert generation_service._resolve_subject_image_aspect(aspect, subject_type) == expected
 
 
 def test_generation_schema_rejects_client_resolved_prompt_forgery():
@@ -463,12 +542,53 @@ def test_create_generation_job_uses_client_prompt_without_valid_enrich(monkeypat
         job = await generation_service.create_generation_job(
             _AsyncSessionAdapter(raw),
             user=seeded.user,
-            payload=_create_payload(prompt="  客户端自定义生图提示词  "),
+            payload=CreateJobIn(
+                material_id=seeded.material.id,
+                subject_id=seeded.subject.id,
+                prompt="  客户端自定义生图提示词  ",
+            ),
             idempotency_key="client-prompt-without-enrich",
         )
 
         assert job.input_json["prompt"] == "客户端自定义生图提示词"
-        assert job.input_json["resolved_prompts"]["final"] == "客户端自定义生图提示词"
+        expected_prompt, expected_negative = _expected_character_sheet(
+            "客户端自定义生图提示词",
+            aspect="3:4",
+        )
+        assert job.input_json["resolved_prompts"]["final"] == expected_prompt
+        assert job.input_json["negative_prompt"] == expected_negative
+        assert job.input_json["aspect"] == "3:4"
+
+    asyncio.run(scenario())
+
+
+def test_create_generation_job_keeps_non_character_prompt_and_resolves_auto_landscape(
+    monkeypatch,
+):
+    async def scenario() -> None:
+        _, raw = _make_db()
+        seeded = _seed(raw, subject_type="scene")
+        seeded.enrich.detail = {
+            "input_version": seeded.episode.episode_version,
+            "prompts": {},
+        }
+        raw.commit()
+        monkeypatch.setattr(generation_service, "enqueue_task", AsyncMock())
+
+        job = await generation_service.create_generation_job(
+            _AsyncSessionAdapter(raw),
+            user=seeded.user,
+            payload=CreateJobIn(
+                material_id=seeded.material.id,
+                subject_id=seeded.subject.id,
+                prompt="场景原始提示词",
+            ),
+            idempotency_key="scene-auto-aspect",
+        )
+
+        assert job.input_json["resolved_prompts"]["final"] == "场景原始提示词"
+        assert job.input_json["negative_prompt"] == ""
+        assert job.input_json["aspect"] == "16:9"
 
     asyncio.run(scenario())
 
@@ -482,8 +602,12 @@ def test_create_generation_job_applies_explicit_style_once_and_preserves_hash_co
 
         style = generation_service.find_style("comic-book")
         assert style is not None
-        expected_final, expected_negative = generation_service.apply_style(
+        styled_final, styled_negative = generation_service.apply_style(
             "comic-book", "a reporter holding a phone", "image"
+        )
+        expected_final, expected_negative = _expected_character_sheet(
+            styled_final,
+            styled_negative,
         )
         job = await generation_service.create_generation_job(
             db,
@@ -498,6 +622,7 @@ def test_create_generation_job_applies_explicit_style_once_and_preserves_hash_co
         assert job.input_json["resolved_prompts"]["final"] == expected_final
         assert job.input_json["negative_prompt"] == expected_negative
         assert job.input_json["style_id"] == "comic-book"
+        assert job.input_json["aspect"] == "16:9"
         assert expected_final.count(str(style["prompt_template"]).split("{prompt}", 1)[0]) == 1
         expected_hash_payload = {
             "material_id": seeded.material.id,
@@ -549,6 +674,10 @@ def test_create_generation_job_infers_exact_prewrapped_style_without_duplicate(m
         wrapped_prompt, expected_negative = generation_service.apply_style(
             "comic-book", "a reporter holding a phone", "image"
         )
+        expected_prompt, expected_negative = _expected_character_sheet(
+            wrapped_prompt,
+            expected_negative,
+        )
         job = await generation_service.create_generation_job(
             db,
             user=seeded.user,
@@ -556,7 +685,7 @@ def test_create_generation_job_infers_exact_prewrapped_style_without_duplicate(m
             idempotency_key="inferred-comic-style",
         )
 
-        assert job.input_json["resolved_prompts"]["final"] == wrapped_prompt
+        assert job.input_json["resolved_prompts"]["final"] == expected_prompt
         assert job.input_json["negative_prompt"] == expected_negative
         assert job.input_json["style_id"] == "comic-book"
 
@@ -567,8 +696,9 @@ def test_create_generation_job_infers_exact_prewrapped_style_without_duplicate(m
             payload=_create_payload(prompt=near_match),
             idempotency_key="not-an-exact-style-wrapper",
         )
-        assert unmatched.input_json["resolved_prompts"]["final"] == near_match
-        assert unmatched.input_json["negative_prompt"] == ""
+        expected_near_match, expected_near_negative = _expected_character_sheet(near_match)
+        assert unmatched.input_json["resolved_prompts"]["final"] == expected_near_match
+        assert unmatched.input_json["negative_prompt"] == expected_near_negative
         assert unmatched.input_json["style_id"] is None
 
     asyncio.run(scenario())
@@ -698,7 +828,9 @@ def test_create_generation_job_requires_server_prompt_and_idempotent_outbox(monk
         assert enqueued[0]["task_type"] == "generation.generate_images"
         assert raw.scalars(select(TaskDispatchOutbox)).all() == []
         assert job.input_json["prompt"] == build_base_prompt(seeded.subject)
-        assert job.input_json["resolved_prompts"]["final"] == _twelve_sections()
+        expected_prompt, expected_negative = _expected_character_sheet(_twelve_sections())
+        assert job.input_json["resolved_prompts"]["final"] == expected_prompt
+        assert job.input_json["negative_prompt"] == expected_negative
         assert job.input_json["input_version"] == seeded.episode.episode_version
         assert job.input_json["reservation_id"]
         assert raw.scalars(select(CreditReservation)).one().status == "reserved"
@@ -761,7 +893,8 @@ def test_create_generation_job_accepts_and_normalizes_numbered_legacy_enrich_pro
             idempotency_key="numbered-legacy",
         )
 
-        assert job.input_json["resolved_prompts"]["final"] == _twelve_sections()
+        expected_prompt, _ = _expected_character_sheet(_twelve_sections())
+        assert job.input_json["resolved_prompts"]["final"] == expected_prompt
 
     asyncio.run(scenario())
 
@@ -855,7 +988,13 @@ def test_batch_explicit_prompt_mapping_overrides_invalid_enrich(monkeypatch):
         assert failed == []
         assert len(created) == 1
         assert created[0].input_json["prompt"] == "批量客户端自定义提示词"
-        assert created[0].input_json["resolved_prompts"]["final"] == "批量客户端自定义提示词"
+        expected_prompt, expected_negative = _expected_character_sheet(
+            "批量客户端自定义提示词",
+            aspect="3:4",
+        )
+        assert created[0].input_json["resolved_prompts"]["final"] == expected_prompt
+        assert created[0].input_json["negative_prompt"] == expected_negative
+        assert created[0].input_json["aspect"] == "3:4"
 
     asyncio.run(scenario())
 

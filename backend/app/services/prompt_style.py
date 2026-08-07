@@ -8,6 +8,7 @@ from collections import Counter
 from typing import TypedDict
 
 from app.providers import LLMProvider, get_chat_llm_provider
+from app.schemas.materials import SUBJECT_DESIGN_PROMPT_MARKER
 
 logger = logging.getLogger(__name__)
 
@@ -159,6 +160,48 @@ STYLE_CATALOG: list[dict] = [
     },
 ]
 
+_SUBJECT_DESIGN_STYLE_DIRECTIONS = {
+    "cinematic": (
+        "cinematic visual-development asset sheet, restrained color grading, subtle film grain, "
+        "evenly readable materials"
+    ),
+    "photoreal": (
+        "photorealistic studio-reference asset sheet, natural skin and material texture, "
+        "balanced exposure, high micro-detail"
+    ),
+    "anime": (
+        "high-quality Japanese anime asset sheet, clean linework, controlled cel shading, "
+        "consistent model-sheet rendering"
+    ),
+    "guo-feng": (
+        "contemporary Chinese ink-wash asset sheet, expressive brush textures, layered ink diffusion, "
+        "restrained mineral-color accents"
+    ),
+    "pixar-3d": (
+        "polished stylized 3D animation asset sheet, appealing forms, tactile materials, "
+        "soft studio illumination"
+    ),
+    "cyberpunk": (
+        "cyberpunk visual-development asset sheet, controlled neon color accents, industrial surface "
+        "treatment, crisp silhouettes, consistent turnaround rendering"
+    ),
+    "watercolor": (
+        "expressive watercolor asset sheet, translucent pigment washes, visible cold-press paper grain, "
+        "selective high-detail rendering"
+    ),
+    "comic-book": (
+        "American comic-book asset sheet, confident ink contours, controlled cross-hatching, "
+        "bold spot colors, consistent turnaround rendering"
+    ),
+}
+
+# 这些词描述场景内容而非渲染媒介，会直接否定主体事实或设定图白底构图。
+_SUBJECT_DESIGN_NEGATIVE_CONFLICTS = {
+    "pastoral daylight",
+    "historical costume",
+    "clean empty background",
+}
+
 
 _IMAGE_OPTIMIZE_SYSTEM = """你是一名专业视觉导演和图像提示词设计师。请把用户输入扩展为可直接用于图像生成的高质量 prompt。
 补充主体的稳定外观特征、环境与构图、镜头景别、光线方向与质感、色彩和视觉风格；视觉风格必须服从用户选择的目标风格，不得自行加入冲突的摄影、插画或渲染语汇；不得改变用户明确指定的核心主体、关系或情节。
@@ -207,6 +250,21 @@ def apply_style(style_id: str, prompt: str, target: str) -> tuple[str, str]:
     if style is None or target not in style["target"]:
         return prompt, ""
 
+    if target == "image" and SUBJECT_DESIGN_PROMPT_MARKER in prompt:
+        direction = _SUBJECT_DESIGN_STYLE_DIRECTIONS.get(style_id)
+        if direction is not None:
+            positive = (
+                f"{prompt.rstrip()}\n\n【风格渲染约束】{direction}. "
+                "Apply the selected style only to rendering; preserve every required view, pose, "
+                "composition, clean background, physical relationship, and subject fact above."
+            )
+            negative_parts = [
+                part.strip()
+                for part in str(style["negative_prompt"]).split(",")
+                if part.strip().lower() not in _SUBJECT_DESIGN_NEGATIVE_CONFLICTS
+            ]
+            return positive, ", ".join(negative_parts)
+
     template = str(style["prompt_template"])
     positive = template.replace("{prompt}", prompt) if "{prompt}" in template else f"{prompt}, {template}"
     return positive, str(style["negative_prompt"])
@@ -239,25 +297,29 @@ async def optimize_prompt(
         if raw_prompt
         else f"请生成一段高质量{target}生成提示词"
     )
-    try:
-        llm = provider or get_chat_llm_provider()
-        optimized_prompt = _validate_provider_prompt(
-            await llm.chat(
-                [{"role": "user", "content": user_message}],
-                system=system,
-                temperature=0.6,
-                max_tokens=800,
-            ),
-            raw_prompt,
-        )
-    except Exception as exc:  # noqa: BLE001
-        optimized_prompt = raw_prompt
-        logger.warning(
-            "提示词优化降级为原始 prompt: target=%s style_id=%s error_type=%s",
-            target,
-            style_id,
-            getattr(exc, "error_type", type(exc).__name__),
-        )
+    if target == "image" and SUBJECT_DESIGN_PROMPT_MARKER in raw_prompt:
+        # 主体设定 prompt 已由 enrich 按事实和多视图契约生成；再次自由改写会丢失硬约束。
+        optimized_prompt = raw_prompt.strip()
+    else:
+        try:
+            llm = provider or get_chat_llm_provider()
+            optimized_prompt = _validate_provider_prompt(
+                await llm.chat(
+                    [{"role": "user", "content": user_message}],
+                    system=system,
+                    temperature=0.6,
+                    max_tokens=800,
+                ),
+                raw_prompt,
+            )
+        except Exception as exc:  # noqa: BLE001
+            optimized_prompt = raw_prompt
+            logger.warning(
+                "提示词优化降级为原始 prompt: target=%s style_id=%s error_type=%s",
+                target,
+                style_id,
+                getattr(exc, "error_type", type(exc).__name__),
+            )
 
     resolved_style_id = str(style["id"]) if style is not None else None
     positive, negative = apply_style(resolved_style_id or "", optimized_prompt, target)

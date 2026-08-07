@@ -14,6 +14,13 @@ from app.models.pipeline_job import PipelineJob
 from app.models.pipeline_stage import PipelineStage
 from app.models.subject import Subject
 from app.providers import get_llm_provider
+from app.schemas.materials import (
+    CHARACTER_SHEET_MARKER,
+    SUBJECT_DESIGN_PROMPT_MARKER,
+    SUBJECT_DESIGN_PROMPT_TEMPLATE_VERSION,
+    build_subject_prompt,
+    ensure_subject_prompt_constraints,
+)
 from app.schemas.pipeline_contracts import (
     EnrichOutput,
     complete_json,
@@ -34,24 +41,39 @@ class _ResolvedSubject(TypedDict):
     target_enrich_version: int
     entry: dict[str, object]
 
-# ---- 固定模板 prompt（06 文档第 5 节，4 插槽）----
-_BASE_PROMPT_TEMPLATE = (
-    "为以下主体设计一张清晰可用于短剧视觉资产库的参考图。\n"
-    "主体名称：{subject_name}\n"
-    "主体类型：{subject_type_label}\n"
-    "主体描述：{subject_description}\n"
-    "要求：主体清晰、特征稳定、背景干扰少、适合后续多图参考生成。"
-)
 
-_TYPE_LABELS = {
-    "character": "角色",
-    "scene": "场景",
-    "prop": "道具",
-    "sound": "声音",
-}
+class CurrentDesignPrompt(TypedDict):
+    prompt: str
+    source: str
+    version: int
+    template_version: int
 
 # ---- 扩展 prompt 提示词骨架（06 文档第 12.3 节）----
-_SYSTEM = "你是一名专业产品/角色摄影指导。请将主体的简单描述扩展为专业摄影级生图 prompt。"
+_SYSTEM = (
+    "你是一名电影美术设定与生图提示词专家。请把主体事实整理成可直接用于视觉资产库的"
+    "专业中文提示词，优先保证事实保真、跨视图一致和后续多图复用。成像媒介不得写死；"
+    "主体事实未指定画风时，使用可被调用方风格安全覆盖的中性表述。"
+)
+
+_MIN_ENRICH_PROMPT_LENGTH = 300
+_MIN_ENRICH_SECTION_COUNT = 3
+
+_TYPE_REQUIREMENTS = {
+    "character": (
+        "角色版须覆盖身份事实、面容与视线、发型头饰、服装配色分层、真实体态、道具物理关系、"
+        "时代考据、跨视图一致、白底布光、画面纯净和成像质感。必须原样保留标记"
+        f"“{CHARACTER_SHEET_MARKER}”，并明确单张组合图中左侧主视觉、右侧正面/标准侧面/"
+        "背面三幅完整全身视图。瞬时剧情动作与声音特征不得误当成标准设定姿态。"
+    ),
+    "scene": (
+        "场景版须覆盖空间身份、前中后景布局、固定设施、材质痕迹、时代地域、物理尺度、"
+        "光色连续性、16:9 主视角、画面纯净和镜头参数；默认不出现人物，不使用人物三视图。"
+    ),
+    "prop": (
+        "道具版须覆盖形制尺度、部件结构、材质配色、使用痕迹、功能关系、时代考据、"
+        "主视图加正侧背与细节视图、物理支撑、白底布光和产品摄影参数；默认不出现手和人物。"
+    ),
+}
 
 _USER_TEMPLATE = """主体信息:
 - 名称: {subject_name}
@@ -63,10 +85,13 @@ _USER_TEMPLATE = """主体信息:
 {base_prompt}
 ---
 
-请输出一段 300～600 字的紧凑中文生图 prompt。应尽量覆盖外形结构、明确材质、
-使用痕迹、摆放与物理支撑、时代、构图、写实画风、三点柔光白底、无水印、
-文字降级和摄影参数。可以自由组织文字，不强制标题、编号、段落数量或顺序。
-不要在 JSON 外添加说明。
+当前类型要求:
+{type_requirements}
+
+请输出 700～1200 个中文字符的高信息密度生图 prompt。可以使用清晰的编号段落，但不要为了
+凑字重复内容。严格区分“主体事实”“合理补全”和“禁止项”：不得把原描述未提供的具体年龄、
+族裔、颜色、伤疤、品牌或历史事件写成确定事实；原描述中的互斥选项必须选择一个稳定方案，
+不得在同一张参考图中并列多个版本。必须原样保留标记“{design_prompt_marker}”。不要在 JSON 外添加说明。
 
 输出格式: JSON，字段 final 为完整扩展 prompt 文本。
 输出 JSON:
@@ -78,11 +103,20 @@ _USER_TEMPLATE = """主体信息:
 
 
 def build_base_prompt(subject: Subject) -> str:
-    """构造固定模板 prompt（06 文档第 5 节，enrich 的输入）。"""
-    return _BASE_PROMPT_TEMPLATE.format(
-        subject_name=subject.name,
-        subject_type_label=_TYPE_LABELS.get(subject.type, subject.type),
-        subject_description=subject.description or "",
+    """构造分型详细 prompt，供 enrich 输入与失败降级共同使用。"""
+    return build_subject_prompt(
+        subject.name,
+        subject.type,
+        subject.description or "",
+    )
+
+
+def _prompt_meets_quality_floor(prompt: str) -> bool:
+    """同时校验信息量与结构，避免极短分段文本冒充完整设定提示词。"""
+    normalized = prompt.strip()
+    return (
+        len(normalized) >= _MIN_ENRICH_PROMPT_LENGTH
+        and normalized.count("【") >= _MIN_ENRICH_SECTION_COUNT
     )
 
 
@@ -97,6 +131,8 @@ def _reusable_prompt(
     # 基础模板只是供应商临时失败时的可用降级结果，不能永久阻止后续重试生成。
     if entry.get("source") == "base_fallback":
         return None
+    if entry.get("prompt_template_version") != SUBJECT_DESIGN_PROMPT_TEMPLATE_VERSION:
+        return None
     raw_version = entry.get("enrich_version")
     if not isinstance(raw_version, (int, str)):
         return None
@@ -108,7 +144,8 @@ def _reusable_prompt(
     final = resolved.get("final") if isinstance(resolved, dict) else None
     if entry_version != enrich_version or not isinstance(final, str) or not final.strip():
         return None
-    return normalize_enrich_prompt(final)
+    normalized = normalize_enrich_prompt(final)
+    return normalized if _prompt_meets_quality_floor(normalized) else None
 
 
 def _merge_prompt_history(
@@ -165,6 +202,94 @@ def _episode_snapshot(
         if int(no) in episode_snapshot_by_no
     )
     return {str(no): episode_snapshot_by_no[no] for no in episode_nos}
+
+
+def _entry_version(value: object) -> int | None:
+    if not isinstance(value, (int, str)):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalized_episode_snapshot(value: object) -> dict[str, dict[str, object]] | None:
+    if not isinstance(value, dict):
+        return None
+    normalized: dict[str, dict[str, object]] = {}
+    for raw_no, raw_snapshot in value.items():
+        if not isinstance(raw_snapshot, dict):
+            return None
+        try:
+            episode_no = str(int(raw_no))
+        except (TypeError, ValueError):
+            return None
+        normalized[episode_no] = raw_snapshot
+    return normalized
+
+
+async def load_current_design_prompts(
+    db: AsyncSession,
+    script_id: str,
+    subjects: list[Subject],
+    episode_snapshot_by_no: dict[int, dict[str, object]],
+) -> dict[str, CurrentDesignPrompt]:
+    """批量读取当前版本可用于画布的 enrich 提示词，避免主体列表产生 N+1。"""
+    if not subjects:
+        return {}
+    detail = (
+        await db.execute(
+            select(PipelineStage.detail).where(
+                PipelineStage.script_id == script_id,
+                PipelineStage.stage == "enrich",
+                PipelineStage.status == "done",
+            )
+        )
+    ).scalar_one_or_none()
+    prompt_entries = detail.get("prompts") if isinstance(detail, dict) else None
+    if not isinstance(prompt_entries, dict):
+        return {}
+
+    resolved: dict[str, CurrentDesignPrompt] = {}
+    for subject in subjects:
+        if not should_enrich_subject(subject.type):
+            continue
+        entry = prompt_entries.get(subject.id)
+        if not isinstance(entry, dict):
+            continue
+        subject_version = _entry_version(entry.get("subject_version"))
+        enrich_version = _entry_version(entry.get("enrich_version"))
+        if subject_version != int(subject.subject_version or 1):
+            continue
+        if enrich_version != int(subject.enrich_version or 1):
+            continue
+        stored_snapshot = _normalized_episode_snapshot(entry.get("episode_snapshot"))
+        if stored_snapshot != _episode_snapshot(subject, episode_snapshot_by_no):
+            continue
+        resolved_payload = entry.get("resolved_prompts")
+        final = resolved_payload.get("final") if isinstance(resolved_payload, dict) else None
+        if not isinstance(final, str) or not final.strip():
+            continue
+        source = entry.get("source")
+        template_version = _entry_version(entry.get("prompt_template_version")) or 1
+        if template_version != SUBJECT_DESIGN_PROMPT_TEMPLATE_VERSION:
+            continue
+        try:
+            prompt = ensure_subject_prompt_constraints(
+                normalize_enrich_prompt(final),
+                subject.type,
+            )
+        except ValueError:
+            continue
+        if not _prompt_meets_quality_floor(prompt):
+            continue
+        resolved[subject.id] = {
+            "prompt": prompt,
+            "source": source if isinstance(source, str) and source else "generated",
+            "version": enrich_version,
+            "template_version": template_version,
+        }
+    return resolved
 
 
 async def run_enrich(
@@ -293,11 +418,18 @@ async def run_enrich(
                             subject_type=subject.type,
                             subject_description=subject.description or "",
                             base_prompt=base_prompt,
+                            design_prompt_marker=SUBJECT_DESIGN_PROMPT_MARKER,
+                            type_requirements=_TYPE_REQUIREMENTS.get(
+                                subject.type,
+                                "保持主体事实清晰、特征稳定和画面纯净。",
+                            ),
                         ),
                         EnrichOutput,
                         max_attempts=1,
                     )
                 final_prompt = contract.resolved_prompts.final
+                if not _prompt_meets_quality_floor(final_prompt):
+                    raise ValueError("enrich prompt 信息量不足")
                 source = "generated"
                 fallback_error_type = None
             except Exception as exc:  # noqa: BLE001
@@ -311,9 +443,12 @@ async def run_enrich(
                     fallback_error_type,
                 )
 
+        final_prompt = ensure_subject_prompt_constraints(final_prompt, subject.type)
+
         entry: dict[str, object] = {
             "subject_version": int(subject.subject_version or 1),
             "enrich_version": target_enrich_version,
+            "prompt_template_version": SUBJECT_DESIGN_PROMPT_TEMPLATE_VERSION,
             "resolved_prompts": {"final": final_prompt},
             "episode_snapshot": _episode_snapshot(subject, episode_snapshot_by_no),
             "source": source,

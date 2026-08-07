@@ -47,6 +47,7 @@ from app.schemas.asset import (
 from app.services import review as review_service
 from app.services.audit import best_effort_log as audit_log
 from app.services.audit import log as strict_audit_log
+from app.services.pipeline.enrich import load_current_design_prompts
 
 router = APIRouter()
 
@@ -122,9 +123,27 @@ async def list_subjects(
     """主体列表 — 含 image_entry/audio_entries/pending_candidate_count/review_status_label。"""
     await _load_script_or_403(db, script_id, user, action=Action.READ)
     subjects, total = await asset_crud.list_subjects(db, script_id, limit, offset)
-    episode_map = await asset_crud.get_episode_id_map(db, script_id)
+    episode_map, episode_snapshot_by_no = await asset_crud.get_episode_context_maps(
+        db, script_id
+    )
+    design_prompts = await load_current_design_prompts(
+        db,
+        script_id,
+        subjects,
+        episode_snapshot_by_no,
+    )
+    items: list[SubjectAssetOut] = []
+    for subject in subjects:
+        item = asset_crud.serialize_subject(subject, episode_map)
+        current_prompt = design_prompts.get(subject.id)
+        if current_prompt is not None:
+            item.design_prompt = current_prompt["prompt"]
+            item.design_prompt_source = current_prompt["source"]
+            item.design_prompt_version = current_prompt["version"]
+            item.design_prompt_template_version = current_prompt["template_version"]
+        items.append(item)
     return SubjectListOut(
-        items=[asset_crud.serialize_subject(s, episode_map) for s in subjects],
+        items=items,
         total=total,
     )
 

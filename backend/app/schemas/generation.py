@@ -53,7 +53,7 @@ class CreateJobIn(BaseModel):
     style_id: str | None = Field(None, description="风格 ID")
     model: ImageModelName = Field("banana-2", description="生图模型")
     size: str = Field("2k", description="尺寸，如 2k")
-    aspect: str = Field("16:9", description="比例，如 16:9")
+    aspect: str = Field("auto", description="比例；auto 按主体类型选择，或显式传入 16:9、3:4 等")
     count: int = Field(1, ge=1, le=4, description="生成张数（多张选一）")
 
 
@@ -77,7 +77,7 @@ class BatchCreateJobIn(BaseModel):
     style_id: str | None = Field(None, description="风格 ID")
     model: ImageModelName = Field("banana-2", description="生图模型")
     size: str = Field("2k", description="尺寸，如 2k")
-    aspect: str = Field("16:9", description="比例，如 16:9")
+    aspect: str = Field("auto", description="比例；auto 按主体类型选择，或显式传入 16:9、3:4 等")
     count: int = Field(1, ge=1, le=4, description="每个主体生成张数（多张选一）")
 
 

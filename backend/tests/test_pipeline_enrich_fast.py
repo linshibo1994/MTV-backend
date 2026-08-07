@@ -7,6 +7,12 @@ import pytest
 from pydantic import ValidationError
 
 from app.models.subject import Subject
+from app.schemas.materials import (
+    CHARACTER_SHEET_MARKER,
+    SUBJECT_DESIGN_PROMPT_MARKER,
+    SUBJECT_DESIGN_PROMPT_TEMPLATE_VERSION,
+    build_subject_prompt,
+)
 from app.schemas.pipeline_contracts import EnrichOutput
 from app.services.pipeline import enrich
 
@@ -55,11 +61,16 @@ class _Session:
 
 
 class _DelayProvider:
-    def __init__(self, *, fail: bool = False) -> None:
+    def __init__(self, *, fail: bool = False, prompt: str | None = None) -> None:
         self.calls = 0
         self.active = 0
         self.max_active = 0
         self.fail = fail
+        self.prompt = prompt or build_subject_prompt(
+            "测试角色",
+            "character",
+            "成年人，稳定面容，穿深色外套与长裤",
+        )
 
     async def complete_json(self, system: str, user: str) -> dict:
         del system, user
@@ -72,7 +83,7 @@ class _DelayProvider:
             raise ConnectionError("测试供应商不可用")
         return {
             "schema_version": "pipeline.v1",
-            "resolved_prompts": {"final": "自由排版的摄影提示词，无需十二段标题。"},
+            "resolved_prompts": {"final": self.prompt},
         }
 
 
@@ -142,7 +153,14 @@ def test_enrich_reuses_matching_version_from_pipeline_job_history(monkeypatch) -
         "prompts": {
             "subject-1": {
                 "enrich_version": 4,
-                "resolved_prompts": {"final": "历史摄影提示词"},
+                "prompt_template_version": SUBJECT_DESIGN_PROMPT_TEMPLATE_VERSION,
+                "resolved_prompts": {
+                    "final": build_subject_prompt(
+                        "历史主体",
+                        "character",
+                        "成年人，稳定面容，穿深色外套与长裤",
+                    )
+                },
             }
         }
     }
@@ -168,6 +186,36 @@ def test_enrich_reuses_matching_version_from_pipeline_job_history(monkeypatch) -
     assert detail["prompts"]["subject-2"]["enrich_version"] == 5
 
 
+@pytest.mark.parametrize(
+    "short_prompt",
+    [
+        "一句话式提示词",
+        "【身份】老农【服装】粗布衣【构图】白底三视图",
+    ],
+)
+def test_enrich_short_provider_output_falls_back_to_detailed_template(
+    monkeypatch,
+    short_prompt: str,
+) -> None:
+    provider = _DelayProvider(prompt=short_prompt)
+    stage = AsyncMock()
+    monkeypatch.setattr(enrich, "set_stage", stage)
+
+    result = asyncio.run(
+        enrich.run_enrich(
+            _Session([_subject(1)]),
+            "script-1",
+            provider=provider,
+        )
+    )
+
+    assert result == 1
+    entry = stage.await_args.kwargs["detail"]["prompts"]["subject-1"]
+    assert entry["source"] == "base_fallback"
+    assert SUBJECT_DESIGN_PROMPT_MARKER in entry["resolved_prompts"]["final"]
+    assert CHARACTER_SHEET_MARKER in entry["resolved_prompts"]["final"]
+
+
 def test_enrich_single_subject_failures_fall_back_without_batch_retry(monkeypatch) -> None:
     subjects = [_subject(index) for index in range(4)]
     provider = _DelayProvider(fail=True)
@@ -190,6 +238,8 @@ def test_enrich_single_subject_failures_fall_back_without_batch_retry(monkeypatc
     assert detail["provider_call_count"] == 4
     assert all(
         item["source"] == "base_fallback"
-        and item["resolved_prompts"]["final"].startswith("为以下主体设计")
+        and item["prompt_template_version"] == SUBJECT_DESIGN_PROMPT_TEMPLATE_VERSION
+        and "请为以下角色制作" in item["resolved_prompts"]["final"]
+        and CHARACTER_SHEET_MARKER in item["resolved_prompts"]["final"]
         for item in detail["prompts"].values()
     )

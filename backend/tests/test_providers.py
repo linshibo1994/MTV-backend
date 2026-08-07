@@ -389,6 +389,26 @@ def test_video_factory_routes_gemini_and_rejects_unknown_vendor(monkeypatch) -> 
         get_video_provider("unknown-vendor")
 
 
+@pytest.mark.parametrize("aspect", ["3:4", "2:3", "4:5", "9:16"])
+def test_openai_image_size_maps_portrait_ratios_to_portrait_size(aspect: str) -> None:
+    from app.providers.image_gen_openai import _map_size
+
+    assert _map_size("2k", aspect) == "1024x1536"
+
+
+@pytest.mark.parametrize(
+    ("aspect", "expected"),
+    [("1:1", "1024x1024"), ("16:9", "1536x1024"), ("4:3", "1536x1024")],
+)
+def test_openai_image_size_keeps_square_and_landscape_mappings(
+    aspect: str,
+    expected: str,
+) -> None:
+    from app.providers.image_gen_openai import _map_size
+
+    assert _map_size("2k", aspect) == expected
+
+
 @pytest.mark.asyncio
 async def test_google_image_provider_uses_capability_key_url_and_model(monkeypatch) -> None:
     from app.providers import image_gen_google

@@ -30,14 +30,18 @@ def _map_size(size: str, aspect: str) -> OpenAIImageSize:
     """将画布尺寸/比例映射为 GPT image canonical size 档位。
 
     跨 gpt-image-1/1.5/2 通用；aspect 决定方向：
-    - 9:16 -> 1024x1536（纵版）
+    - 3:4、9:16 等高大于宽的比例 -> 1024x1536（纵版）
     - 1:1  -> 1024x1024（方版）
-    - 16:9 及其它 -> 1536x1024（横版，对应 06 §3.1 横版契约）
+    - 16:9 等宽大于高的比例及无法识别的值 -> 1536x1024（横版）
     """
-    if aspect == "9:16":
-        return "1024x1536"
     if aspect == "1:1":
         return "1024x1024"
+    try:
+        width, height = (float(part) for part in aspect.split(":", 1))
+    except (TypeError, ValueError):
+        return "1536x1024"
+    if width > 0 and height > width:
+        return "1024x1536"
     return "1536x1024"
 
 

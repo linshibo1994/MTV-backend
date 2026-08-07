@@ -137,6 +137,7 @@ async def test_manual_edit_auto_locks_changed_fields_and_checks_version() -> Non
     assert subject.name_locked is True
     assert subject.description_locked is True
     assert subject.subject_version == 2
+    assert subject.enrich_version == 3
 
     with pytest.raises(ConflictError, match="主体版本已变化"):
         await asset_crud.update_subject(
@@ -397,6 +398,7 @@ async def test_accept_suggestion_updates_locked_field_and_version() -> None:
     assert subject.name == "接受后的名称"
     assert subject.name_locked is True
     assert subject.subject_version == 5
+    assert subject.enrich_version == 3
 
 
 async def test_stale_suggestion_cannot_overwrite_new_manual_value() -> None:

@@ -61,6 +61,20 @@ _MAX_CLIENT_IDEMPOTENCY_KEY_LENGTH = 128
 _BATCH_GENERATION_GROUP_SIZE = 2
 _BATCH_GENERATION_GROUP_INTERVAL_SECONDS = 5
 
+_CHARACTER_SHEET_MARKER = "【人物设定图服务端构图硬约束】"
+_CHARACTER_SHEET_PROMPT_TEMPLATE = (
+    f"{_CHARACTER_SHEET_MARKER}生成单张 {{aspect}} 比例、风格统一的人物设定图，所有视图必须位于同一张图内。"
+    "左侧约占 45%，展示人物头肩大图；右侧约占 55%，恰好依次展示正面、标准侧面、背面三幅"
+    "等比例全身视图。四个呈现必须是同一人物，身份、脸部、发型、服装和体型完全一致。"
+    "三幅全身视图从头到脚完整可见、无遮挡、无裁切，使用浅色纯背景。"
+    "画面不得出现文字、标签、水印、边框、分栏线或额外人物。"
+)
+_CHARACTER_SHEET_NEGATIVE_PROMPT = (
+    "额外人物，多余视图，缺少正面视图，缺少标准侧面视图，缺少背面视图，"
+    "头部裁切，脚部裁切，身体遮挡，身份不一致，脸部不一致，发型不一致，"
+    "服装不一致，体型不一致，文字，标签，水印，边框，分栏线"
+)
+
 
 def _batch_dispatch_available_at(batch_started_at: datetime, created_count: int) -> datetime:
     """按供应商实测容量错峰发布批量生图任务。"""
@@ -125,6 +139,37 @@ def _resolve_image_prompt(prompt: str, explicit_style: dict | None) -> tuple[str
         return prompt, str(style["negative_prompt"]), style_id
     positive_prompt, negative_prompt = apply_style(style_id, prompt, "image")
     return positive_prompt, negative_prompt, style_id
+
+
+def _apply_character_sheet_constraints(
+    prompt: str,
+    negative_prompt: str,
+    subject_type: str,
+    aspect: str,
+) -> tuple[str, str]:
+    """为人物生成追加一次固定设定图构图约束，并合并固定负面提示。"""
+    if subject_type != "character":
+        return prompt, negative_prompt
+
+    resolved_prompt = prompt.rstrip()
+    if _CHARACTER_SHEET_MARKER not in resolved_prompt:
+        character_sheet_prompt = _CHARACTER_SHEET_PROMPT_TEMPLATE.format(aspect=aspect)
+        resolved_prompt = f"{resolved_prompt}\n\n{character_sheet_prompt}"
+
+    resolved_negative = negative_prompt.strip()
+    if _CHARACTER_SHEET_NEGATIVE_PROMPT not in resolved_negative:
+        resolved_negative = ", ".join(
+            part for part in (resolved_negative, _CHARACTER_SHEET_NEGATIVE_PROMPT) if part
+        )
+    return resolved_prompt, resolved_negative
+
+
+def _resolve_subject_image_aspect(aspect: str, subject_type: str) -> str:
+    """将 auto 解析为主体类型对应比例，显式比例保持不变。"""
+    normalized = aspect.strip()
+    if normalized.lower() == "auto":
+        return "3:4" if subject_type == "character" else "16:9"
+    return normalized
 
 
 async def _load_material_script(
@@ -510,6 +555,7 @@ async def create_generation_job(
     if subject.type == "sound":
         raise BadRequestError("声音主体不支持生图")
 
+    aspect = _resolve_subject_image_aspect(payload.aspect, subject.type)
     episode_id, input_version, input_client_save_seq, episode_snapshot = (
         await _subject_episode_snapshot(db, script.id, subject)
     )
@@ -537,7 +583,7 @@ async def create_generation_job(
         "subject_id": subject.id,
         "model": payload.model,
         "size": payload.size,
-        "aspect": payload.aspect,
+        "aspect": aspect,
         "count": payload.count,
         "prompt": prompt,
         "resolved_prompt": resolved_prompt,
@@ -559,6 +605,12 @@ async def create_generation_job(
     explicit_style = _validate_image_style(payload.style_id)
     resolved_prompt, negative_prompt, resolved_style_id = _resolve_image_prompt(
         resolved_prompt, explicit_style
+    )
+    resolved_prompt, negative_prompt = _apply_character_sheet_constraints(
+        resolved_prompt,
+        negative_prompt,
+        subject.type,
+        aspect,
     )
 
     # 3. 查用户积分账户
@@ -585,7 +637,7 @@ async def create_generation_job(
             request_hash=req_hash,
             model=payload.model,
             size=payload.size,
-            aspect=payload.aspect,
+            aspect=aspect,
             count=payload.count,
         )
     except IntegrityError:
@@ -720,6 +772,13 @@ async def create_batch_generation_jobs(
             resolved_prompt, negative_prompt, resolved_style_id = _resolve_image_prompt(
                 resolved_prompt, explicit_style
             )
+            aspect = _resolve_subject_image_aspect(payload.aspect, subject.type)
+            resolved_prompt, negative_prompt = _apply_character_sheet_constraints(
+                resolved_prompt,
+                negative_prompt,
+                subject.type,
+                aspect,
+            )
             job = await _create_one_job(
                 db,
                 user=user,
@@ -739,7 +798,7 @@ async def create_batch_generation_jobs(
                 request_hash=batch_hash,
                 model=payload.model,
                 size=payload.size,
-                aspect=payload.aspect,
+                aspect=aspect,
                 count=payload.count,
                 commit=False,
                 dispatch_available_at=_batch_dispatch_available_at(

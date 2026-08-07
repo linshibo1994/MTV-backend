@@ -41,6 +41,10 @@ from app.models.subject import Subject
 from app.models.task_dispatch_outbox import TaskDispatchOutbox
 from app.models.user import User
 from app.schemas import pipeline_contracts
+from app.schemas.materials import (
+    CHARACTER_SHEET_CONSTRAINT,
+    SUBJECT_DESIGN_PROMPT_MARKER,
+)
 from app.schemas.pipeline_contracts import (
     EnrichOutput,
     ExtractOutput,
@@ -230,7 +234,10 @@ def _twelve_sections() -> str:
         "文字渲染降级方案",
         "写实质感锚定",
     ]
-    return "\n".join(f"【{label}】有效内容" for label in labels)
+    return "\n".join(
+        f"【{label}】有效内容，包含稳定特征、材质、物理关系、构图与布光约束。"
+        for label in labels
+    )
 
 
 def _numbered_twelve_sections() -> str:
@@ -777,7 +784,10 @@ def test_enrich_stage_persists_canonical_prompt_from_numbered_provider_output(mo
     assert result == 1
     assert (
         set_stage.await_args.kwargs["detail"]["prompts"]["subject-1"]["resolved_prompts"]["final"]
-        == _twelve_sections()
+        == (
+            f"{SUBJECT_DESIGN_PROMPT_MARKER}\n"
+            f"{_twelve_sections()}\n{CHARACTER_SHEET_CONSTRAINT}"
+        )
     )
 
 
