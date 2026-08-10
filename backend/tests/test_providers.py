@@ -482,6 +482,16 @@ async def test_google_image_provider_rejects_unsupported_image_size(monkeypatch)
         )
 
 
+def test_bailian_prompt_extension_only_skips_precomposed_style_constraints() -> None:
+    from app.providers.image_gen_bailian import _should_extend_prompt
+
+    assert _should_extend_prompt("一只纸飞机") is True
+    assert (
+        _should_extend_prompt("主体事实：一只纸飞机\n\n【风格渲染约束】赛博朋克风格")
+        is False
+    )
+
+
 @pytest.mark.asyncio
 async def test_bailian_qwen_image_2_uses_sync_multimodal_api(monkeypatch) -> None:
     from app.providers import image_gen_bailian
@@ -536,8 +546,9 @@ async def test_bailian_qwen_image_2_uses_sync_multimodal_api(monkeypatch) -> Non
     download = AsyncMock(return_value=ImageResult(data=b"image", mime_type="image/png"))
     monkeypatch.setattr(provider, "_download", download)
 
+    styled_prompt = "主体事实：一只纸飞机\n\n【风格渲染约束】赛博朋克风格"
     result = await provider.generate(
-        "一只纸飞机",
+        styled_prompt,
         "ignored",
         "2k",
         "1:1",
@@ -547,8 +558,11 @@ async def test_bailian_qwen_image_2_uses_sync_multimodal_api(monkeypatch) -> Non
     assert result[0].data == b"image"
     assert calls["post"]["url"].endswith("/api/v1/services/aigc/multimodal-generation/generation")
     assert "X-DashScope-Async" not in calls["post"]["headers"]
-    assert calls["post"]["json"]["input"]["messages"][0]["content"] == [{"text": "一只纸飞机"}]
+    assert calls["post"]["json"]["input"]["messages"][0]["content"] == [
+        {"text": styled_prompt}
+    ]
     assert calls["post"]["json"]["parameters"]["size"] == "1024*1024"
+    assert calls["post"]["json"]["parameters"]["prompt_extend"] is False
     assert calls["post"]["json"]["parameters"]["negative_prompt"] == "写实摄影"
     download.assert_awaited_once_with(
         "https://oss.aliyuncs.com/result.png",
@@ -605,8 +619,9 @@ async def test_bailian_qwen_image_legacy_passes_negative_prompt(monkeypatch) -> 
         AsyncMock(return_value=ImageResult(data=b"image", mime_type="image/png")),
     )
 
+    styled_prompt = "主体事实：一只纸飞机\n\n【风格渲染约束】赛博朋克风格"
     result = await provider.generate(
-        "一只纸飞机",
+        styled_prompt,
         "ignored",
         "2k",
         "1:1",
@@ -616,7 +631,9 @@ async def test_bailian_qwen_image_legacy_passes_negative_prompt(monkeypatch) -> 
     assert result[0].data == b"image"
     assert calls["post"]["url"].endswith("/api/v1/services/aigc/text2image/image-synthesis")
     assert calls["post"]["headers"]["X-DashScope-Async"] == "enable"
+    assert calls["post"]["json"]["input"]["prompt"] == styled_prompt
     assert calls["post"]["json"]["input"]["negative_prompt"] == "写实摄影"
+    assert calls["post"]["json"]["parameters"]["prompt_extend"] is False
 
 
 @pytest.mark.asyncio

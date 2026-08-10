@@ -7,16 +7,13 @@ import pytest
 from pydantic import ValidationError
 
 from app.api.v1.generation_jobs import _sanitize_input_json
-from app.core.errors import ConflictError
+from app.core.errors import BadRequestError, ConflictError
 from app.schemas.generation import BatchCreateJobIn, CreateJobIn
-from app.schemas.materials import (
-    SUBJECT_DESIGN_PROMPT_MARKER,
-    build_subject_prompt,
-)
+from app.schemas.materials import build_subject_prompt
 from app.schemas.prompt_style import PromptOptimizeIn
 from app.schemas.video import VideoJobBatchCreateIn, VideoJobCreateIn
 from app.services import prompt_style
-from app.services.prompt_style import apply_style, optimize_prompt
+from app.services.prompt_style import apply_style, optimize_prompt, strip_image_style
 
 
 def test_apply_style_with_placeholder() -> None:
@@ -64,16 +61,155 @@ def test_apply_style_uses_asset_safe_cyberpunk_direction_for_subject_design() ->
         "中国乡村老年男性，穿历史时期粗布衣，使用纯净白底设定图",
     )
 
-    positive, negative = apply_style("cyberpunk", raw_prompt, "image")
+    positive, negative = apply_style(
+        "cyberpunk",
+        raw_prompt,
+        "image",
+        subject_type="character",
+    )
 
     assert raw_prompt in positive
-    assert "cyberpunk visual-development asset sheet" in positive
+    assert "unmistakable cyberpunk visual-development rendering" in positive
+    assert "dominant cyan-magenta neon color language" in positive
+    assert "not a mostly photorealistic image with token neon accents" in positive
+    assert "character model sheet" in positive
+    assert "consistent turnaround rendering" in positive
     assert "dense cyberpunk world" not in positive
     assert "preserve every required view" in positive
     assert "clean empty background" not in negative
     assert "historical costume" not in negative
     assert "pastoral daylight" not in negative
     assert "low detail" in negative
+
+
+def test_apply_style_replaces_existing_style_for_real_scene_and_is_idempotent() -> None:
+    raw_prompt = build_subject_prompt(
+        "贫困乡村院落",
+        "scene",
+        "20 世纪末中国北方乡村土坯院落，白天，破旧木门和泥土地面，纪实摄影写实风格",
+    )
+    prompt_with_old_styles = (
+        f"{raw_prompt}\n\n【风格渲染约束】photorealistic studio rendering."
+        "\n\n【风格渲染约束】soft watercolor illustration."
+    )
+
+    first = apply_style(
+        "cyberpunk",
+        prompt_with_old_styles,
+        "image",
+        subject_type="background",
+    )
+    second = apply_style(
+        "cyberpunk",
+        first[0],
+        "image",
+        subject_type="scene",
+    )
+
+    assert first == second
+    assert first[0].count("【风格渲染约束】") == 1
+    style_section = first[0].split("【风格渲染约束】", 1)[1].lower()
+    assert "unmistakable cyberpunk visual-development rendering" in style_section
+    assert "full-frame environment concept scene" in style_section
+    assert "spatial layout" in style_section
+    assert "architecture" in style_section
+    for character_only_term in ("turnaround", "pose", "clean background"):
+        assert character_only_term not in style_section
+
+
+def test_resolve_image_prompt_retypes_legacy_wrapped_scene_when_switching_style() -> None:
+    from app.services import generation as generation_service
+
+    raw_prompt = build_subject_prompt(
+        "贫困乡村院落",
+        "scene",
+        "20 世纪末中国北方乡村土坯院落，保留土坯和木材的真实材质",
+    )
+    old_style = prompt_style.find_style("photoreal")
+    selected_style = prompt_style.find_style("cyberpunk")
+    assert old_style is not None
+    assert selected_style is not None
+    legacy_wrapped = str(old_style["prompt_template"]).replace("{prompt}", raw_prompt)
+
+    positive, negative, style_id = generation_service._resolve_image_prompt(
+        legacy_wrapped,
+        selected_style,
+        subject_type="scene",
+    )
+
+    assert style_id == "cyberpunk"
+    assert positive.count("【风格渲染约束】") == 1
+    assert "photorealistic editorial photograph" not in positive
+    assert "dense cyberpunk world" not in positive
+    assert raw_prompt in positive
+    style_section = positive.split("【风格渲染约束】", 1)[1].lower()
+    assert "full-frame environment concept scene" in style_section
+    for character_only_term in ("turnaround", "pose", "clean background"):
+        assert character_only_term not in style_section
+    assert negative
+
+
+def test_resolve_image_prompt_replaces_legacy_style_for_plain_prompt() -> None:
+    from app.services import generation as generation_service
+
+    raw_prompt = "一盏表面锈蚀的旧煤油灯，产品静物构图"
+    old_prompt, _ = apply_style("anime", raw_prompt, "image")
+    selected_style = prompt_style.find_style("cyberpunk")
+    assert selected_style is not None
+
+    positive, negative, style_id = generation_service._resolve_image_prompt(
+        old_prompt,
+        selected_style,
+        subject_type="prop",
+    )
+
+    expected = str(selected_style["prompt_template"]).replace("{prompt}", raw_prompt)
+    assert positive == expected
+    assert "high-quality Japanese anime" not in positive
+    assert negative == selected_style["negative_prompt"]
+    assert style_id == "cyberpunk"
+
+
+def test_apply_style_uses_product_direction_for_prop() -> None:
+    raw_prompt = build_subject_prompt(
+        "旧煤油灯",
+        "prop",
+        "20 世纪末乡村使用的铁皮煤油灯，表面锈蚀，玻璃灯罩有烟熏痕迹",
+    )
+
+    positive, negative = apply_style(
+        "anime",
+        raw_prompt,
+        "image",
+        subject_type="prop",
+    )
+
+    assert "high-quality Japanese anime rendering" in positive
+    assert "product-design reference sheet" in positive
+    assert "multi-view object rendering" in positive
+    assert "character model sheet" not in positive
+    assert negative.startswith("photorealistic")
+
+
+def test_strip_image_style_removes_legacy_wrapper_and_style_section() -> None:
+    raw_prompt = build_subject_prompt(
+        "旧煤油灯",
+        "prop",
+        "20 世纪末乡村使用的铁皮煤油灯，表面锈蚀",
+    )
+    styled_prompt, _ = apply_style(
+        "anime",
+        raw_prompt,
+        "image",
+        subject_type="prop",
+    )
+    legacy_style = prompt_style.find_style("photoreal")
+    assert legacy_style is not None
+    legacy_wrapped = str(legacy_style["prompt_template"]).replace(
+        "{prompt}", styled_prompt
+    )
+
+    assert strip_image_style(legacy_wrapped) == raw_prompt
 
 
 @pytest.mark.asyncio
@@ -159,11 +295,71 @@ async def test_optimize_subject_design_prompt_preserves_full_contract() -> None:
     )
 
     provider.chat.assert_not_awaited()
-    assert SUBJECT_DESIGN_PROMPT_MARKER in result["optimized_prompt"]
-    assert raw_prompt in result["optimized_prompt"]
+    assert result["optimized_prompt"] == raw_prompt
+    assert result["original_prompt"] == raw_prompt
     assert "【6 道具与物理关系】" in result["optimized_prompt"]
     assert "真人摄影写实" not in raw_prompt
-    assert result["negative_prompt"].startswith("photorealistic")
+    assert result["negative_prompt"] == ""
+    assert result["style_id"] == "anime"
+    assert result["style_name"] == "日式动漫"
+
+
+@pytest.mark.asyncio
+async def test_optimize_subject_design_prompt_removes_baked_style_section() -> None:
+    raw_prompt = build_subject_prompt("老农", "character", "中国乡村老年男性")
+    styled_prompt, _ = apply_style(
+        "photoreal",
+        raw_prompt,
+        "image",
+        subject_type="character",
+    )
+    provider = SimpleNamespace(chat=AsyncMock(return_value="不应调用供应商"))
+
+    result = await optimize_prompt(
+        styled_prompt,
+        "cyberpunk",
+        "image",
+        provider=provider,
+    )
+
+    provider.chat.assert_not_awaited()
+    assert result["optimized_prompt"] == raw_prompt
+    assert result["original_prompt"] == raw_prompt
+    assert "【风格渲染约束】" not in result["optimized_prompt"]
+    assert result["negative_prompt"] == ""
+    assert result["style_id"] == "cyberpunk"
+
+
+@pytest.mark.asyncio
+async def test_structured_style_handles_mixed_legacy_wrapper_and_preserves_next_constraint() -> None:
+    raw_prompt = build_subject_prompt(
+        "贫困乡村院落",
+        "scene",
+        "20 世纪末中国北方乡村土坯院落",
+    )
+    mixed_inner = (
+        f"{raw_prompt}\n\n【风格渲染约束】旧版写实摄影风格。"
+        "\n【额外硬约束】必须保留土坯墙和破旧木门。"
+    )
+    legacy_style = prompt_style.find_style("photoreal")
+    assert legacy_style is not None
+    mixed_prompt = str(legacy_style["prompt_template"]).replace("{prompt}", mixed_inner)
+
+    positive, _ = apply_style(
+        "cyberpunk",
+        mixed_prompt,
+        "image",
+        subject_type="scene",
+    )
+    optimized = await optimize_prompt(mixed_prompt, "cyberpunk", "image")
+
+    assert positive.count("【风格渲染约束】") == 1
+    assert "photorealistic editorial photograph" not in positive
+    assert "【额外硬约束】必须保留土坯墙和破旧木门。" in positive
+    assert "【风格渲染约束】" not in optimized["optimized_prompt"]
+    assert "photorealistic editorial photograph" not in optimized["optimized_prompt"]
+    assert "【额外硬约束】必须保留土坯墙和破旧木门。" in optimized["optimized_prompt"]
+    assert optimized["original_prompt"] == optimized["optimized_prompt"]
 
 
 @pytest.mark.asyncio
@@ -211,10 +407,15 @@ async def test_prompt_styles_api(client) -> None:
 
 def test_generation_schemas_accept_style_id() -> None:
     single = CreateJobIn(material_id="material-1", subject_id="subject-1", style_id="cinematic")
-    batch = BatchCreateJobIn(material_id="material-1", style_id="anime")
+    batch = BatchCreateJobIn(
+        material_id="material-1",
+        style_id="anime",
+        style_ids={"subject-1": "cyberpunk", "subject-2": None},
+    )
 
     assert single.style_id == "cinematic"
     assert batch.style_id == "anime"
+    assert batch.style_ids == {"subject-1": "cyberpunk", "subject-2": None}
 
 
 def test_video_schemas_accept_style_id() -> None:
@@ -350,6 +551,307 @@ async def test_generation_jobs_persist_style_id_and_include_it_in_idempotency(
             payload=batch_payload.model_copy(update={"style_id": "cinematic"}),
             idempotency_key="style-batch",
         )
+
+
+@pytest.mark.asyncio
+async def test_single_generation_applies_scene_specific_cyberpunk_style(monkeypatch) -> None:
+    from app.services import generation as generation_service
+    from tests.test_generation import _AsyncSessionAdapter, _create_payload, _make_db, _seed
+
+    _, raw = _make_db()
+    seeded = _seed(raw, subject_type="scene")
+    monkeypatch.setattr(generation_service, "enqueue_task", AsyncMock())
+    scene_prompt = build_subject_prompt(
+        "贫困乡村院落",
+        "scene",
+        "20 世纪末中国北方乡村土坯院落，白天，破旧木门和泥土地面，纪实摄影写实风格",
+    )
+
+    job = await generation_service.create_generation_job(
+        _AsyncSessionAdapter(raw),
+        user=seeded.user,
+        payload=_create_payload(
+            prompt=scene_prompt,
+            style_id="cyberpunk",
+            aspect="auto",
+        ),
+        idempotency_key="single-scene-cyberpunk",
+    )
+
+    final_prompt = job.input_json["resolved_prompts"]["final"]
+    style_section = final_prompt.split("【风格渲染约束】", 1)[1].lower()
+    assert final_prompt.count("【风格渲染约束】") == 1
+    assert "full-frame environment concept scene" in style_section
+    assert "unmistakable cyberpunk visual-development rendering" in style_section
+    for character_only_term in ("turnaround", "pose", "clean background"):
+        assert character_only_term not in style_section
+    assert job.input_json["style_id"] == "cyberpunk"
+    assert job.input_json["negative_prompt"]
+    assert job.input_json["aspect"] == "16:9"
+
+
+@pytest.mark.asyncio
+async def test_batch_generation_applies_per_subject_style_mapping_and_is_idempotent(
+    monkeypatch,
+) -> None:
+    from app.models.subject import Subject
+    from app.services import generation as generation_service
+    from tests.test_generation import _AsyncSessionAdapter, _make_db, _seed
+
+    _, raw = _make_db()
+    seeded = _seed(raw)
+    extra_subjects = [
+        Subject(
+            id="subject-scene",
+            script_id=seeded.script.id,
+            type="scene",
+            name="乡村院落",
+            description="20 世纪末中国北方乡村土坯院落",
+            episode_nos=[1],
+            review_status="not_designed",
+        ),
+        Subject(
+            id="subject-prop-none",
+            script_id=seeded.script.id,
+            type="prop",
+            name="旧煤油灯",
+            description="铁皮煤油灯，表面锈蚀",
+            episode_nos=[1],
+            review_status="not_designed",
+        ),
+        Subject(
+            id="subject-prop-global",
+            script_id=seeded.script.id,
+            type="prop",
+            name="旧瓷碗",
+            description="有缺口和使用痕迹的白瓷碗",
+            episode_nos=[1],
+            review_status="not_designed",
+        ),
+    ]
+    raw.add_all(extra_subjects)
+    raw.commit()
+    db = _AsyncSessionAdapter(raw)
+    monkeypatch.setattr(generation_service, "enqueue_task", AsyncMock())
+
+    no_style_base_prompt = build_subject_prompt(
+        "旧煤油灯",
+        "prop",
+        "铁皮煤油灯，表面锈蚀",
+    )
+    no_style_styled_prompt, _ = apply_style(
+        "anime",
+        no_style_base_prompt,
+        "image",
+        subject_type="prop",
+    )
+    legacy_style = prompt_style.find_style("photoreal")
+    assert legacy_style is not None
+    no_style_legacy_prompt = str(legacy_style["prompt_template"]).replace(
+        "{prompt}", no_style_styled_prompt
+    )
+    prompts = {
+        seeded.subject.id: build_subject_prompt("老农", "character", "中国乡村老年男性"),
+        "subject-scene": build_subject_prompt(
+            "乡村院落",
+            "scene",
+            "20 世纪末中国北方乡村土坯院落",
+        ),
+        "subject-prop-none": no_style_legacy_prompt,
+        "subject-prop-global": build_subject_prompt(
+            "旧瓷碗",
+            "prop",
+            "有缺口和使用痕迹的白瓷碗",
+        ),
+    }
+    payload = BatchCreateJobIn(
+        material_id=seeded.material.id,
+        subject_ids=list(prompts),
+        prompts=prompts,
+        style_id="cinematic",
+        style_ids={
+            seeded.subject.id: "anime",
+            "subject-scene": "cyberpunk",
+            "subject-prop-none": None,
+        },
+        count=1,
+    )
+
+    created, skipped, failed = await generation_service.create_batch_generation_jobs(
+        db,
+        user=seeded.user,
+        payload=payload,
+        idempotency_key="batch-subject-style-map",
+    )
+
+    assert skipped == []
+    assert failed == []
+    by_subject = {job.subject_id: job for job in created}
+    assert by_subject[seeded.subject.id].input_json["style_id"] == "anime"
+    assert "character model sheet" in by_subject[seeded.subject.id].input_json[
+        "resolved_prompts"
+    ]["final"]
+    scene_job = by_subject["subject-scene"]
+    assert scene_job.input_json["style_id"] == "cyberpunk"
+    assert "full-frame environment concept scene" in scene_job.input_json[
+        "resolved_prompts"
+    ]["final"]
+    no_style_job = by_subject["subject-prop-none"]
+    assert no_style_job.input_json["style_id"] is None
+    no_style_final_prompt = no_style_job.input_json["resolved_prompts"]["final"]
+    assert no_style_final_prompt == no_style_base_prompt
+    assert "【风格渲染约束】" not in no_style_final_prompt
+    assert "photorealistic editorial photograph" not in no_style_final_prompt
+    fallback_job = by_subject["subject-prop-global"]
+    assert fallback_job.input_json["style_id"] == "cinematic"
+    assert "product-design reference sheet" in fallback_job.input_json[
+        "resolved_prompts"
+    ]["final"]
+
+    original_find_style = generation_service.find_style
+    monkeypatch.setattr(generation_service, "find_style", lambda _style_id: None)
+    replayed, replayed_skipped, replayed_failed = (
+        await generation_service.create_batch_generation_jobs(
+            db,
+            user=seeded.user,
+            payload=payload,
+            idempotency_key="batch-subject-style-map",
+        )
+    )
+    assert [job.job_id for job in replayed] == [job.job_id for job in created]
+    assert replayed_skipped == skipped
+    assert replayed_failed == failed
+    monkeypatch.setattr(generation_service, "find_style", original_find_style)
+
+    with pytest.raises(ConflictError):
+        await generation_service.create_batch_generation_jobs(
+            db,
+            user=seeded.user,
+            payload=payload.model_copy(
+                update={
+                    "style_ids": {
+                        **(payload.style_ids or {}),
+                        "subject-scene": "watercolor",
+                    }
+                }
+            ),
+            idempotency_key="batch-subject-style-map",
+        )
+
+
+@pytest.mark.asyncio
+async def test_batch_generation_api_returns_per_subject_styles(client, monkeypatch) -> None:
+    import json
+
+    from app.core.auth import get_current_user
+    from app.core.database import get_db
+    from app.models.subject import Subject
+    from app.services import generation as generation_service
+    from tests.test_generation import _AsyncSessionAdapter, _make_db, _seed
+
+    _, raw = _make_db()
+    seeded = _seed(raw)
+    no_style_subject = Subject(
+        id="subject-api-no-style",
+        script_id=seeded.script.id,
+        type="prop",
+        name="旧煤油灯",
+        description="铁皮煤油灯，表面锈蚀",
+        episode_nos=[1],
+        review_status="not_designed",
+    )
+    raw.add(no_style_subject)
+    raw.commit()
+    db = _AsyncSessionAdapter(raw)
+    monkeypatch.setattr(generation_service, "enqueue_task", AsyncMock())
+
+    async def override_db():
+        yield db
+
+    async def override_user():
+        yield seeded.user
+
+    client._app.dependency_overrides[get_db] = override_db
+    client._app.dependency_overrides[get_current_user] = override_user
+
+    response = await client.post(
+        "/v3api/generation-jobs/batch",
+        headers={"Idempotency-Key": "batch-style-api-contract"},
+        json={
+            "material_id": seeded.material.id,
+            "subject_ids": [seeded.subject.id, no_style_subject.id],
+            "prompts": {
+                seeded.subject.id: build_subject_prompt(
+                    "老农",
+                    "character",
+                    "中国乡村老年男性",
+                ),
+                no_style_subject.id: build_subject_prompt(
+                    "旧煤油灯",
+                    "prop",
+                    "铁皮煤油灯，表面锈蚀",
+                ),
+            },
+            "style_id": "cinematic",
+            "style_ids": {
+                seeded.subject.id: "anime",
+                no_style_subject.id: None,
+            },
+        },
+    )
+
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert body["skipped"] == []
+    assert body["failed"] == []
+    by_subject = {job["subject_id"]: job for job in body["created"]}
+    styled_input = json.loads(by_subject[seeded.subject.id]["input_json"])
+    assert styled_input["style_id"] == "anime"
+    assert "【风格渲染约束】" in styled_input["resolved_prompts"]["final"]
+    no_style_input = json.loads(by_subject[no_style_subject.id]["input_json"])
+    assert no_style_input["style_id"] is None
+    assert "【风格渲染约束】" not in no_style_input["resolved_prompts"]["final"]
+
+
+@pytest.mark.asyncio
+async def test_batch_generation_rejects_invalid_style_mapping_before_creating_jobs() -> None:
+    from sqlalchemy import select
+
+    from app.models.generation_batch_request import GenerationBatchRequest
+    from app.models.generation_job import GenerationJob
+    from app.services import generation as generation_service
+    from tests.test_generation import _AsyncSessionAdapter, _make_db, _seed
+
+    _, raw = _make_db()
+    seeded = _seed(raw)
+    db = _AsyncSessionAdapter(raw)
+
+    with pytest.raises(BadRequestError, match="style_ids 包含非目标主体"):
+        await generation_service.create_batch_generation_jobs(
+            db,
+            user=seeded.user,
+            payload=BatchCreateJobIn(
+                material_id=seeded.material.id,
+                subject_ids=[seeded.subject.id],
+                style_ids={"subject-other": "anime"},
+            ),
+            idempotency_key="batch-style-map-unknown-subject",
+        )
+
+    with pytest.raises(BadRequestError, match="未知风格"):
+        await generation_service.create_batch_generation_jobs(
+            db,
+            user=seeded.user,
+            payload=BatchCreateJobIn(
+                material_id=seeded.material.id,
+                subject_ids=[seeded.subject.id],
+                style_ids={seeded.subject.id: "missing-style"},
+            ),
+            idempotency_key="batch-style-map-unknown-style",
+        )
+
+    assert raw.scalars(select(GenerationJob)).all() == []
+    assert raw.scalars(select(GenerationBatchRequest)).all() == []
 
 
 @pytest.mark.asyncio

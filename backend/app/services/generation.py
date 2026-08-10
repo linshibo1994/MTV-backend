@@ -49,10 +49,16 @@ from app.models.script import Script
 from app.models.subject import Subject
 from app.models.user import User
 from app.schemas.generation import BatchCreateJobIn, CreateJobIn
+from app.schemas.materials import SUBJECT_DESIGN_PROMPT_MARKER
 from app.schemas.pipeline_contracts import normalize_enrich_prompt
 from app.services.credits import reserve
 from app.services.pipeline.enrich import build_base_prompt
-from app.services.prompt_style import apply_style, find_style, get_styles
+from app.services.prompt_style import (
+    apply_style,
+    find_style,
+    get_styles,
+    strip_image_style,
+)
 from app.services.task_dispatch import enqueue_task
 
 _SINGLE_IDEMPOTENCY_NAMESPACE = "single:"
@@ -105,26 +111,57 @@ def _validate_image_style(style_id: str | None) -> dict | None:
     return style
 
 
-def _is_style_template_applied(prompt: str, style: dict) -> bool:
-    """仅按模板固定边界识别已包裹 prompt，避免用模糊关键词误判。"""
+def _unwrap_style_template(prompt: str, style: dict) -> str | None:
+    """精确解包已应用的目录模板；不使用模糊关键词猜测。"""
     template = str(style["prompt_template"])
     if "{prompt}" not in template:
         suffix = f", {template}"
-        return prompt.endswith(suffix) and bool(prompt[: -len(suffix)].strip())
+        if not prompt.endswith(suffix):
+            return None
+        inner = prompt[: -len(suffix)].strip()
+        return inner or None
 
     prefix, suffix = template.split("{prompt}", 1)
     if not prefix and not suffix:
-        return False
+        return None
     if not prompt.startswith(prefix) or not prompt.endswith(suffix):
-        return False
+        return None
     end = len(prompt) - len(suffix) if suffix else len(prompt)
-    return bool(prompt[len(prefix) : end].strip())
+    inner = prompt[len(prefix) : end].strip()
+    return inner or None
 
 
-def _resolve_image_prompt(prompt: str, explicit_style: dict | None) -> tuple[str, str, str | None]:
+def _is_style_template_applied(prompt: str, style: dict) -> bool:
+    """仅按模板固定边界识别已包裹 prompt，避免用模糊关键词误判。"""
+    return _unwrap_style_template(prompt, style) is not None
+
+
+def _unwrap_unique_image_style_template(prompt: str, preferred_style: dict) -> str:
+    """结构化资产兼容旧风格包装；优先解包当前风格，否则要求目录唯一匹配。"""
+    if inner := _unwrap_style_template(prompt, preferred_style):
+        return inner
+    matches = [
+        inner
+        for candidate in get_styles("image")
+        if (inner := _unwrap_style_template(prompt, candidate)) is not None
+    ]
+    return matches[0] if len(matches) == 1 else prompt
+
+
+def _resolve_image_prompt(
+    prompt: str,
+    explicit_style: dict | None,
+    *,
+    subject_type: str | None = None,
+    infer_embedded_style: bool = True,
+) -> tuple[str, str, str | None]:
     """解析并应用一次图片风格；兼容前端只提交完整风格 prompt 的情况。"""
     style = explicit_style
-    if style is None:
+    if style is not None:
+        prompt = strip_image_style(prompt)
+    elif not infer_embedded_style:
+        return strip_image_style(prompt), "", None
+    if style is None and infer_embedded_style:
         matches = [
             candidate
             for candidate in get_styles("image")
@@ -135,9 +172,23 @@ def _resolve_image_prompt(prompt: str, explicit_style: dict | None) -> tuple[str
         return prompt, "", None
 
     style_id = str(style["id"])
+    if SUBJECT_DESIGN_PROMPT_MARKER in prompt:
+        base_prompt = _unwrap_unique_image_style_template(prompt, style)
+        positive_prompt, negative_prompt = apply_style(
+            style_id,
+            base_prompt,
+            "image",
+            subject_type=subject_type,
+        )
+        return positive_prompt, negative_prompt, style_id
     if _is_style_template_applied(prompt, style):
         return prompt, str(style["negative_prompt"]), style_id
-    positive_prompt, negative_prompt = apply_style(style_id, prompt, "image")
+    positive_prompt, negative_prompt = apply_style(
+        style_id,
+        prompt,
+        "image",
+        subject_type=subject_type,
+    )
     return positive_prompt, negative_prompt, style_id
 
 
@@ -604,7 +655,9 @@ async def create_generation_job(
 
     explicit_style = _validate_image_style(payload.style_id)
     resolved_prompt, negative_prompt, resolved_style_id = _resolve_image_prompt(
-        resolved_prompt, explicit_style
+        resolved_prompt,
+        explicit_style,
+        subject_type=subject.type,
     )
     resolved_prompt, negative_prompt = _apply_character_sheet_constraints(
         resolved_prompt,
@@ -667,7 +720,7 @@ async def create_batch_generation_jobs(
 
     material, script = await _load_material_script(db, payload.material_id)
     await check_script_access(db, user, script, action=Action.RUN_AI)
-    batch_payload = {
+    batch_payload: dict[str, object] = {
         "material_id": material.id,
         "script_id": script.id,
         "subject_ids": list(payload.subject_ids) if payload.subject_ids else None,
@@ -679,6 +732,8 @@ async def create_batch_generation_jobs(
     }
     if payload.style_id is not None:
         batch_payload["style_id"] = payload.style_id
+    if payload.style_ids is not None:
+        batch_payload["style_ids"] = payload.style_ids
     batch_hash = _request_hash(batch_payload)
     existing_batch = await _find_batch_request(db, user.user_id, idempotency_key)
     if existing_batch is not None:
@@ -724,6 +779,13 @@ async def create_batch_generation_jobs(
     unknown_prompt_ids = set(payload.prompts or {}) - target_subject_ids
     if unknown_prompt_ids:
         raise BadRequestError("prompts 包含非目标主体")
+    unknown_style_ids = set(payload.style_ids or {}) - target_subject_ids
+    if unknown_style_ids:
+        raise BadRequestError("style_ids 包含非目标主体")
+    explicit_styles_by_subject = {
+        subject_id: _validate_image_style(style_id)
+        for subject_id, style_id in (payload.style_ids or {}).items()
+    }
 
     batch = await _create_batch_request(
         db,
@@ -769,8 +831,17 @@ async def create_batch_generation_jobs(
                     int(subject.subject_version or 1),
                     int(subject.enrich_version or 1),
                 )
+            has_subject_style_override = subject.id in explicit_styles_by_subject
+            subject_style = (
+                explicit_styles_by_subject[subject.id]
+                if has_subject_style_override
+                else explicit_style
+            )
             resolved_prompt, negative_prompt, resolved_style_id = _resolve_image_prompt(
-                resolved_prompt, explicit_style
+                resolved_prompt,
+                subject_style,
+                subject_type=subject.type,
+                infer_embedded_style=not has_subject_style_override,
             )
             aspect = _resolve_subject_image_aspect(payload.aspect, subject.type)
             resolved_prompt, negative_prompt = _apply_character_sheet_constraints(

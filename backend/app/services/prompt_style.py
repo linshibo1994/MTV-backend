@@ -160,38 +160,73 @@ STYLE_CATALOG: list[dict] = [
     },
 ]
 
-_SUBJECT_DESIGN_STYLE_DIRECTIONS = {
+_SUBJECT_DESIGN_STYLE_CORES = {
     "cinematic": (
-        "cinematic visual-development asset sheet, restrained color grading, subtle film grain, "
+        "cinematic visual-development rendering, restrained color grading, subtle film grain, "
         "evenly readable materials"
     ),
     "photoreal": (
-        "photorealistic studio-reference asset sheet, natural skin and material texture, "
+        "photorealistic high-detail rendering, natural skin and material texture, "
         "balanced exposure, high micro-detail"
     ),
     "anime": (
-        "high-quality Japanese anime asset sheet, clean linework, controlled cel shading, "
-        "consistent model-sheet rendering"
+        "high-quality Japanese anime rendering, clean linework, controlled cel shading, "
+        "consistent production-design detail"
     ),
     "guo-feng": (
-        "contemporary Chinese ink-wash asset sheet, expressive brush textures, layered ink diffusion, "
+        "contemporary Chinese ink-wash rendering, expressive brush textures, layered ink diffusion, "
         "restrained mineral-color accents"
     ),
     "pixar-3d": (
-        "polished stylized 3D animation asset sheet, appealing forms, tactile materials, "
-        "soft studio illumination"
+        "polished stylized 3D animation rendering, appealing forms, tactile materials, "
+        "soft global illumination"
     ),
     "cyberpunk": (
-        "cyberpunk visual-development asset sheet, controlled neon color accents, industrial surface "
-        "treatment, crisp silhouettes, consistent turnaround rendering"
+        "unmistakable cyberpunk visual-development rendering, dominant cyan-magenta neon color language, "
+        "vivid emissive edge lighting, high-contrast luminous accents, futuristic industrial graphic "
+        "treatment, atmospheric electronic glow; the cyberpunk aesthetic must remain visually dominant, "
+        "not a mostly photorealistic image with token neon accents"
     ),
     "watercolor": (
-        "expressive watercolor asset sheet, translucent pigment washes, visible cold-press paper grain, "
+        "expressive watercolor rendering, translucent pigment washes, visible cold-press paper grain, "
         "selective high-detail rendering"
     ),
     "comic-book": (
-        "American comic-book asset sheet, confident ink contours, controlled cross-hatching, "
-        "bold spot colors, consistent turnaround rendering"
+        "American comic-book rendering, confident ink contours, controlled cross-hatching, "
+        "bold spot colors, consistent production-design detail"
+    ),
+}
+
+_SUBJECT_DESIGN_PRESENTATION_DIRECTIONS = {
+    "character": (
+        "character model sheet with consistent front, standard side, and back views, "
+        "readable pose, clean studio background, consistent turnaround rendering"
+    ),
+    "scene": (
+        "full-frame environment concept scene with coherent spatial depth, architectural readability, "
+        "and unified environmental lighting"
+    ),
+    "prop": (
+        "product-design reference sheet with consistent multi-view object rendering, isolated product "
+        "readability, and grounded physical support"
+    ),
+}
+
+_SUBJECT_DESIGN_FACT_LOCKS = {
+    "character": (
+        "The selected rendering medium and visual style override any conflicting medium or style wording "
+        "above; preserve every required view, pose, composition, clean background, physical relationship, "
+        "and all identity, period, clothing, and prop facts above."
+    ),
+    "scene": (
+        "The selected rendering medium and visual style override any conflicting medium or style wording "
+        "above; preserve the full-frame composition, spatial layout, architecture, materials, location, "
+        "period, time, weather, and all scene facts above."
+    ),
+    "prop": (
+        "The selected rendering medium and visual style override any conflicting medium or style wording "
+        "above; preserve every required view, product-sheet composition, physical support, scale, "
+        "construction, materials, period, and all prop facts above."
     ),
 }
 
@@ -201,6 +236,12 @@ _SUBJECT_DESIGN_NEGATIVE_CONFLICTS = {
     "historical costume",
     "clean empty background",
 }
+
+_STYLE_RENDER_CONSTRAINT_MARKER = "【风格渲染约束】"
+_STYLE_RENDER_CONSTRAINT_PATTERN = re.compile(
+    rf"{re.escape(_STYLE_RENDER_CONSTRAINT_MARKER)}.*?(?=【[^】\r\n]+】|\Z)",
+    re.DOTALL,
+)
 
 
 _IMAGE_OPTIMIZE_SYSTEM = """你是一名专业视觉导演和图像提示词设计师。请把用户输入扩展为可直接用于图像生成的高质量 prompt。
@@ -244,26 +285,91 @@ def find_style(style_id: str) -> dict | None:
     return next((style for style in STYLE_CATALOG if style["id"] == style_id), None)
 
 
-def apply_style(style_id: str, prompt: str, target: str) -> tuple[str, str]:
+def _unwrap_catalog_style_template(prompt: str, style: dict) -> str | None:
+    """按目录模板固定边界精确解包，避免通过风格关键词误删用户事实。"""
+    template = str(style["prompt_template"])
+    if "{prompt}" not in template:
+        suffix = f", {template}"
+        if not prompt.endswith(suffix):
+            return None
+        inner = prompt[: -len(suffix)].strip()
+        return inner or None
+    prefix, suffix = template.split("{prompt}", 1)
+    if not prefix and not suffix:
+        return None
+    if not prompt.startswith(prefix) or not prompt.endswith(suffix):
+        return None
+    end = len(prompt) - len(suffix) if suffix else len(prompt)
+    inner = prompt[len(prefix) : end].strip()
+    return inner or None
+
+
+def strip_image_style(prompt: str) -> str:
+    """移除已知图片风格包装与结构化风格段，保留主体事实和后续硬约束。"""
+    normalized = prompt.strip()
+    for _ in STYLE_CATALOG:
+        matches = [
+            inner
+            for style in get_styles("image")
+            if (inner := _unwrap_catalog_style_template(normalized, style)) is not None
+        ]
+        if len(matches) != 1:
+            break
+        normalized = matches[0]
+    normalized = _STYLE_RENDER_CONSTRAINT_PATTERN.sub("", normalized)
+    return re.sub(r"\n{3,}", "\n\n", normalized).strip()
+
+
+def _resolve_subject_design_type(subject_type: str | None, prompt: str) -> str:
+    """规范化视觉资产类型；旧调用缺少类型时从结构化段落推断。"""
+    normalized = (subject_type or "").strip().lower()
+    if normalized == "background":
+        return "scene"
+    if normalized in _SUBJECT_DESIGN_PRESENTATION_DIRECTIONS:
+        return normalized
+    if "【1 空间身份锚定】" in prompt or "主体类型：场景" in prompt:
+        return "scene"
+    if "【1 形制与尺度锚定】" in prompt or "主体类型：道具" in prompt:
+        return "prop"
+    return "character"
+
+
+def _subject_design_style_core(style: dict) -> str:
+    """返回结构化资产可用的风格核心，并兼容目录后续新增风格。"""
+    style_id = str(style["id"])
+    if direction := _SUBJECT_DESIGN_STYLE_CORES.get(style_id):
+        return direction
+    return str(style["prompt_template"]).replace("{prompt}", "").strip(" ,")
+
+
+def apply_style(
+    style_id: str,
+    prompt: str,
+    target: str,
+    *,
+    subject_type: str | None = None,
+) -> tuple[str, str]:
     """把风格模板应用到提示词，返回正向与负向提示词。"""
     style = find_style(style_id)
     if style is None or target not in style["target"]:
         return prompt, ""
 
     if target == "image" and SUBJECT_DESIGN_PROMPT_MARKER in prompt:
-        direction = _SUBJECT_DESIGN_STYLE_DIRECTIONS.get(style_id)
-        if direction is not None:
-            positive = (
-                f"{prompt.rstrip()}\n\n【风格渲染约束】{direction}. "
-                "Apply the selected style only to rendering; preserve every required view, pose, "
-                "composition, clean background, physical relationship, and subject fact above."
-            )
-            negative_parts = [
-                part.strip()
-                for part in str(style["negative_prompt"]).split(",")
-                if part.strip().lower() not in _SUBJECT_DESIGN_NEGATIVE_CONFLICTS
-            ]
-            return positive, ", ".join(negative_parts)
+        base_prompt = strip_image_style(prompt)
+        resolved_subject_type = _resolve_subject_design_type(subject_type, base_prompt)
+        style_core = _subject_design_style_core(style)
+        presentation = _SUBJECT_DESIGN_PRESENTATION_DIRECTIONS[resolved_subject_type]
+        fact_lock = _SUBJECT_DESIGN_FACT_LOCKS[resolved_subject_type]
+        positive = (
+            f"{base_prompt}\n\n{_STYLE_RENDER_CONSTRAINT_MARKER}"
+            f"{style_core}, {presentation}. {fact_lock}"
+        )
+        negative_parts = [
+            part.strip()
+            for part in str(style["negative_prompt"]).split(",")
+            if part.strip().lower() not in _SUBJECT_DESIGN_NEGATIVE_CONFLICTS
+        ]
+        return positive, ", ".join(negative_parts)
 
     template = str(style["prompt_template"])
     positive = template.replace("{prompt}", prompt) if "{prompt}" in template else f"{prompt}, {template}"
@@ -285,6 +391,19 @@ async def optimize_prompt(
     if style is not None and target not in style["target"]:
         style = None
 
+    resolved_style_id = str(style["id"]) if style is not None else None
+    style_name = str(style["name_zh"]) if style is not None else None
+    if target == "image" and SUBJECT_DESIGN_PROMPT_MARKER in raw_prompt:
+        # 结构化资产只持久化无风格基础提示词；最终风格由创建任务时按主体类型合成。
+        base_prompt = strip_image_style(raw_prompt)
+        return {
+            "optimized_prompt": base_prompt,
+            "negative_prompt": "",
+            "style_id": resolved_style_id,
+            "style_name": style_name,
+            "original_prompt": base_prompt,
+        }
+
     system = _IMAGE_OPTIMIZE_SYSTEM if target == "image" else _VIDEO_OPTIMIZE_SYSTEM
     if style is not None:
         style_direction = str(style["prompt_template"]).replace("{prompt}", "主体与场景描述")
@@ -297,36 +416,31 @@ async def optimize_prompt(
         if raw_prompt
         else f"请生成一段高质量{target}生成提示词"
     )
-    if target == "image" and SUBJECT_DESIGN_PROMPT_MARKER in raw_prompt:
-        # 主体设定 prompt 已由 enrich 按事实和多视图契约生成；再次自由改写会丢失硬约束。
-        optimized_prompt = raw_prompt.strip()
-    else:
-        try:
-            llm = provider or get_chat_llm_provider()
-            optimized_prompt = _validate_provider_prompt(
-                await llm.chat(
-                    [{"role": "user", "content": user_message}],
-                    system=system,
-                    temperature=0.6,
-                    max_tokens=800,
-                ),
-                raw_prompt,
-            )
-        except Exception as exc:  # noqa: BLE001
-            optimized_prompt = raw_prompt
-            logger.warning(
-                "提示词优化降级为原始 prompt: target=%s style_id=%s error_type=%s",
-                target,
-                style_id,
-                getattr(exc, "error_type", type(exc).__name__),
-            )
+    try:
+        llm = provider or get_chat_llm_provider()
+        optimized_prompt = _validate_provider_prompt(
+            await llm.chat(
+                [{"role": "user", "content": user_message}],
+                system=system,
+                temperature=0.6,
+                max_tokens=800,
+            ),
+            raw_prompt,
+        )
+    except Exception as exc:  # noqa: BLE001
+        optimized_prompt = raw_prompt
+        logger.warning(
+            "提示词优化降级为原始 prompt: target=%s style_id=%s error_type=%s",
+            target,
+            style_id,
+            getattr(exc, "error_type", type(exc).__name__),
+        )
 
-    resolved_style_id = str(style["id"]) if style is not None else None
     positive, negative = apply_style(resolved_style_id or "", optimized_prompt, target)
     return {
         "optimized_prompt": positive,
         "negative_prompt": negative,
         "style_id": resolved_style_id,
-        "style_name": str(style["name_zh"]) if style is not None else None,
+        "style_name": style_name,
         "original_prompt": raw_prompt,
     }

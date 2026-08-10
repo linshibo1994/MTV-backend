@@ -34,6 +34,7 @@ _POLL_TIMEOUT = 300  # 5 分钟
 _RETRYABLE_SUBMIT_STATUSES = {429}
 _MAX_SUBMIT_ATTEMPTS = 5
 _MAX_RETRY_DELAY_SECONDS = 20.0
+_STYLE_RENDER_CONSTRAINT_MARKER = "【风格渲染约束】"
 
 # aspect -> 通义万相 size（宽*高，星号分隔）
 _ASPECT_TO_SIZE: dict[str, str] = {
@@ -57,6 +58,11 @@ def _map_size(size: str, aspect: str) -> str:
 def _uses_sync_multimodal_api(model: str) -> bool:
     """Qwen Image 2.0 仅支持同步多模态生成接口。"""
     return model.strip().lower().startswith("qwen-image-2.0")
+
+
+def _should_extend_prompt(prompt: str) -> bool:
+    """已完成结构化风格合成的 prompt 禁止供应商再次改写。"""
+    return _STYLE_RENDER_CONSTRAINT_MARKER not in prompt
 
 
 def _extract_multimodal_urls(payload: dict) -> list[str]:
@@ -201,7 +207,7 @@ class BailianImageGenProvider:
         parameters: dict[str, object] = {
             "size": size,
             "n": count,
-            "prompt_extend": True,
+            "prompt_extend": _should_extend_prompt(prompt),
             "watermark": False,
         }
         if normalized_negative_prompt := (negative_prompt or "").strip():
@@ -251,7 +257,7 @@ class BailianImageGenProvider:
             "parameters": {
                 "size": size,
                 "n": count,
-                "prompt_extend": True,
+                "prompt_extend": _should_extend_prompt(prompt),
                 "watermark": False,
             },
         }

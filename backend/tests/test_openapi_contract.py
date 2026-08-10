@@ -39,6 +39,7 @@ REQUIRED_OPERATIONS = {
     ("POST", "/v3api/generation-jobs"),
     ("GET", "/v3api/generation-jobs/{job_id}"),
     ("GET", "/v3api/generation-jobs"),
+    ("POST", "/v3api/generation-jobs/batch"),
     ("POST", "/v3api/scripts/{script_id}/episodes/{episode_id}/generate-storyboard"),
     ("POST", "/v3api/scripts/{script_id}/upload-and-split"),
     ("GET", "/v3api/analysis-jobs/{analysis_job_id}"),
@@ -141,3 +142,28 @@ def test_image_and_video_generation_openapi_expose_prompt_overrides() -> None:
             "minLength": 1,
             "maxLength": 32000,
         }
+
+
+def test_batch_image_generation_openapi_exposes_per_subject_style_mapping() -> None:
+    schema = app.openapi()
+    style_ids = schema["components"]["schemas"]["BatchCreateJobIn"]["properties"][
+        "style_ids"
+    ]
+
+    assert style_ids["anyOf"][0] == {
+        "type": "object",
+        "additionalProperties": {
+            "anyOf": [{"type": "string"}, {"type": "null"}],
+        },
+    }
+    request = schema["paths"]["/v3api/generation-jobs/batch"]["post"]["requestBody"][
+        "content"
+    ]["application/json"]["schema"]
+    assert request["$ref"].endswith("/BatchCreateJobIn")
+
+    response = schema["paths"]["/v3api/generation-jobs/batch"]["post"]["responses"][
+        "201"
+    ]["content"]["application/json"]["schema"]
+    assert response["$ref"].endswith("/BatchJobOut")
+    created = schema["components"]["schemas"]["BatchJobOut"]["properties"]["created"]
+    assert created["items"]["$ref"].endswith("/GenerationJobOut")

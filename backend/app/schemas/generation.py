@@ -62,6 +62,7 @@ class BatchCreateJobIn(BaseModel):
 
     subject_ids 为空时自动选取该剧本下未设计(not_designed)且非声音的主体。
     prompts 按 subject_id 分别覆盖最终生图提示词；缺失项兼容旧客户端并回退服务端 enrich。
+    style_ids 按 subject_id 覆盖兼容字段 style_id；显式 null 表示该主体不应用风格。
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -75,6 +76,10 @@ class BatchCreateJobIn(BaseModel):
         description="每个主体的客户端可编辑最终生图提示词，键为 subject_id",
     )
     style_id: str | None = Field(None, description="风格 ID")
+    style_ids: dict[str, str | None] | None = Field(
+        None,
+        description="每个主体的风格 ID，键为 subject_id；单项优先于兼容字段 style_id",
+    )
     model: ImageModelName = Field("banana-2", description="生图模型")
     size: str = Field("2k", description="尺寸，如 2k")
     aspect: str = Field("auto", description="比例；auto 按主体类型选择，或显式传入 16:9、3:4 等")
