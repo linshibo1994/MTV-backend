@@ -2785,8 +2785,14 @@ async def test_submission_uncertain_is_durable_and_keeps_credit_frozen(
     reservation = raw.get(CreditReservation, reservation_id)
     assert saved is not None
     assert reservation is not None
-    assert saved.status == "processing"
-    assert saved.lease_token
+    assert saved.status == "failed"
+    assert saved.progress_stage == "manual_review"
+    assert saved.error_type == "provider_submission_uncertain"
+    assert saved.retryable is False
+    assert saved.finished_at is not None
+    assert saved.lease_owner is None
+    assert saved.lease_token is None
+    assert saved.lease_until is None
     assert reservation.status == "reserved"
     evidence = {
         "state": "submission_uncertain",
@@ -2795,6 +2801,121 @@ async def test_submission_uncertain_is_durable_and_keeps_credit_frozen(
     }
     assert (saved.output_json or {})["provider_submission"] == evidence
     assert (saved.metrics or {})["provider_submission"] == evidence
+    assert "orphan_provider_cancellations" in (saved.output_json or {})
+    assert "orphan_provider_cancellations" in (saved.metrics or {})
+
+
+@pytest.mark.parametrize(
+    ("output_json", "metrics", "provider_key", "attempt", "expected"),
+    [
+        (
+            {
+                "provider_submission": {
+                    "state": "submission_uncertain",
+                    "provider_key": "modelsai",
+                    "attempt": 1,
+                }
+            },
+            {
+                "provider_submission": {
+                    "state": "submission_uncertain",
+                    "provider_key": "modelsai",
+                    "attempt": 1,
+                }
+            },
+            "modelsai",
+            1,
+            True,
+        ),
+        (
+            {
+                "provider_submission": {
+                    "state": "submit_intent",
+                    "provider_key": "modelsai",
+                    "attempt": 1,
+                }
+            },
+            {
+                "provider_submission": {
+                    "state": "submit_intent",
+                    "provider_key": "modelsai",
+                    "attempt": 1,
+                }
+            },
+            "modelsai",
+            1,
+            False,
+        ),
+        (
+            {
+                "provider_submission": {
+                    "state": "submission_uncertain",
+                    "provider_key": "modelsai",
+                    "attempt": 1,
+                }
+            },
+            {},
+            "modelsai",
+            1,
+            False,
+        ),
+        (
+            {
+                "provider_submission": {
+                    "state": "submission_uncertain",
+                    "provider_key": "modelsai",
+                    "attempt": 1,
+                },
+                "provider_task_id": "provider-known",
+            },
+            {
+                "provider_submission": {
+                    "state": "submission_uncertain",
+                    "provider_key": "modelsai",
+                    "attempt": 1,
+                },
+                "provider_task_id": "provider-known",
+            },
+            "modelsai",
+            1,
+            False,
+        ),
+        (
+            {
+                "provider_submission": {
+                    "state": "submission_uncertain",
+                    "provider_key": "modelsai",
+                    "attempt": 1,
+                }
+            },
+            {
+                "provider_submission": {
+                    "state": "submission_uncertain",
+                    "provider_key": "modelsai",
+                    "attempt": 1,
+                }
+            },
+            "bailian",
+            1,
+            False,
+        ),
+    ],
+)
+def test_submission_uncertain_manual_review_requires_complete_authority(
+    output_json: dict,
+    metrics: dict,
+    provider_key: str,
+    attempt: int,
+    expected: bool,
+) -> None:
+    from app.services.video_remote_cancellation import provider_submission_requires_manual_review
+
+    assert provider_submission_requires_manual_review(
+        output_json,
+        metrics,
+        provider_key=provider_key,
+        attempt=attempt,
+    ) is expected
 
 
 @pytest.mark.asyncio

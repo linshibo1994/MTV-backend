@@ -16,17 +16,21 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Callable
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
+from threading import Lock
 from typing import Any
 
-from sqlalchemy import select
+from billiard.exceptions import SoftTimeLimitExceeded
+from celery.exceptions import WorkerTerminate
+from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import noload
 
 from app.core.config import settings
 from app.core.database import async_session_factory
-from app.core.job_state import PipelineFailure
+from app.core.job_state import TASK_SOFT_TIME_LIMIT_SECONDS, PipelineFailure
 from app.crud.storyboard import (
     claim_job,
     complete_job,
@@ -41,10 +45,19 @@ from app.models.storyboard_job import StoryboardJob
 from app.models.task_dispatch_outbox import TaskDispatchOutbox
 from app.services import storyboard as storyboard_service
 from app.services.task_dispatch import enqueue_task
-from app.workers.async_runtime import run_worker_async
+from app.workers.async_runtime import (
+    WorkerAsyncRuntimeStopping,
+    run_worker_async,
+    worker_async_interrupt_hook,
+)
 
 logger = logging.getLogger(__name__)
 STORYBOARD_OUTBOX_TASK_TYPE = "storyboard.generate"
+_STORYBOARD_LEASE_SECONDS = 300
+_STORYBOARD_HEARTBEAT_SECONDS = 60.0
+# 为状态回写、积分释放和 Celery 软超时中断预留 90 秒。
+_STORYBOARD_GENERATION_TIMEOUT_SECONDS = TASK_SOFT_TIME_LIMIT_SECONDS - 90
+_STORYBOARD_INTERRUPT_GRACE_SECONDS = 30.0
 
 # 按 PLAN 路径 import (celery_app 为 Phase 1 产出)
 try:
@@ -100,6 +113,33 @@ def _job_reservation_id(job: StoryboardJob) -> str | None:
     return job.reservation_id or (job.detail or {}).get("reservation_id")
 
 
+class _StoryboardTaskLeaseHolder:
+    """在线程间保留当前任务的 lease token 与 soft-limit 事实。"""
+
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self._lease_token: str | None = None
+        self._soft_time_limit_seen = False
+
+    def observe(self, lease_token: str) -> None:
+        """领取成功后立即记录 token，供软超时取消路径执行 CAS 清理。"""
+
+        with self._lock:
+            self._lease_token = lease_token
+
+    def record_interrupt(self, interrupt: BaseException) -> None:
+        """同步 Celery 线程只记录中断事实，不在这里触碰数据库。"""
+
+        if not isinstance(interrupt, SoftTimeLimitExceeded):
+            return
+        with self._lock:
+            self._soft_time_limit_seen = True
+
+    def is_current_soft_timeout(self, lease_token: str) -> bool:
+        with self._lock:
+            return self._soft_time_limit_seen and self._lease_token == lease_token
+
+
 async def _lock_current_storyboard_job(
     db, job_id: str, lease_token: str
 ) -> StoryboardJob | None:
@@ -120,6 +160,69 @@ async def _lock_current_storyboard_job(
     return job
 
 
+async def _heartbeat_storyboard_job_loop(
+    job_id: str,
+    lease_token: str,
+    stop: asyncio.Event,
+) -> None:
+    """使用独立短事务续租，避免业务会话跨 LLM 调用持有 Job 行锁。"""
+
+    while not stop.is_set():
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=_STORYBOARD_HEARTBEAT_SECONDS)
+            return
+        except TimeoutError:
+            async with async_session_factory() as heartbeat_db:
+                renewed = await heartbeat_job(
+                    heartbeat_db,
+                    job_id,
+                    lease_token,
+                    lease_seconds=_STORYBOARD_LEASE_SECONDS,
+                )
+                if not renewed:
+                    await heartbeat_db.rollback()
+                    raise RuntimeError("storyboard lease heartbeat failed")
+                await heartbeat_db.commit()
+
+
+async def _generate_storyboard_with_heartbeat(
+    db,
+    job: StoryboardJob,
+    lease_token: str,
+) -> dict:
+    """在业务级超时内执行生成，并在 LLM 调用期间持续续租。"""
+
+    stop_heartbeat = asyncio.Event()
+    generation_task = asyncio.create_task(
+        storyboard_service.generate_storyboard(
+            db,
+            job.script_id,
+            job.episode_id,
+            expected_episode_version=job.input_version,
+            expected_client_save_seq=job.input_client_save_seq,
+        )
+    )
+    heartbeat_task = asyncio.create_task(
+        _heartbeat_storyboard_job_loop(job.job_id, lease_token, stop_heartbeat)
+    )
+    try:
+        async with asyncio.timeout(_STORYBOARD_GENERATION_TIMEOUT_SECONDS):
+            done, _ = await asyncio.wait(
+                {generation_task, heartbeat_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        if heartbeat_task in done:
+            heartbeat_task.result()
+            raise RuntimeError("storyboard heartbeat stopped unexpectedly")
+        return generation_task.result()
+    finally:
+        stop_heartbeat.set()
+        for task in (generation_task, heartbeat_task):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(generation_task, heartbeat_task, return_exceptions=True)
+
+
 async def _run_claimed_storyboard_job(db, job: StoryboardJob, lease_token: str) -> dict:
     """执行已持有 lease 的分镜任务；每个关键边界检查版本与取消。"""
     episode = await _load_episode(db, job.episode_id)
@@ -131,22 +234,8 @@ async def _run_claimed_storyboard_job(db, job: StoryboardJob, lease_token: str) 
         if hasattr(db, "rollback"):
             await db.rollback()
         raise RuntimeError("storyboard job canceled")
-    if not await heartbeat_job(db, job.job_id, lease_token):
-        if hasattr(db, "rollback"):
-            await db.rollback()
-        raise RuntimeError("storyboard lease heartbeat failed")
 
-    result = await storyboard_service.generate_storyboard(
-        db,
-        job.script_id,
-        job.episode_id,
-        expected_episode_version=job.input_version,
-        expected_client_save_seq=job.input_client_save_seq,
-    )
-    if not await heartbeat_job(db, job.job_id, lease_token):
-        if hasattr(db, "rollback"):
-            await db.rollback()
-        raise RuntimeError("storyboard lease heartbeat failed")
+    result = await _generate_storyboard_with_heartbeat(db, job, lease_token)
 
     fresh_episode = await _load_episode(db, job.episode_id)
     if not _job_input_matches_episode(job, fresh_episode):
@@ -280,58 +369,96 @@ async def _mark_failed_after_rollback(
         return True
 
 
-async def _run_storyboard_job_by_id(job_id: str) -> dict:
+async def _run_storyboard_job_by_id(
+    job_id: str,
+    lease_holder: _StoryboardTaskLeaseHolder | None = None,
+) -> dict:
     """真实 task 安全入口：job_id -> 原子 claim -> 版本/取消栅栏 -> 终态 CAS。"""
     owner = f"storyboard-worker:{job_id}"
-    async with async_session_factory() as db:
-        lease_token = await claim_job(db, job_id, owner=owner)
-        if lease_token is None:
-            return {"job_id": job_id, "claimed": False}
-        job = await get_job(db, job_id)
-        if job is None:
-            await db.rollback()
-            return {"job_id": job_id, "claimed": False}
-        await update_job(
-            db,
-            job_id,
-            progress=10,
-            progress_stage="claimed",
-            progress_message="分镜任务已领取",
-        )
-        await db.commit()
-
-    async with async_session_factory() as db:
-        job = await get_job(db, job_id)
-        if job is None:
-            return {"job_id": job_id, "claimed": False}
-        try:
-            return await _run_claimed_storyboard_job(db, job, lease_token)
-        except Exception as exc:
-            if hasattr(db, "rollback"):
+    lease_token: str | None = None
+    try:
+        async with async_session_factory() as db:
+            try:
+                lease_token = await claim_job(
+                    db,
+                    job_id,
+                    owner=owner,
+                    lease_seconds=_STORYBOARD_LEASE_SECONDS,
+                )
+                if lease_token is None:
+                    return {"job_id": job_id, "claimed": False}
+                if lease_holder is not None:
+                    lease_holder.observe(lease_token)
+                job = await get_job(db, job_id)
+                if job is None:
+                    await db.rollback()
+                    return {"job_id": job_id, "claimed": False}
+                await update_job(
+                    db,
+                    job_id,
+                    progress=10,
+                    progress_stage="claimed",
+                    progress_message="分镜任务已领取",
+                )
+                await db.commit()
+            except asyncio.CancelledError:
                 await db.rollback()
+                raise
+            except Exception:
+                await db.rollback()
+                raise
+
+        async with async_session_factory() as db:
+            try:
+                job = await get_job(db, job_id)
+                if job is None:
+                    return {"job_id": job_id, "claimed": False}
+                return await _run_claimed_storyboard_job(db, job, lease_token)
+            except asyncio.CancelledError:
+                await db.rollback()
+                raise
+            except Exception:
+                await db.rollback()
+                raise
+    except asyncio.CancelledError:
+        if (
+            lease_holder is not None
+            and lease_token is not None
+            and lease_holder.is_current_soft_timeout(lease_token)
+        ):
+            try:
+                await _mark_failed_after_rollback(
+                    job_id,
+                    TimeoutError("storyboard generation exceeded soft time limit"),
+                    lease_token,
+                )
+            except Exception:  # noqa: BLE001 - 仍需把原始取消传回 Celery
+                logger.exception("分镜软超时后的失败补偿未完成 job_id=%s", job_id)
+        raise
+    except Exception as exc:
+        if lease_token is not None:
             await _mark_failed_after_rollback(job_id, exc, lease_token)
-            raise
+        raise
 
 
 async def reconcile_storyboard_dispatches(
     db,
     *,
     now: datetime | None = None,
-    stale_after_seconds: int = 300,
     limit: int = 100,
 ) -> int:
-    """恢复 storyboard stale job、published 后未启动的 outbox 与缺失 outbox。"""
+    """恢复未投递任务及租约实际到期的运行任务。"""
     current = now or datetime.now(UTC)
-    stale_cutoff = current - timedelta(seconds=stale_after_seconds)
     result = await db.execute(
         select(StoryboardJob)
         .where(
-            StoryboardJob.status.in_(["pending", "running", "retry"]),
-            (
-                (StoryboardJob.heartbeat_at.is_(None))
-                | (StoryboardJob.heartbeat_at <= stale_cutoff)
-                | (StoryboardJob.lease_until <= current)
-            ),
+            or_(
+                StoryboardJob.status.in_(["pending", "retry"]),
+                and_(
+                    StoryboardJob.status == "running",
+                    (StoryboardJob.lease_until.is_(None) | (StoryboardJob.lease_until <= current)),
+                ),
+            )
         )
         .order_by(StoryboardJob.created_at.asc())
         .limit(limit)
@@ -347,9 +474,7 @@ async def reconcile_storyboard_dispatches(
             )
         )
         outbox = outbox_result.scalar_one_or_none()
-        if job.status == "running" and (
-            job.lease_until is None or job.lease_until <= current
-        ):
+        if job.status == "running" and (job.lease_until is None or job.lease_until <= current):
             job.status = "retry"
             job.lease_owner = None
             job.lease_token = None
@@ -408,6 +533,7 @@ async def _reconcile_one_storyboard_financial_cleanup(db: Any, job_id: str) -> b
             select(StoryboardJob)
             .where(
                 StoryboardJob.job_id == job_id,
+                StoryboardJob.status == "failed",
                 StoryboardJob.financial_cleanup_status == "pending",
             )
             .options(noload(StoryboardJob.script))
@@ -481,7 +607,10 @@ async def reconcile_storyboard_financial_cleanup(
         (
             await db.execute(
                 select(StoryboardJob.job_id)
-                .where(StoryboardJob.financial_cleanup_status == "pending")
+                .where(
+                    StoryboardJob.status == "failed",
+                    StoryboardJob.financial_cleanup_status == "pending",
+                )
                 .order_by(StoryboardJob.created_at.asc(), StoryboardJob.job_id.asc())
                 .limit(limit)
                 .with_for_update(skip_locked=True)
@@ -537,9 +666,15 @@ def _generate_storyboard_task(
     episode_id: str,
     user_id: str | None,
     job_id: str,
+    *,
+    lease_holder: _StoryboardTaskLeaseHolder | None = None,
 ) -> dict:
     """Celery task 同步入口, 包装异步执行。"""
-    return run_worker_async(_run_storyboard_job_by_id(job_id))
+    if lease_holder is None:
+        coroutine = _run_storyboard_job_by_id(job_id)
+    else:
+        coroutine = _run_storyboard_job_by_id(job_id, lease_holder)
+    return run_worker_async(coroutine)
 
 
 def build_storyboard_canvas(payload: dict, storyboard_task) -> object:
@@ -558,8 +693,8 @@ if celery_app is not None:
         name="app.workers.storyboard.generate_storyboard",
         bind=True,
         acks_late=True,
-        time_limit=300,
-        soft_time_limit=240,
+        reject_on_worker_lost=True,
+        acks_on_failure_or_timeout=False,
     )
     def generate_storyboard_task(
         self,
@@ -583,7 +718,22 @@ if celery_app is not None:
                 "episode_id": episode_id,
                 "error": "missing job_id",
             }
-        return _generate_storyboard_task(script_id, episode_id, user_id, job_id)
+        lease_holder = _StoryboardTaskLeaseHolder()
+        try:
+            with worker_async_interrupt_hook(
+                lease_holder.record_interrupt,
+                grace_timeout=_STORYBOARD_INTERRUPT_GRACE_SECONDS,
+            ):
+                return _generate_storyboard_task(
+                    script_id,
+                    episode_id,
+                    user_id,
+                    job_id,
+                    lease_holder=lease_holder,
+                )
+        except WorkerAsyncRuntimeStopping as exc:
+            logger.critical("分镜异步运行时已停止，回收 prefork 子进程并重派当前消息")
+            raise WorkerTerminate() from exc
 
     @celery_app.task(
         name="app.workers.storyboard.reconcile_storyboard_dispatches",

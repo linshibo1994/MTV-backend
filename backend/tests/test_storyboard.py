@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import traceback
 from datetime import UTC, datetime, timedelta
@@ -910,7 +911,7 @@ async def test_worker_rolls_back_when_terminal_cas_fails(monkeypatch) -> None:
     assert events == ["job_lock", "settle", "terminal_cas"]
 
 
-async def test_worker_heartbeats_before_and_after_provider(monkeypatch) -> None:
+async def test_worker_delegates_generation_to_independent_heartbeat(monkeypatch) -> None:
     from app.workers import storyboard as storyboard_worker
 
     job = SimpleNamespace(
@@ -929,13 +930,12 @@ async def test_worker_heartbeats_before_and_after_provider(monkeypatch) -> None:
     episode = SimpleNamespace(episode_version=7, client_save_seq=4)
     db = SimpleNamespace(rollback=AsyncMock(), commit=AsyncMock())
     monkeypatch.setattr(storyboard_worker, "_load_episode", AsyncMock(return_value=episode))
+    generate_with_heartbeat = AsyncMock(return_value={"scenes": 1, "shot_groups": 1, "shots": 2})
     monkeypatch.setattr(
-        storyboard_worker.storyboard_service,
-        "generate_storyboard",
-        AsyncMock(return_value={"scenes": 1, "shot_groups": 1, "shots": 2}),
+        storyboard_worker,
+        "_generate_storyboard_with_heartbeat",
+        generate_with_heartbeat,
     )
-    heartbeat = AsyncMock(return_value=True)
-    monkeypatch.setattr(storyboard_worker, "heartbeat_job", heartbeat)
     monkeypatch.setattr(
         storyboard_worker,
         "_lock_current_storyboard_job",
@@ -945,8 +945,172 @@ async def test_worker_heartbeats_before_and_after_provider(monkeypatch) -> None:
 
     await storyboard_worker._run_claimed_storyboard_job(db, job, "token-current")
 
-    assert heartbeat.await_count >= 2
-    assert heartbeat.await_args_list[0].args[:3] == (db, "job-1", "token-current")
+    generate_with_heartbeat.assert_awaited_once_with(db, job, "token-current")
+
+
+def test_storyboard_heartbeat_renews_in_independent_short_transactions(monkeypatch) -> None:
+    from app.workers import storyboard as storyboard_worker
+
+    stop = asyncio.Event()
+    sessions: list[SimpleNamespace] = []
+    renewals = 0
+
+    class SessionContext:
+        async def __aenter__(self):
+            db = SimpleNamespace(commit=AsyncMock(), rollback=AsyncMock())
+            sessions.append(db)
+            return db
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    async def immediate_timeout(awaitable, *, timeout):
+        awaitable.close()
+        raise TimeoutError
+
+    async def heartbeat(db, job_id, token, *, lease_seconds):
+        nonlocal renewals
+        assert job_id == "job-1"
+        assert token == "token-1"
+        assert lease_seconds == storyboard_worker._STORYBOARD_LEASE_SECONDS
+        renewals += 1
+        if renewals == 3:
+            stop.set()
+        return True
+
+    monkeypatch.setattr(storyboard_worker.asyncio, "wait_for", immediate_timeout)
+    monkeypatch.setattr(storyboard_worker, "async_session_factory", SessionContext)
+    monkeypatch.setattr(storyboard_worker, "heartbeat_job", heartbeat)
+
+    asyncio.run(storyboard_worker._heartbeat_storyboard_job_loop("job-1", "token-1", stop))
+
+    assert renewals == 3
+    assert [session.commit.await_count for session in sessions] == [1, 1, 1]
+
+
+async def test_soft_timeout_cancellation_marks_current_job_failed(monkeypatch) -> None:
+    from billiard.exceptions import SoftTimeLimitExceeded
+
+    from app.workers import storyboard as storyboard_worker
+
+    job = SimpleNamespace(job_id="job-1")
+    claim_db = SimpleNamespace(commit=AsyncMock(), rollback=AsyncMock())
+    run_db = SimpleNamespace(commit=AsyncMock(), rollback=AsyncMock())
+    sessions = iter((claim_db, run_db))
+
+    class SessionContext:
+        async def __aenter__(self):
+            return next(sessions)
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    holder = storyboard_worker._StoryboardTaskLeaseHolder()
+    holder.record_interrupt(SoftTimeLimitExceeded())
+    cleanup = AsyncMock(return_value=True)
+
+    async def canceled(*args, **kwargs):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(storyboard_worker, "async_session_factory", SessionContext)
+    monkeypatch.setattr(storyboard_worker, "claim_job", AsyncMock(return_value="token-1"))
+    monkeypatch.setattr(storyboard_worker, "get_job", AsyncMock(return_value=job))
+    monkeypatch.setattr(storyboard_worker, "update_job", AsyncMock())
+    monkeypatch.setattr(storyboard_worker, "_run_claimed_storyboard_job", canceled)
+    monkeypatch.setattr(storyboard_worker, "_mark_failed_after_rollback", cleanup)
+
+    with pytest.raises(asyncio.CancelledError):
+        await storyboard_worker._run_storyboard_job_by_id("job-1", holder)
+
+    cleanup.assert_awaited_once()
+    call = cleanup.await_args
+    assert call.args[0] == "job-1"
+    assert isinstance(call.args[1], TimeoutError)
+    assert call.args[2] == "token-1"
+    run_db.rollback.assert_awaited_once()
+
+
+async def test_soft_timeout_during_claim_setup_marks_claimed_job_failed(monkeypatch) -> None:
+    """超时落在领取提交窗口时，也必须清理已写入的当前租约。"""
+    from billiard.exceptions import SoftTimeLimitExceeded
+
+    from app.workers import storyboard as storyboard_worker
+
+    job = SimpleNamespace(job_id="job-claim-window")
+    claim_db = SimpleNamespace(commit=AsyncMock(), rollback=AsyncMock())
+
+    class SessionContext:
+        async def __aenter__(self):
+            return claim_db
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    holder = storyboard_worker._StoryboardTaskLeaseHolder()
+    holder.record_interrupt(SoftTimeLimitExceeded())
+    cleanup = AsyncMock(return_value=True)
+
+    async def canceled_update(*args, **kwargs):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(storyboard_worker, "async_session_factory", SessionContext)
+    monkeypatch.setattr(storyboard_worker, "claim_job", AsyncMock(return_value="token-claim"))
+    monkeypatch.setattr(storyboard_worker, "get_job", AsyncMock(return_value=job))
+    monkeypatch.setattr(storyboard_worker, "update_job", canceled_update)
+    monkeypatch.setattr(storyboard_worker, "_mark_failed_after_rollback", cleanup)
+
+    with pytest.raises(asyncio.CancelledError):
+        await storyboard_worker._run_storyboard_job_by_id("job-claim-window", holder)
+
+    claim_db.rollback.assert_awaited_once()
+    cleanup.assert_awaited_once()
+    call = cleanup.await_args
+    assert call.args[0] == "job-claim-window"
+    assert isinstance(call.args[1], TimeoutError)
+    assert call.args[2] == "token-claim"
+
+
+def test_storyboard_task_inherits_global_timeout_window() -> None:
+    from app.core.job_state import (
+        TASK_HARD_TIME_LIMIT_SECONDS,
+        TASK_SOFT_TIME_LIMIT_SECONDS,
+    )
+    from app.workers import storyboard as storyboard_worker
+
+    task = storyboard_worker.generate_storyboard_task
+    effective_soft_limit = task.soft_time_limit or storyboard_worker.celery_app.conf.task_soft_time_limit
+    effective_hard_limit = task.time_limit or storyboard_worker.celery_app.conf.task_time_limit
+
+    assert (effective_soft_limit, effective_hard_limit) == (
+        TASK_SOFT_TIME_LIMIT_SECONDS,
+        TASK_HARD_TIME_LIMIT_SECONDS,
+    )
+
+
+async def test_dispatch_reconciler_ignores_running_job_with_live_lease() -> None:
+    """恢复器只能接管租约已到期的运行中任务，不能仅凭心跳时间重派。"""
+    from sqlalchemy.dialects import postgresql
+
+    from app.workers import storyboard as storyboard_worker
+
+    class EmptyResult:
+        def scalars(self):
+            return self
+
+        def all(self):
+            return []
+
+    db = SimpleNamespace(execute=AsyncMock(return_value=EmptyResult()))
+    await storyboard_worker.reconcile_storyboard_dispatches(
+        db,
+        now=datetime(2026, 8, 11, tzinfo=UTC),
+    )
+
+    statement = db.execute.await_args.args[0]
+    where_sql = " ".join(str(statement.whereclause.compile(dialect=postgresql.dialect())).split())
+    assert "storyboard_jobs.heartbeat_at" not in where_sql
+    assert "storyboard_jobs.lease_until" in where_sql
+    assert "storyboard_jobs.status = %(status_2)s" in where_sql
 
 
 async def test_worker_failure_path_does_not_release_or_mark_failed_for_stale_token(monkeypatch) -> None:

@@ -1793,6 +1793,59 @@ def test_lifecycle_delete_preserves_retryable_video_financial_cleanup_debt(
         assert raw.get(VideoGenerationJob, video.job_id) is not None
 
 
+@pytest.mark.parametrize("resource", ["script", "episode"])
+def test_lifecycle_delete_preserves_video_submission_manual_review(
+    resource: str,
+) -> None:
+    """待人工核对的未知远端提交不得被终态删除逻辑误删。"""
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine, expire_on_commit=False) as raw:
+        script, episode, video = _seed_video_cleanup_debt_graph(
+            raw,
+            status="failed",
+            error_type="provider_submission_uncertain",
+            retryable=False,
+            output_json={
+                "provider_submission": {
+                    "state": "submission_uncertain",
+                    "provider_key": "modelsai",
+                    "attempt": 1,
+                }
+            },
+        )
+        db = _AsyncSessionAdapter(raw)
+
+        async def scenario() -> None:
+            if resource == "script":
+                summary = await script_crud.get_script_dependency_summary(db, script.id)
+            else:
+                summary = await script_crud.get_episode_dependency_summary(
+                    db,
+                    script.id,
+                    episode.episode_id,
+                )
+            assert summary.active_job_count == 1
+            with pytest.raises(ConflictError, match="人工核对|债务"):
+                if resource == "script":
+                    await script_crud.delete_script(db, script)
+                else:
+                    await script_crud.delete_episode(
+                        db,
+                        script.id,
+                        episode.episode_id,
+                    )
+            await db.rollback()
+
+        import asyncio
+
+        asyncio.run(scenario())
+
+        assert raw.get(Script, script.id) is not None
+        assert raw.get(Episode, episode.episode_id) is not None
+        assert raw.get(VideoGenerationJob, video.job_id) is not None
+
+
 @pytest.mark.parametrize(
     ("status", "output_json"),
     [

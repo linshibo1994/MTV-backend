@@ -52,6 +52,10 @@ REQUIRED_OPERATIONS = {
         "PATCH",
         "/v3api/scripts/{script_id}/episodes/{episode_id}/shot-groups/{shot_group_id}",
     ),
+    (
+        "DELETE",
+        "/v3api/scripts/{script_id}/episodes/{episode_id}/shot-groups/{shot_group_id}",
+    ),
     ("GET", "/v3api/shots/{script_id}/episodes/{episode_id}/video-workbench"),
     ("GET", "/v3api/shots/{script_id}/cover"),
     ("POST", "/v3api/video-generation-jobs"),
@@ -124,6 +128,20 @@ def test_shot_group_update_openapi_exposes_partial_edit_contract() -> None:
     response = schema["paths"][
         "/v3api/scripts/{script_id}/episodes/{episode_id}/shot-groups/{shot_group_id}"
     ]["patch"]["responses"]["200"]["content"]["application/json"]["schema"]
+    assert response["$ref"].endswith("/VideoWorkbenchOut")
+
+
+def test_shot_group_delete_openapi_requires_version_and_explicit_confirmation() -> None:
+    schema = app.openapi()
+    operation = schema["paths"][
+        "/v3api/scripts/{script_id}/episodes/{episode_id}/shot-groups/{shot_group_id}"
+    ]["delete"]
+    parameters = {item["name"]: item for item in operation["parameters"]}
+
+    assert parameters["expected_episode_version"]["required"] is True
+    assert parameters["expected_episode_version"]["schema"]["minimum"] == 1.0
+    assert parameters["confirm"]["schema"]["default"] is False
+    response = operation["responses"]["200"]["content"]["application/json"]["schema"]
     assert response["$ref"].endswith("/VideoWorkbenchOut")
 
 

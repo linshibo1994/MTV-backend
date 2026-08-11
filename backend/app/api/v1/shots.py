@@ -5,6 +5,7 @@
 - GET  /scripts/<sid>/episodes/<eid>/shot-hierarchy      分镜层级 (场景->镜头组->镜头)
 - POST /scripts/<sid>/episodes/<eid>/shot-groups/merge   自动组合本集全部小分镜
 - PATCH /scripts/<sid>/episodes/<eid>/shot-groups/<gid>  编辑正式镜头组
+- DELETE /scripts/<sid>/episodes/<eid>/shot-groups/<gid> 删除正式镜头组及关联视频
 - GET  /shots/<sid>/episodes/<eid>/video-workbench        视频工作台 (含 unit_id/materials)
 - GET  /shots/<script_id>/cover                           视频项目封面 (首个镜头首帧)
 """
@@ -15,7 +16,7 @@ import json
 import logging
 from hashlib import sha256
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -57,6 +58,12 @@ from app.schemas.shot import (
 )
 from app.services.audit import best_effort_log as audit_log
 from app.services.credits import release, reserve
+from app.services.shot_group_delete import (
+    cancel_active_video_jobs_for_shot_group,
+)
+from app.services.shot_group_delete import (
+    delete_shot_group as delete_shot_group_safely,
+)
 from app.services.shot_group_edit import update_shot_group
 from app.services.shot_group_merge import merge_shots_into_group
 from app.services.task_dispatch import enqueue_task
@@ -669,6 +676,81 @@ async def edit_shot_group(
     )
     workbench = await get_video_workbench(db, script_id, episode_id)
     await db.commit()
+    return workbench
+
+
+@router.delete(
+    "/scripts/{script_id}/episodes/{episode_id}/shot-groups/{shot_group_id}",
+    response_model=VideoWorkbenchOut,
+    summary="删除正式镜头组",
+    description=(
+        "删除已合并的镜头组、其子分镜、关联视频任务及时间线片段。"
+        "正在生成的视频会先尝试走既有取消闭环；远端状态未知或存在清理债务时拒绝删除。"
+    ),
+)
+async def delete_shot_group(
+    script_id: str,
+    episode_id: str,
+    shot_group_id: str,
+    expected_episode_version: int = Query(..., ge=1),
+    confirm: bool = Query(False),
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> VideoWorkbenchOut:
+    """经明确确认后删除镜头组，并返回可直接替换的最新视频工作台。"""
+
+    await _validate_script_episode(
+        db,
+        user,
+        script_id,
+        episode_id,
+        action=Action.EDIT,
+        expected_episode_version=expected_episode_version,
+    )
+    if not confirm:
+        raise ConflictError(
+            "删除镜头组会同时清理组内分镜、视频任务与时间线片段；"
+            "请使用 confirm=true 明确确认"
+        )
+
+    try:
+        canceled_job_ids = await cancel_active_video_jobs_for_shot_group(
+            db,
+            script_id=script_id,
+            episode_id=episode_id,
+            shot_group_id=shot_group_id,
+            actor_user_id=user.user_id,
+        )
+        result = await delete_shot_group_safely(
+            db,
+            script_id=script_id,
+            episode_id=episode_id,
+            shot_group_id=shot_group_id,
+            expected_episode_version=expected_episode_version,
+        )
+        await audit_log(
+            db,
+            actor=user,
+            action="shot_group_delete",
+            resource_type="shot_group",
+            resource_id=shot_group_id,
+            before={
+                "episode_version": expected_episode_version,
+                "canceled_video_job_ids": list(canceled_job_ids),
+            },
+            after={
+                "episode_version": result.episode_version,
+                "removed_shot_count": result.removed_shot_count,
+                "removed_video_job_ids": list(result.removed_video_job_ids),
+                "removed_timeline_arrangement_count": result.removed_timeline_arrangement_count,
+                "scheduled_storage_delete_count": result.scheduled_storage_delete_count,
+            },
+        )
+        workbench = await get_video_workbench(db, script_id, episode_id)
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise
     return workbench
 
 

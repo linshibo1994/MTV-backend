@@ -6,7 +6,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import noload
 
@@ -17,7 +17,10 @@ from app.models.script import Script
 from app.models.shot import Shot
 from app.models.shot_group import FINAL_SHOT_GROUP_UNIT_PREFIX, ShotGroup
 from app.models.subject import Subject
-from app.models.video_generation_job import VideoGenerationJob
+from app.models.video_generation_job import (
+    VIDEO_SUBMISSION_MANUAL_REVIEW_ERROR_TYPE,
+    VideoGenerationJob,
+)
 from app.services.shot_group_merge import _rewrite_shot_line
 
 _ACTIVE_VIDEO_STATUSES = ("starting", "processing")
@@ -388,7 +391,14 @@ async def update_shot_group(
             select(VideoGenerationJob.job_id)
             .where(
                 VideoGenerationJob.shot_group_id == shot_group_id,
-                VideoGenerationJob.status.in_(_ACTIVE_VIDEO_STATUSES),
+                or_(
+                    VideoGenerationJob.status.in_(_ACTIVE_VIDEO_STATUSES),
+                    (VideoGenerationJob.status == "failed")
+                    & (
+                        VideoGenerationJob.error_type
+                        == VIDEO_SUBMISSION_MANUAL_REVIEW_ERROR_TYPE
+                    ),
+                ),
             )
             .limit(1)
         )

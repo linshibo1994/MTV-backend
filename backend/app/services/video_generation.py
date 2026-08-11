@@ -20,6 +20,7 @@ import asyncio
 import hashlib
 import json
 import logging
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
 
 from billiard.exceptions import SoftTimeLimitExceeded, TimeLimitExceeded
@@ -35,7 +36,10 @@ from app.crud import video as video_crud
 from app.models.episode import Episode
 from app.models.script import Script
 from app.models.shot_group import ShotGroup, shot_group_content_hash
-from app.models.video_generation_job import VIDEO_IDEMPOTENCY_KEY_MAX_LENGTH
+from app.models.video_generation_job import (
+    VIDEO_IDEMPOTENCY_KEY_MAX_LENGTH,
+    is_video_job_manual_review,
+)
 from app.providers.video_gen import (
     VideoCancellationOutcome,
     VideoCancellationResult,
@@ -55,6 +59,7 @@ from app.services.video_remote_cancellation import (
     persist_locked_provider_cancellation_result,
     persist_provider_cancellation_result,
     provider_submission_is_unresolved,
+    provider_submission_requires_manual_review,
 )
 
 if TYPE_CHECKING:
@@ -550,6 +555,118 @@ async def cancel_video_job(
         select(VideoGenerationJob).where(VideoGenerationJob.job_id == job_id)
     )
     return r2.scalar_one()  # type: ignore[return-value]
+
+
+async def force_cancel_expired_unresolved_video_job(
+    db: AsyncSession,
+    *,
+    script_id: str,
+    job_id: str,
+    actor_user_id: str,
+    commit: bool = True,
+) -> "VideoGenerationJob":
+    """在已获明确授权时，终止无远端 ID 的过期未决提交并释放预扣积分。
+
+    这是受限的运维修复入口，不对 API 暴露：仅接受远端任务 ID 确认缺失、
+    提交证据镜像一致的 ``submission_uncertain`` 任务。processing 任务还必须
+    已过租约，避免与仍在运行的 Worker 并发覆盖。
+    """
+
+    from fastapi import HTTPException, status
+
+    from app.core.errors import ConflictError
+    from app.models.video_generation_job import VideoGenerationJob
+
+    if not actor_user_id:
+        raise ConflictError("强制清理必须记录操作者")
+
+    try:
+        job = (
+            await db.execute(
+                select(VideoGenerationJob)
+                .where(VideoGenerationJob.job_id == job_id)
+                .options(noload(VideoGenerationJob.script))
+                .execution_options(populate_existing=True)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if job is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="视频生成任务不存在")
+        if job.script_id != script_id:
+            raise ConflictError("任务不属于该剧本")
+
+        now = datetime.now(UTC)
+        is_manual_review = is_video_job_manual_review(job.status, job.error_type)
+        if job.status == "processing":
+            lease_until = job.lease_until
+            comparable_now = now if getattr(lease_until, "tzinfo", None) else now.replace(tzinfo=None)
+            if lease_until is None or lease_until > comparable_now:
+                raise ConflictError("任务租约尚未过期，不可强制终止")
+        elif not is_manual_review:
+            raise ConflictError(f"任务当前状态 {job.status}，不可强制终止")
+
+        if not provider_submission_requires_manual_review(
+            job.output_json,
+            job.metrics,
+            provider_key=job.provider_key,
+            attempt=job.attempt,
+        ):
+            raise ConflictError("任务存在远端 ID、证据冲突或提交事实不完整，不可本地强制清理")
+
+        reservation_id = await _lookup_reservation_for_cancel(db, job_id)
+        if reservation_id:
+            from app.services.credits import release as _credits_release
+
+            await _credits_release(
+                db,
+                reservation_id=reservation_id,
+                reason=f"用户确认强制清理未决视频任务 job_id={job_id}",
+                actor_user_id=actor_user_id,
+                commit=False,
+            )
+
+        await cancel_outbox_task(
+            db,
+            task_type="video.generate",
+            job_id=job.job_id,
+            attempt=job.attempt,
+        )
+        expected_version = int(job.version or 0)
+        updated = cast(
+            CursorResult[Any],
+            await db.execute(
+                update(VideoGenerationJob)
+                .where(
+                    VideoGenerationJob.job_id == job.job_id,
+                    VideoGenerationJob.status == job.status,
+                    VideoGenerationJob.version == expected_version,
+                )
+                .values(
+                    status="canceled",
+                    progress_stage="forced_local_cleanup",
+                    progress_message="已按用户确认强制终止本地任务",
+                    error_type="forced_local_cleanup",
+                    error_message="远端提交无可核对任务 ID，已按用户确认释放本地预扣",
+                    retryable=False,
+                    lease_owner=None,
+                    lease_token=None,
+                    lease_until=None,
+                    canceled_at=now,
+                    finished_at=now,
+                    version=VideoGenerationJob.version + 1,
+                )
+            ),
+        )
+        await db.flush()
+        if updated.rowcount != 1:
+            raise ConflictError("任务状态已变化，请重新核对后再强制终止")
+        if commit:
+            await db.commit()
+        return job
+    except Exception:
+        if commit:
+            await db.rollback()
+        raise
 
 
 async def _best_effort_cancel_rollback(

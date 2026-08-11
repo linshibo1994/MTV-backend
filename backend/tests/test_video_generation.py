@@ -922,10 +922,11 @@ def test_manual_retry_reuses_unresolved_submission_without_new_attempt(monkeypat
             job_id="job-manual-retry-blocked",
             reservation_id="reservation-manual-retry-blocked",
         )
-        job.status = "processing"
-        job.lease_owner = "worker"
-        job.lease_token = "lease-token"
-        job.lease_until = datetime.now(UTC) + timedelta(minutes=5)
+        job.status = "failed"
+        job.progress_stage = "manual_review"
+        job.error_type = "provider_submission_uncertain"
+        job.retryable = False
+        job.finished_at = datetime.now(UTC)
         submission = {
             "state": "submission_uncertain",
             "provider_key": "modelsai",
@@ -3895,9 +3896,19 @@ def test_stale_video_reconciler_does_not_resubmit_unresolved_submission() -> Non
     asyncio.run(run())
     raw.expire_all()
     saved = raw.get(VideoGenerationJob, job.job_id)
+    reservation = raw.get(CreditReservation, job.reservation_id)
     assert saved is not None
-    assert saved.status == "processing"
-    assert saved.lease_token == "expired-token"
+    assert reservation is not None
+    assert saved.status == "failed"
+    assert saved.progress_stage == "manual_review"
+    assert saved.error_type == "provider_submission_uncertain"
+    assert saved.retryable is False
+    assert saved.finished_at is not None
+    assert saved.lease_owner is None
+    assert saved.lease_token is None
+    assert saved.lease_until is None
+    assert reservation.status == "reserved"
+    assert raw.scalars(select(TaskDispatchOutbox)).all() == []
 
 
 def test_cancel_refuses_unresolved_submission_and_keeps_credit_frozen() -> None:
@@ -3931,6 +3942,131 @@ def test_cancel_refuses_unresolved_submission_and_keeps_credit_frozen() -> None:
                 script_id=seeded.script.id,
                 job_id=job.job_id,
                 actor_user_id=seeded.user.user_id,
+            )
+
+    asyncio.run(run())
+    raw.expire_all()
+    saved = raw.get(VideoGenerationJob, job.job_id)
+    reservation = raw.get(CreditReservation, job.reservation_id)
+    assert saved is not None
+    assert reservation is not None
+    assert saved.status == "processing"
+    assert reservation.status == "reserved"
+
+
+def test_force_cancel_expired_unresolved_video_job_releases_credit_and_cancels_outbox() -> None:
+    from app.services.video_generation import force_cancel_expired_unresolved_video_job
+
+    _, raw = _make_db()
+    seeded = _seed(raw)
+    job = _add_worker_job(
+        raw,
+        seeded,
+        job_id="job-force-cancel-submission-uncertain",
+        reservation_id="reservation-force-cancel-submission-uncertain",
+    )
+    job.status = "processing"
+    job.lease_owner = "worker"
+    job.lease_token = "expired-lease-token"
+    job.lease_until = datetime.now(UTC) - timedelta(minutes=1)
+    submission = {
+        "state": "submission_uncertain",
+        "provider_key": "modelsai",
+        "attempt": 1,
+    }
+    job.output_json = {"provider_submission": submission}
+    job.metrics = {"provider_submission": submission}
+    outbox = TaskDispatchOutbox(
+        id="dispatch-force-cancel-submission-uncertain",
+        task_type="video.generate",
+        job_id=job.job_id,
+        attempt=job.attempt,
+        payload={"job_id": job.job_id},
+        status="pending",
+    )
+    raw.add(outbox)
+    raw.commit()
+
+    async def run() -> None:
+        canceled = await force_cancel_expired_unresolved_video_job(
+            _AsyncSessionAdapter(raw),
+            script_id=seeded.script.id,
+            job_id=job.job_id,
+            actor_user_id=seeded.user.user_id,
+        )
+        assert canceled.status == "canceled"
+
+    asyncio.run(run())
+    raw.expire_all()
+    saved = raw.get(VideoGenerationJob, job.job_id)
+    reservation = raw.get(CreditReservation, job.reservation_id)
+    saved_outbox = raw.get(TaskDispatchOutbox, outbox.id)
+    assert saved is not None
+    assert reservation is not None
+    assert saved_outbox is not None
+    assert saved.status == "canceled"
+    assert saved.progress_stage == "forced_local_cleanup"
+    assert saved.error_type == "forced_local_cleanup"
+    assert saved.retryable is False
+    assert saved.lease_owner is None
+    assert saved.lease_token is None
+    assert saved.lease_until is None
+    assert reservation.status == "released"
+    assert saved_outbox.status == "canceled"
+
+
+def test_force_cancel_expired_unresolved_video_job_rejects_live_or_known_remote_task() -> None:
+    from app.services.video_generation import force_cancel_expired_unresolved_video_job
+
+    _, raw = _make_db()
+    seeded = _seed(raw)
+    script_id = seeded.script.id
+    actor_user_id = seeded.user.user_id
+    job = _add_worker_job(
+        raw,
+        seeded,
+        job_id="job-force-cancel-rejected",
+        reservation_id="reservation-force-cancel-rejected",
+    )
+    job_id = job.job_id
+    job.status = "processing"
+    job.lease_owner = "worker"
+    job.lease_token = "live-lease-token"
+    job.lease_until = datetime.now(UTC) + timedelta(minutes=1)
+    submission = {
+        "state": "submission_uncertain",
+        "provider_key": "modelsai",
+        "attempt": 1,
+    }
+    job.output_json = {"provider_submission": submission}
+    job.metrics = {"provider_submission": submission}
+    raw.commit()
+
+    async def run() -> None:
+        with pytest.raises(ConflictError, match="租约尚未过期"):
+                await force_cancel_expired_unresolved_video_job(
+                    _AsyncSessionAdapter(raw),
+                    script_id=script_id,
+                    job_id=job_id,
+                    actor_user_id=actor_user_id,
+            )
+
+        job.lease_until = datetime.now(UTC) - timedelta(minutes=1)
+        job.output_json = {
+            "provider_submission": submission,
+            "provider_task_id": "remote-task-known",
+        }
+        job.metrics = {
+            "provider_submission": submission,
+            "provider_task_id": "remote-task-known",
+        }
+        raw.commit()
+        with pytest.raises(ConflictError, match="远端 ID"):
+                await force_cancel_expired_unresolved_video_job(
+                    _AsyncSessionAdapter(raw),
+                    script_id=script_id,
+                    job_id=job_id,
+                    actor_user_id=actor_user_id,
             )
 
     asyncio.run(run())

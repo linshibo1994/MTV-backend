@@ -11,6 +11,7 @@ from sqlalchemy.orm import noload
 
 from app.core.ids import new_id
 from app.models.video_generation_job import (
+    VIDEO_SUBMISSION_MANUAL_REVIEW_ERROR_TYPE,
     VideoGenerationIdempotencyRequest,
     VideoGenerationJob,
 )
@@ -230,7 +231,14 @@ async def find_active_job_by_unit(
         select(VideoGenerationJob)
         .where(
             VideoGenerationJob.unit_id == unit_id,
-            VideoGenerationJob.status.in_(_ACTIVE_STATUSES),
+            or_(
+                VideoGenerationJob.status.in_(_ACTIVE_STATUSES),
+                (VideoGenerationJob.status == "failed")
+                & (
+                    VideoGenerationJob.error_type
+                    == VIDEO_SUBMISSION_MANUAL_REVIEW_ERROR_TYPE
+                ),
+            ),
         )
         .order_by(VideoGenerationJob.created_at.desc())
         .limit(1)
@@ -518,6 +526,78 @@ async def finish_video_job(
     )
     await db.flush()
     return result.rowcount == 1
+
+
+async def mark_video_submission_uncertain_for_manual_review(
+    db: AsyncSession,
+    job_id: str,
+    lease_token: str,
+    *,
+    provider_key: str,
+    attempt: int,
+) -> bool:
+    """将已确认的未决远端提交转为待人工核对，绝不处理积分。"""
+
+    current = await _lock_video_job_for_update(db, job_id)
+    if (
+        current is None
+        or current.status != "processing"
+        or current.lease_token != lease_token
+    ):
+        return False
+    from app.providers.video_gen import VideoTaskCheckpointConflict
+    from app.services.video_remote_cancellation import (
+        OrphanProviderCancellationCapacityExceeded,
+        merge_reclaimed_video_task_generation,
+        provider_submission_requires_manual_review,
+    )
+
+    if not provider_submission_requires_manual_review(
+        current.output_json,
+        current.metrics,
+        provider_key=provider_key,
+        attempt=attempt,
+    ):
+        return False
+    try:
+        output_json, metrics = merge_reclaimed_video_task_generation(
+            current.output_json,
+            current.metrics,
+            lease_token,
+        )
+    except (VideoTaskCheckpointConflict, OrphanProviderCancellationCapacityExceeded):
+        return False
+    expected_version = int(current.version or 0)
+    now = datetime.now(UTC)
+    updated = cast(
+        CursorResult[Any],
+        await db.execute(
+            update(VideoGenerationJob)
+            .where(
+                VideoGenerationJob.job_id == job_id,
+                VideoGenerationJob.status == "processing",
+                VideoGenerationJob.lease_token == lease_token,
+                VideoGenerationJob.version == expected_version,
+            )
+            .values(
+                status="failed",
+                progress_stage="manual_review",
+                progress_message="远端任务与积分事实待人工核对",
+                error_type=VIDEO_SUBMISSION_MANUAL_REVIEW_ERROR_TYPE,
+                error_message="远端提交结果未确认，需人工核对后处理积分",
+                retryable=False,
+                output_json=output_json,
+                metrics=metrics,
+                lease_owner=None,
+                lease_token=None,
+                lease_until=None,
+                finished_at=now,
+                version=VideoGenerationJob.version + 1,
+            )
+        ),
+    )
+    await db.flush()
+    return updated.rowcount == 1
 
 
 async def list_stale_processing_jobs(

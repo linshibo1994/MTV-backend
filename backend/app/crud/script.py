@@ -50,6 +50,7 @@ from app.services.storage_references import (
     normalize_storage_keys,
 )
 from app.services.task_dispatch import cancel_outbox_task
+from app.services.video_cleanup_policy import has_retryable_video_cleanup_debt
 
 logger = logging.getLogger(__name__)
 
@@ -58,9 +59,6 @@ _VIDEO_ACTIVE_STATUSES = frozenset(
 )
 _STORYBOARD_ACTIVE_STATUSES = frozenset({"pending", "ready", "retry", "running"})
 _PIPELINE_ACTIVE_STATUSES = frozenset({"pending", "ready", "retry", "running"})
-_PROVIDER_CANCELLATION_KEY = "provider_cancellation"
-_ATTEMPT_OUTPUT_CLEANUP_KEY = "attempt_output_cleanup"
-_RETRYABLE_PROVIDER_CANCELLATION_OUTCOMES = frozenset({"pending", "failed"})
 
 # --------------------------------------------------------------------------- #
 # 内部辅助
@@ -592,32 +590,13 @@ def _has_retryable_video_cleanup_debt(
     error_type: str | None,
     retryable: bool,
 ) -> bool:
-    """识别删除视频任务会丢失的远端取消、媒体或财务补偿债务。"""
-    if _has_retryable_financial_cleanup_debt(status, error_type, retryable):
-        return True
+    """兼容既有内部调用，实际判定由视频清理策略统一维护。"""
 
-    if not isinstance(output_json, dict):
-        return False
-
-    cancellation = output_json.get(_PROVIDER_CANCELLATION_KEY)
-    if status == "canceled" and isinstance(cancellation, dict):
-        provider_task_id = str(
-            cancellation.get("provider_task_id")
-            or output_json.get("provider_task_id")
-            or ""
-        ).strip()
-        if (
-            provider_task_id
-            and cancellation.get("retryable") is True
-            and str(cancellation.get("outcome") or "")
-            in _RETRYABLE_PROVIDER_CANCELLATION_OUTCOMES
-        ):
-            return True
-
-    attempt_cleanup = output_json.get(_ATTEMPT_OUTPUT_CLEANUP_KEY)
-    return isinstance(attempt_cleanup, dict) and any(
-        isinstance(record, dict) and record.get("retryable") is True
-        for record in attempt_cleanup.values()
+    return has_retryable_video_cleanup_debt(
+        status,
+        output_json,
+        error_type,
+        retryable,
     )
 
 
@@ -927,7 +906,7 @@ async def _lock_video_jobs_for_delete(
     )
     if debt_count:
         raise ConflictError(
-            f"仍有 {debt_count} 个视频任务存在可重试的远端取消、"
+            f"仍有 {debt_count} 个视频任务存在待人工核对或可重试的远端取消、"
             "媒体清理债务或财务清理债务，"
             "请等待后台清理完成后再删除"
         )

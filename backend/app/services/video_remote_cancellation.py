@@ -263,6 +263,39 @@ def provider_submission_is_unresolved(
     return state in _UNRESOLVED_SUBMISSION_STATES
 
 
+def provider_submission_requires_manual_review(
+    output_json: dict[str, Any] | None,
+    metrics: dict[str, Any] | None,
+    *,
+    provider_key: str,
+    attempt: int,
+) -> bool:
+    """仅将完整、镜像一致且无远端 ID 的提交不确定记录转入人工核对。"""
+
+    if not provider_key or attempt <= 0:
+        return False
+    authority_consistent, provider_task_id = provider_task_id_authority(output_json, metrics)
+    if not authority_consistent or provider_task_id is not None:
+        return False
+    output_record = (output_json or {}).get(PROVIDER_SUBMISSION_KEY)
+    metrics_record = (metrics or {}).get(PROVIDER_SUBMISSION_KEY)
+    if (
+        not isinstance(output_record, dict)
+        or not isinstance(metrics_record, dict)
+        or output_record != metrics_record
+        or output_record.get("state") != "submission_uncertain"
+        or str(output_record.get("provider_key") or "") != provider_key
+    ):
+        return False
+    raw_attempt = output_record.get("attempt")
+    if isinstance(raw_attempt, bool) or not isinstance(raw_attempt, int | str):
+        return False
+    try:
+        return int(raw_attempt) == attempt
+    except (TypeError, ValueError):
+        return False
+
+
 def _merge_provider_submission_state(
     output_json: dict[str, Any] | None,
     metrics: dict[str, Any] | None,

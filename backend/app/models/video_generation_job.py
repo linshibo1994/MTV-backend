@@ -21,6 +21,16 @@ from app.models.base import Base, TimestampMixin
 
 VIDEO_IDEMPOTENCY_KEY_MAX_LENGTH = 256
 
+# 远端提交或恢复事实无法自动判定时，复用 failed 终态承载“待人工核对”。
+# 这类失败不可自动重试、不可释放积分，也不可删除所属剧本。
+VIDEO_SUBMISSION_MANUAL_REVIEW_ERROR_TYPE = "provider_submission_uncertain"
+
+
+def is_video_job_manual_review(status: str | None, error_type: str | None) -> bool:
+    """判断视频任务是否已进入保留账务与远端事实的人工核对状态。"""
+
+    return status == "failed" and error_type == VIDEO_SUBMISSION_MANUAL_REVIEW_ERROR_TYPE
+
 
 class VideoGenerationJob(TimestampMixin, Base):
     """视频生成任务 — 多参考图图生视频，provider_key 由数据库或 env 选择规范供应商。"""

@@ -1473,6 +1473,7 @@ async def run_video_generation_once(
         VideoGenerationRequest,
         get_video_provider,
     )
+    from app.services.task_dispatch import cancel_outbox_task
 
     checkpoint_state = checkpoint_holder or _VideoTaskCheckpointHolder()
     claim = None
@@ -1902,6 +1903,34 @@ async def run_video_generation_once(
             "视频远端提交响应不确定，禁止自动重提并保留冻结 job_id=%s",
             job_id,
         )
+        try:
+            reviewed = await video_crud.mark_video_submission_uncertain_for_manual_review(
+                db,
+                job_id,
+                claim.lease_token,
+                provider_key=job_provider_key,
+                attempt=claim.attempt,
+            )
+            if reviewed:
+                await cancel_outbox_task(
+                    db,
+                    task_type="video.generate",
+                    job_id=job_id,
+                    attempt=claim.attempt,
+                )
+                await db.commit()
+                logger.warning("视频任务已转入人工核对 job_id=%s", job_id)
+                return
+            await db.rollback()
+        except (SoftTimeLimitExceeded, TimeLimitExceeded):
+            raise
+        except Exception:  # noqa: BLE001 - stale reconciler 仍可接管历史遗留任务
+            await _best_effort_rollback(
+                db,
+                job_id=job_id,
+                stage="submission_uncertain_manual_review",
+            )
+            logger.exception("视频任务转人工核对失败 job_id=%s", job_id)
         return
     except VideoGenerationSubmitRejected as exc:
         diagnostics = sanitize_video_submit_rejection_diagnostics(exc.diagnostics)
@@ -2900,9 +2929,17 @@ def _record_stale_video_attempt_cleanup_debt(job: Any) -> bool:
             metrics,
             lease_token,
         )
-    except (VideoTaskCheckpointConflict, OrphanProviderCancellationCapacityExceeded) as exc:
+    except VideoTaskCheckpointConflict as exc:
         logger.error(
             "卡死视频任务旧代际无法持久化，保留原 lease "
+            "job_id=%s error_type=%s",
+            job_id,
+            exc.__class__.__name__,
+        )
+        return False
+    except OrphanProviderCancellationCapacityExceeded as exc:
+        logger.error(
+            "卡死视频任务旧代际容量已满，保留原 lease "
             "job_id=%s error_type=%s",
             job_id,
             exc.__class__.__name__,
@@ -3633,17 +3670,47 @@ async def reconcile_stale_video_jobs(db: Any, *, limit: int = 50) -> list[str]:
 
     from app.crud import video as video_crud
     from app.models.task_dispatch_outbox import TaskDispatchOutbox
-    from app.services.task_dispatch import enqueue_task
-    from app.services.video_remote_cancellation import provider_submission_is_unresolved
+    from app.services.task_dispatch import cancel_outbox_task, enqueue_task
+    from app.services.video_remote_cancellation import (
+        provider_submission_is_unresolved,
+        provider_submission_requires_manual_review,
+    )
 
     await reconcile_video_attempt_cleanup_debts(db, limit=limit)
     current = datetime.now(UTC)
     stale = await video_crud.list_stale_processing_jobs(db, lease_seconds=_LEASE_SECONDS, limit=limit)
     recovered: list[str] = []
     for job in stale:
+        provider_key = str(getattr(job, "provider_key", "") or "")
+        attempt = int(getattr(job, "attempt", 0) or 0)
+        if provider_submission_requires_manual_review(
+            job.output_json,
+            job.metrics,
+            provider_key=provider_key,
+            attempt=attempt,
+        ):
+            reviewed = await video_crud.mark_video_submission_uncertain_for_manual_review(
+                db,
+                job.job_id,
+                job.lease_token or "",
+                provider_key=provider_key,
+                attempt=attempt,
+            )
+            if reviewed:
+                await cancel_outbox_task(
+                    db,
+                    task_type="video.generate",
+                    job_id=job.job_id,
+                    attempt=job.attempt,
+                )
+                logger.warning("卡死视频任务已转人工核对 job_id=%s", job.job_id)
+            else:
+                logger.error("卡死视频任务无法转人工核对 job_id=%s", job.job_id)
+            continue
         if provider_submission_is_unresolved(job.output_json, job.metrics):
             logger.error(
-                "卡死视频任务存在未决远端提交，禁止自动重提 job_id=%s",
+                "卡死视频任务存在未决远端提交但证据不完整，保留原 lease "
+                "job_id=%s",
                 job.job_id,
             )
             continue
