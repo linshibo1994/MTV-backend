@@ -361,6 +361,7 @@ async def _mark_failed_after_rollback(
             error_message=failure.error_message,
             error_type=failure.error_type,
             retryable=failure.retryable or release_failed,
+            diagnostic=failure.diagnostic,
         )
         if not completed:
             await db.rollback()

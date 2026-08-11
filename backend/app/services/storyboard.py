@@ -3,8 +3,9 @@
 严格遵循 06-AI能力与Prompt工程文档.md 第 7 节 (分镜 Shot Prompt 结构) 与第 8 节 (视频生成约束锁)。
 
 输入: 单集剧本 + 主体列表
-LLM 产出: 场景 -> 叙事分组建议 -> 小分镜
-每镜头: content (画面内容) + description (摄影级结构化描述)
+LLM 产出: 场景 -> 叙事分组建议 -> 结构化小分镜 storyboard.v2
+每镜头: 景别、构图、机位、运镜、动作、画面、光影、情绪、声音与叙事目的
+服务端再确定性派生旧版 content / description / shot_line，避免多份事实漂移。
 每个 draft 组: 多镜头分时段建议 + 叙事目的；后续由合并接口发布为正式视频单元
 解析引用主体填充 shot_group.materials {character/background/prop/other}
 audio_elements 需配音角色
@@ -12,8 +13,11 @@ audio_elements 需配音角色
 
 from __future__ import annotations
 
+import inspect
+import json
 import logging
-from typing import Any
+from dataclasses import dataclass
+from typing import cast
 
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -27,12 +31,25 @@ from app.models.shot import Shot
 from app.models.shot_group import DRAFT_SHOT_GROUP_UNIT_PREFIX, ShotGroup
 from app.models.subject import Subject
 from app.models.video_generation_job import VideoGenerationJob
+from app.providers.llm import LLMJSONResponseError
 from app.schemas.pipeline_contracts import ProviderContractError
-from app.schemas.storyboard_contracts import StoryboardContract, validate_storyboard_contract
+from app.schemas.storyboard_contracts import (
+    CAMERA_ANGLE_VALUES,
+    CAMERA_MOVEMENT_VALUES,
+    COMPOSITION_VALUES,
+    SHOT_SIZE_VALUES,
+    StoryboardContract,
+    StoryboardContractValidationError,
+    StoryboardV2Contract,
+    storyboard_contract_diagnostic,
+    validate_storyboard_contract,
+    validate_storyboard_v2_contract,
+)
 
 logger = logging.getLogger(__name__)
 
-_STORYBOARD_CONTRACT_MAX_ATTEMPTS = 3
+_STORYBOARD_CONTRACT_MAX_ATTEMPTS = 2
+_STORYBOARD_REPAIR_PAYLOAD_MAX_CHARS = 120_000
 
 
 # ---------------------------------------------------------------------------
@@ -72,7 +89,9 @@ DESCRIPTION_TEMPLATE = (
 SHOT_LINE_TEMPLATE = (
     "【镜头{n}:{start}s～{end}s】场景是{scene}，"
     "{shot_scale}·{camera}，{camera_movement}，"
-    "{lighting}，{action}，{emotion}，{characters}:{dialogue}"
+    "{lighting}，{action}，{emotion}，{characters}:{dialogue}，"
+    "构图是【{composition}】，声音设计是【{sound_design}】，"
+    "台词类型是【{dialogue_kind}】"
 )
 
 
@@ -80,137 +99,216 @@ SHOT_LINE_TEMPLATE = (
 # LLM Prompt 构造
 # ---------------------------------------------------------------------------
 
-_SYSTEM_PROMPT = """你是一位专业的短剧分镜导演与摄影指导。你的任务是将剧本拆分为分镜层级结构。
+_SYSTEM_PROMPT = f"""你是一位专业的短剧分镜导演与摄影指导。请把剧本转换为可拍摄、可验证的 storyboard.v2 JSON。
 
-## 层级结构
-Episode (集) -> Scene (场景, 按背景主体聚合) -> Shot Group (镜头组, 视频生成单元) -> Shot (镜头, 最小叙事单元)
+## 层级
+Episode -> Scene（连续时空段落）-> Shot Group（3~15 秒叙事单元）-> Shot（单一视觉节拍）。
 
-## 输出要求
+## 导演规则
+1. 场景、地点、日夜、时间或连续叙事段落变化时新建 Scene；离开后再回到同一地点也要新建 Scene。
+2. 每个新场景最多用 1~2 个镜头完成定场；每镜只承载一个主要动作或信息变化，避免无叙事作用的装饰镜头。
+3. 景别随叙事逐步聚焦或释放，避免连续三镜使用相同景别；运镜必须服务于发现、强调、跟随或情绪变化。
+4. 相邻镜头保持人物位置、朝向、视线与动作进度连续；用反应镜、动作桥或声音桥承接情绪和转场。
+5. frame_description 只写可见的主体、动作状态与前中后景空间，不写无法拍摄的心理判断。
+6. 剧本中的对白、旁白和内心独白必须逐字保留；不得增删或改写。无语言内容时 dialogue 必须为 null。
+7. 只可引用输入目录中的短引用；不得输出主体名称、subject_id、asset_entry_id，也不得创造新资产。
+8. 不要输出 content、description 或 shot_line；这些派生字段由服务端生成。
 
-### Scene (场景)
-- Scene 表示一次连续的时空与叙事段落；背景、日夜、时间或连续叙事段落变化时建立新 Scene
-- 剧情离开后再次回到相同背景时也必须建立新的 scene_no，不得把不连续片段聚合到一起
-- scene_no: 从 1 开始递增
-- background: 背景主体名 (如 "养鸡场办公室-内-夜")
+## 受控摄影词表
+- shot_size: {'/'.join(SHOT_SIZE_VALUES)}
+- composition: {'/'.join(COMPOSITION_VALUES)}（每镜 1~3 项）
+- camera_angle: {'/'.join(CAMERA_ANGLE_VALUES)}
+- camera_movement: {'/'.join(CAMERA_MOVEMENT_VALUES)}
 
-### Shot Group (叙事分组建议)
-- 此阶段只负责给连续小分镜提供语义边界；用户点击“合并镜头组”后才发布为视频生成单元
-- group_no: G1, G2, G3... (场景内递增)
-- narrative_purpose: 该镜头组的叙事目的
-- duration_seconds: 该镜头组的总时长 (秒), 为各镜头时长之和
+## 结构与时码
+- schema_version 必须是 storyboard.v2。
+- scene_no 从 1 连续递增；每个 Scene 内 group_no 从 G1 连续递增。
+- 每组 1~5 镜，duration_seconds 为 3~15 的整数秒；单镜头组可用于定场、反应或转场，
+  叙事需要时优先使用 2~5 镜的连续镜头组。
+- 每组 display_no 必须严格为 1, 2, ..., N；首镜 start_seconds=0，相邻区间首尾相接。
+- end_seconds 必须大于 start_seconds，末镜 end_seconds 必须等于 duration_seconds；所有时码只能是整数。
+- background_ref 只能引用场景；character_refs 只能引用角色；prop_refs 只能引用道具；sound_refs 只能引用声音。
+- kind=dialogue/inner_monologue 时 speaker_ref 必须是当前镜头可见角色；kind=voice_over 时 speaker_ref 可为角色、声音主体或 null。
+- narrative_purpose 要说明该镜头让观众获得什么信息、感受什么变化，不能只写“推进剧情”。
+- sound_design 写可执行的环境音/动作音/声音衔接，无声音时写“无”。
 
-### Shot (镜头)
-- 每镜头包含: content (画面内容, 自然语言) + description (摄影级结构化描述)
-- display_no: 每个镜头组内必须按 shots 数组顺序从 1 开始连续编号 (1, 2, 3...), 不得跳号或重复; 新镜头组重新从 1 开始
-- description 必须严格使用模板: "在【{背景}】中采用【{机位}】拍摄视角，画面主体【{角色}】的关键动作是【{动作}】，整体表现的画面是【{画面}】，表达了【{情绪}】，整体画面的光影效果是【{光影}】，整个镜头的叙事目的是【{叙事目的}】。"
-- shot_line: 该镜头在组合 prompt 中的单行, 格式 "【镜头N:起s～止s】场景是{场景}，{景别}·{机位}，{运镜}，{光影}，{画面动作}，{情绪}，{角色名}:{台词}"
-- 景别可选: 全景/中景/近景/特写/俯拍特写
-- 机位可选: 平视/俯拍/仰拍/侧拍
-- 运镜可选: 固定/推轨/拉轨/摇镜/跟拍
-- start_seconds / end_seconds: 该镜头在镜头组内的非负整数秒时间区间, 禁止小数
-- characters: 出场角色名列表
-- dialogue_character: 有台词的角色名 (如有)
-- props: 该镜头出现的道具主体名列表 (引用主体列表中的 prop 类型, 无则空数组)
-- sounds: 该镜头出现的声音主体名列表 (引用主体列表中的 sound 类型, 如背景音乐/音效主体, 无则空数组)
-
-## 关键规则
-1. 引用的主体名必须来自提供的主体列表
-2. 一个镜头组必须包含 2~5 个镜头, 总时长 3~15 秒
-3. 每组 display_no 必须严格为 1, 2, ..., N, 与 shots 数组顺序一致
-4. 每组首镜头 start_seconds 必须为 0; 后续镜头 start_seconds 必须等于前一镜头 end_seconds
-5. end_seconds 必须严格大于 start_seconds, 最后一个 end_seconds 必须等于 duration_seconds
-6. 所有时间字段只能使用整数秒, 例如 0、3、7; 禁止 2.5 等小数
-7. shot_line 中的镜头编号和起止秒数必须与 display_no/start_seconds/end_seconds 完全一致
-8. description 的背景场景、角色、光影等需与剧本内容贴合
-9. 只输出 JSON, 不要任何额外文本
+只输出符合 JSON Schema 的 JSON 对象，不要 markdown 或解释文字。
 """
 
 
-def _build_subject_list_block(subjects: list[Subject], episode_no: int) -> str:
-    """构造主体列表文本块 (按类型分组)。"""
-    by_type: dict[str, list[Subject]] = {}
-    for s in subjects:
-        # 仅保留该集出现的主体
-        ep_nos = s.episode_nos or []
-        if ep_nos and episode_no not in ep_nos:
-            continue
-        by_type.setdefault(s.type, []).append(s)
+@dataclass(frozen=True)
+class _SubjectReference:
+    ref: str
+    name: str
+    subject_type: str
+    description: str
+    subject_id: str
+    asset_entry_id: str | None
 
-    type_labels = {
-        "character": "角色",
-        "scene": "场景",
-        "background": "场景",
-        "prop": "道具",
-        "sound": "声音",
+    @property
+    def has_image_asset(self) -> bool:
+        return self.asset_entry_id is not None
+
+
+@dataclass(frozen=True)
+class _ValidatedStoryboard:
+    """同时保留兼容落库合约与 v2 引用事实。
+
+    ``v2_contract`` 使资产绑定能一直使用稳定短引用，不会在不同类型同名
+    主体之间二次按名称猜测。历史 v1 响应则为 ``None``。
+    """
+
+    contract: StoryboardContract
+    v2_contract: StoryboardV2Contract | None
+
+
+def _build_subject_reference_catalog(
+    subjects: list[Subject],
+    episode_no: int,
+) -> dict[str, _SubjectReference]:
+    """为当前分集生成稳定短引用，模型永不接触服务端 UUID。"""
+    prefixes = {
+        "character": "C",
+        "scene": "BG",
+        "background": "BG",
+        "prop": "P",
+        "sound": "S",
     }
+    counters: dict[str, int] = {}
+    catalog: dict[str, _SubjectReference] = {}
+    eligible = [
+        subject
+        for subject in subjects
+        if (not (subject.episode_nos or []) or episode_no in (subject.episode_nos or []))
+        and getattr(subject, "is_active", True)
+        and subject.type in prefixes
+    ]
+    for subject in sorted(
+        eligible,
+        key=lambda item: (item.type, item.name, getattr(item, "id", "")),
+    ):
+        prefix = prefixes[subject.type]
+        counters[prefix] = counters.get(prefix, 0) + 1
+        ref = f"{prefix}{counters[prefix]:02d}"
+        subject_type = "background" if subject.type == "scene" else subject.type
+        catalog[ref] = _SubjectReference(
+            ref=ref,
+            name=subject.name,
+            subject_type=subject_type,
+            description=(getattr(subject, "description", None) or "无补充描述").strip(),
+            subject_id=str(subject.id),
+            asset_entry_id=(
+                str(subject.image_entry_id)
+                if getattr(subject, "image_entry_id", None)
+                else None
+            ),
+        )
+    return catalog
 
+
+def _build_subject_list_block(
+    subjects: list[Subject],
+    episode_no: int,
+    references: dict[str, _SubjectReference] | None = None,
+) -> str:
+    """构造只含短引用、名称与创作上下文的主体目录。"""
+    reference_catalog = references or _build_subject_reference_catalog(subjects, episode_no)
     lines: list[str] = []
-    for stype, items in by_type.items():
-        label = type_labels.get(stype, stype)
-        lines.append(f"\n### {label}")
-        for s in items:
-            desc = s.description or ""
-            lines.append(f"- {s.name}: {desc}")
-    return "\n".join(lines)
+    for ref, item in reference_catalog.items():
+        asset_state = "已绑定参考图" if item.has_image_asset else "暂无参考图"
+        lines.append(
+            f"- {ref} | {item.subject_type} | {item.name} | {item.description} | {asset_state}"
+        )
+    return "\n".join(lines) or "（当前分集没有可引用主体）"
 
 
-def _build_user_prompt(episode: Episode, subjects: list[Subject]) -> str:
-    """构造用户 prompt: 单集剧本 + 主体列表。"""
-    subject_block = _build_subject_list_block(subjects, episode.episode_no)
-    return f"""请为以下剧本集生成分镜层级结构。
+def _build_user_prompt(
+    episode: Episode,
+    subjects: list[Subject],
+    references: dict[str, _SubjectReference] | None = None,
+) -> str:
+    """构造 v2 用户提示；示例只表达形状，真实引用以目录为准。"""
+    reference_catalog = references or _build_subject_reference_catalog(
+        subjects,
+        episode.episode_no,
+    )
+    subject_block = _build_subject_list_block(
+        subjects,
+        episode.episode_no,
+        reference_catalog,
+    )
+    return f"""请为以下分集生成 storyboard.v2 分镜。
 
-## 分集信息
-- 集号: 第 {episode.episode_no} 集
-- 标题: {episode.title}
+## 分集
+- 集号：第 {episode.episode_no} 集
+- 标题：{episode.title}
 
-## 剧本内容
+## 剧本原文
 {episode.script_text or '(无剧本内容)'}
 
-## 可引用的主体列表
+## 当前分集可引用主体目录
+格式为：短引用 | 类型 | 名称 | 描述 | 参考图状态。JSON 中只能填写短引用。
 {subject_block}
 
-## 输出前自检
-- 每个 Scene 的 scene_no 从 1 连续递增
-- 每个 Scene 内的 group_no 从 G1 连续递增
-- 每个 Shot Group 内的 display_no 从 1 连续递增, 不跳号、不重复
-- start_seconds/end_seconds 只能是非负整数; 首镜头从 0 开始, 相邻区间首尾相接
-- 每个镜头必须满足 end_seconds > start_seconds, 末镜头 end_seconds 等于 duration_seconds
-
-## 输出 JSON 格式
+## JSON 形状示例
+下面的 BG01/C01/P01/S01 只是形状示例；若目录不存在该引用，不得使用。
 {{
+  "schema_version": "storyboard.v2",
   "scenes": [
     {{
       "scene_no": 1,
-      "background": "背景主体名",
+      "background_ref": "BG01",
       "shot_groups": [
         {{
           "group_no": "G1",
-          "narrative_purpose": "镜头组叙事目的",
-          "duration_seconds": 7,
+          "narrative_purpose": "建立空间关系并引出冲突",
+          "duration_seconds": 6,
           "shots": [
             {{
               "display_no": 1,
-              "content": "镜头画面内容 (自然语言)",
-              "description": "在【背景】中采用【机位】拍摄视角，画面主体【角色】的关键动作是【动作】，整体表现的画面是【画面】，表达了【情绪】，整体画面的光影效果是【光影】，整个镜头的叙事目的是【叙事目的】。",
-              "shot_line": "【镜头1:0s～4s】场景是背景，全景·平视机位，固定，光影描述，画面动作，情绪，角色名:台词",
               "start_seconds": 0,
-              "end_seconds": 4,
-              "characters": ["角色名1", "角色名2"],
-              "dialogue_character": "有台词的角色名 (无则为空字符串)",
-              "props": ["道具主体名1"],
-              "sounds": ["声音主体名1"]
+              "end_seconds": 3,
+              "visual": {{
+                "shot_size": "全景",
+                "composition": ["三分法", "纵深构图"],
+                "camera_angle": "平视",
+                "camera_movement": "推镜",
+                "action": "角色推门进入并在门口停住",
+                "frame_description": "前景门框形成框景，中景角色推门进入，背景人物抬头看向门口",
+                "lighting": "室内冷色顶光与门外自然光形成层次",
+                "emotion": "紧张、试探"
+              }},
+              "narrative_purpose": "交代人物进入空间并触发对视",
+              "character_refs": ["C01"],
+              "prop_refs": ["P01"],
+              "sound_refs": ["S01"],
+              "sound_design": "门轴轻响，室内环境声短暂停顿",
+              "dialogue": {{
+                "speaker_ref": "C01",
+                "text": "逐字保留的原台词",
+                "kind": "dialogue"
+              }}
             }},
             {{
               "display_no": 2,
-              "content": "下一镜头画面内容 (自然语言)",
-              "description": "在【背景】中采用【机位】拍摄视角，画面主体【角色】的关键动作是【动作】，整体表现的画面是【画面】，表达了【情绪】，整体画面的光影效果是【光影】，整个镜头的叙事目的是【叙事目的】。",
-              "shot_line": "【镜头2:4s～7s】场景是背景，中景·平视机位，固定，光影描述，画面动作，情绪，角色名:",
-              "start_seconds": 4,
-              "end_seconds": 7,
-              "characters": ["角色名1"],
-              "dialogue_character": "",
-              "props": [],
-              "sounds": []
+              "start_seconds": 3,
+              "end_seconds": 6,
+              "visual": {{
+                "shot_size": "近景",
+                "composition": ["单人", "三分法"],
+                "camera_angle": "平视",
+                "camera_movement": "固定",
+                "action": "人物停下手中动作并抬眼回应",
+                "frame_description": "人物位于画面右侧，视线越过前景物体看向门口",
+                "lighting": "冷色顶光勾勒面部轮廓",
+                "emotion": "迟疑"
+              }},
+              "narrative_purpose": "用反应镜承接前一镜并强化冲突",
+              "character_refs": ["C01"],
+              "prop_refs": [],
+              "sound_refs": [],
+              "sound_design": "无",
+              "dialogue": null
             }}
           ]
         }}
@@ -218,82 +316,66 @@ def _build_user_prompt(episode: Episode, subjects: list[Subject]) -> str:
     }}
   ]
 }}
+
+## 输出前自检
+- 是否覆盖剧本全部叙事、台词/旁白且没有新增情节；
+- scene_no、group_no、display_no 是否连续；
+- 时码是否全部为整数、连续且与组时长一致；
+- 所有短引用是否存在且类型正确；
+- 每镜是否都有明确景别、构图、机位、运镜、动作、光线、情绪和叙事目的；
+- 相邻镜头的动作、视线、空间和情绪是否自然承接。
 """
 
 
-# LLM 响应 JSON Schema (用于 response_format 引导)
-_RESPONSE_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "scenes": {
-            "type": "array",
-            "minItems": 1,
-            "items": {
-                "type": "object",
-                "properties": {
-                    "scene_no": {"type": "integer", "minimum": 1},
-                    "background": {"type": "string"},
-                    "shot_groups": {
-                        "type": "array",
-                        "minItems": 1,
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "group_no": {"type": "string"},
-                                "narrative_purpose": {"type": "string"},
-                                "duration_seconds": {
-                                    "type": "integer",
-                                    "minimum": 3,
-                                    "maximum": 15,
-                                },
-                                "shots": {
-                                    "type": "array",
-                                    "minItems": 2,
-                                    "maxItems": 5,
-                                    "items": {
-                                        "type": "object",
-                                        "properties": {
-                                            "display_no": {"type": "integer", "minimum": 1},
-                                            "content": {"type": "string"},
-                                            "description": {"type": "string"},
-                                            "shot_line": {"type": "string"},
-                                            "start_seconds": {"type": "integer", "minimum": 0},
-                                            "end_seconds": {"type": "integer", "minimum": 0},
-                                            "characters": {
-                                                "type": "array",
-                                                "items": {"type": "string"},
-                                            },
-                                            "dialogue_character": {"type": "string"},
-                                            "props": {
-                                                "type": "array",
-                                                "items": {"type": "string"},
-                                            },
-                                            "sounds": {
-                                                "type": "array",
-                                                "items": {"type": "string"},
-                                            },
-                                        },
-                                        "required": [
-                                            "display_no", "content", "description",
-                                            "shot_line", "start_seconds", "end_seconds",
-                                            "characters", "dialogue_character",
-                                            "props", "sounds",
-                                        ],
-                                    },
-                                },
-                            },
-                            "required": [
-                                "group_no", "narrative_purpose", "duration_seconds", "shots",
-                            ],
-                        },
-                    },
-                },
-                "required": ["scene_no", "background", "shot_groups"],
-            },
-        },
-    },
-    "required": ["scenes"],
-}
+_UNSUPPORTED_PROVIDER_SCHEMA_KEYS = frozenset(
+    {
+        "default",
+        "format",
+        "maxItems",
+        "maxLength",
+        "maximum",
+        "minItems",
+        "minLength",
+        "minimum",
+        "multipleOf",
+        "pattern",
+        "uniqueItems",
+    }
+)
+
+
+def _provider_safe_json_schema(value: object) -> object:
+    """把 Pydantic Schema 收敛为主流结构化输出的交集。
+
+    长度、数值边界、正则和数组数量等约束仍由本地 Pydantic 与语义校验执行。
+    ``properties`` / ``$defs`` 下的业务字段名必须原样保留，不能当作 Schema 关键字过滤。
+    """
+    if isinstance(value, list):
+        return [_provider_safe_json_schema(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+
+    sanitized: dict[str, object] = {}
+    for key, item in value.items():
+        if key in _UNSUPPORTED_PROVIDER_SCHEMA_KEYS:
+            continue
+        if key == "const":
+            sanitized["enum"] = [item]
+            continue
+        if key in {"properties", "$defs"} and isinstance(item, dict):
+            sanitized[key] = {
+                name: _provider_safe_json_schema(child) for name, child in item.items()
+            }
+            continue
+        sanitized[key] = _provider_safe_json_schema(item)
+    return sanitized
+
+
+_RESPONSE_SCHEMA: dict[str, object] = StoryboardV2Contract.model_json_schema()
+_PROVIDER_RESPONSE_SCHEMA = cast(
+    dict[str, object],
+    _provider_safe_json_schema(_RESPONSE_SCHEMA),
+)
 
 
 # ---------------------------------------------------------------------------
@@ -361,6 +443,35 @@ def _classify_materials(
     return materials
 
 
+def _classify_reference_materials(
+    referenced_refs: list[str],
+    references: dict[str, _SubjectReference],
+) -> dict[str, list[dict[str, str]]]:
+    """用 v2 短引用组装视觉素材，全程保留稳定主体身份。"""
+    materials: dict[str, list[dict[str, str]]] = {
+        "character": [],
+        "background": [],
+        "prop": [],
+        "other": [],
+    }
+    seen: set[str] = set()
+    for ref in referenced_refs:
+        if ref in seen:
+            continue
+        seen.add(ref)
+        subject = references.get(ref)
+        if subject is None or subject.subject_type == "sound":
+            continue
+        item = {"subject_id": subject.subject_id, "name": subject.name}
+        if subject.asset_entry_id is not None:
+            item["asset_entry_id"] = subject.asset_entry_id
+        bucket = subject.subject_type
+        if bucket not in materials:
+            bucket = "other"
+        materials[bucket].append(item)
+    return materials
+
+
 async def _extract_audio_elements(
     db: AsyncSession, shots_data: list[dict], subjects: list[Subject]
 ) -> list[dict[str, str]]:
@@ -409,14 +520,64 @@ async def _extract_audio_elements(
     return result
 
 
+async def _extract_audio_elements_from_references(
+    db: AsyncSession,
+    referenced_refs: list[str],
+    references: dict[str, _SubjectReference],
+) -> list[dict[str, str]]:
+    """用 v2 短引用提取配音与声音资产，避免同名主体错绑。"""
+    ordered: list[_SubjectReference] = []
+    seen: set[str] = set()
+    for ref in referenced_refs:
+        if ref in seen:
+            continue
+        seen.add(ref)
+        subject = references.get(ref)
+        if subject is not None and subject.subject_type in {"character", "sound"}:
+            ordered.append(subject)
+
+    subject_ids = [subject.subject_id for subject in ordered]
+    audio_entry_by_subject_id: dict[str, str] = {}
+    if subject_ids:
+        audio_result = await db.execute(
+            select(AssetEntry).where(
+                AssetEntry.subject_id.in_(subject_ids),
+                AssetEntry.kind == "audio",
+                AssetEntry.is_approved.is_(True),
+                AssetEntry.superseded.is_(False),
+            )
+        )
+        for entry in audio_result.scalars().all():
+            audio_entry_by_subject_id.setdefault(entry.subject_id, entry.id)
+
+    result: list[dict[str, str]] = []
+    for subject in ordered:
+        item = {
+            "subject_id": subject.subject_id,
+            "name": subject.name,
+            "type": subject.subject_type,
+        }
+        asset_entry_id = audio_entry_by_subject_id.get(subject.subject_id)
+        if asset_entry_id is not None:
+            item["asset_entry_id"] = asset_entry_id
+        result.append(item)
+    return result
+
+
 def _subject_catalog(subjects: list[Subject], episode_no: int) -> dict[str, str]:
     catalog: dict[str, str] = {}
     for subject in subjects:
         episode_nos = subject.episode_nos or []
-        if episode_nos and episode_no not in episode_nos:
+        if (
+            (episode_nos and episode_no not in episode_nos)
+            or not getattr(subject, "is_active", True)
+        ):
             continue
         stype = "background" if subject.type == "scene" else subject.type
-        catalog[subject.name] = stype
+        previous = catalog.get(subject.name)
+        # v1 只有名称，无法安全区分跨类型同名主体。标记为歧义后由
+        # 旧版契约明确拒绝；新版 v2 始终使用短引用，不受此限制。
+        catalog[subject.name] = stype if previous in {None, stype} else "ambiguous"
     return catalog
 
 
@@ -444,40 +605,333 @@ def _gen_shot_no(display_no: int) -> str:
 # ---------------------------------------------------------------------------
 
 
-async def _call_llm(system: str, user: str) -> dict:
-    """调用 LLM-5 分镜生成, 返回 JSON dict。
+def _safe_template_text(value: str) -> str:
+    """防止模型文本中的模板分隔符破坏确定性展示格式。"""
+    return value.strip().replace("【", "〔").replace("】", "〕")
 
-    按 PLAN 第 5.1 节 LLMProvider 协议 (complete_json(system, user)) 调用。
-    期望的 JSON 形态已通过 _build_user_prompt 中的示例描述给模型，
-    OpenAI json_object 模式不消费 schema 参数，故不向 provider 传入 schema。
-    缺 AI key 时 provider 抛 RuntimeError，由 worker 层捕获并 release 积分。
-    """
+
+def _safe_shot_line_text(value: str) -> str:
+    """单行字段使用顿号分隔内部短语，保留模板逗号作为结构边界。"""
+    return _safe_template_text(value).replace("，", "、").replace("\n", " ")
+
+
+def _render_v2_contract(
+    contract: StoryboardV2Contract,
+    *,
+    subject_reference_names: dict[str, str],
+) -> StoryboardContract:
+    """把 v2 单一事实源确定性渲染为现有 v1 持久化形态。"""
+    scenes: list[dict] = []
+    for scene in contract.scenes:
+        background = subject_reference_names[scene.background_ref]
+        groups: list[dict] = []
+        for group in scene.shot_groups:
+            shots: list[dict] = []
+            for shot in group.shots:
+                visual = shot.visual
+                characters = [subject_reference_names[ref] for ref in shot.character_refs]
+                props = [subject_reference_names[ref] for ref in shot.prop_refs]
+                sounds = [subject_reference_names[ref] for ref in shot.sound_refs]
+                dialogue_character = ""
+                dialogue_text = ""
+                dialogue_kind = "none"
+                if shot.dialogue is not None:
+                    if shot.dialogue.speaker_ref is not None:
+                        dialogue_character = subject_reference_names[shot.dialogue.speaker_ref]
+                    dialogue_text = shot.dialogue.text.strip()
+                    dialogue_kind = shot.dialogue.kind
+                character_text = "、".join(characters) or "环境与场景"
+                action = _safe_template_text(visual.action)
+                frame_description = _safe_template_text(visual.frame_description)
+                lighting = _safe_template_text(visual.lighting)
+                emotion = _safe_template_text(visual.emotion)
+                narrative_purpose = _safe_template_text(shot.narrative_purpose)
+                description = DESCRIPTION_TEMPLATE.format(
+                    background=_safe_template_text(background),
+                    camera=visual.camera_angle,
+                    characters=_safe_template_text(character_text),
+                    action=action,
+                    scene=frame_description,
+                    emotion=emotion,
+                    lighting=lighting,
+                    narrative_purpose=narrative_purpose,
+                )
+                shot_line = SHOT_LINE_TEMPLATE.format(
+                    n=shot.display_no,
+                    start=shot.start_seconds,
+                    end=shot.end_seconds,
+                    scene=_safe_shot_line_text(background),
+                    shot_scale=visual.shot_size,
+                    camera=visual.camera_angle,
+                    camera_movement=visual.camera_movement,
+                    lighting=_safe_shot_line_text(lighting),
+                    action=_safe_shot_line_text(action),
+                    emotion=_safe_shot_line_text(emotion),
+                    characters=_safe_shot_line_text(character_text),
+                    dialogue=dialogue_text,
+                    composition="、".join(visual.composition),
+                    sound_design=_safe_template_text(shot.sound_design),
+                    dialogue_kind=dialogue_kind,
+                )
+                shots.append(
+                    {
+                        "display_no": shot.display_no,
+                        "content": frame_description,
+                        "description": description,
+                        "shot_line": shot_line,
+                        "start_seconds": shot.start_seconds,
+                        "end_seconds": shot.end_seconds,
+                        "characters": characters,
+                        "dialogue_character": dialogue_character,
+                        "props": props,
+                        "sounds": sounds,
+                    }
+                )
+            groups.append(
+                {
+                    "group_no": group.group_no,
+                    "narrative_purpose": _safe_template_text(group.narrative_purpose),
+                    "duration_seconds": group.duration_seconds,
+                    "shots": shots,
+                }
+            )
+        scenes.append(
+            {
+                "scene_no": scene.scene_no,
+                "background": background,
+                "shot_groups": groups,
+            }
+        )
+    rendered = {"schema_version": "storyboard.v1", "scenes": scenes}
+    try:
+        # 类型与引用已在 v2 短引用层校验。此处只校验派生的 v1 结构、
+        # 编号、时码和固定模板，避免跨类型同名主体再次按名称误判。
+        return StoryboardContract.model_validate(rendered)
+    except ValueError as exc:
+        raise StoryboardContractValidationError(
+            str(exc),
+            diagnostic=storyboard_contract_diagnostic("StoryboardContract", exc),
+        ) from exc
+
+
+def _validate_provider_payload_result(
+    payload: dict,
+    *,
+    subject_catalog: dict[str, str],
+    subject_reference_names: dict[str, str],
+    subject_reference_types: dict[str, str],
+) -> _ValidatedStoryboard:
+    """按版本验证 Provider 响应，并保留 v2 的稳定引用事实。"""
+    schema_version = payload.get("schema_version")
+    looks_like_v2 = (
+        any(
+            isinstance(scene, dict) and "background_ref" in scene
+            for scene in payload.get("scenes", [])
+        )
+        if isinstance(payload.get("scenes"), list)
+        else False
+    )
+    if schema_version == "storyboard.v2" or (schema_version is None and looks_like_v2):
+        normalized = dict(payload)
+        normalized.setdefault("schema_version", "storyboard.v2")
+        v2_contract = validate_storyboard_v2_contract(normalized, subject_reference_types)
+        return _ValidatedStoryboard(
+            contract=_render_v2_contract(
+                v2_contract,
+                subject_reference_names=subject_reference_names,
+            ),
+            v2_contract=v2_contract,
+        )
+    if schema_version in {None, "storyboard.v1"}:
+        return _ValidatedStoryboard(
+            contract=validate_storyboard_contract(payload, subject_catalog),
+            v2_contract=None,
+        )
+    exc = ValueError("unsupported storyboard schema_version")
+    raise StoryboardContractValidationError(
+        str(exc),
+        diagnostic=storyboard_contract_diagnostic("StoryboardV2Contract", exc),
+    ) from exc
+
+
+def _validate_provider_payload(
+    payload: dict,
+    *,
+    subject_catalog: dict[str, str],
+    subject_reference_names: dict[str, str],
+    subject_reference_types: dict[str, str],
+) -> StoryboardContract:
+    """按版本验证 Provider 响应；无版本的历史 v1 仍保持兼容。"""
+    return _validate_provider_payload_result(
+        payload,
+        subject_catalog=subject_catalog,
+        subject_reference_names=subject_reference_names,
+        subject_reference_types=subject_reference_types,
+    ).contract
+
+
+def _build_contract_repair_prompt(
+    payload: dict,
+    diagnostic: dict[str, object],
+    references: dict[str, _SubjectReference],
+) -> str | None:
+    """只携带首答与脱敏字段路径的定向修复提示，不重发原剧本。"""
+    serialized = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    if len(serialized) > _STORYBOARD_REPAIR_PAYLOAD_MAX_CHARS:
+        return None
+    reference_lines = [
+        f"{ref}:{item.subject_type}" for ref, item in references.items()
+    ]
+    validation = diagnostic.get("validation")
+    codes = validation.get("codes", []) if isinstance(validation, dict) else []
+    continuity_codes = {
+        "scene_no_not_consecutive",
+        "group_no_not_consecutive",
+        "display_no_not_consecutive",
+        "shot_time_not_continuous",
+        "shot_end_must_be_greater_than_start",
+        "shot_duration_total_mismatch",
+    }
+    if isinstance(codes, list) and any(code in continuity_codes for code in codes):
+        repair_instruction = (
+            "本次检测到全局连续性错误。请无条件重建全部元数据："
+            "scene_no 按 scenes 数组顺序从 1 编号；每个 Scene 的 group_no 从 G1 编号；"
+            "每组 display_no 从 1 编号；每组首镜从 0s 开始，所有镜头首尾相接，"
+            "每镜 end_seconds 大于 start_seconds，最后一镜 end_seconds 必须等于 "
+            "duration_seconds。保留 visual、动作、叙事文本、台词及主体短引用不变。"
+        )
+    else:
+        repair_instruction = "按脱敏校验摘要逐项修复，不得改写剧情、动作、台词或主体短引用。"
+    return (
+        "请只修复下面 JSON 的结构、枚举、引用、编号或连续整数时码错误。"
+        "保持原剧情、动作和台词内容，不要新增情节，不要输出解释。\n"
+        f"修复规则：{repair_instruction}\n"
+        f"允许的主体短引用：{json.dumps(reference_lines, ensure_ascii=False)}\n"
+        f"脱敏校验摘要：{json.dumps(diagnostic, ensure_ascii=False, sort_keys=True)}\n"
+        f"待修复 JSON：{serialized}"
+    )
+
+
+_REPAIR_SYSTEM_PROMPT = (
+    "你是 storyboard.v2 JSON 修复器。只修复给定对象以符合 JSON Schema；"
+    "不得改写台词或创造资产，只输出修复后的 JSON 对象。"
+)
+
+
+async def _call_llm(system: str, user: str) -> dict:
+    """调用共享 LLM Provider；能力允许时下发供应商安全版 Schema。"""
     from app.providers import get_llm_provider
 
     provider = get_llm_provider()
-    return await provider.complete_json(system=system, user=user)
+    complete_json = provider.complete_json
+    try:
+        parameters = inspect.signature(complete_json).parameters.values()
+        supports_schema = any(
+            parameter.name == "response_schema"
+            or parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters
+        )
+    except (TypeError, ValueError):
+        supports_schema = False
+    if supports_schema:
+        return await complete_json(
+            system=system,
+            user=user,
+            response_schema=_PROVIDER_RESPONSE_SCHEMA,
+        )
+    return await complete_json(system=system, user=user)
+
+
+async def _call_llm_with_contract_result(
+    system: str,
+    user: str,
+    subject_catalog: dict[str, str],
+    *,
+    subject_references: dict[str, _SubjectReference] | None = None,
+) -> _ValidatedStoryboard:
+    """首答后最多做一次定向修复，避免三次整集盲重试。"""
+    references = subject_references or {}
+    reference_names = {ref: item.name for ref, item in references.items()}
+    reference_types = {ref: item.subject_type for ref, item in references.items()}
+    call_system = system
+    call_user = user
+    last_diagnostic: dict[str, object] | None = None
+    for attempt in range(1, _STORYBOARD_CONTRACT_MAX_ATTEMPTS + 1):
+        payload: dict | None = None
+        try:
+            raw_payload = await _call_llm(call_system, call_user)
+            if not isinstance(raw_payload, dict):
+                content_length = (
+                    len(raw_payload)
+                    if isinstance(raw_payload, (str, list, tuple))
+                    else 0
+                )
+                raise LLMJSONResponseError(
+                    "non_object_json",
+                    kind=type(raw_payload).__name__,
+                    content_length=content_length,
+                )
+            payload = raw_payload
+            return _validate_provider_payload_result(
+                payload,
+                subject_catalog=subject_catalog,
+                subject_reference_names=reference_names,
+                subject_reference_types=reference_types,
+            )
+        except StoryboardContractValidationError as exc:
+            last_diagnostic = exc.diagnostic
+        except ValueError as exc:
+            last_diagnostic = storyboard_contract_diagnostic(
+                "StoryboardV2Contract",
+                exc,
+            )
+        validation = (last_diagnostic or {}).get("validation")
+        error_count = validation.get("error_count") if isinstance(validation, dict) else None
+        error_codes = validation.get("codes") if isinstance(validation, dict) else None
+        error_paths = validation.get("paths") if isinstance(validation, dict) else None
+        category = (last_diagnostic or {}).get("category")
+        logger.warning(
+            "分镜 Provider 响应未通过契约 attempt=%d/%d category=%s error_count=%s "
+            "codes=%s paths=%s",
+            attempt,
+            _STORYBOARD_CONTRACT_MAX_ATTEMPTS,
+            category,
+            error_count,
+            error_codes,
+            error_paths,
+        )
+        if attempt < _STORYBOARD_CONTRACT_MAX_ATTEMPTS and payload is not None:
+            repair_user = _build_contract_repair_prompt(payload, last_diagnostic or {}, references)
+            if repair_user is not None:
+                call_system = _REPAIR_SYSTEM_PROMPT
+                call_user = repair_user
+                continue
+        if attempt < _STORYBOARD_CONTRACT_MAX_ATTEMPTS and payload is None:
+            # Provider 未能解析出 JSON 时只再尝试一次原始请求。
+            continue
+        break
+    raise ProviderContractError(
+        f"供应商响应在 {_STORYBOARD_CONTRACT_MAX_ATTEMPTS} 次总预算内"
+        "不符合 StoryboardV2Contract 合约",
+        diagnostic=last_diagnostic,
+    ) from None
 
 
 async def _call_llm_with_contract(
     system: str,
     user: str,
     subject_catalog: dict[str, str],
+    *,
+    subject_references: dict[str, _SubjectReference] | None = None,
 ) -> StoryboardContract:
-    """在单个分镜任务内有限重试 Provider 契约错误。"""
-    for attempt in range(1, _STORYBOARD_CONTRACT_MAX_ATTEMPTS + 1):
-        payload = await _call_llm(system, user)
-        try:
-            return validate_storyboard_contract(payload, subject_catalog)
-        except ValueError:
-            logger.warning(
-                "分镜 Provider 第 %d/%d 次响应未通过契约",
-                attempt,
-                _STORYBOARD_CONTRACT_MAX_ATTEMPTS,
-            )
-    raise ProviderContractError(
-        f"供应商响应在 {_STORYBOARD_CONTRACT_MAX_ATTEMPTS} 次总预算内"
-        "不符合 StoryboardContract 合约"
-    ) from None
+    """兼容既有内部调用，只返回可落库的 v1 形态。"""
+    result = await _call_llm_with_contract_result(
+        system,
+        user,
+        subject_catalog,
+        subject_references=subject_references,
+    )
+    return result.contract
 
 
 # ---------------------------------------------------------------------------
@@ -526,14 +980,21 @@ async def generate_storyboard(
     )
     subjects = list(subjects_result.scalars().all())
 
-    # 3. 构造 prompt
+    # 3. 构造 prompt 与短引用目录；UUID/资产 ID 不进入 Provider 输入输出合约。
+    subject_references = _build_subject_reference_catalog(subjects, episode.episode_no)
     system_prompt = _SYSTEM_PROMPT
-    user_prompt = _build_user_prompt(episode, subjects)
+    user_prompt = _build_user_prompt(episode, subjects, subject_references)
 
     catalog = _subject_catalog(subjects, episode.episode_no)
 
-    # 4. 调用 LLM；契约失败在同一任务内最多追加两次尝试。
-    contract = await _call_llm_with_contract(system_prompt, user_prompt, catalog)
+    # 4. 调用 LLM；首答失败时最多进行一次不含原剧本的定向修复。
+    validated = await _call_llm_with_contract_result(
+        system_prompt,
+        user_prompt,
+        catalog,
+        subject_references=subject_references,
+    )
+    contract = validated.contract
     scenes_data = contract.model_dump()["scenes"]
 
     fresh_ep_result = await db.execute(
@@ -567,7 +1028,12 @@ async def generate_storyboard(
     total_groups = 0
     total_shots = 0
 
-    for scene_data in scenes_data:
+    for scene_index, scene_data in enumerate(scenes_data):
+        source_scene = (
+            validated.v2_contract.scenes[scene_index]
+            if validated.v2_contract is not None
+            else None
+        )
         scene_no = scene_data["scene_no"]
         background = scene_data["background"]
         scene_key = f"bg:{background}"
@@ -589,7 +1055,12 @@ async def generate_storyboard(
         db.add(scene)
         total_scenes += 1
 
-        for group_data in source_groups:
+        for group_index, group_data in enumerate(source_groups):
+            source_group = (
+                source_scene.shot_groups[group_index]
+                if source_scene is not None
+                else None
+            )
             group_no = group_data["group_no"]
             narrative_purpose = group_data.get("narrative_purpose", "")
             duration_seconds = group_data.get("duration_seconds", 0)
@@ -624,11 +1095,31 @@ async def generate_storyboard(
                 narrative_purpose=narrative_purpose,
             )
 
-            # 解析 materials 分组
-            materials = _classify_materials(all_referenced, subjects)
-
-            # 提取 audio_elements (需配音角色)
-            audio_elements = await _extract_audio_elements(db, shots_data, subjects)
+            if source_group is not None and source_scene is not None:
+                material_refs = [source_scene.background_ref]
+                audio_refs: list[str] = []
+                for source_shot in source_group.shots:
+                    material_refs.extend(source_shot.character_refs)
+                    material_refs.extend(source_shot.prop_refs)
+                    if (
+                        source_shot.dialogue is not None
+                        and source_shot.dialogue.speaker_ref is not None
+                    ):
+                        audio_refs.append(source_shot.dialogue.speaker_ref)
+                    audio_refs.extend(source_shot.sound_refs)
+                materials = _classify_reference_materials(
+                    material_refs,
+                    subject_references,
+                )
+                audio_elements = await _extract_audio_elements_from_references(
+                    db,
+                    audio_refs,
+                    subject_references,
+                )
+            else:
+                # 历史 v1 Provider 无短引用，仅在该兼容路径按名称解析。
+                materials = _classify_materials(all_referenced, subjects)
+                audio_elements = await _extract_audio_elements(db, shots_data, subjects)
 
             shot_group_id = new_id()
             # Shot 当前必须归属于 ShotGroup，因此用 draft 组保存分镜生成阶段的

@@ -20,6 +20,7 @@
 """
 
 import logging
+from typing import Any
 
 from fastapi import APIRouter, Depends, File, Query, UploadFile, status
 from sqlalchemy import select
@@ -32,6 +33,7 @@ from app.core.database import get_db
 from app.core.errors import ConflictError, ForbiddenError, NotFoundError
 from app.core.ids import new_id
 from app.core.permissions import Action, check_script_access
+from app.core.storyboard_fields import storyboard_fields_from_shot
 from app.crud import script as script_crud
 from app.models.episode import Episode
 from app.models.script import Script
@@ -70,6 +72,47 @@ from app.services.script_document import cleanup_staged_script_document, stage_s
 
 router = APIRouter(prefix="/scripts", tags=["scripts"])
 logger = logging.getLogger(__name__)
+
+
+def _optional_text(value: object) -> str | None:
+    """把持久化的可选文本安全投影为 API 空值。"""
+
+    return value.strip() or None if isinstance(value, str) else None
+
+
+def _breakdown_shot_out(shot: Any) -> BreakdownShot:
+    """将 ORM Shot 显式投影为含摄影展示字段的 breakdown 镜头。"""
+
+    return BreakdownShot(
+        shot_id=shot.shot_id,
+        scene_no=shot.scene_no,
+        shot_group_id=shot.shot_group_id,
+        group_no=shot.group_no,
+        display_no=getattr(shot, "display_no", None),
+        content=getattr(shot, "content", None),
+        description=getattr(shot, "description", None),
+        shot_line=getattr(shot, "shot_line", None),
+        start_seconds=getattr(shot, "start_seconds", None),
+        end_seconds=getattr(shot, "end_seconds", None),
+        characters=list(getattr(shot, "characters", None) or []),
+        props=list(getattr(shot, "props", None) or []),
+        sounds=list(getattr(shot, "sounds", None) or []),
+        dialogue_character=getattr(shot, "dialogue_character", "") or "",
+        **storyboard_fields_from_shot(shot).model_dump(),
+    )
+
+
+def _breakdown_shot_group_out(group: Any) -> BreakdownShotGroup:
+    """将叙事目的从既有 description_text 以语义化字段返回。"""
+
+    return BreakdownShotGroup(
+        shot_group_id=group.shot_group_id,
+        scene_no=group.scene_no,
+        group_no=group.group_no,
+        prompt=getattr(group, "prompt", None),
+        duration_seconds=getattr(group, "duration_seconds", None),
+        narrative_purpose=_optional_text(getattr(group, "description_text", None)),
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -563,8 +606,8 @@ async def get_breakdown(
         episode=EpisodeOut.model_validate(data["episode"]),
         subjects=subjects,
         subject_catalog=SubjectCatalogStateOut.model_validate(subject_catalog),
-        shots=[BreakdownShot.model_validate(item) for item in data["shots"]],
-        shot_groups=[BreakdownShotGroup.model_validate(item) for item in data["shot_groups"]],
+        shots=[_breakdown_shot_out(item) for item in data["shots"]],
+        shot_groups=[_breakdown_shot_group_out(item) for item in data["shot_groups"]],
     )
 
 

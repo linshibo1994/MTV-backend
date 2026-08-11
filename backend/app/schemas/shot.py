@@ -17,7 +17,30 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 # ---------------------------------------------------------------------------
 
 
-class ShotOut(BaseModel):
+class StoryboardFieldsOut(BaseModel):
+    """由既有 description/shot_line 确定性解析出的分镜展示字段。"""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    scene: str | None = None
+    background: str | None = None
+    shot_size: str | None = None
+    shot_scale: str | None = None
+    camera_angle: str | None = None
+    camera: str | None = None
+    camera_movement: str | None = None
+    action: str | None = None
+    frame_description: str | None = None
+    lighting: str | None = None
+    emotion: str | None = None
+    narrative_purpose: str | None = None
+    dialogue_text: str | None = None
+    dialogue_kind: str | None = None
+    composition: str | None = None
+    sound_design: str | None = None
+
+
+class ShotOut(StoryboardFieldsOut):
     """镜头 — 分镜最细粒度。"""
 
     model_config = ConfigDict(from_attributes=True)
@@ -90,6 +113,10 @@ class ShotGroupHierarchyOut(BaseModel):
     scene_no: int
     group_no: str
     prompt: str | None = None
+    duration_seconds: int | None = None
+    narrative_purpose: str | None = None
+    materials: MaterialsOut | None = None
+    audio_elements: list[dict[str, Any]] = Field(default_factory=list)
     reference_frames: ReferenceFramesOut | None = None
     shots: list[ShotOut] = Field(default_factory=list)
 
@@ -99,7 +126,10 @@ class SceneHierarchyOut(BaseModel):
 
     model_config = ConfigDict(from_attributes=True)
 
+    scene_key: str | None = None
     scene_no: int
+    background: str | None = None
+    label: str | None = None
     groups: list[ShotGroupHierarchyOut] = Field(default_factory=list)
     ungrouped_shots: list[ShotOut] = Field(default_factory=list)
 

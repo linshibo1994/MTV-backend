@@ -12,6 +12,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.core.storyboard_fields import storyboard_fields_from_shot
 from app.models.episode import Episode
 from app.models.scene import Scene
 from app.models.shot import Shot
@@ -166,6 +167,7 @@ def _job_matches_group_snapshot(
 
 
 def _shot_to_out(shot: Shot) -> ShotOut:
+    display_fields = storyboard_fields_from_shot(shot).model_dump()
     return ShotOut(
         shot_id=shot.shot_id,
         scene_no=shot.scene_no,
@@ -182,6 +184,7 @@ def _shot_to_out(shot: Shot) -> ShotOut:
         props=list(getattr(shot, "props", None) or []),
         sounds=list(getattr(shot, "sounds", None) or []),
         dialogue_character=getattr(shot, "dialogue_character", "") or "",
+        **display_fields,
     )
 
 
@@ -290,13 +293,20 @@ async def get_shot_hierarchy(
                     scene_no=g.scene_no,
                     group_no=g.group_no,
                     prompt=g.prompt,
+                    duration_seconds=g.duration_seconds,
+                    narrative_purpose=(g.description_text or "").strip() or None,
+                    materials=_to_materials(g.materials),
+                    audio_elements=_normalise_audio_elements(g.audio_elements),
                     reference_frames=_to_reference_frames(g.reference_frames),
                     shots=[_shot_to_out(s) for s in sorted_shots],
                 )
             )
         scene_list.append(
             SceneHierarchyOut(
+                scene_key=scene.scene_key,
                 scene_no=scene.scene_no,
+                background=scene.background,
+                label=scene.label,
                 groups=hierarchy_groups,
                 ungrouped_shots=[
                     _shot_to_out(s) for s in ungrouped_by_scene.get(scene.scene_no, [])

@@ -9,6 +9,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from app.schemas.shot import StoryboardFieldsOut
+
 
 # --------------------------------------------------------------------------- #
 # Script
@@ -242,7 +244,7 @@ class BreakdownSubject(BaseModel):
 
 
 class BreakdownShotGroup(BaseModel):
-    """breakdown 中的镜头组（分镜生成前为空）。"""
+    """breakdown 中的镜头组。"""
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -250,10 +252,12 @@ class BreakdownShotGroup(BaseModel):
     scene_no: int
     group_no: str
     prompt: str | None = None
+    duration_seconds: int | None = None
+    narrative_purpose: str | None = None
 
 
-class BreakdownShot(BaseModel):
-    """breakdown 中的镜头（分镜生成前为空）。"""
+class BreakdownShot(StoryboardFieldsOut):
+    """breakdown 中的镜头及从固定分镜文本解析出的展示字段。"""
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -261,7 +265,16 @@ class BreakdownShot(BaseModel):
     scene_no: int
     shot_group_id: str
     group_no: str
+    display_no: int | None = None
     content: str | None = None
+    description: str | None = None
+    shot_line: str | None = None
+    start_seconds: int | None = None
+    end_seconds: int | None = None
+    characters: list[str] = Field(default_factory=list)
+    props: list[str] = Field(default_factory=list)
+    sounds: list[str] = Field(default_factory=list)
+    dialogue_character: str = ""
 
 
 class BreakdownOut(BaseModel):

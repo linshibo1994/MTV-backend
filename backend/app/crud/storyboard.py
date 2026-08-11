@@ -282,6 +282,7 @@ async def fail_job_if_current_token(
     error_message: str,
     error_type: str | None = None,
     retryable: bool | None = None,
+    diagnostic: dict[str, object] | None = None,
 ) -> bool:
     """仅当前 lease token 可以把运行中任务标记为 failed。"""
     row = await db.get(StoryboardJob, job_id, with_for_update=True)
@@ -295,6 +296,10 @@ async def fail_job_if_current_token(
     row.error_type = error_type
     if retryable is not None:
         row.retryable = retryable
+    if diagnostic is not None:
+        detail = dict(row.detail or {})
+        detail["diagnostic"] = diagnostic
+        row.detail = detail
     row.lease_owner = None
     row.lease_token = None
     row.lease_until = None

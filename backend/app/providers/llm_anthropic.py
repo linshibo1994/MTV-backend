@@ -6,10 +6,10 @@
 - system 为请求体顶层字段（非 messages 内消息）
 - messages 必须 user/assistant 交替
 
-JSON 结构化输出：用 tool_use 强制。定义通用工具 emit_result，
-input_schema={"type":"object","additionalProperties":true}，设
-tool_choice={"type":"tool","name":"emit_result"}，模型返回的 ToolUseBlock.input
-即为 dict，比提示词约束更可靠。chat 取 text 块拼接。
+JSON 结构化输出：用 tool_use 强制。定义通用工具 emit_result，默认
+input_schema={"type":"object","additionalProperties":true}；调用方提供 Schema 时将其
+作为 input_schema。设 tool_choice={"type":"tool","name":"emit_result"}，模型返回的
+ToolUseBlock.input 即为 dict，比提示词约束更可靠。chat 取 text 块拼接。
 
 缺 ANTHROPIC_API_KEY 时抛 RuntimeError，由调用方捕获后释放积分。
 """
@@ -31,10 +31,11 @@ from app.providers.registry import ProviderConfigurationError
 
 _API_VERSION = "2023-06-01"
 _MAX_TOKENS_DEFAULT = 4096
+_SCHEMA_COMPATIBILITY_STATUS_CODES = frozenset({400, 422})
 
 # 强制结构化输出的通用工具：input_schema 放宽为任意 object，
 # 由上层 pipeline_contracts 的 Pydantic 严格校验兜底。
-_EMIT_RESULT_TOOL = {
+_EMIT_RESULT_TOOL: dict[str, Any] = {
     "name": "emit_result",
     "description": "以 JSON 对象形式返回最终结果",
     "input_schema": {
@@ -42,6 +43,22 @@ _EMIT_RESULT_TOOL = {
         "additionalProperties": True,
     },
 }
+
+
+class _AnthropicHTTPStatusError(RuntimeError):
+    """Anthropic 非瞬态 HTTP 错误，只保留安全的状态码。"""
+
+    def __init__(self, status_code: int) -> None:
+        self.status_code = status_code
+        super().__init__(f"Claude 调用失败 status={status_code}")
+
+
+def _build_emit_result_tool(response_schema: dict | None) -> dict[str, Any]:
+    """构造本次调用的输出工具，避免修改默认宽松 Schema。"""
+    tool = dict(_EMIT_RESULT_TOOL)
+    if response_schema is not None:
+        tool["input_schema"] = response_schema
+    return tool
 
 
 class AnthropicLLMProvider:
@@ -102,25 +119,48 @@ class AnthropicLLMProvider:
                     headers=self._headers(),
                     json=body,
                 )
-        except httpx.HTTPError as exc:
-            raise ConnectionError("Claude 供应商暂不可用") from exc
+        except httpx.HTTPError:
+            raise ConnectionError("Claude 供应商暂不可用") from None
         if resp.status_code >= 500:
             raise ConnectionError("Claude 供应商暂不可用")
         if resp.status_code == 429:
             raise ConnectionError("Claude 供应商暂不可用")
         if resp.status_code >= 400:
-            raise RuntimeError(f"Claude 调用失败 status={resp.status_code}")
+            raise _AnthropicHTTPStatusError(resp.status_code)
         return resp.json()
 
-    async def complete_json(self, system: str, user: str) -> dict:
-        """用 tool_use 强制返回结构化 JSON 对象。"""
+    async def complete_json(
+        self,
+        system: str,
+        user: str,
+        *,
+        response_schema: dict | None = None,
+    ) -> dict:
+        """用 tool_use 强制返回结构化 JSON 对象。
+
+        带 Schema 的工具仅在 400/422 时降级一次到默认宽松工具，避免认证等其他
+        4xx 被误判为 Schema 兼容问题。
+        """
         messages = [{"role": "user", "content": user}]
-        data = await self._create(
-            system=system,
-            messages=messages,
-            tools=[_EMIT_RESULT_TOOL],
-            tool_choice={"type": "tool", "name": "emit_result"},
-        )
+        try:
+            data = await self._create(
+                system=system,
+                messages=messages,
+                tools=[_build_emit_result_tool(response_schema)],
+                tool_choice={"type": "tool", "name": "emit_result"},
+            )
+        except _AnthropicHTTPStatusError as exc:
+            if (
+                response_schema is None
+                or exc.status_code not in _SCHEMA_COMPATIBILITY_STATUS_CODES
+            ):
+                raise
+            data = await self._create(
+                system=system,
+                messages=messages,
+                tools=[_build_emit_result_tool(None)],
+                tool_choice={"type": "tool", "name": "emit_result"},
+            )
         for block in data.get("content", []):
             if block.get("type") == "tool_use" and block.get("name") == "emit_result":
                 inp = block.get("input")

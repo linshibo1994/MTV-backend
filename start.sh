@@ -162,14 +162,14 @@ start() {
 
   (
     cd "$BACKEND_DIR"
-    exec env \
+    exec nohup env \
       DATABASE_URL="$LOCAL_DATABASE_URL" \
       DATABASE_SYNC_URL="$LOCAL_DATABASE_SYNC_URL" \
       REDIS_URL="$LOCAL_REDIS_URL" \
       CELERY_BROKER_URL="$LOCAL_CELERY_BROKER_URL" \
       CELERY_RESULT_BACKEND="$LOCAL_CELERY_RESULT_BACKEND" \
       "$UVICORN_BIN" app.main:app --host "$HOST" --port "$PORT" --reload
-  ) >>"$LOG_FILE" 2>&1 &
+  ) >>"$LOG_FILE" 2>&1 </dev/null &
   local pid=$!
   echo "$pid" >"$PID_FILE"
 

@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import traceback
 from datetime import UTC, datetime, timedelta
@@ -76,6 +77,73 @@ def _valid_storyboard_payload() -> dict:
     }
 
 
+def _valid_storyboard_v2_payload() -> dict:
+    return {
+        "schema_version": "storyboard.v2",
+        "scenes": [
+            {
+                "scene_no": 1,
+                "background_ref": "BG01",
+                "shot_groups": [
+                    {
+                        "group_no": "G1",
+                        "narrative_purpose": "建立空间并交代冲突",
+                        "duration_seconds": 6,
+                        "shots": [
+                            {
+                                "display_no": 1,
+                                "start_seconds": 0,
+                                "end_seconds": 3,
+                                "visual": {
+                                    "shot_size": "全景",
+                                    "composition": ["三分法", "纵深构图"],
+                                    "camera_angle": "平视",
+                                    "camera_movement": "推镜",
+                                    "action": "阿明推门进入",
+                                    "frame_description": "前景门框形成框景，阿明进入办公室",
+                                    "lighting": "冷色顶光",
+                                    "emotion": "紧张",
+                                },
+                                "narrative_purpose": "交代阿明进入并触发冲突",
+                                "character_refs": ["C01"],
+                                "prop_refs": ["P01"],
+                                "sound_refs": ["S01"],
+                                "sound_design": "门轴轻响，室内环境声短暂停顿",
+                                "dialogue": {
+                                    "speaker_ref": "C01",
+                                    "text": "我们谈谈",
+                                    "kind": "dialogue",
+                                },
+                            },
+                            {
+                                "display_no": 2,
+                                "start_seconds": 3,
+                                "end_seconds": 6,
+                                "visual": {
+                                    "shot_size": "近景",
+                                    "composition": ["单人", "三分法"],
+                                    "camera_angle": "平视",
+                                    "camera_movement": "固定",
+                                    "action": "小林停下工作并抬头",
+                                    "frame_description": "小林越过前景文件看向门口",
+                                    "lighting": "冷色顶光勾勒面部",
+                                    "emotion": "迟疑",
+                                },
+                                "narrative_purpose": "用反应镜承接前一镜",
+                                "character_refs": ["C02"],
+                                "prop_refs": [],
+                                "sound_refs": [],
+                                "sound_design": "无",
+                                "dialogue": None,
+                            },
+                        ],
+                    }
+                ],
+            }
+        ],
+    }
+
+
 def _subject_catalog() -> dict[str, str]:
     return {
         "办公室": "background",
@@ -83,6 +151,16 @@ def _subject_catalog() -> dict[str, str]:
         "小林": "character",
         "钥匙": "prop",
         "门响": "sound",
+    }
+
+
+def _subject_references() -> dict[str, SimpleNamespace]:
+    return {
+        "BG01": SimpleNamespace(name="办公室", subject_type="background"),
+        "C01": SimpleNamespace(name="阿明", subject_type="character"),
+        "C02": SimpleNamespace(name="小林", subject_type="character"),
+        "P01": SimpleNamespace(name="钥匙", subject_type="prop"),
+        "S01": SimpleNamespace(name="门响", subject_type="sound"),
     }
 
 
@@ -123,6 +201,199 @@ def test_storyboard_contract_accepts_valid_payload_and_rejects_extra_fields() ->
     invalid["unexpected"] = True
     with pytest.raises(ValueError):
         validate_storyboard_contract(invalid, _subject_catalog())
+
+
+def test_storyboard_v2_contract_renders_legacy_fields_deterministically() -> None:
+    from app.core.storyboard_fields import parse_storyboard_fields
+    from app.services import storyboard as storyboard_service
+
+    contract = storyboard_service._validate_provider_payload(
+        _valid_storyboard_v2_payload(),
+        subject_catalog=_subject_catalog(),
+        subject_reference_names={
+            ref: item.name for ref, item in _subject_references().items()
+        },
+        subject_reference_types={
+            ref: item.subject_type for ref, item in _subject_references().items()
+        },
+    )
+
+    shot = contract.scenes[0].shot_groups[0].shots[0]
+    assert shot.content == "前景门框形成框景，阿明进入办公室"
+    assert shot.characters == ["阿明"]
+    assert shot.props == ["钥匙"]
+    assert shot.sounds == ["门响"]
+    assert shot.dialogue_character == "阿明"
+    assert "全景·平视，推镜" in shot.shot_line
+    assert "构图是【三分法、纵深构图】" in shot.shot_line
+    assert "声音设计是【门轴轻响，室内环境声短暂停顿】" in shot.shot_line
+    assert "整个镜头的叙事目的是【交代阿明进入并触发冲突】" in shot.description
+    fields = parse_storyboard_fields(
+        shot.description,
+        shot.shot_line,
+        display_no=shot.display_no,
+        start_seconds=shot.start_seconds,
+        end_seconds=shot.end_seconds,
+    )
+    assert fields.scene == "办公室"
+    assert fields.shot_size == "全景"
+    assert fields.camera_movement == "推镜"
+    assert fields.action == "阿明推门进入"
+    assert fields.narrative_purpose == "交代阿明进入并触发冲突"
+    assert fields.composition == "三分法、纵深构图"
+    assert fields.sound_design == "门轴轻响，室内环境声短暂停顿"
+
+
+def test_storyboard_v2_contract_accepts_single_shot_video_unit() -> None:
+    """定场、反应和转场允许作为单镜头 3 秒视频单元落库。"""
+    from app.services import storyboard as storyboard_service
+
+    payload = _valid_storyboard_v2_payload()
+    group = payload["scenes"][0]["shot_groups"][0]
+    group["duration_seconds"] = 3
+    group["shots"] = [group["shots"][0]]
+    group["shots"][0]["end_seconds"] = 3
+
+    contract = storyboard_service._validate_provider_payload(
+        payload,
+        subject_catalog=_subject_catalog(),
+        subject_reference_names={
+            ref: item.name for ref, item in _subject_references().items()
+        },
+        subject_reference_types={
+            ref: item.subject_type for ref, item in _subject_references().items()
+        },
+    )
+
+    assert len(contract.scenes[0].shot_groups[0].shots) == 1
+    assert contract.scenes[0].shot_groups[0].duration_seconds == 3
+
+
+def test_storyboard_v2_continuity_diagnostic_has_safe_rule_code_and_path() -> None:
+    from app.schemas.storyboard_contracts import validate_storyboard_v2_contract
+
+    payload = _valid_storyboard_v2_payload()
+    payload["scenes"][0]["shot_groups"][0]["shots"][1]["start_seconds"] = 4
+
+    with pytest.raises(ValueError) as exc_info:
+        validate_storyboard_v2_contract(
+            payload,
+            {
+                ref: item.subject_type for ref, item in _subject_references().items()
+            },
+        )
+
+    assert getattr(exc_info.value, "diagnostic") == {
+        "version": 1,
+        "category": "semantic_validation",
+        "schema": "StoryboardV2Contract",
+        "validation": {
+            "error_count": 1,
+            "codes": ["shot_time_not_continuous"],
+            "paths": ["scenes[].shot_groups[].shots[].start_seconds"],
+        },
+    }
+
+
+def test_storyboard_v2_voice_over_without_speaker_preserves_kind_and_multiline_text() -> None:
+    from app.core.storyboard_fields import parse_storyboard_fields
+    from app.services import storyboard as storyboard_service
+
+    payload = _valid_storyboard_v2_payload()
+    payload["scenes"][0]["shot_groups"][0]["shots"][0]["dialogue"] = {
+        "speaker_ref": None,
+        "text": "第一句旁白\n第二句旁白",
+        "kind": "voice_over",
+    }
+    contract = storyboard_service._validate_provider_payload(
+        payload,
+        subject_catalog=_subject_catalog(),
+        subject_reference_names={
+            ref: item.name for ref, item in _subject_references().items()
+        },
+        subject_reference_types={
+            ref: item.subject_type for ref, item in _subject_references().items()
+        },
+    )
+
+    shot = contract.scenes[0].shot_groups[0].shots[0]
+    assert shot.dialogue_character == ""
+    fields = parse_storyboard_fields(
+        shot.description,
+        shot.shot_line,
+        display_no=shot.display_no,
+        start_seconds=shot.start_seconds,
+        end_seconds=shot.end_seconds,
+    )
+    assert fields.dialogue_text == "第一句旁白\n第二句旁白"
+    assert fields.dialogue_kind == "voice_over"
+
+
+def test_storyboard_v2_dialogue_requires_visible_character_speaker() -> None:
+    from app.schemas.storyboard_contracts import validate_storyboard_v2_contract
+
+    payload = _valid_storyboard_v2_payload()
+    payload["scenes"][0]["shot_groups"][0]["shots"][0]["dialogue"][
+        "speaker_ref"
+    ] = None
+
+    with pytest.raises(ValueError, match="speaker_ref"):
+        validate_storyboard_v2_contract(
+            payload,
+            {
+                ref: item.subject_type for ref, item in _subject_references().items()
+            },
+        )
+
+
+def test_storyboard_v2_cross_type_same_name_keeps_reference_identity() -> None:
+    from app.services import storyboard as storyboard_service
+
+    references = _subject_references()
+    reference_names = {ref: item.name for ref, item in references.items()}
+    reference_names["C01"] = "同名主体"
+    reference_names["P01"] = "同名主体"
+    contract = storyboard_service._validate_provider_payload(
+        _valid_storyboard_v2_payload(),
+        subject_catalog={"办公室": "background", "同名主体": "ambiguous", "小林": "character", "门响": "sound"},
+        subject_reference_names=reference_names,
+        subject_reference_types={
+            ref: item.subject_type for ref, item in references.items()
+        },
+    )
+
+    shot = contract.scenes[0].shot_groups[0].shots[0]
+    assert shot.characters == ["同名主体"]
+    assert shot.props == ["同名主体"]
+
+
+def test_storyboard_v2_contract_rejects_wrong_subject_reference_type() -> None:
+    from app.schemas.storyboard_contracts import validate_storyboard_v2_contract
+
+    payload = _valid_storyboard_v2_payload()
+    payload["scenes"][0]["shot_groups"][0]["shots"][0]["prop_refs"] = ["S01"]
+    reference_types = {
+        ref: item.subject_type for ref, item in _subject_references().items()
+    }
+    with pytest.raises(ValueError, match="prop_refs"):
+        validate_storyboard_v2_contract(payload, reference_types)
+
+
+def test_storyboard_v2_contract_accepts_four_digit_subject_reference() -> None:
+    from app.schemas.storyboard_contracts import validate_storyboard_v2_contract
+
+    payload = _valid_storyboard_v2_payload()
+    first_shot = payload["scenes"][0]["shot_groups"][0]["shots"][0]
+    first_shot["character_refs"] = ["C1000"]
+    first_shot["dialogue"]["speaker_ref"] = "C1000"
+    reference_types = {
+        ref: item.subject_type for ref, item in _subject_references().items()
+    }
+    reference_types["C1000"] = "character"
+
+    contract = validate_storyboard_v2_contract(payload, reference_types)
+
+    assert contract.scenes[0].shot_groups[0].shots[0].character_refs == ["C1000"]
 
 
 def test_storyboard_contract_rejects_empty_scene_groups_and_empty_global_product() -> None:
@@ -194,6 +465,40 @@ def test_prompt_contains_all_nine_constraints() -> None:
         assert f"{index}. {constraint}" in prompt
 
 
+def test_storyboard_prompt_uses_short_subject_refs_without_server_ids() -> None:
+    from app.services import storyboard as storyboard_service
+
+    subjects = [
+        SimpleNamespace(
+            id="private-subject-uuid",
+            name="办公室",
+            type="background",
+            episode_nos=[1],
+            description="现代办公室",
+            image_entry_id="private-asset-uuid",
+            is_active=True,
+        ),
+        SimpleNamespace(
+            id="private-character-uuid",
+            name="阿明",
+            type="character",
+            episode_nos=[1],
+            description="项目负责人",
+            image_entry_id=None,
+            is_active=True,
+        ),
+    ]
+    prompt = storyboard_service._build_user_prompt(
+        SimpleNamespace(episode_no=1, title="第一集", script_text="阿明进入办公室。"),
+        subjects,
+    )
+
+    assert "BG01 | background | 办公室" in prompt
+    assert "C01 | character | 阿明" in prompt
+    assert "private-subject-uuid" not in prompt
+    assert "private-asset-uuid" not in prompt
+
+
 async def test_storyboard_llm_call_uses_shared_provider_factory(monkeypatch) -> None:
     from app.services import storyboard as storyboard_service
 
@@ -207,30 +512,86 @@ async def test_storyboard_llm_call_uses_shared_provider_factory(monkeypatch) -> 
     assert await storyboard_service._call_llm("system", "user") == {"scenes": []}
 
 
-async def test_storyboard_retries_invalid_contract_within_one_job(monkeypatch) -> None:
+async def test_storyboard_llm_call_passes_v2_schema_to_capable_provider(monkeypatch) -> None:
     from app.services import storyboard as storyboard_service
 
-    invalid_display_no = _valid_storyboard_payload()
-    invalid_display_no["scenes"][0]["shot_groups"][0]["shots"][1]["display_no"] = 3
-    invalid_fractional_time = _valid_storyboard_payload()
-    invalid_fractional_time["scenes"][0]["shot_groups"][0]["shots"][0]["end_seconds"] = 2.5
+    class Provider:
+        async def complete_json(
+            self,
+            system: str,
+            user: str,
+            *,
+            response_schema: dict | None = None,
+        ) -> dict:
+            assert system == "system"
+            assert user == "user"
+            assert response_schema == storyboard_service._PROVIDER_RESPONSE_SCHEMA
+            return {"scenes": []}
+
+    monkeypatch.setattr("app.providers.get_llm_provider", lambda: Provider())
+    assert await storyboard_service._call_llm("system", "user") == {"scenes": []}
+
+
+async def test_storyboard_repairs_invalid_contract_once_without_resending_script(monkeypatch) -> None:
+    from app.services import storyboard as storyboard_service
+
+    invalid_shot_size = _valid_storyboard_v2_payload()
+    invalid_shot_size["scenes"][0]["shot_groups"][0]["shots"][1]["visual"][
+        "shot_size"
+    ] = "超广角"
     call_llm = AsyncMock(
         side_effect=[
-            invalid_display_no,
-            invalid_fractional_time,
-            _valid_storyboard_payload(),
+            invalid_shot_size,
+            _valid_storyboard_v2_payload(),
         ]
     )
     monkeypatch.setattr(storyboard_service, "_call_llm", call_llm)
 
     contract = await storyboard_service._call_llm_with_contract(
         "system",
-        "user",
+        "SCRIPT_PRIVATE_SENTINEL",
         _subject_catalog(),
+        subject_references=_subject_references(),
     )
 
     assert contract.scenes[0].shot_groups[0].shots[1].display_no == 2
-    assert call_llm.await_count == 3
+    assert call_llm.await_count == 2
+    repair_call = call_llm.await_args_list[1]
+    assert repair_call.args[0] == storyboard_service._REPAIR_SYSTEM_PROMPT
+    assert "SCRIPT_PRIVATE_SENTINEL" not in repair_call.args[1]
+    assert "scenes[].shot_groups[].shots[].visual.shot_size" in repair_call.args[1]
+
+
+async def test_storyboard_repair_explicitly_rebuilds_continuity_without_resending_script(
+    monkeypatch,
+) -> None:
+    from app.services import storyboard as storyboard_service
+
+    invalid_timing = _valid_storyboard_v2_payload()
+    invalid_timing["scenes"][0]["shot_groups"][0]["shots"][1]["start_seconds"] = 4
+    call_llm = AsyncMock(
+        side_effect=[
+            invalid_timing,
+            _valid_storyboard_v2_payload(),
+        ]
+    )
+    monkeypatch.setattr(storyboard_service, "_call_llm", call_llm)
+
+    contract = await storyboard_service._call_llm_with_contract(
+        "system",
+        "SCRIPT_PRIVATE_SENTINEL",
+        _subject_catalog(),
+        subject_references=_subject_references(),
+    )
+
+    assert contract.scenes[0].shot_groups[0].shots[1].start_seconds == 3
+    assert call_llm.await_count == 2
+    repair_call = call_llm.await_args_list[1]
+    assert repair_call.args[0] == storyboard_service._REPAIR_SYSTEM_PROMPT
+    assert "SCRIPT_PRIVATE_SENTINEL" not in repair_call.args[1]
+    assert "shot_time_not_continuous" in repair_call.args[1]
+    assert "scenes[].shot_groups[].shots[].start_seconds" in repair_call.args[1]
+    assert "无条件重建全部元数据" in repair_call.args[1]
 
 
 async def test_storyboard_contract_exhaustion_redacts_provider_payload(
@@ -256,9 +617,19 @@ async def test_storyboard_contract_exhaustion_redacts_provider_payload(
             _subject_catalog(),
         )
 
-    assert call_llm.await_count == 3
+    assert call_llm.await_count == 2
     assert exc_info.value.__cause__ is None
     assert exc_info.value.__context__ is None
+    assert exc_info.value.diagnostic == {
+        "version": 1,
+        "category": "schema_validation",
+        "schema": "StoryboardContract",
+        "validation": {
+            "error_count": 1,
+            "codes": ["int_type"],
+            "paths": ["scenes[].shot_groups[].shots[].start_seconds"],
+        },
+    }
     assert sensitive_sentinel not in "".join(traceback.format_exception(exc_info.value))
     assert sensitive_sentinel not in caplog.text
     assert [
@@ -266,9 +637,12 @@ async def test_storyboard_contract_exhaustion_redacts_provider_payload(
         for record in caplog.records
         if record.name == storyboard_service.__name__
     ] == [
-        "分镜 Provider 第 1/3 次响应未通过契约",
-        "分镜 Provider 第 2/3 次响应未通过契约",
-        "分镜 Provider 第 3/3 次响应未通过契约",
+        "分镜 Provider 响应未通过契约 attempt=1/2 category=schema_validation "
+        "error_count=1 codes=['int_type'] "
+        "paths=['scenes[].shot_groups[].shots[].start_seconds']",
+        "分镜 Provider 响应未通过契约 attempt=2/2 category=schema_validation "
+        "error_count=1 codes=['int_type'] "
+        "paths=['scenes[].shot_groups[].shots[].start_seconds']",
     ]
 
 
@@ -276,19 +650,28 @@ def test_storyboard_prompt_and_response_schema_require_integer_continuous_timing
     from app.services import storyboard as storyboard_service
 
     assert "display_no 必须严格为 1, 2, ..., N" in storyboard_service._SYSTEM_PROMPT
-    assert "所有时间字段只能使用整数秒" in storyboard_service._SYSTEM_PROMPT
+    assert "所有时码只能是整数" in storyboard_service._SYSTEM_PROMPT
+    assert "不要输出 content、description 或 shot_line" in storyboard_service._SYSTEM_PROMPT
     user_prompt = storyboard_service._build_user_prompt(
         SimpleNamespace(episode_no=1, title="第一集", script_text="剧情"),
         [],
     )
+    assert '"schema_version": "storyboard.v2"' in user_prompt
     assert '"display_no": 2' in user_prompt
-    assert '"start_seconds": 4' in user_prompt
-    assert '"end_seconds": 7' in user_prompt
-    shot_properties = storyboard_service._RESPONSE_SCHEMA["properties"]["scenes"]["items"][
-        "properties"
-    ]["shot_groups"]["items"]["properties"]["shots"]["items"]["properties"]
-    assert shot_properties["start_seconds"] == {"type": "integer", "minimum": 0}
-    assert shot_properties["end_seconds"] == {"type": "integer", "minimum": 0}
+    assert '"start_seconds": 3' in user_prompt
+    assert '"end_seconds": 6' in user_prompt
+    response_schema = json.dumps(storyboard_service._RESPONSE_SCHEMA, ensure_ascii=False)
+    assert '"start_seconds"' in response_schema
+    assert '"end_seconds"' in response_schema
+    assert '"type": "integer"' in response_schema
+    assert '"shot_size"' in response_schema
+    provider_schema = json.dumps(
+        storyboard_service._PROVIDER_RESPONSE_SCHEMA,
+        ensure_ascii=False,
+    )
+    for unsupported_key in storyboard_service._UNSUPPORTED_PROVIDER_SCHEMA_KEYS:
+        assert f'"{unsupported_key}"' not in provider_schema
+    assert '"enum": ["storyboard.v2"]' in provider_schema
 
 
 async def test_invalid_provider_contract_does_not_delete_old_storyboard(monkeypatch) -> None:
@@ -339,7 +722,7 @@ async def test_invalid_provider_contract_does_not_delete_old_storyboard(monkeypa
     with pytest.raises(ProviderContractError):
         await storyboard_service.generate_storyboard(db, "script-1", "episode-1", expected_episode_version=7)
 
-    assert call_llm.await_count == 3
+    assert call_llm.await_count == 2
     cleanup.assert_not_awaited()
     db.flush.assert_not_awaited()
 
@@ -386,6 +769,100 @@ async def test_materials_are_typed_and_sound_is_audio_not_visual_material() -> N
         {"subject_id": "c1", "name": "阿明", "asset_entry_id": "audio-c1", "type": "character"},
         {"subject_id": "s1", "name": "门响", "asset_entry_id": "audio-s1", "type": "sound"},
     ]
+
+
+def test_subject_reference_catalog_excludes_archived_duplicate_and_binds_same_name_by_ref() -> None:
+    from app.services import storyboard as storyboard_service
+
+    subjects = [
+        SimpleNamespace(
+            id="character-current",
+            name="同名",
+            type="character",
+            episode_nos=[1],
+            description="当前集角色描述",
+            image_entry_id="image-character",
+            is_active=True,
+        ),
+        SimpleNamespace(
+            id="character-archived",
+            name="同名",
+            type="character",
+            episode_nos=[99],
+            description="PRIVATE_ARCHIVED_SUBJECT_DESCRIPTION",
+            image_entry_id="private-image",
+            is_active=False,
+        ),
+        SimpleNamespace(
+            id="prop-current",
+            name="同名",
+            type="prop",
+            episode_nos=[1],
+            description="当前集道具描述",
+            image_entry_id="image-prop",
+            is_active=True,
+        ),
+    ]
+    references = storyboard_service._build_subject_reference_catalog(subjects, 1)
+    prompt_block = storyboard_service._build_subject_list_block(
+        subjects,
+        1,
+        references,
+    )
+
+    assert "PRIVATE_ARCHIVED_SUBJECT_DESCRIPTION" not in prompt_block
+    assert "character-archived" not in prompt_block
+    assert "private-image" not in prompt_block
+    assert "当前集角色描述" in prompt_block
+    assert "当前集道具描述" in prompt_block
+    character_ref = next(
+        ref for ref, item in references.items() if item.subject_type == "character"
+    )
+    prop_ref = next(ref for ref, item in references.items() if item.subject_type == "prop")
+    materials = storyboard_service._classify_reference_materials(
+        [character_ref, prop_ref],
+        references,
+    )
+    assert materials["character"] == [
+        {
+            "subject_id": "character-current",
+            "asset_entry_id": "image-character",
+            "name": "同名",
+        }
+    ]
+    assert materials["prop"] == [
+        {
+            "subject_id": "prop-current",
+            "asset_entry_id": "image-prop",
+            "name": "同名",
+        }
+    ]
+
+
+async def test_storyboard_non_object_provider_response_is_contract_error(monkeypatch) -> None:
+    from app.schemas.pipeline_contracts import ProviderContractError
+    from app.services import storyboard as storyboard_service
+
+    monkeypatch.setattr(storyboard_service, "_call_llm", AsyncMock(return_value=["private"]))
+
+    with pytest.raises(ProviderContractError) as exc_info:
+        await storyboard_service._call_llm_with_contract(
+            "system",
+            "user",
+            _subject_catalog(),
+            subject_references=_subject_references(),
+        )
+
+    assert exc_info.value.diagnostic == {
+        "version": 1,
+        "category": "non_object_json",
+        "schema": "StoryboardV2Contract",
+        "response": {
+            "kind": "list",
+            "length_bucket": "1_128",
+            "top_level_kind": "list",
+        },
+    }
 
 
 async def test_audio_elements_use_approved_audio_asset_not_subject_image(monkeypatch) -> None:
@@ -828,6 +1305,112 @@ async def test_storyboard_claim_lease_cas_and_cancel() -> None:
     assert await cancel_job(db, "job-1", reason="user request")
     assert job.status == "canceled"
     assert not await complete_job(db, "job-1", "cancel-token", status="succeeded", detail={})
+
+
+async def test_storyboard_failed_job_preserves_reservation_and_adds_safe_diagnostic() -> None:
+    from app.core.job_state import PipelineFailure
+    from app.crud.storyboard import fail_job_if_current_token
+    from app.schemas.pipeline_contracts import ProviderContractError
+
+    diagnostic = {
+        "version": 1,
+        "category": "schema_validation",
+        "schema": "StoryboardV2Contract",
+        "validation": {
+            "error_count": 1,
+            "codes": ["literal_error"],
+            "paths": ["scenes[].shot_groups[].shots[].visual.shot_size"],
+        },
+    }
+    failure = PipelineFailure.from_exception(
+        ProviderContractError("private provider payload", diagnostic=diagnostic)
+    )
+    assert failure.diagnostic == diagnostic
+
+    job = SimpleNamespace(
+        status="running",
+        lease_token="token-1",
+        detail={"reservation_id": "reservation-1"},
+        retryable=False,
+        lease_owner="worker-1",
+        lease_until=datetime.now(UTC) + timedelta(minutes=1),
+        finished_at=None,
+    )
+    db = SimpleNamespace(get=AsyncMock(return_value=job), flush=AsyncMock())
+
+    assert await fail_job_if_current_token(
+        db,
+        "job-1",
+        "token-1",
+        error_message=failure.error_message,
+        error_type=failure.error_type,
+        retryable=failure.retryable,
+        diagnostic=failure.diagnostic,
+    )
+    assert job.status == "failed"
+    assert job.detail == {
+        "reservation_id": "reservation-1",
+        "diagnostic": diagnostic,
+    }
+
+
+def test_storyboard_failure_diagnostic_redacts_unknown_paths_and_response_kinds() -> None:
+    from app.core.job_state import PipelineFailure
+    from app.schemas.pipeline_contracts import ProviderContractError
+
+    failure = PipelineFailure.from_exception(
+        ProviderContractError(
+            "private",
+            diagnostic={
+                "version": 1,
+                "category": "schema_validation",
+                "schema": "StoryboardV2Contract",
+                "validation": {
+                    "error_count": 1,
+                    "codes": ["literal_error"],
+                    "paths": ["scenes[].PRIVATE_FIELD_WITH_SECRET"],
+                },
+            },
+        )
+    )
+    assert failure.diagnostic is not None
+    assert failure.diagnostic["validation"]["paths"] == [
+        "scenes[].<unknown_field>"
+    ]
+
+    unsafe_kind = PipelineFailure.from_exception(
+        ProviderContractError(
+            "private",
+            diagnostic={
+                "version": 1,
+                "category": "invalid_json",
+                "schema": "StoryboardV2Contract",
+                "response": {
+                    "kind": "PRIVATE_RESPONSE_KIND",
+                    "length_bucket": "1_128",
+                    "top_level_kind": "invalid_json",
+                },
+            },
+        )
+    )
+    assert unsafe_kind.diagnostic is None
+
+    unsafe_semantic_code = PipelineFailure.from_exception(
+        ProviderContractError(
+            "private",
+            diagnostic={
+                "version": 1,
+                "category": "semantic_validation",
+                "schema": "StoryboardV2Contract",
+                "validation": {
+                    "error_count": 1,
+                    "codes": ["PRIVATE_PROVIDER_TEXT"],
+                    "paths": ["scenes[].scene_no"],
+                },
+            },
+        )
+    )
+    assert unsafe_semantic_code.diagnostic is None
 
 
 async def test_worker_checks_input_version_before_provider_and_before_commit(monkeypatch) -> None:

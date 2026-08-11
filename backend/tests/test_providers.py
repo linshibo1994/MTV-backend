@@ -197,6 +197,451 @@ def test_llm_factory_supports_anthropic_and_custom_openai_compatible(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_openai_complete_json_uses_strict_json_schema_when_provided() -> None:
+    from app.providers.llm_openai_compat import OpenAICompatLLMProvider
+
+    create = AsyncMock(
+        return_value=SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content='{"title": "分镜"}'))]
+        )
+    )
+    provider = OpenAICompatLLMProvider.__new__(OpenAICompatLLMProvider)
+    provider._model = "gpt-test"
+    provider._vendor = "openai"
+    provider._client = SimpleNamespace(  # type: ignore[assignment]
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+    )
+    response_schema = {
+        "type": "object",
+        "properties": {"title": {"type": "string"}},
+        "required": ["title"],
+        "additionalProperties": False,
+    }
+
+    result = await provider.complete_json(
+        "系统 JSON 指令",
+        "用户输入",
+        response_schema=response_schema,
+    )
+
+    assert result == {"title": "分镜"}
+    create.assert_awaited_once_with(
+        model="gpt-test",
+        messages=[
+            {"role": "system", "content": "系统 JSON 指令"},
+            {"role": "user", "content": "用户输入"},
+        ],
+        response_format={
+            "type": "json_schema",
+            "json_schema": {
+                "name": "structured_response",
+                "strict": True,
+                "schema": response_schema,
+            },
+        },
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [400, 422])
+async def test_openai_strict_schema_falls_back_once_for_schema_compatibility_status(
+    status_code: int,
+) -> None:
+    from httpx import Request, Response
+    from openai import BadRequestError, UnprocessableEntityError
+
+    from app.providers.llm_openai_compat import OpenAICompatLLMProvider
+
+    response_body = "STRICT_SCHEMA_PRIVATE_RESPONSE_BODY"
+    error_type = BadRequestError if status_code == 400 else UnprocessableEntityError
+    schema_error = error_type(
+        response_body,
+        response=Response(
+            status_code,
+            request=Request("POST", "https://provider.example/v1/chat/completions"),
+            json={"error": {"message": response_body}},
+        ),
+        body={"error": {"message": response_body}},
+    )
+    create = AsyncMock(
+        side_effect=[
+            schema_error,
+            SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content='{"title": "降级成功"}'))]
+            ),
+        ]
+    )
+    provider = OpenAICompatLLMProvider.__new__(OpenAICompatLLMProvider)
+    provider._model = "gpt-test"
+    provider._vendor = "openai"
+    provider._client = SimpleNamespace(  # type: ignore[assignment]
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+    )
+    response_schema = {"type": "object", "additionalProperties": False}
+
+    result = await provider.complete_json(
+        "系统 json 指令",
+        "用户输入",
+        response_schema=response_schema,
+    )
+
+    assert result == {"title": "降级成功"}
+    assert create.await_count == 2
+    first_kwargs = create.await_args_list[0].kwargs
+    second_kwargs = create.await_args_list[1].kwargs
+    assert first_kwargs["response_format"] == {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "structured_response",
+            "strict": True,
+            "schema": response_schema,
+        },
+    }
+    assert second_kwargs["response_format"] == {"type": "json_object"}
+
+
+@pytest.mark.asyncio
+async def test_openai_strict_schema_fallback_runs_once_and_sanitizes_failure() -> None:
+    from httpx import Request, Response
+    from openai import BadRequestError, UnprocessableEntityError
+
+    from app.providers.llm_openai_compat import OpenAICompatLLMProvider
+
+    first_body = "FIRST_PRIVATE_RESPONSE_BODY"
+    fallback_body = "FALLBACK_PRIVATE_RESPONSE_BODY"
+    request = Request("POST", "https://provider.example/v1/chat/completions")
+    create = AsyncMock(
+        side_effect=[
+            BadRequestError(
+                first_body,
+                response=Response(400, request=request, json={"error": {"message": first_body}}),
+                body={"error": {"message": first_body}},
+            ),
+            UnprocessableEntityError(
+                fallback_body,
+                response=Response(422, request=request, json={"error": {"message": fallback_body}}),
+                body={"error": {"message": fallback_body}},
+            ),
+        ]
+    )
+    provider = OpenAICompatLLMProvider.__new__(OpenAICompatLLMProvider)
+    provider._model = "gpt-test"
+    provider._vendor = "openai"
+    provider._client = SimpleNamespace(  # type: ignore[assignment]
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+    )
+
+    with pytest.raises(RuntimeError, match="status=422") as exc_info:
+        await provider.complete_json(
+            "系统 json 指令",
+            "用户输入",
+            response_schema={"type": "object"},
+        )
+
+    assert create.await_count == 2
+    assert first_body not in str(exc_info.value)
+    assert fallback_body not in str(exc_info.value)
+    assert exc_info.value.__cause__ is None
+
+
+@pytest.mark.asyncio
+async def test_openai_strict_schema_does_not_fallback_for_auth_error() -> None:
+    from httpx import Request, Response
+    from openai import AuthenticationError
+
+    from app.providers.llm_openai_compat import OpenAICompatLLMProvider
+
+    response_body = "AUTH_PRIVATE_RESPONSE_BODY"
+    create = AsyncMock(
+        side_effect=AuthenticationError(
+            response_body,
+            response=Response(
+                401,
+                request=Request("POST", "https://provider.example/v1/chat/completions"),
+                json={"error": {"message": response_body}},
+            ),
+            body={"error": {"message": response_body}},
+        )
+    )
+    provider = OpenAICompatLLMProvider.__new__(OpenAICompatLLMProvider)
+    provider._model = "gpt-test"
+    provider._vendor = "openai"
+    provider._client = SimpleNamespace(  # type: ignore[assignment]
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+    )
+
+    with pytest.raises(RuntimeError, match="status=401") as exc_info:
+        await provider.complete_json(
+            "系统 json 指令",
+            "用户输入",
+            response_schema={"type": "object"},
+        )
+
+    assert create.await_count == 1
+    assert response_body not in str(exc_info.value)
+    assert exc_info.value.__cause__ is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("vendor", "response_schema"),
+    [
+        ("openai", None),
+        ("openai_compatible", {"type": "object"}),
+        ("deepseek", {"type": "object"}),
+        ("bailian", {"type": "object"}),
+    ],
+)
+async def test_openai_compatible_complete_json_keeps_json_object_for_compatible_endpoints(
+    vendor: str,
+    response_schema: dict | None,
+) -> None:
+    from app.providers.llm_openai_compat import OpenAICompatLLMProvider
+
+    create = AsyncMock(
+        return_value=SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="{}"))]
+        )
+    )
+    provider = OpenAICompatLLMProvider.__new__(OpenAICompatLLMProvider)
+    provider._model = "vendor-model"
+    provider._vendor = vendor
+    provider._client = SimpleNamespace(  # type: ignore[assignment]
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+    )
+
+    if response_schema is None:
+        result = await provider.complete_json("系统 json 指令", "用户输入")
+    else:
+        result = await provider.complete_json(
+            "系统 json 指令",
+            "用户输入",
+            response_schema=response_schema,
+        )
+
+    assert result == {}
+    create.assert_awaited_once_with(
+        model="vendor-model",
+        messages=[
+            {"role": "system", "content": "系统 json 指令"},
+            {"role": "user", "content": "用户输入"},
+        ],
+        response_format={"type": "json_object"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_gemini_complete_json_omits_response_format_even_with_schema() -> None:
+    from app.providers.llm_openai_compat import OpenAICompatLLMProvider
+
+    create = AsyncMock(
+        return_value=SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="{}"))]
+        )
+    )
+    provider = OpenAICompatLLMProvider.__new__(OpenAICompatLLMProvider)
+    provider._model = "gemini-model"
+    provider._vendor = "gemini"
+    provider._client = SimpleNamespace(  # type: ignore[assignment]
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+    )
+
+    result = await provider.complete_json(
+        "系统 json 指令",
+        "用户输入",
+        response_schema={"type": "object"},
+    )
+
+    assert result == {}
+    create.assert_awaited_once_with(
+        model="gemini-model",
+        messages=[
+            {"role": "system", "content": "系统 json 指令"},
+            {"role": "user", "content": "用户输入"},
+        ],
+    )
+
+
+@pytest.mark.asyncio
+async def test_anthropic_complete_json_passes_response_schema_to_emit_result_tool(
+    monkeypatch,
+) -> None:
+    from app.providers.llm_anthropic import AnthropicLLMProvider
+
+    provider = AnthropicLLMProvider(api_key="key", model="claude-model")
+    create = AsyncMock(
+        return_value={"content": [{"type": "tool_use", "name": "emit_result", "input": {}}]}
+    )
+    monkeypatch.setattr(provider, "_create", create)
+    response_schema = {
+        "type": "object",
+        "properties": {"shots": {"type": "array"}},
+        "required": ["shots"],
+    }
+
+    result = await provider.complete_json(
+        "系统指令",
+        "用户输入",
+        response_schema=response_schema,
+    )
+
+    assert result == {}
+    create.assert_awaited_once_with(
+        system="系统指令",
+        messages=[{"role": "user", "content": "用户输入"}],
+        tools=[
+            {
+                "name": "emit_result",
+                "description": "以 JSON 对象形式返回最终结果",
+                "input_schema": response_schema,
+            }
+        ],
+        tool_choice={"type": "tool", "name": "emit_result"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_anthropic_complete_json_keeps_wide_schema_for_two_argument_calls(
+    monkeypatch,
+) -> None:
+    from app.providers.llm_anthropic import AnthropicLLMProvider
+
+    provider = AnthropicLLMProvider(api_key="key", model="claude-model")
+    create = AsyncMock(
+        return_value={"content": [{"type": "tool_use", "name": "emit_result", "input": {}}]}
+    )
+    monkeypatch.setattr(provider, "_create", create)
+
+    result = await provider.complete_json("系统指令", "用户输入")
+
+    assert result == {}
+    create.assert_awaited_once_with(
+        system="系统指令",
+        messages=[{"role": "user", "content": "用户输入"}],
+        tools=[
+            {
+                "name": "emit_result",
+                "description": "以 JSON 对象形式返回最终结果",
+                "input_schema": {"type": "object", "additionalProperties": True},
+            }
+        ],
+        tool_choice={"type": "tool", "name": "emit_result"},
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [400, 422])
+async def test_anthropic_schema_falls_back_once_for_schema_compatibility_status(
+    monkeypatch,
+    status_code: int,
+) -> None:
+    from app.providers.llm_anthropic import AnthropicLLMProvider, _AnthropicHTTPStatusError
+
+    provider = AnthropicLLMProvider(api_key="key", model="claude-model")
+    create = AsyncMock(
+        side_effect=[
+            _AnthropicHTTPStatusError(status_code),
+            {"content": [{"type": "tool_use", "name": "emit_result", "input": {}}]},
+        ]
+    )
+    monkeypatch.setattr(provider, "_create", create)
+    response_schema = {"type": "object", "additionalProperties": False}
+
+    result = await provider.complete_json(
+        "系统指令",
+        "用户输入",
+        response_schema=response_schema,
+    )
+
+    assert result == {}
+    assert create.await_count == 2
+    first_kwargs = create.await_args_list[0].kwargs
+    second_kwargs = create.await_args_list[1].kwargs
+    assert first_kwargs["tools"][0]["input_schema"] == response_schema
+    assert second_kwargs["tools"][0]["input_schema"] == {
+        "type": "object",
+        "additionalProperties": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_anthropic_schema_fallback_runs_once_when_fallback_fails(monkeypatch) -> None:
+    from app.providers.llm_anthropic import AnthropicLLMProvider, _AnthropicHTTPStatusError
+
+    provider = AnthropicLLMProvider(api_key="key", model="claude-model")
+    create = AsyncMock(
+        side_effect=[_AnthropicHTTPStatusError(400), _AnthropicHTTPStatusError(422)]
+    )
+    monkeypatch.setattr(provider, "_create", create)
+
+    with pytest.raises(RuntimeError, match="status=422") as exc_info:
+        await provider.complete_json(
+            "系统指令",
+            "用户输入",
+            response_schema={"type": "object"},
+        )
+
+    assert create.await_count == 2
+    assert exc_info.value.__cause__ is None
+
+
+@pytest.mark.asyncio
+async def test_anthropic_schema_does_not_fallback_for_auth_error(monkeypatch) -> None:
+    from app.providers.llm_anthropic import AnthropicLLMProvider, _AnthropicHTTPStatusError
+
+    provider = AnthropicLLMProvider(api_key="key", model="claude-model")
+    create = AsyncMock(side_effect=_AnthropicHTTPStatusError(401))
+    monkeypatch.setattr(provider, "_create", create)
+
+    with pytest.raises(RuntimeError, match="status=401") as exc_info:
+        await provider.complete_json(
+            "系统指令",
+            "用户输入",
+            response_schema={"type": "object"},
+        )
+
+    assert create.await_count == 1
+    assert exc_info.value.__cause__ is None
+
+
+@pytest.mark.asyncio
+async def test_anthropic_http_error_hides_response_body(monkeypatch) -> None:
+    from app.providers import llm_anthropic
+    from app.providers.llm_anthropic import AnthropicLLMProvider
+
+    response_body = "ANTHROPIC_PRIVATE_RESPONSE_BODY"
+
+    class FakeResponse:
+        status_code = 401
+        text = response_body
+
+        def json(self) -> dict:
+            return {"error": {"message": response_body}}
+
+    class FakeAsyncClient:
+        def __init__(self, *, timeout: float) -> None:
+            self.timeout = timeout
+
+        async def __aenter__(self) -> FakeAsyncClient:
+            return self
+
+        async def __aexit__(self, *_args) -> None:
+            return None
+
+        async def post(self, *_args, **_kwargs) -> FakeResponse:
+            return FakeResponse()
+
+    monkeypatch.setattr(llm_anthropic.httpx, "AsyncClient", FakeAsyncClient)
+    provider = AnthropicLLMProvider(api_key="key", model="claude-model")
+
+    with pytest.raises(RuntimeError, match="status=401") as exc_info:
+        await provider._create(system="系统指令", messages=[{"role": "user", "content": "输入"}])
+
+    assert response_body not in str(exc_info.value)
+    assert exc_info.value.__cause__ is None
+
+
+@pytest.mark.asyncio
 async def test_openai_compatible_chat_preserves_multi_turn_messages() -> None:
     from app.providers.llm_openai_compat import OpenAICompatLLMProvider
 

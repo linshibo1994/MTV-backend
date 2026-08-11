@@ -23,8 +23,114 @@ _SAFE_DIAGNOSTIC_CATEGORIES = frozenset(
     {"invalid_json", "non_object_json", "schema_validation", "semantic_validation"}
 )
 _SAFE_DIAGNOSTIC_SCHEMAS = frozenset(
-    {"SplitOutput", "ExtractOutput", "MergeOutput", "EnrichOutput", "ParentsOutput"}
+    {
+        "SplitOutput",
+        "ExtractOutput",
+        "MergeOutput",
+        "EnrichOutput",
+        "ParentsOutput",
+        "StoryboardContract",
+        "StoryboardV2Contract",
+    }
 )
+_SAFE_DIAGNOSTIC_RESPONSE_KINDS = frozenset(
+    {"text", "tool_input", "empty", "list", "str", "int", "float", "bool", "NoneType"}
+)
+_SAFE_SEMANTIC_DIAGNOSTIC_CODES = frozenset(
+    {
+        "semantic_validation",
+        "scene_no_not_consecutive",
+        "group_no_not_consecutive",
+        "group_duration_out_of_range",
+        "shot_count_out_of_range",
+        "display_no_not_consecutive",
+        "shot_time_not_continuous",
+        "shot_end_must_be_greater_than_start",
+        "shot_duration_total_mismatch",
+        "description_template_mismatch",
+        "shot_line_format_invalid",
+        "shot_line_time_mismatch",
+        "reference_not_allowed",
+        "reference_type_mismatch",
+        "schema_version_unsupported",
+    }
+)
+_SAFE_DIAGNOSTIC_PATH_FIELDS = frozenset(
+    {
+        "schema_version",
+        "episodes",
+        "episode_no",
+        "title",
+        "script_text",
+        "subjects",
+        "merged_subjects",
+        "supplemental_subjects",
+        "total_count",
+        "name",
+        "type",
+        "description",
+        "is_child",
+        "episode_nos",
+        "evidence",
+        "quote",
+        "resolved_prompts",
+        "final",
+        "parent_subjects",
+        "child_count",
+        "child_ids",
+        "scenes",
+        "scene_no",
+        "background",
+        "background_ref",
+        "shot_groups",
+        "group_no",
+        "narrative_purpose",
+        "duration_seconds",
+        "shots",
+        "display_no",
+        "content",
+        "shot_line",
+        "start_seconds",
+        "end_seconds",
+        "characters",
+        "character_refs",
+        "dialogue_character",
+        "dialogue",
+        "speaker_ref",
+        "text",
+        "kind",
+        "props",
+        "prop_refs",
+        "sounds",
+        "sound_refs",
+        "sound_design",
+        "visual",
+        "shot_size",
+        "composition",
+        "camera_angle",
+        "camera_movement",
+        "action",
+        "frame_description",
+        "lighting",
+        "emotion",
+    }
+)
+
+
+def _normalize_diagnostic_path(value: object) -> str | None:
+    """把诊断路径收敛为已知合约字段，未知片段不原样出站。"""
+    if not isinstance(value, str) or len(value) > 255:
+        return None
+    if value == "<root>":
+        return value
+    normalized: list[str] = []
+    for raw_segment in value.split("."):
+        is_array = raw_segment.endswith("[]")
+        segment = raw_segment[:-2] if is_array else raw_segment
+        if segment not in _SAFE_DIAGNOSTIC_PATH_FIELDS and segment != "<unknown_field>":
+            segment = "<unknown_field>"
+        normalized.append(f"{segment}[]" if is_array else segment)
+    return ".".join(normalized) if normalized else None
 
 
 def _safe_diagnostic(value: object) -> dict[str, object] | None:
@@ -47,6 +153,7 @@ def _safe_diagnostic(value: object) -> dict[str, object] | None:
         top_level_kind = response.get("top_level_kind")
         if (
             not isinstance(kind, str)
+            or kind not in _SAFE_DIAGNOSTIC_RESPONSE_KINDS
             or length_bucket not in {"0", "1_128", "129_2048", "over_2048"}
             or top_level_kind not in {"invalid_json", "list", "str", "int", "float", "bool", "NoneType"}
         ):
@@ -71,14 +178,17 @@ def _safe_diagnostic(value: object) -> dict[str, object] | None:
     codes = [
         item
         for item in raw_codes[:8]
-        if isinstance(item, str) and item.replace("_", "").isalnum()
+        if isinstance(item, str)
+        and (
+            item in _SAFE_SEMANTIC_DIAGNOSTIC_CODES
+            if category == "semantic_validation"
+            else item.replace("_", "").isalnum()
+        )
     ]
     paths = [
-        item
+        path
         for item in raw_paths[:8]
-        if isinstance(item, str)
-        and len(item) <= 255
-        and all(char.isalnum() or char in "._<>[]" for char in item)
+        if (path := _normalize_diagnostic_path(item)) is not None
     ]
     if not codes or not paths:
         return None
