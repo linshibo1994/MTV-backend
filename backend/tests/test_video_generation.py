@@ -4471,6 +4471,35 @@ def test_active_provider_switch_seeds_mgrouter_for_existing_database(monkeypatch
     asyncio.run(scenario())
 
 
+def test_active_provider_switch_seeds_neolink_for_existing_database(monkeypatch) -> None:
+    async def scenario() -> None:
+        from app.api.v1 import video_generation as api
+        from app.schemas.video import ActiveProviderUpdateIn
+
+        monkeypatch.setattr(api.settings, "video_provider_selection_mode", "database")
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        db = _AsyncSessionAdapter(raw)
+        monkeypatch.setattr(api, "audit_log", AsyncMock())
+
+        out = await api.set_active_provider(
+            body=ActiveProviderUpdateIn(provider_key="neolink"),
+            db=db,
+            user=SimpleNamespace(user_id=seeded.user.user_id, is_admin=True),
+        )
+
+        assert out.provider_key == "neolink"
+        assert out.model == "doubao-seedance-2-0-260128"
+        assert raw.scalar(
+            select(VideoProviderConfig).where(
+                VideoProviderConfig.provider_key == "neolink",
+                VideoProviderConfig.is_active.is_(True),
+            )
+        ) is not None
+
+    asyncio.run(scenario())
+
+
 def test_video_provider_and_job_type_constraints_are_declared() -> None:
     job_checks = {
         constraint.name: str(constraint.sqltext)
@@ -4490,6 +4519,8 @@ def test_video_provider_and_job_type_constraints_are_declared() -> None:
     assert "'gemini'" in provider_checks["ck_video_provider_configs_provider_key"]
     assert "'mgrouter'" in job_checks["ck_video_jobs_provider_key"]
     assert "'mgrouter'" in provider_checks["ck_video_provider_configs_provider_key"]
+    assert "'neolink'" in job_checks["ck_video_jobs_provider_key"]
+    assert "'neolink'" in provider_checks["ck_video_provider_configs_provider_key"]
 
 
 def test_active_provider_schema_accepts_canonical_gemini() -> None:
@@ -4506,6 +4537,14 @@ def test_active_provider_schema_accepts_canonical_mgrouter() -> None:
     payload = ActiveProviderUpdateIn(provider_key="mgrouter")
 
     assert payload.provider_key == "mgrouter"
+
+
+def test_active_provider_schema_accepts_canonical_neolink() -> None:
+    from app.schemas.video import ActiveProviderUpdateIn
+
+    payload = ActiveProviderUpdateIn(provider_key="neolink")
+
+    assert payload.provider_key == "neolink"
 
 
 @pytest.mark.parametrize("alias", ["google", "gemini", "veo"])
@@ -5549,6 +5588,91 @@ def test_cancel_video_job_best_effort_cancels_known_provider_task(monkeypatch) -
         cancellation = (result.output_json or {})["provider_cancellation"]
         assert cancellation["outcome"] == "canceled"
         assert cancellation["retryable"] is False
+
+    asyncio.run(scenario())
+
+
+def test_cancel_neolink_job_before_remote_submission_is_allowed(monkeypatch) -> None:
+    async def scenario() -> None:
+        from app.services import video_generation as service
+
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        job = _add_worker_job(
+            raw,
+            seeded,
+            job_id="job-neolink-cancel-before-submit",
+            reservation_id="reservation-neolink-cancel-before-submit",
+        )
+        job.provider_key = "neolink"
+        raw.commit()
+        db = _AsyncSessionAdapter(raw)
+        release = AsyncMock()
+        cancel_outbox = AsyncMock()
+        monkeypatch.setattr(service, "_credits_reserve", object())
+        monkeypatch.setattr("app.services.credits.release", release)
+        monkeypatch.setattr(service, "cancel_outbox_task", cancel_outbox)
+
+        result = await service.cancel_video_job(
+            db,
+            script_id=seeded.script.id,
+            job_id=job.job_id,
+            actor_user_id=seeded.user.user_id,
+        )
+
+        assert result.status == "canceled"
+        release.assert_awaited_once()
+        cancel_outbox.assert_awaited_once_with(
+            db,
+            task_type="video.generate",
+            job_id=job.job_id,
+            attempt=job.attempt,
+        )
+
+    asyncio.run(scenario())
+
+
+def test_cancel_neolink_job_after_remote_submission_has_no_side_effects(monkeypatch) -> None:
+    async def scenario() -> None:
+        from app.services import video_generation as service
+
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        job = _add_worker_job(
+            raw,
+            seeded,
+            job_id="job-neolink-cancel-after-submit",
+            reservation_id="reservation-neolink-cancel-after-submit",
+        )
+        job.provider_key = "neolink"
+        job.output_json = {"provider_task_id": "neolink-task-known"}
+        raw.commit()
+        db = _AsyncSessionAdapter(raw)
+        release = AsyncMock(side_effect=AssertionError("不得释放冻结积分"))
+        cancel_outbox = AsyncMock(side_effect=AssertionError("不得取消 Outbox"))
+        remote_cancel = AsyncMock(side_effect=AssertionError("不得尝试不存在的远端取消接口"))
+        monkeypatch.setattr(service, "_credits_reserve", object())
+        monkeypatch.setattr("app.services.credits.release", release)
+        monkeypatch.setattr(service, "cancel_outbox_task", cancel_outbox)
+        monkeypatch.setattr(service, "get_video_provider", remote_cancel)
+
+        with pytest.raises(ConflictError, match="NeoLink.*不支持取消"):
+            await service.cancel_video_job(
+                db,
+                script_id=seeded.script.id,
+                job_id=job.job_id,
+                actor_user_id=seeded.user.user_id,
+            )
+
+        raw.expire_all()
+        saved = raw.get(VideoGenerationJob, job.job_id)
+        assert saved is not None
+        assert saved.status == "starting"
+        assert saved.output_json == {"provider_task_id": "neolink-task-known"}
+        assert raw.get(CreditReservation, job.reservation_id).status == "reserved"
+        release.assert_not_awaited()
+        cancel_outbox.assert_not_awaited()
+        remote_cancel.assert_not_awaited()
 
     asyncio.run(scenario())
 

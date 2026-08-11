@@ -65,6 +65,7 @@ def resolve_env_video_model(configured_settings: Any | None = None) -> RuntimeVi
     provider = require_capability(configured_settings.video_gen_provider, "video")
     fallback_models = {
         "volcengine": configured_settings.seedance_model,
+        "neolink": configured_settings.seedance_model,
         "bailian": configured_settings.dashscope_video_model,
         "openai": configured_settings.openai_video_model,
         "gemini": configured_settings.google_video_model,
@@ -74,9 +75,14 @@ def resolve_env_video_model(configured_settings: Any | None = None) -> RuntimeVi
             "AICC-Doubao-Seedance-2.0",
         ),
     }
+    model = (
+        configured_settings.seedance_model
+        if provider == "neolink"
+        else configured_settings.video_gen_model or fallback_models[provider]
+    )
     return RuntimeVideoModel(
         provider=provider,
-        model=configured_settings.video_gen_model or fallback_models[provider],
+        model=model,
         reference_image_audit_required=provider == "volcengine",
         task_provider_key=provider,
     )

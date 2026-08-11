@@ -164,6 +164,10 @@ class VolcengineVideoGenProvider:
             outcome=VideoCancellationOutcome.CANCELED,
         )
 
+    async def _cancel_remote_task(self, tasks, provider_task_id: str) -> VideoCancellationResult:
+        """取消远端任务；兼容网关可覆盖为明确的不支持结果。"""
+        return await self._cancel_task(tasks, provider_task_id)
+
     def _resolve_ark_api_key(self) -> str:
         """解析 Ark API Key：显式 VIDEO_GEN_API_KEY 优先，否则回退 VOLCENGINE_API_KEY。"""
         if settings.is_explicitly_configured("video_gen_api_key") and settings.video_gen_api_key:
@@ -537,6 +541,33 @@ class VolcengineVideoGenProvider:
         )
         return content
 
+    def _build_create_kwargs(
+        self,
+        model: str,
+        prompt: str,
+        image_urls: list[str],
+        audio_urls: list[str],
+        first_frame_url: str | None,
+        duration_seconds: int | None,
+    ) -> dict:
+        """构造 Ark 创建任务参数，兼容网关可覆盖供应商专属字段。"""
+        create_kwargs: dict = {
+            "model": model,
+            "content": self._build_content(
+                prompt,
+                image_urls,
+                audio_urls,
+                first_frame_url,
+            ),
+            # 参考音频是可选的声音约束，不应成为是否生成音轨的开关。
+            # 没有参考音频时也让 Seedance 根据 Prompt 生成对白、环境音和音效。
+            "generate_audio": True,
+            "return_last_frame": True,
+        }
+        if duration_seconds and duration_seconds > 0:
+            create_kwargs["duration"] = duration_seconds
+        return create_kwargs
+
     async def _submit_and_poll(
         self,
         model: str,
@@ -569,18 +600,14 @@ class VolcengineVideoGenProvider:
                 await raise_if_video_cancel_requested_before_submit(
                     cancel_requested
                 )
-                create_kwargs: dict = {
-                    "model": model,
-                    "content": self._build_content(
-                        prompt, image_urls, audio_urls, first_frame_url
-                    ),
-                    # 参考音频是可选的声音约束，不应成为是否生成音轨的开关。
-                    # 没有参考音频时也让 Seedance 根据 Prompt 生成对白、环境音和音效。
-                    "generate_audio": True,
-                    "return_last_frame": True,
-                }
-                if duration_seconds and duration_seconds > 0:
-                    create_kwargs["duration"] = duration_seconds
+                create_kwargs = self._build_create_kwargs(
+                    model,
+                    prompt,
+                    image_urls,
+                    audio_urls,
+                    first_frame_url,
+                    duration_seconds,
+                )
                 async def _submit_video():
                     return await tasks.create(**create_kwargs)
 
@@ -607,7 +634,7 @@ class VolcengineVideoGenProvider:
                 await raise_if_video_cancel_requested(
                     cancel_requested,
                     task_id,
-                    lambda remote_id: self._cancel_task(tasks, remote_id),
+                    lambda remote_id: self._cancel_remote_task(tasks, remote_id),
                 )
                 _notify("submitted", "视频生成任务已提交", 15, task_id)
 
@@ -620,19 +647,28 @@ class VolcengineVideoGenProvider:
                 await raise_if_video_cancel_requested(
                     cancel_requested,
                     task_id,
-                    lambda remote_id: self._cancel_task(tasks, remote_id),
+                    lambda remote_id: self._cancel_remote_task(tasks, remote_id),
                 )
                 result_resp = await tasks.get(task_id=task_id)
                 await raise_if_video_cancel_requested(
                     cancel_requested,
                     task_id,
-                    lambda remote_id: self._cancel_task(tasks, remote_id),
+                    lambda remote_id: self._cancel_remote_task(tasks, remote_id),
                 )
                 status = self._extract_status(result_resp)
-                if status in {"failed", "error", "succeeded", "cancelled", "canceled"}:
+                if status in {
+                    "failed",
+                    "error",
+                    "expired",
+                    "succeeded",
+                    "cancelled",
+                    "canceled",
+                }:
                     break
                 if time.monotonic() > deadline:
-                    raise RuntimeError(f"volcengine 视频生成轮询超时 task_id={task_id}")
+                    raise RuntimeError(
+                        f"{self.provider_key} 视频生成轮询超时 task_id={task_id}"
+                    )
                 pct = min(90, 20 + int((time.monotonic() - started_at) / _POLL_TIMEOUT * 70))
                 if pct > last_progress:
                     last_progress = pct
@@ -649,7 +685,7 @@ class VolcengineVideoGenProvider:
             video_url = self._extract_video_url(result_resp)
             if not video_url:
                 raise RuntimeError(
-                    f"volcengine 视频生成完成但未返回 video_url task_id={task_id}"
+                    f"{self.provider_key} 视频生成完成但未返回 video_url task_id={task_id}"
                 )
 
             return video_url, {
@@ -710,7 +746,9 @@ class VolcengineVideoGenProvider:
                 if not url:
                     # 部分响应把 URL 放在 content/resp_data 列表
                     content = inner.get("content") or inner.get("resp_data") or []
-                    if isinstance(content, list) and content:
+                    if isinstance(content, dict):
+                        url = content.get("video_url") or content.get("url") or ""
+                    elif isinstance(content, list) and content:
                         first = content[0]
                         if isinstance(first, dict):
                             url = first.get("video_url") or first.get("url") or ""

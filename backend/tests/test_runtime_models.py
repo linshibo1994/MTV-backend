@@ -84,6 +84,28 @@ def test_resolve_env_video_model_normalizes_aicc_without_volcengine_audit() -> N
     )
 
 
+def test_resolve_env_video_model_uses_neolink_seedance_without_volcengine_audit() -> None:
+    from app.core.config import Settings
+
+    configured = Settings(
+        _env_file=None,
+        video_provider_selection_mode="env",
+        video_gen_provider="neolink",
+        neolink_api_key="test-key",
+        neolink_base_url="https://neolink.com/api",
+        video_gen_model="AICC-Doubao-Seedance-2.0",
+    )
+
+    resolved = resolve_env_video_model(configured)
+
+    assert resolved == RuntimeVideoModel(
+        provider="neolink",
+        model="doubao-seedance-2-0-260128",
+        reference_image_audit_required=False,
+        task_provider_key="neolink",
+    )
+
+
 @pytest.mark.asyncio
 async def test_runtime_models_api_returns_only_public_model_metadata(client, monkeypatch) -> None:
     from app.api.v1 import runtime_models as api

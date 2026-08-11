@@ -17,6 +17,7 @@ ProviderName = Literal[
     "bailian",
     "deepseek",
     "volcengine",
+    "neolink",
     "mgrouter",
 ]
 
@@ -44,6 +45,8 @@ _ALIASES: dict[str, ProviderName] = {
     "seedance": "volcengine",
     "jianyu": "volcengine",
     "modelsai": "volcengine",
+    "neolink": "neolink",
+    "neo-link": "neolink",
     "mgrouter": "mgrouter",
     "mg-router": "mgrouter",
     "aicc": "mgrouter",
@@ -58,7 +61,9 @@ _CAPABILITIES: dict[ProviderCapability, frozenset[ProviderName]] = {
         {"openai", "openai_compatible", "anthropic", "gemini", "bailian", "deepseek"}
     ),
     "image": frozenset({"openai", "gemini", "bailian"}),
-    "video": frozenset({"openai", "gemini", "bailian", "volcengine", "mgrouter"}),
+    "video": frozenset(
+        {"openai", "gemini", "bailian", "volcengine", "neolink", "mgrouter"}
+    ),
 }
 
 

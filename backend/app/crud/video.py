@@ -637,6 +637,7 @@ async def ensure_provider_configs(db: AsyncSession) -> None:
     provider_models = {
         "jianyu": settings.seedance_model,
         "modelsai": settings.seedance_model,
+        "neolink": settings.seedance_model,
         "bailian": settings.dashscope_video_model,
         "openai": settings.openai_video_model,
         "gemini": settings.google_video_model,

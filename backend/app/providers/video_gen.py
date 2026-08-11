@@ -1,6 +1,7 @@
 """视频生成供应商抽象与工厂。
 
-统一覆盖火山方舟 Seedance、mgrouter AICC、阿里百炼万相、OpenAI Sora 和 Google Gemini Veo；
+统一覆盖火山方舟 Seedance、NeoLink Seedance、mgrouter AICC、阿里百炼万相、OpenAI Sora
+和 Google Gemini Veo；
 未知厂商立即失败，避免静默切换后产生错误计费。
 """
 
@@ -127,6 +128,7 @@ class VideoGenerationRemoteTerminalError(RuntimeError):
     _NORMALIZED_STATUSES = {
         "failed": "failed",
         "error": "failed",
+        "expired": "failed",
         "cancelled": "canceled",
         "canceled": "canceled",
     }
@@ -629,6 +631,7 @@ def get_video_provider(provider_key: str | None = None) -> VideoGenProvider:
     - openai / sora -> OpenAI Sora
     - gemini / google / veo -> Google Gemini Veo
     - mgrouter / aicc -> mgrouter AICC Seedance
+    - neolink / neo-link -> NeoLink Seedance
     - 未传 provider_key -> 按 settings.video_gen_provider 选厂商
     - 未识别 -> 明确报错，不静默回退
     缺少对应密钥时实例可创建，但调用 generate 时抛 RuntimeError。
@@ -655,6 +658,10 @@ def get_video_provider(provider_key: str | None = None) -> VideoGenProvider:
         from app.providers.video_gen_mgrouter import MgrouterVideoGenProvider
 
         return MgrouterVideoGenProvider(provider_key="mgrouter")
+    if key in ("neolink", "neo-link"):
+        from app.providers.video_gen_neolink import NeolinkVideoGenProvider
+
+        return NeolinkVideoGenProvider()
 
     # 未识别的非空 key 必须失败，不能静默调用并产生其他厂商费用。
     from app.providers.registry import require_capability

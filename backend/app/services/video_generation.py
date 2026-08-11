@@ -406,6 +406,8 @@ async def cancel_video_job(
         or ""
     )
     provider_key = job.provider_key
+    if provider_key == "neolink" and provider_task_id:
+        raise ConflictError("NeoLink 远端任务已提交且不支持取消，请等待任务完成")
     canceled_output, canceled_metrics = merge_video_task_checkpoint_lease_authority(
         job.output_json,
         job.metrics,

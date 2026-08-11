@@ -87,6 +87,9 @@ class Settings(BaseSettings):
     volcengine_api_key: str = ""
     volcengine_ark_base_url: str = "https://ark.cn-beijing.volces.com/api/v3"
     seedance_model: str = "doubao-seedance-2-0-260128"
+    # NeoLink Seedance（火山内容生成兼容协议；模型复用 SEEDANCE_MODEL）
+    neolink_api_key: str = ""
+    neolink_base_url: str = "https://neolink.com/api"
     # mgrouter AICC Seedance（火山内容生成兼容协议）
     mgrouter_api_key: str = ""
     mgrouter_base_url: str = "https://mgrouter.com/api/v3"
@@ -122,7 +125,7 @@ class Settings(BaseSettings):
     image_gen_api_key: str = ""
     image_gen_model: str = ""
 
-    # 视频生成 —— volcengine | bailian | openai | gemini | mgrouter
+    # 视频生成 —— volcengine | neolink | bailian | openai | gemini | mgrouter
     # database 保持历史后台切换；env 让 VIDEO_GEN_* 成为权威配置。
     video_provider_selection_mode: Literal["database", "env"] = "database"
     video_gen_provider: str = "volcengine"
@@ -258,6 +261,16 @@ class Settings(BaseSettings):
                 self.seedance_model,
                 self.volcengine_ark_base_url,
             ),
+            "neolink": (
+                self.neolink_api_key,
+                self.seedance_model,
+                self.neolink_base_url,
+            ),
+            "neo-link": (
+                self.neolink_api_key,
+                self.seedance_model,
+                self.neolink_base_url,
+            ),
             "bailian": (
                 self.dashscope_api_key,
                 self.dashscope_video_model,
@@ -335,6 +348,7 @@ class Settings(BaseSettings):
             "chat_llm_base_url",
             "image_gen_base_url",
             "video_gen_base_url",
+            "neolink_base_url",
             "mgrouter_base_url",
             "dashscope_base_url",
             "anthropic_base_url",
