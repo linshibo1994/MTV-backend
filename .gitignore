@@ -42,3 +42,5 @@ junit.xml
 
 # 项目文档仅保留在本地，不纳入版本控制。
 /docs/
+deploy.env
+.deploy.env

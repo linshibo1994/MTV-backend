@@ -398,8 +398,11 @@ def test_generation_schema_accepts_optional_trimmed_prompt_with_length_limit():
         subject_id="subject-1",
     )
     assert without_prompt.prompt is None
+    assert without_prompt.model == "qwen-image-2.0"
     assert without_prompt.aspect == "auto"
-    assert BatchCreateJobIn(material_id="material-1").aspect == "auto"
+    batch_without_prompt = BatchCreateJobIn(material_id="material-1")
+    assert batch_without_prompt.model == "qwen-image-2.0"
+    assert batch_without_prompt.aspect == "auto"
 
     with_prompt = CreateJobIn(
         material_id="material-1",

@@ -751,7 +751,7 @@ async def run_generation_once(
         return
 
     prompt = (input_json.get("resolved_prompts") or {}).get("final") or input_json.get("prompt") or ""
-    model = input_json.get("model", "banana-2")
+    model = input_json.get("model", "qwen-image-2.0")
     size = input_json.get("size", "2k")
     aspect = input_json.get("aspect", "16:9")
     prompt, negative_prompt = _resolve_job_prompts(input_json, prompt)
