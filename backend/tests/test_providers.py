@@ -149,15 +149,44 @@ def test_neolink_video_capability_only_needs_dedicated_url_and_key() -> None:
     assert configured.video_gen_model == "doubao-seedance-2-0-260128"
 
 
-def test_image_factory_explicit_env_provider_wins_over_model_alias(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("model", "expected_provider"),
+    [
+        ("banana-2", "google"),
+        ("gpt-image-2", "openai"),
+        ("wan2.1-t2i-plus", "bailian"),
+        ("qwen-image", "bailian"),
+        ("qwen-image-2.0", "bailian"),
+    ],
+)
+def test_image_factory_recognized_model_alias_wins_over_explicit_env_provider(
+    monkeypatch, model: str, expected_provider: str
+) -> None:
     from app.core import config
     from app.providers.image_gen import get_image_provider
+    from app.providers.image_gen_bailian import BailianImageGenProvider
+    from app.providers.image_gen_google import GoogleImageGenProvider
     from app.providers.image_gen_openai import OpenAIImageGenProvider
 
     configured = _settings(image_gen_provider="openai")
     monkeypatch.setattr(config, "settings", configured)
 
-    assert isinstance(get_image_provider("wan2.1-t2i-plus"), OpenAIImageGenProvider)
+    expected_types = {
+        "bailian": BailianImageGenProvider,
+        "google": GoogleImageGenProvider,
+        "openai": OpenAIImageGenProvider,
+    }
+    assert isinstance(get_image_provider(model), expected_types[expected_provider])
+
+
+def test_image_factory_unknown_model_uses_explicit_env_provider(monkeypatch) -> None:
+    from app.core import config
+    from app.providers.image_gen import get_image_provider
+    from app.providers.image_gen_google import GoogleImageGenProvider
+
+    monkeypatch.setattr(config, "settings", _settings(image_gen_provider="gemini"))
+
+    assert isinstance(get_image_provider("custom-image-model"), GoogleImageGenProvider)
 
 
 def test_image_factory_keeps_legacy_model_alias_without_explicit_provider(monkeypatch) -> None:
@@ -943,7 +972,47 @@ async def test_google_image_provider_rejects_unsupported_image_size(monkeypatch)
         )
 
 
-def test_bailian_prompt_extension_only_skips_precomposed_style_constraints() -> None:
+@pytest.mark.parametrize(
+    ("model", "size", "aspect", "expected"),
+    [
+        ("qwen-image-2.0", "1k", "3:4", "864*1184"),
+        ("qwen-image-2.0", "2k", "3:4", "1728*2368"),
+        ("qwen-image-2.0", "2k", "16:9", "2688*1536"),
+        ("qwen-image", "1k", "3:4", "1104*1472"),
+    ],
+)
+def test_bailian_size_mapping_uses_effective_model_capabilities(
+    model: str,
+    size: str,
+    aspect: str,
+    expected: str,
+) -> None:
+    from app.providers.image_gen_bailian import _map_size
+
+    assert _map_size(model, size, aspect) == expected
+
+
+@pytest.mark.parametrize(
+    ("model", "size", "message"),
+    [
+        ("qwen-image-2.0", "4k", "仅支持 1K 或 2K"),
+        ("qwen-image", "2k", "仅支持固定预设尺寸"),
+        ("qwen-image-2.0", "8k", "仅支持 1K、2K 或 4K"),
+    ],
+)
+def test_bailian_size_mapping_rejects_unsupported_tiers(
+    model: str,
+    size: str,
+    message: str,
+) -> None:
+    from app.providers.image_gen_bailian import _map_size
+    from app.providers.registry import ProviderConfigurationError
+
+    with pytest.raises(ProviderConfigurationError, match=message):
+        _map_size(model, size, "3:4")
+
+
+def test_bailian_prompt_extension_preserves_structured_constraints() -> None:
     from app.providers.image_gen_bailian import _should_extend_prompt
 
     assert _should_extend_prompt("一只纸飞机") is True
@@ -951,6 +1020,50 @@ def test_bailian_prompt_extension_only_skips_precomposed_style_constraints() -> 
         _should_extend_prompt("主体事实：一只纸飞机\n\n【风格渲染约束】赛博朋克风格")
         is False
     )
+    assert _should_extend_prompt("【视觉资产设定提示词】\n【人物设定图构图硬约束 v2】") is False
+    assert _should_extend_prompt("【人物设定图构图硬约束】存量角色图") is False
+
+
+@pytest.mark.asyncio
+async def test_bailian_provider_config_keeps_requested_model_without_explicit_model(monkeypatch) -> None:
+    """仅配置厂商时，不能用 Settings 的回退模型覆盖画布任务模型。"""
+    from app.providers import image_gen_bailian
+    from app.providers.image_gen import ImageResult
+    from app.providers.image_gen_bailian import BailianImageGenProvider
+
+    configured = _settings(
+        image_gen_provider="bailian",
+        image_gen_api_key="image-key",
+        image_gen_base_url="https://dashscope.example",
+    )
+    assert configured.image_gen_model == "wan2.1-t2i-plus"
+    assert configured.is_explicitly_configured("image_gen_model") is False
+    monkeypatch.setattr(image_gen_bailian, "settings", configured)
+
+    class Client:
+        def __init__(self, **kwargs) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+    monkeypatch.setattr(image_gen_bailian.httpx, "AsyncClient", Client)
+    provider = BailianImageGenProvider()
+    sync_generate = AsyncMock(return_value=["https://oss.aliyuncs.com/result.png"])
+    monkeypatch.setattr(provider, "_generate_sync_multimodal", sync_generate)
+    monkeypatch.setattr(
+        provider,
+        "_download",
+        AsyncMock(return_value=ImageResult(data=b"image", mime_type="image/png")),
+    )
+
+    result = await provider.generate("角色设定图", "qwen-image-2.0", "2k", "3:4")
+
+    assert result[0].data == b"image"
+    assert sync_generate.await_args.args[4:7] == ("qwen-image-2.0", "1728*2368", 1)
 
 
 @pytest.mark.asyncio
@@ -1022,7 +1135,7 @@ async def test_bailian_qwen_image_2_uses_sync_multimodal_api(monkeypatch) -> Non
     assert calls["post"]["json"]["input"]["messages"][0]["content"] == [
         {"text": styled_prompt}
     ]
-    assert calls["post"]["json"]["parameters"]["size"] == "1024*1024"
+    assert calls["post"]["json"]["parameters"]["size"] == "2048*2048"
     assert calls["post"]["json"]["parameters"]["prompt_extend"] is False
     assert calls["post"]["json"]["parameters"]["negative_prompt"] == "写实摄影"
     download.assert_awaited_once_with(
@@ -1084,7 +1197,7 @@ async def test_bailian_qwen_image_legacy_passes_negative_prompt(monkeypatch) -> 
     result = await provider.generate(
         styled_prompt,
         "ignored",
-        "2k",
+        "1k",
         "1:1",
         negative_prompt="写实摄影",
     )
@@ -1094,6 +1207,7 @@ async def test_bailian_qwen_image_legacy_passes_negative_prompt(monkeypatch) -> 
     assert calls["post"]["headers"]["X-DashScope-Async"] == "enable"
     assert calls["post"]["json"]["input"]["prompt"] == styled_prompt
     assert calls["post"]["json"]["input"]["negative_prompt"] == "写实摄影"
+    assert calls["post"]["json"]["parameters"]["size"] == "1328*1328"
     assert calls["post"]["json"]["parameters"]["prompt_extend"] is False
 
 

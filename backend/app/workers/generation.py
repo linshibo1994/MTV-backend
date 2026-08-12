@@ -52,9 +52,10 @@ from app.models.task_dispatch_outbox import TaskDispatchOutbox
 from app.providers.image_gen import ImageResult, get_image_provider
 from app.providers.registry import ProviderError
 from app.providers.storage import get_storage
+from app.schemas.materials import CHARACTER_SHEET_MARKER, LEGACY_CHARACTER_SHEET_MARKERS
 from app.services.credits import release as credits_release
 from app.services.credits import settle as credits_settle
-from app.services.generation import _resolve_image_prompt
+from app.services.generation import _apply_character_sheet_constraints, _resolve_image_prompt
 from app.services.media_storage_jobs import enqueue_delete
 from app.services.prompt_style import find_style
 from app.services.task_dispatch import cancel_outbox_task
@@ -64,6 +65,12 @@ from app.workers.celery_app import celery_app
 logger = logging.getLogger(__name__)
 _LEASE_SECONDS = 300
 _TERMINAL_STATUSES = {"succeeded", "failed", "canceled"}
+_LEGACY_SERVICE_CHARACTER_SHEET_MARKER = "【人物设定图服务端构图硬约束】"
+_QUEUED_CHARACTER_SHEET_MARKERS = (
+    CHARACTER_SHEET_MARKER,
+    *LEGACY_CHARACTER_SHEET_MARKERS,
+    _LEGACY_SERVICE_CHARACTER_SHEET_MARKER,
+)
 
 
 def _safe_log_generation_exception(
@@ -108,6 +115,21 @@ def _resolve_job_prompts(input_json: dict[str, Any], prompt: str) -> tuple[str, 
     return positive_prompt, negative_prompt
 
 
+def _normalize_queued_character_sheet_prompt(
+    prompt: str,
+    negative_prompt: str,
+    aspect: str,
+) -> tuple[str, str]:
+    """让部署前已入队的角色图任务也使用当前唯一的三视图约束。
+
+    新任务在创建时已完成规范化。此处仅根据明确的历史/当前标记处理旧任务，
+    避免把任意普通图片任务误判为角色设定图。
+    """
+    if not any(marker in prompt for marker in _QUEUED_CHARACTER_SHEET_MARKERS):
+        return prompt, negative_prompt
+    return _apply_character_sheet_constraints(prompt, negative_prompt, "character", aspect)
+
+
 @dataclass(frozen=True)
 class GenerationJobClaim:
     job_id: str
@@ -121,6 +143,8 @@ class ValidatedImage:
     data: bytes
     mime_type: str
     extension: str
+    width: int
+    height: int
 
 
 @dataclass(frozen=True)
@@ -328,10 +352,13 @@ def validate_image_result(result: ImageResult) -> ValidatedImage:
         raise ValueError("Provider 返回空图片")
     try:
         with Image.open(BytesIO(result.data)) as image:
-            image.verify()
             fmt = (image.format or "").upper()
+            width, height = image.size
+            image.verify()
     except Exception as exc:
         raise ValueError("Provider 返回的图片无法解码") from exc
+    if width <= 0 or height <= 0:
+        raise ValueError("Provider 返回的图片尺寸无效")
     mapping = {
         "PNG": ("image/png", "png"),
         "JPEG": ("image/jpeg", "jpg"),
@@ -340,7 +367,13 @@ def validate_image_result(result: ImageResult) -> ValidatedImage:
     if fmt not in mapping:
         raise ValueError("Provider 返回了不支持的图片格式")
     mime_type, extension = mapping[fmt]
-    return ValidatedImage(data=result.data, mime_type=mime_type, extension=extension)
+    return ValidatedImage(
+        data=result.data,
+        mime_type=mime_type,
+        extension=extension,
+        width=width,
+        height=height,
+    )
 
 
 def ensure_provider_result_count(results: list[ImageResult], *, expected: int) -> None:
@@ -718,10 +751,15 @@ async def run_generation_once(
         return
 
     prompt = (input_json.get("resolved_prompts") or {}).get("final") or input_json.get("prompt") or ""
-    prompt, negative_prompt = _resolve_job_prompts(input_json, prompt)
     model = input_json.get("model", "banana-2")
     size = input_json.get("size", "2k")
     aspect = input_json.get("aspect", "16:9")
+    prompt, negative_prompt = _resolve_job_prompts(input_json, prompt)
+    prompt, negative_prompt = _normalize_queued_character_sheet_prompt(
+        prompt,
+        negative_prompt,
+        aspect,
+    )
     count = int(input_json.get("count", 1) or 1)
     subject_id = input_json.get("subject_id") or job.subject_id
     material_id = job.material_id
@@ -800,7 +838,13 @@ async def run_generation_once(
                 subject=await _load_subject_for_candidate(db, subject_id),
             )
             image_outputs.append(
-                {"status": "succeeded", "assetId": asset.id, "storageKey": item.final_key}
+                {
+                    "status": "succeeded",
+                    "assetId": asset.id,
+                    "storageKey": item.final_key,
+                    "width": item.image.width,
+                    "height": item.image.height,
+                }
             )
         actual = settings.price_image_gen * len(image_outputs)
         if await _lock_current_generation_job(db, job_id, claim.lease_token) is None:

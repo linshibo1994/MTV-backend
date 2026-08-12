@@ -212,12 +212,21 @@ def test_node_schema_rejects_unknown_type_and_builds_prompt_from_subject_data():
             "model": "banana-2",
             "size": "2k",
             "aspect": "16:9",
-            "imageOutputs": [{"status": "succeeded", "assetId": "image-1", "storageKey": "/a.png"}],
+            "imageOutputs": [
+                {
+                    "status": "succeeded",
+                    "assetId": "image-1",
+                    "storageKey": "/a.png",
+                    "width": 1728,
+                    "height": 2368,
+                }
+            ],
         },
     )
 
     assert "主体名称：主角" in materials_crud.build_prompt_from_node_data(node.data)
     assert node.data["imageOutputs"][0]["assetId"] == "image-1"
+    assert node.data["imageOutputs"][0]["width"] == 1728
 
 
 def test_subject_design_prompt_uses_type_specific_detailed_templates():
@@ -230,10 +239,12 @@ def test_subject_design_prompt_uses_type_specific_detailed_templates():
     prop = build_subject_prompt("烙饼", "prop", "表面焦黄、边缘不规则的手工烙饼")
 
     assert CHARACTER_SHEET_MARKER in character
-    assert "正面、标准侧面、背面三幅等比例全身视图" in character
+    assert "左侧 33%" in character
+    assert "正面 0°、标准侧面 90°、背面 180°" in character
+    assert "orthographic projection" in character
     assert "3:4" not in character
-    assert "瞬时动作只作为身份线索" in character
-    assert "不套用统一九头身" in character
+    assert "剧情动作只作身份线索，不进入设定姿态" in character
+    assert "符合年龄、职业和经历的真实比例" in character
     assert "【2 空间布局】" in scene
     assert "单张 16:9 横版场景设定图" in scene
     assert CHARACTER_SHEET_MARKER not in scene

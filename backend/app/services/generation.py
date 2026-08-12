@@ -49,7 +49,12 @@ from app.models.script import Script
 from app.models.subject import Subject
 from app.models.user import User
 from app.schemas.generation import BatchCreateJobIn, CreateJobIn
-from app.schemas.materials import SUBJECT_DESIGN_PROMPT_MARKER
+from app.schemas.materials import (
+    CHARACTER_SHEET_MARKER,
+    SUBJECT_DESIGN_PROMPT_MARKER,
+    ensure_character_sheet_constraint,
+    strip_legacy_character_sheet_constraints,
+)
 from app.schemas.pipeline_contracts import normalize_enrich_prompt
 from app.services.credits import reserve
 from app.services.pipeline.enrich import build_base_prompt
@@ -67,18 +72,12 @@ _MAX_CLIENT_IDEMPOTENCY_KEY_LENGTH = 128
 _BATCH_GENERATION_GROUP_SIZE = 2
 _BATCH_GENERATION_GROUP_INTERVAL_SECONDS = 5
 
-_CHARACTER_SHEET_MARKER = "【人物设定图服务端构图硬约束】"
-_CHARACTER_SHEET_PROMPT_TEMPLATE = (
-    f"{_CHARACTER_SHEET_MARKER}生成单张 {{aspect}} 比例、风格统一的人物设定图，所有视图必须位于同一张图内。"
-    "左侧约占 45%，展示人物头肩大图；右侧约占 55%，恰好依次展示正面、标准侧面、背面三幅"
-    "等比例全身视图。四个呈现必须是同一人物，身份、脸部、发型、服装和体型完全一致。"
-    "三幅全身视图从头到脚完整可见、无遮挡、无裁切，使用浅色纯背景。"
-    "画面不得出现文字、标签、水印、边框、分栏线或额外人物。"
-)
+_CHARACTER_SHEET_MARKER = CHARACTER_SHEET_MARKER
 _CHARACTER_SHEET_NEGATIVE_PROMPT = (
-    "额外人物，多余视图，缺少正面视图，缺少标准侧面视图，缺少背面视图，"
-    "头部裁切，脚部裁切，身体遮挡，身份不一致，脸部不一致，发型不一致，"
-    "服装不一致，体型不一致，文字，标签，水印，边框，分栏线"
+    "额外人物，多余视图，缺少左侧极近面部特写，缺少正面 0° 视图，缺少标准侧面 90° 视图，"
+    "缺少背面 180° 视图，头部裁切，脚部裁切，肩部进入左侧特写，身体遮挡，视图重叠，"
+    "透视变形，身份不一致，脸部不一致，发型不一致，服装不一致，体型不一致，文字，标签，"
+    "尺寸线，水印，边框，分栏线，额外剧情动作"
 )
 
 
@@ -192,6 +191,11 @@ def _resolve_image_prompt(
     return positive_prompt, negative_prompt, style_id
 
 
+def _remove_legacy_character_sheet_constraints(prompt: str) -> str:
+    """清理历史角色三视图约束，避免与 v2 版式重复注入。"""
+    return strip_legacy_character_sheet_constraints(prompt)
+
+
 def _apply_character_sheet_constraints(
     prompt: str,
     negative_prompt: str,
@@ -202,10 +206,9 @@ def _apply_character_sheet_constraints(
     if subject_type != "character":
         return prompt, negative_prompt
 
-    resolved_prompt = prompt.rstrip()
-    if _CHARACTER_SHEET_MARKER not in resolved_prompt:
-        character_sheet_prompt = _CHARACTER_SHEET_PROMPT_TEMPLATE.format(aspect=aspect)
-        resolved_prompt = f"{resolved_prompt}\n\n{character_sheet_prompt}"
+    resolved_prompt = ensure_character_sheet_constraint(
+        _remove_legacy_character_sheet_constraints(prompt)
+    )
 
     resolved_negative = negative_prompt.strip()
     if _CHARACTER_SHEET_NEGATIVE_PROMPT not in resolved_negative:

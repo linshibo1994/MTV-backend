@@ -817,6 +817,102 @@ def test_normalize_provider_continuity_coerces_invalid_enums() -> None:
     assert "平视" in shot.description
 
 
+def test_normalize_provider_continuity_repairs_dialogue_speaker_visibility() -> None:
+    """对白 speaker 缺失/不在 character_refs 应被确定性收敛，不抛 value_error 卡住生成。"""
+    from app.services import storyboard as storyboard_service
+
+    reference_names = {
+        ref: item.name for ref, item in _subject_references().items()
+    }
+    reference_types = {
+        ref: item.subject_type for ref, item in _subject_references().items()
+    }
+
+    # 分支 b：speaker 合法但不在 character_refs -> 补入
+    payload = _valid_storyboard_v2_payload()
+    shot = payload["scenes"][0]["shot_groups"][0]["shots"][0]
+    shot["character_refs"] = []  # 清空，speaker C01 不在其中
+    contract = storyboard_service._validate_provider_payload(
+        payload,
+        subject_catalog=_subject_catalog(),
+        subject_reference_names=reference_names,
+        subject_reference_types=reference_types,
+    )
+    assert contract.scenes[0].shot_groups[0].shots[0].dialogue_character == "阿明"
+
+    # 分支 a：kind=dialogue 但 speaker_ref=None -> 从 character_refs 回填
+    payload = _valid_storyboard_v2_payload()
+    shot = payload["scenes"][0]["shot_groups"][0]["shots"][0]
+    shot["dialogue"]["speaker_ref"] = None
+    contract = storyboard_service._validate_provider_payload(
+        payload,
+        subject_catalog=_subject_catalog(),
+        subject_reference_names=reference_names,
+        subject_reference_types=reference_types,
+    )
+    assert contract.scenes[0].shot_groups[0].shots[0].dialogue_character == "阿明"
+
+    # 分支 a 兜底：speaker=None 且 character_refs 也无角色 -> 降级 voice_over
+    payload = _valid_storyboard_v2_payload()
+    shot = payload["scenes"][0]["shot_groups"][0]["shots"][0]
+    shot["character_refs"] = ["P01"]  # 只有道具，无角色可回填
+    shot["dialogue"]["speaker_ref"] = None
+    contract = storyboard_service._validate_provider_payload(
+        payload,
+        subject_catalog=_subject_catalog(),
+        subject_reference_names=reference_names,
+        subject_reference_types=reference_types,
+    )
+    # 降级为 voice_over，台词文本保留，不阻断生成
+    result = contract.scenes[0].shot_groups[0].shots[0]
+    assert result.dialogue_character == ""
+
+
+def test_normalize_provider_continuity_resolves_background_ref_strongly() -> None:
+    """background_ref 为 null/非法/名称时应强解析为合法背景引用，不卡死生成。"""
+    from app.services import storyboard as storyboard_service
+
+    reference_names = {
+        ref: item.name for ref, item in _subject_references().items()
+    }
+    reference_types = {
+        ref: item.subject_type for ref, item in _subject_references().items()
+    }
+
+    # 情形一：background_ref=null -> 兜底首个背景引用 BG01
+    payload = _valid_storyboard_v2_payload()
+    payload["scenes"][0]["background_ref"] = None
+    contract = storyboard_service._validate_provider_payload(
+        payload,
+        subject_catalog=_subject_catalog(),
+        subject_reference_names=reference_names,
+        subject_reference_types=reference_types,
+    )
+    assert contract.scenes[0].background == "办公室"  # BG01 -> 办公室
+
+    # 情形二：background_ref 写中文名 -> 名称映射
+    payload = _valid_storyboard_v2_payload()
+    payload["scenes"][0]["background_ref"] = "办公室"
+    contract = storyboard_service._validate_provider_payload(
+        payload,
+        subject_catalog=_subject_catalog(),
+        subject_reference_names=reference_names,
+        subject_reference_types=reference_types,
+    )
+    assert contract.scenes[0].background == "办公室"
+
+    # 情形三：background_ref 是非法自造值 -> 兜底首个背景引用
+    payload = _valid_storyboard_v2_payload()
+    payload["scenes"][0]["background_ref"] = "不存在的场景XX"
+    contract = storyboard_service._validate_provider_payload(
+        payload,
+        subject_catalog=_subject_catalog(),
+        subject_reference_names=reference_names,
+        subject_reference_types=reference_types,
+    )
+    assert contract.scenes[0].background == "办公室"
+
+
 def test_normalize_provider_continuity_clamps_oversized_group_duration() -> None:
     """组时长越界（>15s）绝不卡住生成：按镜头总时长是否合法分别处理。"""
     from app.services import storyboard as storyboard_service
@@ -1010,6 +1106,67 @@ async def test_invalid_provider_contract_does_not_delete_old_storyboard(monkeypa
     assert call_llm.await_count == 2
     cleanup.assert_not_awaited()
     db.flush.assert_not_awaited()
+
+
+async def test_generate_storyboard_provisions_fallback_scene_when_no_background(monkeypatch) -> None:
+    """分集缺少场景主体时应自动补建默认场景主体，避免 background_ref 无合法引用卡死生成。"""
+    from app.models.subject import Subject
+    from app.schemas.pipeline_contracts import ProviderContractError
+    from app.services import storyboard as storyboard_service
+
+    episode = SimpleNamespace(
+        episode_id="episode-1",
+        script_id="script-1",
+        episode_no=1,
+        title="第一集",
+        script_text="阿明和林晚对话。",
+        episode_version=7,
+    )
+    # 只有角色，没有场景/背景主体
+    subjects = [
+        SimpleNamespace(id="c1", name="阿明", type="character", episode_nos=[1], description="", image_entry_id=None, is_active=True),
+        SimpleNamespace(id="c2", name="林晚", type="character", episode_nos=[1], description="", image_entry_id=None, is_active=True),
+    ]
+
+    class _Scalars:
+        def __init__(self, values):
+            self._values = values
+
+        def all(self):
+            return self._values
+
+    class _Result:
+        def __init__(self, scalar=None, scalars=None):
+            self._scalar = scalar
+            self._scalars = scalars or []
+
+        def scalar_one_or_none(self):
+            return self._scalar
+
+        def scalars(self):
+            return _Scalars(self._scalars)
+
+    added: list = []
+    db = SimpleNamespace(
+        execute=AsyncMock(side_effect=[_Result(episode), _Result(scalars=subjects)]),
+        flush=AsyncMock(),
+        add=lambda obj: added.append(obj),
+    )
+    monkeypatch.setattr(storyboard_service, "_call_llm", AsyncMock(return_value={"scenes": []}))
+    monkeypatch.setattr(storyboard_service, "_cleanup_existing_storyboard", AsyncMock())
+
+    with pytest.raises(ProviderContractError):
+        await storyboard_service.generate_storyboard(
+            db, "script-1", "episode-1", expected_episode_version=7
+        )
+
+    fallback = next(
+        (s for s in added if isinstance(s, Subject) and s.type == "scene"),
+        None,
+    )
+    assert fallback is not None
+    assert fallback.name == "默认场景-第1集"
+    assert fallback.episode_nos == [1]
 
 
 async def test_materials_are_typed_and_sound_is_audio_not_visual_material() -> None:

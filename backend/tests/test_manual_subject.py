@@ -27,7 +27,7 @@ from app.models.script import Script
 from app.models.subject import Subject
 from app.models.user import User
 from app.schemas.asset import SubjectCreateIn
-from app.schemas.materials import build_subject_prompt
+from app.schemas.materials import SUBJECT_DESIGN_PROMPT_TEMPLATE_VERSION, build_subject_prompt
 
 
 @compiles(JSONB, "sqlite")
@@ -202,7 +202,7 @@ async def test_subject_list_prefers_current_enrich_prompt_and_rejects_stale_entr
                     subject.id: {
                         "subject_version": 2,
                         "enrich_version": 3,
-                        "prompt_template_version": 2,
+                        "prompt_template_version": SUBJECT_DESIGN_PROMPT_TEMPLATE_VERSION,
                         "resolved_prompts": {
                             "final": "服务端生成的老农设定提示词。\n"
                             + build_subject_prompt(
@@ -249,7 +249,7 @@ async def test_subject_list_prefers_current_enrich_prompt_and_rejects_stale_entr
                 "prompts": {
                     subject.id: {
                         **stage.detail["prompts"][subject.id],
-                        "prompt_template_version": 2,
+                        "prompt_template_version": SUBJECT_DESIGN_PROMPT_TEMPLATE_VERSION,
                         "subject_version": 1,
                     }
                 },
@@ -261,10 +261,10 @@ async def test_subject_list_prefers_current_enrich_prompt_and_rejects_stale_entr
         current_item = current.json()["items"][0]
         assert "服务端生成的老农设定提示词" in current_item["design_prompt"]
         assert "【视觉资产设定提示词】" in current_item["design_prompt"]
-        assert "【人物设定图构图硬约束】" in current_item["design_prompt"]
+        assert "【人物设定图构图硬约束 v2】" in current_item["design_prompt"]
         assert current_item["design_prompt_source"] == "generated"
         assert current_item["design_prompt_version"] == 3
-        assert current_item["design_prompt_template_version"] == 2
+        assert current_item["design_prompt_template_version"] == SUBJECT_DESIGN_PROMPT_TEMPLATE_VERSION
 
         assert old_template.status_code == 200
         old_template_item = old_template.json()["items"][0]

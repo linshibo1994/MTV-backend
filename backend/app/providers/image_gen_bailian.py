@@ -26,6 +26,11 @@ import httpx
 from app.core.config import settings
 from app.providers.image_gen import ImageResult
 from app.providers.registry import ProviderConfigurationError
+from app.schemas.materials import (
+    CHARACTER_SHEET_MARKER,
+    LEGACY_CHARACTER_SHEET_MARKERS,
+    SUBJECT_DESIGN_PROMPT_MARKER,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -35,9 +40,43 @@ _RETRYABLE_SUBMIT_STATUSES = {429}
 _MAX_SUBMIT_ATTEMPTS = 5
 _MAX_RETRY_DELAY_SECONDS = 20.0
 _STYLE_RENDER_CONSTRAINT_MARKER = "【风格渲染约束】"
+_LEGACY_CHARACTER_SHEET_MARKER = "【人物设定图服务端构图硬约束】"
 
-# aspect -> 通义万相 size（宽*高，星号分隔）
-_ASPECT_TO_SIZE: dict[str, str] = {
+# Qwen Image 2.0 支持自定义宽高；以下 2K 值采用百炼官方推荐分辨率。
+# 1K 值使用该 API 的常用低分辨率档，均为 16 的倍数并保持相同宽高比。
+_QWEN_IMAGE_2_SIZE_BY_TIER: dict[str, dict[str, str]] = {
+    "1k": {
+        "16:9": "1344*768",
+        "9:16": "768*1344",
+        "1:1": "1024*1024",
+        "4:3": "1184*864",
+        "3:4": "864*1184",
+        "3:2": "1152*768",
+        "2:3": "768*1152",
+    },
+    "2k": {
+        "16:9": "2688*1536",
+        "9:16": "1536*2688",
+        "1:1": "2048*2048",
+        "4:3": "2368*1728",
+        "3:4": "1728*2368",
+        "3:2": "2304*1536",
+        "2:3": "1536*2304",
+    },
+}
+
+# 旧 qwen-image / qwen-image-plus / qwen-image-max 只支持这五种固定预设。
+_LEGACY_QWEN_PRESET_SIZE_BY_ASPECT: dict[str, str] = {
+    "16:9": "1664*928",
+    "9:16": "928*1664",
+    "1:1": "1328*1328",
+    "4:3": "1472*1104",
+    "3:4": "1104*1472",
+}
+
+# 其余旧万相模型没有统一的 2K/4K 能力契约；仅保留已验证的基础尺寸映射，
+# 对更高档位显式拒绝，不能再把调用方的 2K/4K 静默降级。
+_LEGACY_1K_SIZE_BY_ASPECT: dict[str, str] = {
     "16:9": "1280*720",
     "9:16": "720*1280",
     "1:1": "1024*1024",
@@ -48,11 +87,66 @@ _ASPECT_TO_SIZE: dict[str, str] = {
 }
 
 
-def _map_size(size: str, aspect: str) -> str:
-    """按 aspect 选取通义万相 size；aspect 缺失时默认 16:9 横版。"""
-    if aspect and aspect in _ASPECT_TO_SIZE:
-        return _ASPECT_TO_SIZE[aspect]
-    return _ASPECT_TO_SIZE["16:9"]
+def _normalize_size_tier(size: str) -> str:
+    """规范化画布尺寸档位，拒绝供应商未声明的档位。"""
+    normalized = (size or "2k").strip().lower()
+    if normalized not in {"1k", "2k", "4k"}:
+        raise ProviderConfigurationError("百炼图片尺寸仅支持 1K、2K 或 4K")
+    return normalized
+
+
+def _normalize_aspect(aspect: str) -> str:
+    """规范化比例；auto 会在服务层解析，Provider 直接调用时保守回退横版。"""
+    normalized = (aspect or "16:9").strip().lower()
+    return "16:9" if normalized == "auto" else normalized
+
+
+def _map_size(model: str, size: str, aspect: str) -> str:
+    """按有效模型、尺寸档位和比例选择百炼实际请求的 ``width*height``。
+
+    ``size`` 是产品层的 1K/2K/4K 档位，不允许再被无条件忽略。对于不具备
+    对应能力的模型，直接抛出可恢复的配置错误，避免用户把低清预设误认为 2K/4K。
+    """
+    normalized_model = (model or "").strip().lower()
+    normalized_size = _normalize_size_tier(size)
+    normalized_aspect = _normalize_aspect(aspect)
+
+    if normalized_model.startswith("qwen-image-2.0"):
+        if normalized_size == "4k":
+            raise ProviderConfigurationError("Qwen Image 2.0 图片尺寸仅支持 1K 或 2K，不支持 4K")
+        try:
+            return _QWEN_IMAGE_2_SIZE_BY_TIER[normalized_size][normalized_aspect]
+        except KeyError as exc:
+            supported = "、".join(_QWEN_IMAGE_2_SIZE_BY_TIER[normalized_size])
+            raise ProviderConfigurationError(
+                f"Qwen Image 2.0 不支持比例 {normalized_aspect}；支持：{supported}"
+            ) from exc
+
+    if normalized_model.startswith(("qwen-image", "qwen-image-plus", "qwen-image-max")):
+        if normalized_size != "1k":
+            raise ProviderConfigurationError(
+                f"{model} 仅支持固定预设尺寸；请使用 1K，或切换至 qwen-image-2.0 使用 2K"
+            )
+        try:
+            return _LEGACY_QWEN_PRESET_SIZE_BY_ASPECT[normalized_aspect]
+        except KeyError as exc:
+            supported = "、".join(_LEGACY_QWEN_PRESET_SIZE_BY_ASPECT)
+            raise ProviderConfigurationError(
+                f"{model} 不支持比例 {normalized_aspect}；支持：{supported}"
+            ) from exc
+
+    if normalized_size != "1k":
+        raise ProviderConfigurationError(
+            f"{model or '当前百炼模型'} 的尺寸能力未声明；仅支持 1K，"
+            "若需要 2K 请切换至 qwen-image-2.0"
+        )
+    try:
+        return _LEGACY_1K_SIZE_BY_ASPECT[normalized_aspect]
+    except KeyError as exc:
+        supported = "、".join(_LEGACY_1K_SIZE_BY_ASPECT)
+        raise ProviderConfigurationError(
+            f"{model or '当前百炼模型'} 不支持比例 {normalized_aspect}；支持：{supported}"
+        ) from exc
 
 
 def _uses_sync_multimodal_api(model: str) -> bool:
@@ -61,8 +155,15 @@ def _uses_sync_multimodal_api(model: str) -> bool:
 
 
 def _should_extend_prompt(prompt: str) -> bool:
-    """已完成结构化风格合成的 prompt 禁止供应商再次改写。"""
-    return _STYLE_RENDER_CONSTRAINT_MARKER not in prompt
+    """仅让供应商扩展简短自由提示词，保留结构化设定图的版式硬约束。"""
+    structured_markers = (
+        _STYLE_RENDER_CONSTRAINT_MARKER,
+        SUBJECT_DESIGN_PROMPT_MARKER,
+        CHARACTER_SHEET_MARKER,
+        _LEGACY_CHARACTER_SHEET_MARKER,
+        *LEGACY_CHARACTER_SHEET_MARKERS,
+    )
+    return not any(marker in prompt for marker in structured_markers)
 
 
 def _extract_multimodal_urls(payload: dict) -> list[str]:
@@ -144,13 +245,11 @@ class BailianImageGenProvider:
             raise ProviderConfigurationError(
                 "未配置 IMAGE_GEN_API_KEY（或 DASHSCOPE_API_KEY），无法调用通义万相文生图"
             )
+        # IMAGE_GEN_PROVIDER 只决定厂商，不能把 Settings 的回退模型伪装成显式模型
+        # 配置并覆盖画布任务的模型。只有部署明确设置 IMAGE_GEN_MODEL 时才强制覆盖。
         use_model = (
             settings.image_gen_model
-            if (
-                settings.is_explicitly_configured("image_gen_provider")
-                or settings.is_explicitly_configured("image_gen_model")
-            )
-            and settings.image_gen_model
+            if settings.is_explicitly_configured("image_gen_model") and settings.image_gen_model
             else model or "wan2.1-t2i-plus"
         )
         base_url = (
@@ -158,7 +257,14 @@ class BailianImageGenProvider:
             if settings.is_explicitly_configured("image_gen_base_url") and settings.image_gen_base_url
             else settings.dashscope_base_url
         ).rstrip("/")
-        wanx_size = _map_size(size, aspect)
+        wanx_size = _map_size(use_model, size, aspect)
+        logger.info(
+            "百炼生图尺寸映射 model=%s requested_size=%s requested_aspect=%s effective_size=%s",
+            use_model,
+            size,
+            aspect,
+            wanx_size,
+        )
         n = max(count, 1)
 
         async with httpx.AsyncClient(timeout=60.0) as http:

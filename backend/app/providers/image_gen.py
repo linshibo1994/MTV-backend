@@ -3,13 +3,14 @@
 ImageGenProvider 协议统一文生图调用入口：
 generate(prompt, model, size, aspect, count, negative_prompt) -> list[ImageResult]。
 
-get_image_provider(model) 路由策略（.env 主导 + model 别名向后兼容）：
-  1. model 为已知别名 -> 对应厂商：
+get_image_provider(model) 路由策略（模型别名优先 + .env 未知模型回退）：
+  1. 调用方显式传入 provider -> 对应厂商。
+  2. model 为已知别名 -> 对应厂商：
      - banana-2     -> Google Nano Banana (image_gen_google)
      - gpt-image-2  -> OpenAI GPT Image (image_gen_openai)
      - wan2.1-* / wanx-* / qwen-image* -> 阿里百炼通义万相 (image_gen_bailian)
-  2. model 为未知别名/真实 id -> 按 settings.image_gen_provider 选厂商，model 作为真实 id
-  3. 缺对应 API key 由具体实现抛 RuntimeError，worker 捕获后 release 积分。
+  3. model 为未知别名/真实 id -> 按 settings.image_gen_provider 选厂商，model 作为真实 id。
+  4. 缺对应 API key 由具体实现抛 RuntimeError，worker 捕获后 release 积分。
 """
 
 from __future__ import annotations
@@ -69,7 +70,7 @@ def _provider_for_model(model: str) -> str | None:
 def get_image_provider(
     model: str | None = None, *, provider: str | None = None
 ) -> ImageGenProvider:
-    """按 model 别名优先、否则按 .env image_gen_provider 路由到供应商实现。
+    """已知 model 别名优先；未知真实模型再按 .env provider 路由。
 
     缺少对应 API key 时由具体实现抛 RuntimeError，worker 捕获后 release 积分。
     """
@@ -79,17 +80,17 @@ def get_image_provider(
     if provider:
         return _instantiate(provider)
 
-    # 2) 仅当 provider 确实来自环境变量/显式 Settings 入参时由配置主导；
-    # 类默认值不能冒充用户配置，否则会破坏旧 model 别名路由。
-    configured = (settings.image_gen_provider or "").strip().lower()
-    if configured and settings.is_explicitly_configured("image_gen_provider"):
-        return _instantiate(configured)
-
-    # 3) 未显式配置 provider 时保留旧 model 别名路由。
+    # 2) 已知模型别名代表产品层明确选择的供应商。即使部署默认 provider
+    # 被设为 OpenAI/Gemini，也不能把 qwen-image 等百炼模型误发给其他厂商。
     if model:
         vendor = _provider_for_model(model)
         if vendor:
             return _instantiate(vendor)
+
+    # 3) 未知真实模型才由显式环境配置决定供应商；类默认值仍作为最终回退。
+    configured = (settings.image_gen_provider or "").strip().lower()
+    if configured and settings.is_explicitly_configured("image_gen_provider"):
+        return _instantiate(configured)
 
     # 4) 最后使用 Settings 默认值，旧部署仍默认为 OpenAI。
     return _instantiate(configured or "openai")

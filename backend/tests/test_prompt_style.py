@@ -297,7 +297,7 @@ async def test_optimize_subject_design_prompt_preserves_full_contract() -> None:
     provider.chat.assert_not_awaited()
     assert result["optimized_prompt"] == raw_prompt
     assert result["original_prompt"] == raw_prompt
-    assert "【6 道具与物理关系】" in result["optimized_prompt"]
+    assert "【4 体态与道具】" in result["optimized_prompt"]
     assert "真人摄影写实" not in raw_prompt
     assert result["negative_prompt"] == ""
     assert result["style_id"] == "anime"

@@ -6,6 +6,7 @@ prompt 自动构造用 06 文档第 5 节固定模板。
 
 from __future__ import annotations
 
+import re
 from typing import Annotated, Any, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
@@ -21,15 +22,63 @@ _SUBJECT_TYPE_CN: dict[str, str] = {
     "sound": "声音",
 }
 
-SUBJECT_DESIGN_PROMPT_TEMPLATE_VERSION = 2
+SUBJECT_DESIGN_PROMPT_TEMPLATE_VERSION = 3
 SUBJECT_DESIGN_PROMPT_MARKER = "【视觉资产设定提示词】"
-CHARACTER_SHEET_MARKER = "【人物设定图构图硬约束】"
+CHARACTER_SHEET_MARKER = "【人物设定图构图硬约束 v2】"
+LEGACY_CHARACTER_SHEET_MARKERS = ("【人物设定图构图硬约束】",)
 CHARACTER_SHEET_CONSTRAINT = (
-    f"{CHARACTER_SHEET_MARKER}单张组合图，所有视图位于同一张图内。"
+    f"{CHARACTER_SHEET_MARKER}单张角色设定组合图，严格固定版式：左侧 33% 仅为正面极近面部特写"
+    "（extreme facial close-up，头顶留 5% 空间，下颌/颈部截止，肩部不入镜），中性直视镜头，不复制剧情动作。"
+    "右侧 67% 严格分为三个等宽、不重叠的全身栏，依次仅为正面 0°、标准侧面 90°、背面 180° 的"
+    "正交投影视图（orthographic projection）；同一人物中性 A-Pose，头脚完整，无裁切、遮挡或透视变形。"
+    "四视图身份、脸部、发型、服装、配色、体型和稳定配饰完全一致；白色无缝摄影棚背景、均匀柔光。"
+    "禁止文字、标签、尺寸线、水印、边框、分栏线、额外人物、额外视图或剧情动作。"
+)
+_LEGACY_CHARACTER_SHEET_CONSTRAINTS = (
+    "【人物设定图构图硬约束】单张组合图，所有视图位于同一张图内。"
     "左侧约 45% 为头肩或半身正面主视觉；右侧约 55% 恰好依次为正面、标准侧面、"
     "背面三幅等比例全身视图。三幅全身视图采用自然 A-Pose 或放松站姿，从头到脚"
-    "无遮挡、无裁切。"
+    "无遮挡、无裁切。",
 )
+
+
+def _strip_character_sheet_block(prompt: str, marker: str) -> str:
+    """删除标记后的旧构图块，直到下一个结构化段落或风格段。
+
+    历史提示词有单行和多行两种形态。不能只删 marker 所在行，否则旧版
+    ``左侧 45% / 右侧 55%`` 残句会和新版版式同时传入模型。
+    """
+    return re.sub(
+        rf"{re.escape(marker)}.*?(?=\n【[^】]+】|\Z)",
+        "",
+        prompt,
+        flags=re.DOTALL,
+    )
+
+
+def strip_legacy_character_sheet_constraints(prompt: str) -> str:
+    """移除已知旧版角色三视图约束，同时保留其余主体事实与风格段。"""
+    normalized = prompt
+    for legacy_constraint in _LEGACY_CHARACTER_SHEET_CONSTRAINTS:
+        normalized = normalized.replace(legacy_constraint, "")
+    for legacy_marker in LEGACY_CHARACTER_SHEET_MARKERS:
+        normalized = _strip_character_sheet_block(normalized, legacy_marker)
+    return re.sub(r"\n{3,}", "\n\n", normalized).strip()
+
+
+def ensure_character_sheet_constraint(prompt: str) -> str:
+    """规范为唯一且完整的 v2 人物设定图约束。"""
+    normalized = strip_legacy_character_sheet_constraints(prompt)
+    if (
+        normalized.count(CHARACTER_SHEET_MARKER) == 1
+        and CHARACTER_SHEET_CONSTRAINT in normalized
+    ):
+        return normalized
+
+    normalized = normalized.replace(CHARACTER_SHEET_CONSTRAINT, "")
+    normalized = _strip_character_sheet_block(normalized, CHARACTER_SHEET_MARKER)
+    normalized = re.sub(r"\n{3,}", "\n\n", normalized).strip()
+    return f"{normalized}\n{CHARACTER_SHEET_CONSTRAINT}".strip()
 
 
 def ensure_subject_prompt_constraints(prompt: str, subject_type: str) -> str:
@@ -39,8 +88,8 @@ def ensure_subject_prompt_constraints(prompt: str, subject_type: str) -> str:
         SUBJECT_DESIGN_PROMPT_MARKER not in normalized
     ):
         normalized = f"{SUBJECT_DESIGN_PROMPT_MARKER}\n{normalized}"
-    if subject_type == "character" and CHARACTER_SHEET_MARKER not in normalized:
-        return f"{normalized}\n{CHARACTER_SHEET_CONSTRAINT}"
+    if subject_type == "character":
+        return ensure_character_sheet_constraint(normalized)
     return normalized
 
 
@@ -59,18 +108,13 @@ def _build_character_prompt(name: str, type_cn: str, description: str) -> str:
             f"主体名称：{name}",
             f"主体类型：{type_cn}",
             f"主体事实：{description}",
-            "【1 身份与主体锚定】严格保留主体事实中的年龄、性别、身份、地域、职业和生活状态；未明确的信息不得升级为确定事实，只采用低存在感且符合身份的克制补全。",
-            "【2 面容与视线约束】把脸型、五官、肤质、皱纹、伤痕等稳定特征描述清楚。正面主视觉保持自然中性神情并看向镜头；侧面与背面遵循对应视角，不强行扭头或复制正面表情。",
-            "【3 发型与头饰考据】严格落实已描述的发型、帽子或头巾。描述中存在“或”等互斥方案时只选择一种，选定后主视觉和全部三视图保持完全一致，不同时展示多个造型版本。",
-            "【4 服装、配色与分层】逐层表现外套、内搭、下装、鞋袜和配饰；所有已明确的颜色、材质、磨损、污渍与穿着方式必须保留。上下装边界清楚，不把分体服装误画成连体服或长袍。",
-            "【5 体态与比例】使用符合人物年龄、职业和生活经历的真实人体比例与骨骼体态，不套用统一九头身。三幅全身视图保持相同身高、肩宽、体型和肢体比例，双脚完整入镜。",
-            "【6 道具与物理关系】稳定随身道具必须真实接触手指、身体或地面，体现重力、受力、遮挡和材质形变，禁止悬浮、穿模、粘连或多余手指。剧情中的坐地、咀嚼、说话等瞬时动作只作为身份线索，不复制到标准设定姿态。",
-            "【7 时代与文化锚定】服装、发式、道具和工艺严格符合主体描述对应的年代、地域与社会身份，避免现代都市时尚、错误年代用品和戏曲化夸张。",
+            "【1 身份】严格保留主体事实中的年龄、性别、身份、地域、职业和生活状态；未明确处只做克制补全。",
+            "【2 面容】锁定脸型、五官、肤质、皱纹和伤痕等稳定特征；左侧特写中性直视，右侧三视图不得扭头。",
+            "【3 发型与服装】落实发型、帽饰、外套、内搭、下装、鞋袜和配饰；互斥方案只选一种。保留颜色、材质、磨损与分层，不把分体服装画成连体服或长袍。",
+            "【4 体态与道具】采用符合年龄、职业和经历的真实比例；稳定道具须有真实接触、重力和受力。坐地、咀嚼、说话等剧情动作只作身份线索，不进入设定姿态。",
+            "【5 时代】服装、发式、道具和工艺符合对应年代、地域与社会身份，避免跨时代和戏曲化夸张。",
             CHARACTER_SHEET_CONSTRAINT,
-            "【9 跨视图一致性锁】四个呈现必须是同一人物，脸型、五官、发型、年龄、肤色、体态、服装款式、颜色、材质、磨损位置和配饰完全一致；不得出现换装、镜像错位或正背面穿帮。",
-            "【10 白底布光】使用浅色纯净无缝摄影棚背景与均匀三点柔光，保留自然接触阴影，避免死黑暗部、强烈投影和背景杂物，确保皮肤、毛发、布料和道具纹理清晰。",
-            "【11 画面纯净锁】画面不得出现额外人物、重复肢体、额外视图、分栏线、边框、文字、标签、尺寸标注、品牌 LOGO、水印、签名或无意义符号。",
-            "【12 质感与成像】成像媒介严格服从主体事实或调用方所选风格，整张设定图保持统一；采用电影级高细节美术设定品质，清晰呈现皮肤、毛发、布料与道具材质，使用相当于 85mm 人像视角的自然透视，色彩克制，不做过度磨皮或锐化。",
+            "【7 一致与质感】四视图不得换装、镜像错位或正背面穿帮。整图服从调用方所选风格，清晰呈现皮肤、毛发、布料和道具材质；左侧可用 85mm 人像视角，右侧必须正交投影。",
         ]
     )
 
@@ -243,6 +287,8 @@ class ImageOutputData(BaseModel):
     status: str
     asset_id: str | None = Field(default=None, alias="assetId")
     storage_key: str | None = Field(default=None, alias="storageKey")
+    width: int | None = Field(default=None, ge=1)
+    height: int | None = Field(default=None, ge=1)
 
 
 class SubjectImageNodeData(CanvasNodeData):
@@ -257,6 +303,7 @@ class SubjectImageNodeData(CanvasNodeData):
         "wan2.1-t2i-turbo",
         "wanx-v1",
         "qwen-image",
+        "qwen-image-2.0",
     ] | None = None
     size: str | None = None
     aspect: str | None = None
@@ -331,7 +378,7 @@ def normalize_node_data(node_type: CanvasNodeType, data: dict[str, Any]) -> dict
             )
 
     normalized = model.model_dump(
-        by_alias=True, exclude_none=False
+        by_alias=True, exclude_none=False, exclude_unset=True
     )
     # 只保留来访字段，避免模型默认值把未提供字段注入到 round-trip payload。
     return {key: normalized[key] for key in data}

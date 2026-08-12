@@ -42,6 +42,7 @@ from app.models.task_dispatch_outbox import TaskDispatchOutbox
 from app.models.user import User
 from app.providers.image_gen import ImageResult, image_result_from_url
 from app.schemas.generation import BatchCreateJobIn, CreateJobIn
+from app.schemas.materials import CHARACTER_SHEET_MARKER
 from app.services import generation as generation_service
 from app.services.pipeline.enrich import build_base_prompt
 from app.workers import generation as generation_worker
@@ -102,9 +103,11 @@ class _AsyncSessionAdapter:
         return _AsyncNested(self.session.begin_nested())
 
 
-def _png(color: tuple[int, int, int] = (255, 0, 0)) -> bytes:
+def _png(
+    color: tuple[int, int, int] = (255, 0, 0), *, width: int = 4, height: int = 4
+) -> bytes:
     out = io.BytesIO()
-    Image.new("RGB", (4, 4), color).save(out, format="PNG")
+    Image.new("RGB", (width, height), color).save(out, format="PNG")
     return out.getvalue()
 
 
@@ -419,7 +422,7 @@ def test_generation_schema_accepts_optional_trimmed_prompt_with_length_limit():
             )
 
 
-def test_character_sheet_constraints_are_complete_idempotent_and_character_only():
+def test_character_sheet_constraints_use_v2_layout_are_idempotent_and_character_only():
     prompt, negative_prompt = _expected_character_sheet(
         "原始提示词",
         "已有负面提示",
@@ -427,15 +430,16 @@ def test_character_sheet_constraints_are_complete_idempotent_and_character_only(
     )
 
     for required in (
-        "单张 3:4 比例",
-        "左侧约占 45%",
-        "人物头肩大图",
-        "右侧约占 55%",
-        "恰好依次展示正面、标准侧面、背面三幅等比例全身视图",
-        "身份、脸部、发型、服装和体型完全一致",
-        "无遮挡、无裁切",
-        "浅色纯背景",
-        "文字、标签、水印、边框、分栏线或额外人物",
+        CHARACTER_SHEET_MARKER,
+        "左侧 33%",
+        "extreme facial close-up",
+        "肩部不入镜",
+        "右侧 67%",
+        "三个等宽、不重叠的全身栏",
+        "正面 0°、标准侧面 90°、背面 180°",
+        "orthographic projection",
+        "头脚完整，无裁切、遮挡或透视变形",
+        "额外人物、额外视图或剧情动作",
     ):
         assert required in prompt
     assert prompt.count(generation_service._CHARACTER_SHEET_MARKER) == 1
@@ -455,13 +459,34 @@ def test_character_sheet_constraints_are_complete_idempotent_and_character_only(
     ) == ("场景提示词", "场景负面提示")
 
     landscape_prompt, _ = _expected_character_sheet("横版人物提示词", aspect="16:9")
-    assert "单张 16:9 比例" in landscape_prompt
-    assert "单张 3:4 比例" not in landscape_prompt
+    assert CHARACTER_SHEET_MARKER in landscape_prompt
+    assert "左侧 33%" in landscape_prompt
 
-    frontend_prompt = "原始提示词\n【人物设定图构图硬约束】前端可见约束"
-    server_prompt, _ = _expected_character_sheet(frontend_prompt, aspect="3:4")
-    assert frontend_prompt in server_prompt
-    assert server_prompt.count(generation_service._CHARACTER_SHEET_MARKER) == 1
+    legacy_prompt = (
+        "原始提示词\n"
+        "【人物设定图构图硬约束】单张组合图，所有视图位于同一张图内。"
+        "左侧约 45% 为头肩或半身正面主视觉；右侧约 55% 恰好依次为正面、标准侧面、"
+        "背面三幅等比例全身视图。三幅全身视图采用自然 A-Pose 或放松站姿，从头到脚无遮挡、无裁切。"
+        "\n【风格渲染约束】high-quality Japanese anime rendering"
+    )
+    server_prompt, _ = _expected_character_sheet(legacy_prompt, aspect="3:4")
+    assert "原始提示词" in server_prompt
+    assert "【风格渲染约束】high-quality Japanese anime rendering" in server_prompt
+    assert "左侧约 45%" not in server_prompt
+    assert server_prompt.count(CHARACTER_SHEET_MARKER) == 1
+
+    multiline_legacy = (
+        "原始提示词\n"
+        "【人物设定图构图硬约束 v2】旧版错误版式\n"
+        "左侧约 45% 为头肩主视觉\n"
+        "右侧约 55% 为正面、侧面、背面\n"
+        "【风格渲染约束】photorealistic high-detail rendering"
+    )
+    normalized_prompt, _ = _expected_character_sheet(multiline_legacy, aspect="3:4")
+    assert "左侧约 45%" not in normalized_prompt
+    assert "右侧约 55%" not in normalized_prompt
+    assert "【风格渲染约束】photorealistic high-detail rendering" in normalized_prompt
+    assert normalized_prompt.count(CHARACTER_SHEET_MARKER) == 1
 
 
 @pytest.mark.parametrize(
@@ -1736,6 +1761,9 @@ def test_generation_job_output_sanitizes_public_metrics_and_errors() -> None:
         error_message="provider_or_storage_error",
         input_json={
             "prompt": "公开 prompt",
+            "model": "qwen-image-2.0",
+            "size": "2k",
+            "aspect": "3:4",
             "reservation_id": "reservation-secret",
             "resolved_prompts": {
                 "final": _twelve_sections(),
@@ -1755,6 +1783,9 @@ def test_generation_job_output_sanitizes_public_metrics_and_errors() -> None:
     assert out.subject_id == "subject-1"
     assert out.input_json == {
         "prompt": "公开 prompt",
+        "model": "qwen-image-2.0",
+        "size": "2k",
+        "aspect": "3:4",
         "resolved_prompts": {"final": _twelve_sections()},
     }
     assert out.metrics == {"actual_points": 10, "count": 1}
@@ -1853,9 +1884,11 @@ def test_generation_create_batch_and_poll_share_public_subject_mapping(monkeypat
 
 
 def test_provider_result_validation_accepts_partial_and_rejects_invalid_counts_and_ssrf_url():
-    assert generation_worker.validate_image_result(
-        ImageResult(data=_png(), mime_type="image/png")
-    ).mime_type == "image/png"
+    validated_png = generation_worker.validate_image_result(
+        ImageResult(data=_png(width=7, height=5), mime_type="image/png")
+    )
+    assert validated_png.mime_type == "image/png"
+    assert (validated_png.width, validated_png.height) == (7, 5)
     assert generation_worker.validate_image_result(
         ImageResult(data=_webp(), mime_type="image/png")
     ).mime_type == "image/webp"
@@ -1947,6 +1980,32 @@ def test_generation_worker_recovers_negative_prompt_for_queued_legacy_jobs() -> 
     ) == ("an unwrapped prompt", "")
 
 
+def test_generation_worker_upgrades_queued_legacy_character_sheet_prompt() -> None:
+    historical_prompt = (
+        "【视觉资产设定提示词】\n"
+        "主体事实：现代大学生\n"
+        "【人物设定图构图硬约束】\n"
+        "左侧约 45% 为头肩或半身正面主视觉；右侧约 55% 为三幅全身视图。\n"
+        "【风格渲染约束】写实摄影"
+    )
+
+    prompt, negative_prompt = generation_worker._normalize_queued_character_sheet_prompt(
+        historical_prompt,
+        "原有负面提示",
+        "3:4",
+    )
+
+    assert prompt.count(CHARACTER_SHEET_MARKER) == 1
+    assert "左侧约 45%" not in prompt
+    assert "【风格渲染约束】写实摄影" in prompt
+    assert generation_service._CHARACTER_SHEET_NEGATIVE_PROMPT in negative_prompt
+    assert generation_worker._normalize_queued_character_sheet_prompt(
+        "普通场景提示词",
+        "场景负面提示",
+        "16:9",
+    ) == ("普通场景提示词", "场景负面提示")
+
+
 @pytest.mark.parametrize(("provider_count", "expected_actual"), [(2, 20), (1, 10)])
 def test_run_generation_persists_candidates_settles_actual_and_guards_old_version(
     monkeypatch, provider_count, expected_actual
@@ -2020,6 +2079,10 @@ def test_run_generation_persists_candidates_settles_actual_and_guards_old_versio
         assert finished.metrics["actual_points"] == expected_actual
         assert finished.metrics["count"] == provider_count
         assert len(finished.output_json["imageOutputs"]) == provider_count
+        assert {
+            (output["width"], output["height"])
+            for output in finished.output_json["imageOutputs"]
+        } == {(4, 4)}
         assert {entry.mime_type for entry in raw.scalars(select(AssetEntry)).all()} == {"image/png"}
         assert raw.get(Subject, "subject-1").review_status == "pending"
         assert raw.get(CreditReservation, "reservation-1").status == "captured"

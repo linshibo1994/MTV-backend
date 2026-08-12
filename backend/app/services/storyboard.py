@@ -934,6 +934,33 @@ _COMPOSITION_SET = frozenset(COMPOSITION_VALUES)
 _CAMERA_ANGLE_SET = frozenset(CAMERA_ANGLE_VALUES)
 _CAMERA_MOVEMENT_SET = frozenset(CAMERA_MOVEMENT_VALUES)
 
+# 镜头级字段与视觉字段白名单，用于归位模型错放的字段（镜头字段误入 visual 或反之）。
+_VISUAL_FIELDS = frozenset(
+    {
+        "shot_size",
+        "composition",
+        "camera_angle",
+        "camera_movement",
+        "action",
+        "frame_description",
+        "lighting",
+        "emotion",
+    }
+)
+_SHOT_ONLY_FIELDS = frozenset(
+    {
+        "display_no",
+        "start_seconds",
+        "end_seconds",
+        "narrative_purpose",
+        "character_refs",
+        "prop_refs",
+        "sound_refs",
+        "sound_design",
+        "dialogue",
+    }
+)
+
 
 def _coerce_enum(value: object, allowed: frozenset, default: str) -> str:
     """枚举值收敛：合法则保留，否则取中性默认。"""
@@ -985,13 +1012,39 @@ def _normalize_ref_value(
     return value
 
 
+def _resolve_background_ref(
+    value: object,
+    *,
+    name_to_ref: dict[str, str],
+    background_refs: list[str],
+) -> str | None:
+    """强解析 background_ref：合法背景引用则保留，名称则映射，否则兜底首个背景引用。
+
+    background_ref 是必填且必须为 background 类型；模型常输出 null/中文名/非法引用
+    或拼错 BG 编号，导致 string_pattern_mismatch 或 reference_not_allowed。此处保证
+    返回一个合法背景引用（无任何背景主体时返回 None，交给校验处理——理论上
+    generate_storyboard 已在目录无背景时补建默认场景）。
+    """
+    if not background_refs:
+        return None
+    if isinstance(value, str):
+        if value in background_refs:
+            return value
+        mapped = name_to_ref.get(value)
+        if isinstance(mapped, str) and mapped in background_refs:
+            return mapped
+    return background_refs[0]
+
+
 def _normalize_ref_list(
     items: object,
     *,
     name_to_ref: dict[str, str],
     valid_refs: set[str],
+    subject_reference_types: dict[str, str],
+    expected_type: str,
 ) -> list[str]:
-    """归一化引用列表：映射名称、去重、丢弃仍非法的引用（不阻断生成）。"""
+    """归一化引用列表：映射名称、按字段期望类型过滤、去重、丢弃仍非法的引用。"""
     if not isinstance(items, list):
         return []
     result: list[str] = []
@@ -1001,6 +1054,7 @@ def _normalize_ref_list(
         if (
             isinstance(normalized, str)
             and normalized in valid_refs
+            and subject_reference_types.get(normalized) == expected_type
             and normalized not in seen
         ):
             result.append(normalized)
@@ -1013,18 +1067,35 @@ def _normalize_shot_fields(
     *,
     name_to_ref: dict[str, str],
     valid_refs: set[str],
+    subject_reference_types: dict[str, str],
 ) -> None:
-    """归位错放字段、去重构图、截断超长文本、收敛主体引用。
+    """归位错放字段、去重构图、截断超长文本、收敛主体引用与对白可见性。
 
     只对已存在的字段操作（v2 形态）；v1 形态镜头没有 visual / character_refs
     等字段，全部跳过，避免向 v1 字典注入 v2 字段触发 extra="forbid"。
     """
     visual = shot.get("visual")
+    if not isinstance(visual, dict):
+        # visual 整体缺失但视觉字段散落在 shot 层 -> 重建 visual
+        stray_visual = [k for k in shot if k in _VISUAL_FIELDS]
+        if stray_visual:
+            visual = {}
+            shot["visual"] = visual
+            for key in stray_visual:
+                visual[key] = shot.pop(key)
     if isinstance(visual, dict):
-        # narrative_purpose 偶被错放进 visual；镜头层级缺失时回迁
-        misplaced = visual.pop("narrative_purpose", None)
-        if misplaced is not None and not shot.get("narrative_purpose"):
-            shot["narrative_purpose"] = misplaced
+        # 视觉字段误放在 shot 层 -> 移入 visual（shot 层重复则丢弃 shot 上的）
+        for key in list(shot.keys()):
+            if key in _VISUAL_FIELDS:
+                if key not in visual:
+                    visual[key] = shot[key]
+                del shot[key]
+        # 镜头级字段误放在 visual -> 移回 shot（shot 已有则丢弃 visual 里的）
+        for key in list(visual.keys()):
+            if key in _SHOT_ONLY_FIELDS:
+                if key not in shot:
+                    shot[key] = visual[key]
+                del visual[key]
         # 枚举收敛：shot_size/camera_angle/camera_movement 非法则补中性默认
         if "shot_size" in visual:
             visual["shot_size"] = _coerce_enum(
@@ -1075,25 +1146,89 @@ def _normalize_shot_fields(
         )
     if "character_refs" in shot:
         shot["character_refs"] = _normalize_ref_list(
-            shot.get("character_refs"), name_to_ref=name_to_ref, valid_refs=valid_refs
+            shot.get("character_refs"),
+            name_to_ref=name_to_ref,
+            valid_refs=valid_refs,
+            subject_reference_types=subject_reference_types,
+            expected_type="character",
         )
     if "prop_refs" in shot:
         shot["prop_refs"] = _normalize_ref_list(
-            shot.get("prop_refs"), name_to_ref=name_to_ref, valid_refs=valid_refs
+            shot.get("prop_refs"),
+            name_to_ref=name_to_ref,
+            valid_refs=valid_refs,
+            subject_reference_types=subject_reference_types,
+            expected_type="prop",
         )
     if "sound_refs" in shot:
         shot["sound_refs"] = _normalize_ref_list(
-            shot.get("sound_refs"), name_to_ref=name_to_ref, valid_refs=valid_refs
+            shot.get("sound_refs"),
+            name_to_ref=name_to_ref,
+            valid_refs=valid_refs,
+            subject_reference_types=subject_reference_types,
+            expected_type="sound",
         )
     dialogue = shot.get("dialogue")
     if isinstance(dialogue, dict):
         if dialogue.get("text") is not None:
             dialogue["text"] = _truncate_text(dialogue["text"], _LONG_TEXT_MAX)
+        kind = dialogue.get("kind")
         speaker = dialogue.get("speaker_ref")
         if speaker is not None:
-            dialogue["speaker_ref"] = _normalize_ref_value(
+            speaker = _normalize_ref_value(
                 speaker, name_to_ref=name_to_ref, valid_refs=valid_refs
             )
+            dialogue["speaker_ref"] = speaker
+        # dialogue/inner_monologue 要求 speaker 是当前镜头可见角色；模型常漏列或写错，
+        # 这里确定性收敛避免 model_validator(dialogue_speaker_must_be_visible) 抛 value_error。
+        if kind in {"dialogue", "inner_monologue"}:
+            is_character_speaker = (
+                isinstance(speaker, str)
+                and subject_reference_types.get(speaker) == "character"
+            )
+            if is_character_speaker:
+                # 确保可见：补入 character_refs
+                if (
+                    "character_refs" in shot
+                    and speaker not in shot["character_refs"]
+                ):
+                    shot["character_refs"].append(speaker)
+            else:
+                # speaker 缺失或非角色类型：优先从 character_refs 回填一个角色
+                crefs = shot.get("character_refs")
+                crefs = crefs if isinstance(crefs, list) else []
+                fallback = next(
+                    (
+                        ref
+                        for ref in crefs
+                        if subject_reference_types.get(ref) == "character"
+                    ),
+                    None,
+                )
+                if fallback is not None:
+                    dialogue["speaker_ref"] = fallback
+                else:
+                    # 无可回填角色：降级为 voice_over（允许 None speaker），保留台词文本
+                    dialogue["kind"] = "voice_over"
+                    # voice_over 允许角色/声音或 None；若当前 speaker 非合法引用则置 None
+                    if not (
+                        isinstance(speaker, str)
+                        and speaker in valid_refs
+                        and subject_reference_types.get(speaker)
+                        in {"character", "sound"}
+                    ):
+                        dialogue["speaker_ref"] = None
+        else:
+            # voice_over：speaker 可为角色/声音或 None；非法引用置 None，
+            # 避免 require_reference 类型不匹配抛裸 ValueError 退化为 <root> 诊断。
+            if speaker is not None:
+                sp_type = (
+                    subject_reference_types.get(speaker)
+                    if isinstance(speaker, str)
+                    else None
+                )
+                if sp_type not in {"character", "sound"}:
+                    dialogue["speaker_ref"] = None
 
 
 def _normalize_provider_continuity(
@@ -1121,23 +1256,31 @@ def _normalize_provider_continuity(
         return payload
     name_to_ref = _build_name_to_ref(subject_reference_names)
     valid_refs = set(subject_reference_types)
+    # v2 形态的背景引用候选（按目录顺序，首个作为兜底）
+    background_refs = [
+        ref for ref, t in subject_reference_types.items() if t == "background"
+    ]
     # 形态是 v2（含 background_ref）但 schema_version 拼错时强制为 storyboard.v2
-    if isinstance(payload, dict) and payload.get("schema_version") != "storyboard.v2":
-        if any(
+    is_v2_payload = isinstance(payload, dict) and (
+        payload.get("schema_version") == "storyboard.v2"
+        or any(
             isinstance(scene, dict) and "background_ref" in scene
             for scene in scenes
-        ):
-            payload["schema_version"] = "storyboard.v2"
+        )
+    )
+    if isinstance(payload, dict) and is_v2_payload:
+        payload["schema_version"] = "storyboard.v2"
     for scene_index, scene in enumerate(scenes, start=1):
         if not isinstance(scene, dict):
             continue
         scene["scene_no"] = scene_index
-        # background_ref 是必填，仅做名称->引用映射；仍非法则留给校验处理
-        if "background_ref" in scene:
-            scene["background_ref"] = _normalize_ref_value(
-                scene["background_ref"],
+        # background_ref 必填且必须是 background 类型；模型常输出 null/名称/非法引用，
+        # 这里强解析：合法则保留、名称则映射、否则兜底为目录首个背景引用，绝不留给校验卡死。
+        if is_v2_payload or "background_ref" in scene:
+            scene["background_ref"] = _resolve_background_ref(
+                scene.get("background_ref"),
                 name_to_ref=name_to_ref,
-                valid_refs=valid_refs,
+                background_refs=background_refs,
             )
         groups = scene.get("shot_groups")
         if not isinstance(groups, list):
@@ -1158,7 +1301,10 @@ def _normalize_provider_continuity(
                 if isinstance(shot, dict):
                     shot["display_no"] = shot_index
                     _normalize_shot_fields(
-                        shot, name_to_ref=name_to_ref, valid_refs=valid_refs
+                        shot,
+                        name_to_ref=name_to_ref,
+                        valid_refs=valid_refs,
+                        subject_reference_types=subject_reference_types,
                     )
             _normalize_group_timecodes(group, shots)
     return payload
@@ -1442,6 +1588,27 @@ async def generate_storyboard(
 
     # 3. 构造 prompt 与短引用目录；UUID/资产 ID 不进入 Provider 输入输出合约。
     subject_references = _build_subject_reference_catalog(subjects, episode.episode_no)
+    # 兜底：若该分集无场景/背景主体，background_ref 无合法引用可用，模型只能自造或写中文名，
+    # 必然触发 string_pattern_mismatch / reference_not_allowed。补建一个默认场景主体（type=scene），
+    # 让生成不因缺背景而卡死；用户可事后在主体管理替换为真实场景。
+    if not any(item.subject_type == "background" for item in subject_references.values()):
+        fallback_subject = Subject(
+            id=new_id(),
+            script_id=script_id,
+            type="scene",
+            name=f"默认场景-第{episode.episode_no}集",
+            description="自动补建的默认场景主体（剧本缺少场景描写时兜底，可替换）",
+            episode_nos=[episode.episode_no],
+            is_active=True,
+        )
+        db.add(fallback_subject)
+        await db.flush()
+        subjects.append(fallback_subject)
+        subject_references = _build_subject_reference_catalog(subjects, episode.episode_no)
+        logger.warning(
+            "分镜生成兜底：分集缺少场景主体，已自动补建默认场景 script_id=%s episode_id=%s",
+            script_id, episode_id,
+        )
     system_prompt = _SYSTEM_PROMPT
     user_prompt = _build_user_prompt(episode, subjects, subject_references)
 
@@ -1780,3 +1947,4 @@ __all__ = [
     "CONSTRAINT_LOCK",
     "DESCRIPTION_TEMPLATE",
 ]
+
