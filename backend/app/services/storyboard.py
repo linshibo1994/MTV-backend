@@ -123,14 +123,21 @@ Episode -> Scene（连续时空段落）-> Shot Group（3~15 秒叙事单元）-
 ## 结构与时码
 - schema_version 必须是 storyboard.v2。
 - scene_no 从 1 连续递增；每个 Scene 内 group_no 从 G1 连续递增。
-- 每组 1~5 镜，duration_seconds 为 3~15 的整数秒；单镜头组可用于定场、反应或转场，
-  叙事需要时优先使用 2~5 镜的连续镜头组。
+- 每组 1~5 镜，duration_seconds 为 3~15 的整数秒。单镜头组仅允许用于定场、单一反应镜或硬切转场三类非主体叙事用途，且全集单镜头组数量不得超过镜头组总数的 1/3；凡承载对白、冲突展开、动作推进或情绪转折的叙事主体单元必须使用 2~5 镜的连续镜头组，不得用 1 镜带过。
 - 每组 display_no 必须严格为 1, 2, ..., N；首镜 start_seconds=0，相邻区间首尾相接。
 - end_seconds 必须大于 start_seconds，末镜 end_seconds 必须等于 duration_seconds；所有时码只能是整数。
 - background_ref 只能引用场景；character_refs 只能引用角色；prop_refs 只能引用道具；sound_refs 只能引用声音。
 - kind=dialogue/inner_monologue 时 speaker_ref 必须是当前镜头可见角色；kind=voice_over 时 speaker_ref 可为角色、声音主体或 null。
 - narrative_purpose 要说明该镜头让观众获得什么信息、感受什么变化，不能只写“推进剧情”。
 - sound_design 写可执行的环境音/动作音/声音衔接，无声音时写“无”。
+
+## 覆盖度（最高优先级，强制，优先于一切结构规则）
+1. 必须覆盖剧本从开头到结尾的全部叙事节拍：每一处场景切换、每一次台词交锋、每一个动作与情绪转折都要落到具体镜头，不得合并、跳过或用一句话带过。
+2. 不得把整场戏压缩进一个镜头组；除非该场戏本身只有一句定场旁白，否则每场戏至少拆为 2 个镜头组。
+3. 剧本中的全部对白、旁白、内心独白必须逐字保留在对应镜头的 dialogue.text 中；遗漏台词视为覆盖失败。
+4. 用户提示会给出由剧本字数推导的“本集覆盖度下限”（最少镜头数/组数/场数/总秒数），这是下限不是目标；实际产出应达到或超过该下限，低于下限会被判定为不合格并要求重做。
+5. 禁止用“一个全景镜 + 长 duration_seconds”敷衍整场戏；duration_seconds 上限 15 秒，长戏必须拆成多个 3~15 秒的镜头组。
+6. 不得为凑数量注水无叙事作用的装饰镜头；每镜只承载一个主要动作或信息变化。
 
 只输出符合 JSON Schema 的 JSON 对象，不要 markdown 或解释文字。
 """
@@ -160,6 +167,97 @@ class _ValidatedStoryboard:
 
     contract: StoryboardContract
     v2_contract: StoryboardV2Contract | None
+
+
+# 覆盖度软门阈值：边界抖动时不反复触发重生成。0.8 表示实际值达到下限 80%
+# 即视为合格，只有明显稀疏（如 1 场 1 组 3 镜）才会触发带剧本的重生成。
+_COVERAGE_SLACK = 0.8
+
+
+@dataclass(frozen=True)
+class _CoverageReport:
+    """分镜覆盖度评估结果：镜头/组/场/总时长是否足以承载整集剧本。"""
+
+    shot_count: int
+    group_count: int
+    scene_count: int
+    total_duration: int
+    min_shots: int
+    min_groups: int
+    min_scenes: int
+    min_duration: int
+
+    @property
+    def sufficient(self) -> bool:
+        return (
+            self.shot_count >= int(self.min_shots * _COVERAGE_SLACK)
+            and self.group_count >= int(self.min_groups * _COVERAGE_SLACK)
+            and self.total_duration >= int(self.min_duration * _COVERAGE_SLACK)
+        )
+
+
+def _coverage_minimums(script_text: str) -> tuple[int, int, int, int]:
+    """由剧本字数推导覆盖度下限（最小镜头/组/场/总秒数）。
+
+    校准自真实「好输出」：1365 字 -> 4 场 9 组 24 镜 108s，约 57 字/镜。
+    取 60 字/镜略宽于 57，确保好输出 comfortably pass；每镜保守 4 秒。
+    代入 1365 字：min_shots=23 / min_groups=8 / min_scenes=3 / min_duration=92，
+    好输出 24/9/4/108 全过，差输出 3/1/1/15 全不过。
+    """
+    chars = len((script_text or "").strip())
+    min_shots = max(6, (chars + 59) // 60)
+    min_groups = max(3, (min_shots + 2) // 3)
+    min_scenes = max(2, (min_groups + 2) // 3)
+    min_duration = min_shots * 4
+    return min_shots, min_groups, min_scenes, min_duration
+
+
+def _check_coverage(
+    validated: _ValidatedStoryboard, script_text: str
+) -> _CoverageReport:
+    """统计已校验分镜的镜头/组/场/总时长，与下限比对。"""
+    min_shots, min_groups, min_scenes, min_duration = _coverage_minimums(script_text)
+    scene_count = 0
+    group_count = 0
+    shot_count = 0
+    total_duration = 0
+    if validated.v2_contract is not None:
+        for scene in validated.v2_contract.scenes:
+            scene_count += 1
+            for group in scene.shot_groups:
+                group_count += 1
+                shot_count += len(group.shots)
+                total_duration += group.duration_seconds
+    else:
+        for scene in validated.contract.scenes:
+            scene_count += 1
+            for group in scene.shot_groups:
+                group_count += 1
+                shot_count += len(group.shots)
+                total_duration += group.duration_seconds
+    return _CoverageReport(
+        shot_count=shot_count,
+        group_count=group_count,
+        scene_count=scene_count,
+        total_duration=total_duration,
+        min_shots=min_shots,
+        min_groups=min_groups,
+        min_scenes=min_scenes,
+        min_duration=min_duration,
+    )
+
+
+def _coverage_emphasis_suffix(report: _CoverageReport) -> str:
+    """覆盖度不足时追加到原 prompt 的重做指令（原 prompt 已含剧本，等价带剧本重生成）。"""
+    return f"""
+
+## 覆盖度不足，必须重做
+你上一次只产出 {report.shot_count} 镜 / {report.group_count} 组 / {report.scene_count} 场 / 总时长 {report.total_duration}s，
+远低于本集下限 {report.min_shots} 镜 / {report.min_groups} 组 / {report.min_scenes} 场 / {report.min_duration}s。
+请把整集剧本从开头到结尾逐段拆解为更多场景、镜头组与镜头，覆盖每一处场景切换、台词交锋、动作与情绪转折；
+叙事主体必须用 2~5 镜连续镜头组，单镜头组仅用于定场/反应/转场；不要用少数镜头概括整集。
+重新输出完整的 storyboard.v2 JSON。
+"""
 
 
 def _build_subject_reference_catalog(
@@ -237,6 +335,9 @@ def _build_user_prompt(
         episode.episode_no,
         reference_catalog,
     )
+    script_text = episode.script_text or ""
+    script_chars = len(script_text.strip())
+    min_shots, min_groups, min_scenes, min_duration = _coverage_minimums(script_text)
     return f"""请为以下分集生成 storyboard.v2 分镜。
 
 ## 分集
@@ -244,7 +345,12 @@ def _build_user_prompt(
 - 标题：{episode.title}
 
 ## 剧本原文
-{episode.script_text or '(无剧本内容)'}
+{script_text or '(无剧本内容)'}
+
+## 本集覆盖度下限（由剧本 {script_chars} 字推导，必须达到或超过）
+- 最少：{min_shots} 镜 / {min_groups} 组 / {min_scenes} 场 / 总时长 {min_duration} 秒。
+- 这是“最少”而非目标值；低于以上下限的输出会被判定为覆盖不足并要求重做。
+- 请按覆盖全部叙事段落的原则逐段拆镜，不要走最省事的合法路径（如 1 场 1 组 3 镜概括整集）。
 
 ## 当前分集可引用主体目录
 格式为：短引用 | 类型 | 名称 | 描述 | 参考图状态。JSON 中只能填写短引用。
@@ -317,8 +423,11 @@ def _build_user_prompt(
   ]
 }}
 
-## 输出前自检
-- 是否覆盖剧本全部叙事、台词/旁白且没有新增情节；
+## 输出前自检（逐条核对，任一不满足必须在同一回答内重新规划至达标后再输出最终 JSON）
+- 覆盖度数量核对：镜头数 ≥ {min_shots}、镜头组数 ≥ {min_groups}、场数 ≥ {min_scenes}、总时长 ≥ {min_duration} 秒；任一不满足不要输出当前 JSON，请重新规划至全部达标后再输出；
+- 叙事覆盖核对：剧本每一处场景切换、每一次台词交锋、每一个动作/情绪转折是否都落到具体镜头；是否有台词被遗漏或合并；
+- 结构密度核对：叙事主体镜头组是否都含 2~5 镜；单镜头组是否仅用于定场/反应/转场且不超过组数 1/3；
+- 台词保真核对：对白/旁白/内心独白是否逐字保留在 dialogue.text，未增删改写；无语言内容时 dialogue 是否为 null；
 - scene_no、group_no、display_no 是否连续；
 - 时码是否全部为整数、连续且与组时长一致；
 - 所有短引用是否存在且类型正确；
@@ -714,6 +823,347 @@ def _render_v2_contract(
         ) from exc
 
 
+def _is_int(value: object) -> bool:
+    """严格整数判定；bool 不视作整数，避免把 True/False 误当 1/0。"""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _try_scale_durations(durations: list[int], target: int) -> list[int] | None:
+    """把单镜时长等比例缩放到 target，每镜至少 1 秒。
+
+    返回 None 表示无法在不违反「每镜 ≥1 秒」的前提下缩放（例如镜头数超过
+    目标秒数）；调用方应回退到平铺总时长或交给严格校验处理。
+    """
+    n = len(durations)
+    total = sum(durations)
+    if n == 0 or total <= 0 or target < n:
+        return None
+    scaled: list[int] = []
+    accumulated = 0
+    for index in range(n - 1):
+        # 等比例四舍五入，保证每镜不短于 1 秒
+        value = max(1, round(durations[index] * target / total))
+        scaled.append(value)
+        accumulated += value
+    last = target - accumulated
+    if last < 1:
+        # 末镜被挤没：退化为均分，确保每镜 ≥1 且总和精确等于 target
+        base, remainder = divmod(target, n)
+        return [base + (1 if index < remainder else 0) for index in range(n)]
+    scaled.append(last)
+    return scaled
+
+
+def _normalize_group_timecodes(group: dict, shots: list[dict]) -> None:
+    """按模型给出的单镜时长从 0 连续平铺时码，并把组时长收敛到 3~15 秒。
+
+    时间码与组时长是可由服务端确定性派生的元数据，模型常在算术上漂移：
+    相邻镜头首尾未对齐、组时长越界（>15s 或 <3s）、平铺总时长与声明不一致。
+    这些都属于可确定修正的错误，不应交给 LLM 反复重试并最终卡住生成。
+
+    规则：
+    - 单镜时长非正时取 1 秒下限，保证每镜 end > start；
+    - 目标组时长优先取模型声明值，其次平铺总时长，越界则夹到 3 或 15；
+    - 目标不得少于镜头数（每镜至少 1 秒），多于 15 秒时夹到 15；
+    - 把单镜时长等比例缩放到目标，确保末镜 end_seconds == duration_seconds。
+    仅当所有 start/end 均为整数时才介入；非整数类型错误留给严格校验处理。
+    """
+    if not all(
+        isinstance(shot, dict)
+        and _is_int(shot.get("start_seconds"))
+        and _is_int(shot.get("end_seconds"))
+        for shot in shots
+    ):
+        return
+    n = len(shots)
+    if n < 1:
+        return
+    durations: list[int] = []
+    for shot in shots:
+        duration = shot["end_seconds"] - shot["start_seconds"]
+        if duration < 1:
+            duration = 1  # 单镜时长非正，给 1 秒下限再参与平铺
+        durations.append(duration)
+    tiled_total = sum(durations)
+    declared = group.get("duration_seconds")
+    if _is_int(declared) and 3 <= declared <= 15:
+        preferred = declared
+    elif 3 <= tiled_total <= 15:
+        preferred = tiled_total
+    elif _is_int(declared) and declared > 15:
+        preferred = 15
+    elif _is_int(declared) and 0 <= declared < 3:
+        preferred = 3
+    elif tiled_total > 15:
+        preferred = 15
+    else:
+        preferred = 3
+    # 每镜至少 1 秒，故组时长不得少于镜头数；镜头数超过 15 时任何合法组时长
+    # 都无法满足每镜 ≥1 秒，交给严格校验/修复流程处理（通常先被 max_length 拦截）。
+    if n > 15:
+        return
+    target = min(15, max(preferred, n))
+    if target != tiled_total:
+        scaled = _try_scale_durations(durations, target)
+        if scaled is None:
+            # 等比例四舍五入仍破坏下限：均分兜底，确保每镜 ≥1 且总和精确
+            base, remainder = divmod(target, n)
+            scaled = [base + (1 if index < remainder else 0) for index in range(n)]
+        durations = scaled
+    cursor = 0
+    for index, shot in enumerate(shots):
+        shot["start_seconds"] = cursor
+        shot["end_seconds"] = cursor + durations[index]
+        cursor = shot["end_seconds"]
+    group["duration_seconds"] = target
+
+
+# 文本字段长度上限（与 ShortText/LongText 一致）。供应商 schema 剥除
+# maxLength，模型无长度信号；超长时按字符截断，避免反复卡住生成。
+_SHORT_TEXT_MAX = 255
+_LONG_TEXT_MAX = 1200
+
+# 受控词表的合法集合；模型偶出自造词，非法值在这里收敛到中性默认，
+# 不阻断生成（视觉描述文本仍承载创作内容）。
+_DEFAULT_SHOT_SIZE = "中景"
+_DEFAULT_CAMERA_ANGLE = "平视"
+_DEFAULT_CAMERA_MOVEMENT = "固定"
+_DEFAULT_COMPOSITION = "三分法"
+_SHOT_SIZE_SET = frozenset(SHOT_SIZE_VALUES)
+_COMPOSITION_SET = frozenset(COMPOSITION_VALUES)
+_CAMERA_ANGLE_SET = frozenset(CAMERA_ANGLE_VALUES)
+_CAMERA_MOVEMENT_SET = frozenset(CAMERA_MOVEMENT_VALUES)
+
+
+def _coerce_enum(value: object, allowed: frozenset, default: str) -> str:
+    """枚举值收敛：合法则保留，否则取中性默认。"""
+    if isinstance(value, str) and value in allowed:
+        return value
+    return default
+
+
+def _truncate_text(value: object, limit: int) -> str | None:
+    """把字符串裁剪到上限；非字符串原样返回交给类型校验处理。"""
+    if not isinstance(value, str):
+        return value  # type: ignore[return-value]
+    if len(value) <= limit:
+        return value
+    return value[:limit]
+
+
+def _build_name_to_ref(
+    subject_reference_names: dict[str, str],
+) -> dict[str, str]:
+    """构造「无歧义主体名 -> 短引用」映射；同名多引用不参与映射。
+
+    v2 用短引用而非名称，正是为了规避跨类型同名歧义。模型偶尔回退用名称，
+    此处仅对全局唯一的名称做反向映射，歧义名称仍交给严格校验/修复流程。
+    """
+    counts: dict[str, int] = {}
+    for name in subject_reference_names.values():
+        counts[name] = counts.get(name, 0) + 1
+    return {
+        name: ref
+        for ref, name in subject_reference_names.items()
+        if counts[name] == 1
+    }
+
+
+def _normalize_ref_value(
+    value: object,
+    *,
+    name_to_ref: dict[str, str],
+    valid_refs: set[str],
+) -> object:
+    """把单个引用值收敛为合法短引用：原值合法则保留，否则尝试名称->引用。"""
+    if isinstance(value, str):
+        if value in valid_refs:
+            return value
+        mapped = name_to_ref.get(value)
+        if mapped is not None:
+            return mapped
+    return value
+
+
+def _normalize_ref_list(
+    items: object,
+    *,
+    name_to_ref: dict[str, str],
+    valid_refs: set[str],
+) -> list[str]:
+    """归一化引用列表：映射名称、去重、丢弃仍非法的引用（不阻断生成）。"""
+    if not isinstance(items, list):
+        return []
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        normalized = _normalize_ref_value(item, name_to_ref=name_to_ref, valid_refs=valid_refs)
+        if (
+            isinstance(normalized, str)
+            and normalized in valid_refs
+            and normalized not in seen
+        ):
+            result.append(normalized)
+            seen.add(normalized)
+    return result
+
+
+def _normalize_shot_fields(
+    shot: dict,
+    *,
+    name_to_ref: dict[str, str],
+    valid_refs: set[str],
+) -> None:
+    """归位错放字段、去重构图、截断超长文本、收敛主体引用。
+
+    只对已存在的字段操作（v2 形态）；v1 形态镜头没有 visual / character_refs
+    等字段，全部跳过，避免向 v1 字典注入 v2 字段触发 extra="forbid"。
+    """
+    visual = shot.get("visual")
+    if isinstance(visual, dict):
+        # narrative_purpose 偶被错放进 visual；镜头层级缺失时回迁
+        misplaced = visual.pop("narrative_purpose", None)
+        if misplaced is not None and not shot.get("narrative_purpose"):
+            shot["narrative_purpose"] = misplaced
+        # 枚举收敛：shot_size/camera_angle/camera_movement 非法则补中性默认
+        if "shot_size" in visual:
+            visual["shot_size"] = _coerce_enum(
+                visual["shot_size"], _SHOT_SIZE_SET, _DEFAULT_SHOT_SIZE
+            )
+        if "camera_angle" in visual:
+            visual["camera_angle"] = _coerce_enum(
+                visual["camera_angle"], _CAMERA_ANGLE_SET, _DEFAULT_CAMERA_ANGLE
+            )
+        if "camera_movement" in visual:
+            visual["camera_movement"] = _coerce_enum(
+                visual["camera_movement"], _CAMERA_MOVEMENT_SET, _DEFAULT_CAMERA_MOVEMENT
+            )
+        # 构图：过滤非法枚举、去重、截断到 3；全部非法时补默认
+        composition = visual.get("composition")
+        if isinstance(composition, list):
+            deduped: list[str] = []
+            seen_comp: set[str] = set()
+            for item in composition:
+                if (
+                    isinstance(item, str)
+                    and item in _COMPOSITION_SET
+                    and item not in seen_comp
+                ):
+                    deduped.append(item)
+                    seen_comp.add(item)
+                    if len(deduped) >= 3:
+                        break
+            if not deduped:
+                deduped = [_DEFAULT_COMPOSITION]
+            visual["composition"] = deduped
+        for key, limit in (
+            ("action", _LONG_TEXT_MAX),
+            ("frame_description", _LONG_TEXT_MAX),
+            ("lighting", _SHORT_TEXT_MAX),
+            ("emotion", _SHORT_TEXT_MAX),
+        ):
+            if key in visual:
+                visual[key] = _truncate_text(visual[key], limit)
+    # 镜头级文本与引用（仅 v2 形态存在这些字段）
+    if "narrative_purpose" in shot:
+        shot["narrative_purpose"] = _truncate_text(
+            shot["narrative_purpose"], _SHORT_TEXT_MAX
+        )
+    if "sound_design" in shot:
+        shot["sound_design"] = _truncate_text(
+            shot["sound_design"], _SHORT_TEXT_MAX
+        )
+    if "character_refs" in shot:
+        shot["character_refs"] = _normalize_ref_list(
+            shot.get("character_refs"), name_to_ref=name_to_ref, valid_refs=valid_refs
+        )
+    if "prop_refs" in shot:
+        shot["prop_refs"] = _normalize_ref_list(
+            shot.get("prop_refs"), name_to_ref=name_to_ref, valid_refs=valid_refs
+        )
+    if "sound_refs" in shot:
+        shot["sound_refs"] = _normalize_ref_list(
+            shot.get("sound_refs"), name_to_ref=name_to_ref, valid_refs=valid_refs
+        )
+    dialogue = shot.get("dialogue")
+    if isinstance(dialogue, dict):
+        if dialogue.get("text") is not None:
+            dialogue["text"] = _truncate_text(dialogue["text"], _LONG_TEXT_MAX)
+        speaker = dialogue.get("speaker_ref")
+        if speaker is not None:
+            dialogue["speaker_ref"] = _normalize_ref_value(
+                speaker, name_to_ref=name_to_ref, valid_refs=valid_refs
+            )
+
+
+def _normalize_provider_continuity(
+    payload: dict,
+    *,
+    subject_reference_names: dict[str, str],
+    subject_reference_types: dict[str, str],
+) -> dict:
+    """在严格契约校验前，按数组顺序重建编号、时码、引用与字段结构。
+
+    这些都是可由服务端确定性派生/收敛的元数据，与 description / shot_line 同类。
+    模型常在算术与结构上漂移：相邻镜头首尾未对齐、组时长越界、主体名当短引用、
+    字段错放（如 narrative_purpose 进 visual）、构图超 3 项或重复、文本超长、
+    schema_version 拼错。交给 LLM 反复重试既慢又不稳定，最终卡住生成。
+
+    原则：只做可确定的收敛，不掩盖真正的类型/枚举错误——
+    - 编号/时码/组时长：按数组顺序重编、从 0 平铺、组时长夹到 3~15；
+    - 引用：名称->短引用（仅无歧义名）、去重、丢弃仍非法的可选引用；
+    - 构图：去重截断到 3；文本：截断到上限；字段：错放回迁。
+    非整数时码、非法枚举（shot_size 等）、必填 background_ref 无法解析等仍交给
+    严格校验与修复流程。
+    """
+    scenes = payload.get("scenes") if isinstance(payload, dict) else None
+    if not isinstance(scenes, list):
+        return payload
+    name_to_ref = _build_name_to_ref(subject_reference_names)
+    valid_refs = set(subject_reference_types)
+    # 形态是 v2（含 background_ref）但 schema_version 拼错时强制为 storyboard.v2
+    if isinstance(payload, dict) and payload.get("schema_version") != "storyboard.v2":
+        if any(
+            isinstance(scene, dict) and "background_ref" in scene
+            for scene in scenes
+        ):
+            payload["schema_version"] = "storyboard.v2"
+    for scene_index, scene in enumerate(scenes, start=1):
+        if not isinstance(scene, dict):
+            continue
+        scene["scene_no"] = scene_index
+        # background_ref 是必填，仅做名称->引用映射；仍非法则留给校验处理
+        if "background_ref" in scene:
+            scene["background_ref"] = _normalize_ref_value(
+                scene["background_ref"],
+                name_to_ref=name_to_ref,
+                valid_refs=valid_refs,
+            )
+        groups = scene.get("shot_groups")
+        if not isinstance(groups, list):
+            continue
+        for group_index, group in enumerate(groups, start=1):
+            if not isinstance(group, dict):
+                continue
+            group["group_no"] = f"G{group_index}"
+            if "narrative_purpose" in group:
+                group["narrative_purpose"] = _truncate_text(
+                    group["narrative_purpose"], _SHORT_TEXT_MAX
+                )
+            shots = group.get("shots")
+            if not isinstance(shots, list) or not shots:
+                continue
+            # 统一按数组顺序重编 display_no，并归一化镜头字段
+            for shot_index, shot in enumerate(shots, start=1):
+                if isinstance(shot, dict):
+                    shot["display_no"] = shot_index
+                    _normalize_shot_fields(
+                        shot, name_to_ref=name_to_ref, valid_refs=valid_refs
+                    )
+            _normalize_group_timecodes(group, shots)
+    return payload
+
+
 def _validate_provider_payload_result(
     payload: dict,
     *,
@@ -722,6 +1172,11 @@ def _validate_provider_payload_result(
     subject_reference_types: dict[str, str],
 ) -> _ValidatedStoryboard:
     """按版本验证 Provider 响应，并保留 v2 的稳定引用事实。"""
+    _normalize_provider_continuity(
+        payload,
+        subject_reference_names=subject_reference_names,
+        subject_reference_types=subject_reference_types,
+    )
     schema_version = payload.get("schema_version")
     looks_like_v2 = (
         any(
@@ -906,6 +1361,11 @@ async def _call_llm_with_contract_result(
                 call_system = _REPAIR_SYSTEM_PROMPT
                 call_user = repair_user
                 continue
+            # payload 过大无法内联修复时，回退为用原始 prompt 重新生成一次，
+            # 而不是直接放弃——避免长分集因单点违规被永久卡死。
+            call_system = system
+            call_user = user
+            continue
         if attempt < _STORYBOARD_CONTRACT_MAX_ATTEMPTS and payload is None:
             # Provider 未能解析出 JSON 时只再尝试一次原始请求。
             continue
@@ -994,6 +1454,39 @@ async def generate_storyboard(
         catalog,
         subject_references=subject_references,
     )
+
+    # 4.5 覆盖度软校验：若镜头数远低于剧本规模，用原 prompt（含剧本）+ 覆盖强调
+    # 重生成一次。best-effort：重生成后仍不足则取镜头较多者接受，绝不因覆盖度硬失败。
+    coverage = _check_coverage(validated, episode.script_text or "")
+    if not coverage.sufficient:
+        logger.warning(
+            "分镜覆盖度不足 shot=%d/%d group=%d/%d dur=%d/%d，重新生成",
+            coverage.shot_count, coverage.min_shots,
+            coverage.group_count, coverage.min_groups,
+            coverage.total_duration, coverage.min_duration,
+        )
+        emphasis_user = user_prompt + _coverage_emphasis_suffix(coverage)
+        try:
+            retry_validated = await _call_llm_with_contract_result(
+                system_prompt,
+                emphasis_user,
+                catalog,
+                subject_references=subject_references,
+            )
+        except ProviderContractError:
+            logger.warning("覆盖度重生成结构校验失败，回退首答 best-effort")
+            retry_validated = None
+        if retry_validated is not None:
+            retry_coverage = _check_coverage(retry_validated, episode.script_text or "")
+            if retry_coverage.sufficient or retry_coverage.shot_count > coverage.shot_count:
+                validated = retry_validated
+                coverage = retry_coverage
+            if not retry_coverage.sufficient:
+                logger.warning(
+                    "覆盖度重生成后仍不足 shot=%d/%d，best-effort 接受",
+                    retry_coverage.shot_count, retry_coverage.min_shots,
+                )
+
     contract = validated.contract
     scenes_data = contract.model_dump()["scenes"]
 

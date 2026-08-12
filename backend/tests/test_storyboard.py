@@ -533,15 +533,15 @@ async def test_storyboard_llm_call_passes_v2_schema_to_capable_provider(monkeypa
 
 
 async def test_storyboard_repairs_invalid_contract_once_without_resending_script(monkeypatch) -> None:
+    """非整数时码属类型错误、不可确定性归一化，应交给一次 LLM 定向修复，且不重发剧本。"""
     from app.services import storyboard as storyboard_service
 
-    invalid_shot_size = _valid_storyboard_v2_payload()
-    invalid_shot_size["scenes"][0]["shot_groups"][0]["shots"][1]["visual"][
-        "shot_size"
-    ] = "超广角"
+    invalid_timing = _valid_storyboard_v2_payload()
+    # start_seconds 给非整数字符串：归一化只处理整数时码，类型错误会穿透到严格校验
+    invalid_timing["scenes"][0]["shot_groups"][0]["shots"][1]["start_seconds"] = "3"
     call_llm = AsyncMock(
         side_effect=[
-            invalid_shot_size,
+            invalid_timing,
             _valid_storyboard_v2_payload(),
         ]
     )
@@ -559,22 +559,21 @@ async def test_storyboard_repairs_invalid_contract_once_without_resending_script
     repair_call = call_llm.await_args_list[1]
     assert repair_call.args[0] == storyboard_service._REPAIR_SYSTEM_PROMPT
     assert "SCRIPT_PRIVATE_SENTINEL" not in repair_call.args[1]
-    assert "scenes[].shot_groups[].shots[].visual.shot_size" in repair_call.args[1]
+    assert "scenes[].shot_groups[].shots[].start_seconds" in repair_call.args[1]
 
 
-async def test_storyboard_repair_explicitly_rebuilds_continuity_without_resending_script(
+
+async def test_storyboard_normalizes_timecode_drift_without_llm_repair(
     monkeypatch,
 ) -> None:
+    """时码连续性是可派生元数据，漂移应由服务端归一化，不交给 LLM 重试。"""
     from app.services import storyboard as storyboard_service
 
     invalid_timing = _valid_storyboard_v2_payload()
+    # 相邻镜头首尾未对齐（shot2 起始 4s 而非 3s），单镜时长仍为 3s，属算术漂移
     invalid_timing["scenes"][0]["shot_groups"][0]["shots"][1]["start_seconds"] = 4
-    call_llm = AsyncMock(
-        side_effect=[
-            invalid_timing,
-            _valid_storyboard_v2_payload(),
-        ]
-    )
+    invalid_timing["scenes"][0]["shot_groups"][0]["shots"][1]["end_seconds"] = 7
+    call_llm = AsyncMock(side_effect=[invalid_timing])
     monkeypatch.setattr(storyboard_service, "_call_llm", call_llm)
 
     contract = await storyboard_service._call_llm_with_contract(
@@ -584,14 +583,300 @@ async def test_storyboard_repair_explicitly_rebuilds_continuity_without_resendin
         subject_references=_subject_references(),
     )
 
-    assert contract.scenes[0].shot_groups[0].shots[1].start_seconds == 3
-    assert call_llm.await_count == 2
-    repair_call = call_llm.await_args_list[1]
-    assert repair_call.args[0] == storyboard_service._REPAIR_SYSTEM_PROMPT
-    assert "SCRIPT_PRIVATE_SENTINEL" not in repair_call.args[1]
-    assert "shot_time_not_continuous" in repair_call.args[1]
-    assert "scenes[].shot_groups[].shots[].start_seconds" in repair_call.args[1]
-    assert "无条件重建全部元数据" in repair_call.args[1]
+    group = contract.scenes[0].shot_groups[0]
+    assert group.shots[0].start_seconds == 0
+    assert group.shots[0].end_seconds == 3
+    assert group.shots[1].start_seconds == 3
+    assert group.shots[1].end_seconds == 6
+    assert group.duration_seconds == 6
+    # 时码漂移已在服务端归一化，无需触发 LLM 修复，原剧本不入修复请求
+    assert call_llm.await_count == 1
+
+
+def test_normalize_provider_continuity_renumbers_and_scales_timecodes() -> None:
+    """编号与整数时码属于可派生元数据，归一化应按数组顺序重建并校正总时长。"""
+    from app.services import storyboard as storyboard_service
+
+    payload = {
+        "schema_version": "storyboard.v2",
+        "scenes": [
+            {
+                "scene_no": 3,  # 非连续编号
+                "background_ref": "BG01",
+                "shot_groups": [
+                    {
+                        "group_no": "G2",  # 非连续编号
+                        "narrative_purpose": "建立空间",
+                        "duration_seconds": 8,  # 与镜头时长不一致
+                        "shots": [
+                            {
+                                "display_no": 5,  # 非连续编号
+                                "start_seconds": 0,
+                                "end_seconds": 3,
+                                "visual": {
+                                    "shot_size": "全景",
+                                    "composition": ["三分法"],
+                                    "camera_angle": "平视",
+                                    "camera_movement": "推镜",
+                                    "action": "角色进入",
+                                    "frame_description": "门框前景，角色进入",
+                                    "lighting": "冷色顶光",
+                                    "emotion": "紧张",
+                                },
+                                "narrative_purpose": "交代进入",
+                                "character_refs": ["C01"],
+                                "prop_refs": [],
+                                "sound_refs": [],
+                                "sound_design": "门轴轻响",
+                                "dialogue": None,
+                            },
+                            {
+                                "display_no": 9,  # 非连续编号
+                                "start_seconds": 5,  # 与上一镜 3 未对齐（漂移）
+                                "end_seconds": 6,
+                                "visual": {
+                                    "shot_size": "近景",
+                                    "composition": ["单人"],
+                                    "camera_angle": "平视",
+                                    "camera_movement": "固定",
+                                    "action": "抬头回应",
+                                    "frame_description": "角色抬头",
+                                    "lighting": "冷色顶光",
+                                    "emotion": "迟疑",
+                                },
+                                "narrative_purpose": "反应镜",
+                                "character_refs": ["C02"],
+                                "prop_refs": [],
+                                "sound_refs": [],
+                                "sound_design": "无",
+                                "dialogue": None,
+                            },
+                        ],
+                    }
+                ],
+            }
+        ],
+    }
+    reference_types = {
+        ref: item.subject_type for ref, item in _subject_references().items()
+    }
+    contract = storyboard_service._validate_provider_payload(
+        payload,
+        subject_catalog=_subject_catalog(),
+        subject_reference_names={
+            ref: item.name for ref, item in _subject_references().items()
+        },
+        subject_reference_types=reference_types,
+    )
+    scene = contract.scenes[0]
+    group = scene.shot_groups[0]
+    # 编号按数组顺序重建
+    assert scene.scene_no == 1
+    assert group.group_no == "G1"
+    assert [shot.display_no for shot in group.shots] == [1, 2]
+    # 组时长声明 8s，单镜时长 [3,1]=4s，等比例缩放后总和精确为 8
+    assert group.duration_seconds == 8
+    shots = group.shots
+    assert shots[0].start_seconds == 0
+    assert shots[1].start_seconds == shots[0].end_seconds  # 首尾相接
+    assert shots[1].end_seconds == 8  # 末镜对齐组时长
+    assert all(
+        shot.end_seconds > shot.start_seconds for shot in shots
+    )
+
+
+def test_normalize_provider_continuity_repairs_misplaced_and_overshot_fields() -> None:
+    """字段错放、构图超 3/重复、名称当引用、文本超长都应被确定性归一化。"""
+    from app.services import storyboard as storyboard_service
+
+    reference_names = {
+        ref: item.name for ref, item in _subject_references().items()
+    }
+    reference_types = {
+        ref: item.subject_type for ref, item in _subject_references().items()
+    }
+    payload = _valid_storyboard_v2_payload()
+    shot = payload["scenes"][0]["shot_groups"][0]["shots"][0]
+    # narrative_purpose 错放进 visual，镜头层级缺失
+    shot["visual"]["narrative_purpose"] = shot.pop("narrative_purpose")
+    # 构图 4 项且重复 -> 去重截断到 3
+    shot["visual"]["composition"] = ["三分法", "三分法", "纵深构图", "框景"]
+    # 引用用名称而非短引用 -> 名称映射回短引用
+    shot["character_refs"] = ["阿明"]
+    shot["prop_refs"] = ["钥匙"]
+    shot["sound_refs"] = ["门响"]
+    shot["dialogue"]["speaker_ref"] = "阿明"
+    # 文本超长 -> 截断
+    shot["visual"]["action"] = "动" * 2000
+    shot["visual"]["lighting"] = "光" * 400
+    # schema_version 拼错 -> 强制 v2
+    payload["schema_version"] = "storyboard.v2-typo"
+
+    contract = storyboard_service._validate_provider_payload(
+        payload,
+        subject_catalog=_subject_catalog(),
+        subject_reference_names=reference_names,
+        subject_reference_types=reference_types,
+    )
+    result = contract.scenes[0].shot_groups[0].shots[0]
+    # 归一化成功即证明：visual.narrative_purpose 已回迁(否则 extra_forbidden)、
+    # composition 已去重截断(否则 too_many)、文本已截断(否则 string_too_long)、
+    # 名称已映射回短引用(否则 reference_not_allowed)、schema_version 已纠正。
+    assert "交代阿明进入并触发冲突" in result.description
+    assert result.characters == ["阿明"]
+    assert result.props == ["钥匙"]
+    assert result.sounds == ["门响"]
+    assert result.dialogue_character == "阿明"
+
+
+def test_normalize_provider_continuity_drops_unresolvable_optional_refs() -> None:
+    """无法解析的可选引用应被丢弃而非卡住生成。"""
+    from app.services import storyboard as storyboard_service
+
+    reference_names = {
+        ref: item.name for ref, item in _subject_references().items()
+    }
+    reference_types = {
+        ref: item.subject_type for ref, item in _subject_references().items()
+    }
+    payload = _valid_storyboard_v2_payload()
+    shot = payload["scenes"][0]["shot_groups"][0]["shots"][0]
+    # 既非合法短引用、又非已知名称的垃圾引用 -> 丢弃
+    shot["character_refs"] = ["C01", "GARBAGE99", "阿明"]
+    shot["prop_refs"] = ["未知道具"]
+    contract = storyboard_service._validate_provider_payload(
+        payload,
+        subject_catalog=_subject_catalog(),
+        subject_reference_names=reference_names,
+        subject_reference_types=reference_types,
+    )
+    result = contract.scenes[0].shot_groups[0].shots[0]
+    assert result.characters == ["阿明"]  # C01 渲染为阿明，垃圾被丢
+    assert result.props == []  # 未知道具无法解析被丢弃
+
+
+def test_coverage_minimums_and_check_distinguish_sparse_from_rich() -> None:
+    """覆盖度下限应让稀疏输出不合格、让充分输出合格。"""
+    from app.services import storyboard as storyboard_service
+
+    # 1365 字 -> min_shots=23 / min_groups=8 / min_scenes=3 / min_duration=92
+    script = "剧" * 1365
+    min_shots, min_groups, min_scenes, min_dur = (
+        storyboard_service._coverage_minimums(script)
+    )
+    assert (min_shots, min_groups, min_scenes, min_dur) == (23, 8, 3, 92)
+
+    # 极短剧本走 floor，不坍缩到 1
+    assert storyboard_service._coverage_minimums("短") == (6, 3, 2, 24)
+
+    # 用 mock 构造稀疏(3镜)与充分(24镜)两种 _ValidatedStoryboard
+    def make_report(shot_count, group_count, scene_count, total_duration):
+        return storyboard_service._CoverageReport(
+            shot_count=shot_count,
+            group_count=group_count,
+            scene_count=scene_count,
+            total_duration=total_duration,
+            min_shots=23,
+            min_groups=8,
+            min_scenes=3,
+            min_duration=92,
+        )
+
+    # 差输出 1场1组3镜15s -> 不足
+    assert not make_report(3, 1, 1, 15).sufficient
+    # 好输出 4场9组24镜108s -> 合格
+    assert make_report(24, 9, 4, 108).sufficient
+    # 边界：达到 80% slack 即合格（19/7/..）
+    assert make_report(19, 7, 4, 74).sufficient
+
+
+def test_normalize_provider_continuity_coerces_invalid_enums() -> None:
+    """模型自造的非法枚举值应被收敛到中性默认，不阻断生成。"""
+    from app.services import storyboard as storyboard_service
+
+    reference_names = {
+        ref: item.name for ref, item in _subject_references().items()
+    }
+    reference_types = {
+        ref: item.subject_type for ref, item in _subject_references().items()
+    }
+    payload = _valid_storyboard_v2_payload()
+    visual = payload["scenes"][0]["shot_groups"][0]["shots"][0]["visual"]
+    visual["shot_size"] = "超广角"  # 非法
+    visual["camera_angle"] = "斜上方"  # 非法
+    visual["camera_movement"] = "甩镜头"  # 非法
+    visual["composition"] = ["自造构图", "三分法", "三分法", "纵深构图"]  # 含非法+重复
+    contract = storyboard_service._validate_provider_payload(
+        payload,
+        subject_catalog=_subject_catalog(),
+        subject_reference_names=reference_names,
+        subject_reference_types=reference_types,
+    )
+    # 归一化成功即证明非法枚举已收敛为合法默认值（否则 literal_error）
+    shot = contract.scenes[0].shot_groups[0].shots[0]
+    assert "平视" in shot.description
+
+
+def test_normalize_provider_continuity_clamps_oversized_group_duration() -> None:
+    """组时长越界（>15s）绝不卡住生成：按镜头总时长是否合法分别处理。"""
+    from app.services import storyboard as storyboard_service
+
+    reference_names = {
+        ref: item.name for ref, item in _subject_references().items()
+    }
+    reference_types = {
+        ref: item.subject_type for ref, item in _subject_references().items()
+    }
+
+    # 情形一：声明 24s，但镜头实际只占 6s（声明虚高）-> 采用镜头总时长 6s
+    payload = _valid_storyboard_v2_payload()
+    payload["scenes"][0]["shot_groups"][0]["duration_seconds"] = 24
+    contract = storyboard_service._validate_provider_payload(
+        payload,
+        subject_catalog=_subject_catalog(),
+        subject_reference_names=reference_names,
+        subject_reference_types=reference_types,
+    )
+    group_a = contract.scenes[0].shot_groups[0]
+    assert group_a.duration_seconds == 6
+    assert [s.end_seconds - s.start_seconds for s in group_a.shots] == [3, 3]
+    assert group_a.shots[-1].end_seconds == 6
+
+    # 情形二：声明 24s，镜头总时长也 24s（4 镜 ×6s 越界）-> 夹到 15s 并等比例缩放
+    payload = _valid_storyboard_v2_payload()
+    group = payload["scenes"][0]["shot_groups"][0]
+    group["duration_seconds"] = 24
+    group["shots"][0]["start_seconds"] = 0
+    group["shots"][0]["end_seconds"] = 6
+    group["shots"][1]["start_seconds"] = 6
+    group["shots"][1]["end_seconds"] = 12
+    group["shots"].append(dict(group["shots"][1]))  # 复制结构补两镜
+    group["shots"][2]["display_no"] = 3
+    group["shots"][2]["start_seconds"] = 12
+    group["shots"][2]["end_seconds"] = 18
+    group["shots"].append(dict(group["shots"][2]))
+    group["shots"][3]["display_no"] = 4
+    group["shots"][3]["start_seconds"] = 18
+    group["shots"][3]["end_seconds"] = 24
+    contract = storyboard_service._validate_provider_payload(
+        payload,
+        subject_catalog=_subject_catalog(),
+        subject_reference_names=reference_names,
+        subject_reference_types=reference_types,
+    )
+    group_b = contract.scenes[0].shot_groups[0]
+    assert group_b.duration_seconds == 15
+    shots = group_b.shots
+    assert shots[0].start_seconds == 0
+    assert shots[-1].end_seconds == 15
+    assert all(
+        shots[i + 1].start_seconds == shots[i].end_seconds
+        for i in range(len(shots) - 1)
+    )
+    assert all(shot.end_seconds > shot.start_seconds for shot in shots)
+
+
+
 
 
 async def test_storyboard_contract_exhaustion_redacts_provider_payload(
