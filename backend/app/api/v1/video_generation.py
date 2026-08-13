@@ -12,6 +12,7 @@ router 已在 app/api/router.py 挂载到 /v3api 前缀下。
 
 import logging
 from datetime import UTC, datetime
+from heapq import heappop, heappush
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 from sqlalchemy import select
@@ -54,6 +55,87 @@ def _derive_batch_idempotency_keys(prefix: str, count: int) -> list[str]:
             f"批量 Idempotency-Key 派生后超过 {VIDEO_IDEMPOTENCY_KEY_MAX_LENGTH} 字符"
         )
     return keys
+
+
+async def _order_batch_items_by_continuation_dependency(
+    db: AsyncSession,
+    *,
+    script_id: str,
+    episode_id: str,
+    shot_group_ids: list[str],
+    idempotency_keys: list[str],
+) -> list[tuple[str, str]]:
+    """稳定拓扑排序：只调整续帧 child 与同场景直接前驱的相对顺序。
+
+    幂等键在排序前按原请求索引派生，并和镜头组一起移动，确保客户端重放契约
+    不因数据库排序变化。未知/越权 ID 不参与依赖图，仍由单项创建返回既有错误。
+    """
+    if len(shot_group_ids) != len(idempotency_keys):
+        raise ValueError("批量镜头组与幂等键数量不一致")
+    rows = (
+        await db.execute(
+            select(
+                ShotGroup.shot_group_id,
+                ShotGroup.scene_no,
+                ShotGroup.group_index,
+                ShotGroup.is_continuation,
+            ).where(
+                ShotGroup.script_id == script_id,
+                ShotGroup.episode_id == episode_id,
+                ShotGroup.shot_group_id.in_(set(shot_group_ids)),
+            )
+        )
+    ).all()
+    metadata = {
+        str(row.shot_group_id): (
+            int(row.scene_no),
+            int(row.group_index),
+            bool(row.is_continuation),
+        )
+        for row in rows
+    }
+    first_index_by_group: dict[str, int] = {}
+    for index, shot_group_id in enumerate(shot_group_ids):
+        first_index_by_group.setdefault(shot_group_id, index)
+    group_by_position = {
+        (scene_no, group_index): shot_group_id
+        for shot_group_id, (scene_no, group_index, _is_continuation) in metadata.items()
+    }
+
+    outgoing: dict[int, list[int]] = {index: [] for index in range(len(shot_group_ids))}
+    indegree = [0] * len(shot_group_ids)
+    for child_index, shot_group_id in enumerate(shot_group_ids):
+        child = metadata.get(shot_group_id)
+        if child is None or not child[2] or child[1] <= 1:
+            continue
+        predecessor_group_id = group_by_position.get((child[0], child[1] - 1))
+        if predecessor_group_id is None:
+            continue
+        predecessor_index = first_index_by_group.get(predecessor_group_id)
+        if predecessor_index is None or predecessor_index == child_index:
+            continue
+        outgoing[predecessor_index].append(child_index)
+        indegree[child_index] += 1
+
+    ready: list[int] = []
+    for index, degree in enumerate(indegree):
+        if degree == 0:
+            heappush(ready, index)
+    ordered_indices: list[int] = []
+    while ready:
+        index = heappop(ready)
+        ordered_indices.append(index)
+        for child_index in outgoing[index]:
+            indegree[child_index] -= 1
+            if indegree[child_index] == 0:
+                heappush(ready, child_index)
+    if len(ordered_indices) != len(shot_group_ids):
+        # 直接前驱关系按 group_index 单调递增，本不应成环；保守回退原顺序。
+        ordered_indices = list(range(len(shot_group_ids)))
+    return [
+        (shot_group_ids[index], idempotency_keys[index])
+        for index in ordered_indices
+    ]
 
 
 def _effective_env_video_provider() -> ActiveProviderOut:
@@ -415,12 +497,19 @@ async def batch_create_video_generation_jobs(
     derived_keys = _derive_batch_idempotency_keys(
         idempotency_key, len(body.shot_group_ids)
     )
+    ordered_items = await _order_batch_items_by_continuation_dependency(
+        db,
+        script_id=body.script_id,
+        episode_id=body.episode_id,
+        shot_group_ids=body.shot_group_ids,
+        idempotency_keys=derived_keys,
+    )
 
     from app.services.video_generation import create_video_job
 
     success: list[VideoJobOut] = []
     failed: list[VideoJobFailedItem] = []
-    for sg_id, key in zip(body.shot_group_ids, derived_keys, strict=True):
+    for sg_id, key in ordered_items:
         try:
             job = await create_video_job(
                 db,

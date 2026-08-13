@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import secrets
 from datetime import UTC, datetime, timedelta
@@ -549,6 +550,16 @@ def test_reference_aggregation_is_fail_closed_and_keeps_image_audio_names_aligne
         aggregated = await aggregate_references(db, "sg-10")
 
         assert aggregated.reference_image_names == ["阿明"]
+        assert aggregated.reference_image_refs == [
+            {
+                "token": "图1",
+                "ref": None,
+                "name": "阿明",
+                "category": "character",
+                "subject_id": "subject-c",
+                "asset_entry_id": "asset-img",
+            }
+        ]
         # 持久化对象引用统一使用 canonical 相对 key。
         assert [item["storage_key"] for item in aggregated.reference_images] == [
             "generate_images/material-1/image.png"
@@ -690,15 +701,158 @@ def test_create_video_job_persists_explicit_prompt_with_exactly_one_full_constra
             prompt="  客户端自定义运镜  ",
         )
 
-        expected = f"客户端自定义运镜\n{video_generation._CONSTRAINT_LOCK_TEXT}"
+        expected = (
+            "## 图片内容说明\n"
+            "图1: 首帧参考（短引用 无；类型 first_frame）\n"
+            "图2: 阿明（短引用 无；类型 character）\n"
+            "## 图片内容说明结束\n"
+            f"客户端自定义运镜\n{video_generation._CONSTRAINT_LOCK_TEXT}"
+        )
         assert job.input_json["prompt"] == expected
+        assert job.input_json["base_prompt"] == "客户端自定义运镜"
+        assert job.input_json["source_prompt"] == expected
+        assert job.input_json["adapted_prompt"] == expected
+        assert job.input_json["adapted_prompt_sha256"] == hashlib.sha256(
+            expected.encode("utf-8")
+        ).hexdigest()
+        assert job.input_json["adapter_version"] == "video-prompt-adapter.v1"
+        assert job.input_json["prompt_adapter"]["version"] == "video-prompt-adapter.v1"
+        assert job.input_json["constraint_prompt_template"]["key"] == "video.constraint_lock"
+        assert job.input_json["constraint_prompt_template"]["source"] == "fallback"
+        assert job.input_json["reference_token_map"] == {
+            "图1": {
+                "ref": None,
+                "name": "首帧参考",
+                "category": "first_frame",
+                "subject_id": None,
+                "asset_entry_id": None,
+                "sha256": hashlib.sha256(b"/frames/g2-last.png").hexdigest(),
+            },
+            "图2": {
+                "ref": None,
+                "name": "阿明",
+                "category": "character",
+                "subject_id": "subject-c",
+                "asset_entry_id": "asset-img",
+                "sha256": "a" * 64,
+            },
+        }
         assert job.input_json["prompt"].count(video_generation._CONSTRAINT_LOCK_TEXT) == 1
         assert video_generation._ensure_constraint_lock(expected) == expected
 
         hollow_heading = "客户端自定义运镜\n【约束】"
         repaired = video_generation._ensure_constraint_lock(hollow_heading)
-        assert repaired == f"{hollow_heading}\n{video_generation._CONSTRAINT_LOCK_TEXT}"
+        assert repaired == f"客户端自定义运镜\n{video_generation._CONSTRAINT_LOCK_TEXT}"
         assert repaired.count(video_generation._CONSTRAINT_LOCK_TEXT) == 1
+
+        storyboard_lock = (
+            "客户端自定义运镜\n【约束】\n1. 人物特征高度一致\n2. 禁止字幕"
+        )
+        normalized = video_generation._ensure_constraint_lock(storyboard_lock)
+        assert normalized == f"客户端自定义运镜\n{video_generation._CONSTRAINT_LOCK_TEXT}"
+        assert normalized.count("【约束】") == 1
+
+    asyncio.run(scenario())
+
+
+def test_create_video_job_enhances_structured_prompt_before_constraint_and_adapter(
+    monkeypatch,
+) -> None:
+    async def scenario() -> None:
+        from app.services import video_generation
+
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        raw.add_all(
+            [
+                Shot(
+                    shot_id="shot-structured-1",
+                    shot_group_id=seeded.shot_group.shot_group_id,
+                    scene_no=1,
+                    group_no="G10",
+                    shot_no="2x2x2x2x2x",
+                    display_no=1,
+                    content="阿明推门进入",
+                    description="镜头一",
+                    shot_line="镜头一",
+                    start_seconds=0,
+                    end_seconds=3,
+                    characters=["阿明"],
+                    structured_data={
+                        "visual": {
+                            "camera_movement": "推镜",
+                            "action": "推门进入",
+                        }
+                    },
+                ),
+                Shot(
+                    shot_id="shot-structured-2",
+                    shot_group_id=seeded.shot_group.shot_group_id,
+                    scene_no=1,
+                    group_no="G10",
+                    shot_no="3x3x3x3x3x",
+                    display_no=2,
+                    content="阿明停下回头",
+                    description="镜头二",
+                    shot_line="镜头二",
+                    start_seconds=3,
+                    end_seconds=6,
+                    characters=["阿明"],
+                    structured_data={
+                        "visual": {
+                            "camera_movement": "固定",
+                            "action": "停下并回头",
+                        }
+                    },
+                ),
+            ]
+        )
+        seeded.shot_group.reference_frames = {
+            "boundary_projections": {
+                "start": {"prompt_fragment": "起始边界：阿明位于门外，右手刚触及门把。"},
+                "end": {"prompt_fragment": "结束边界：阿明已进入室内并回望门口。"},
+            }
+        }
+        raw.commit()
+        db = _AsyncSessionAdapter(raw)
+
+        async def fake_enqueue(db, **kwargs):
+            row = TaskDispatchOutbox(
+                id="dispatch-structured-prompt",
+                task_type=kwargs["task_type"],
+                job_id=kwargs["job_id"],
+                attempt=kwargs["attempt"],
+                payload=kwargs["payload"],
+                status="pending",
+            )
+            db.add(row)
+            return row
+
+        monkeypatch.setattr(video_generation, "enqueue_task", fake_enqueue)
+        job = await video_generation.create_video_job(
+            db,
+            script_id=seeded.script.id,
+            episode_id=seeded.episode.episode_id,
+            shot_group_id=seeded.shot_group.shot_group_id,
+            user_id=seeded.user.user_id,
+            idempotency_key="structured-video-prompt",
+        )
+
+        source = job.input_json["source_prompt"]
+        assert source.startswith("Camera dollies forward smoothly at a steady pace.\n")
+        assert "0s～3s：阿明：推门进入" in source
+        assert "3s～6s：阿明：停下并回头" in source
+        assert source.index("## 图片内容说明") < source.index("镜头组提示词")
+        assert source.index("【主体时长动作 subject-over-duration】") < source.index("【约束】")
+        assert source.index("【冻结边界事实 boundary-facts】") < source.index("【约束】")
+        assert "起始边界：阿明位于门外，右手刚触及门把。" in source
+        assert "结束边界：阿明已进入室内并回望门口。" in source
+        assert source.count(video_generation._CONSTRAINT_LOCK_TEXT) == 1
+        assert job.input_json["prompt"] == source
+        assert job.input_json["boundary_prompt_fragments"] == [
+            "起始边界：阿明位于门外，右手刚触及门把。",
+            "结束边界：阿明已进入室内并回望门口。",
+        ]
 
     asyncio.run(scenario())
 
@@ -1766,9 +1920,10 @@ def test_video_provider_seed_includes_all_routable_vendors(monkeypatch) -> None:
             "modelsai",
             "bailian",
             "openai",
-            "gemini",
-            "mgrouter",
-        }
+                "gemini",
+                "mgrouter",
+                "neolink",
+            }
         gemini = next(row for row in rows if row.provider_key == "gemini")
         assert gemini.model == "veo-google-test"
         mgrouter = next(row for row in rows if row.provider_key == "mgrouter")

@@ -23,11 +23,24 @@ from app.models.shot_group import (
 from app.models.storyboard_job import StoryboardJob
 from app.models.subject import Subject
 from app.models.video_generation_job import VideoGenerationJob
+from app.schemas.storyboard_contracts import (
+    StoryboardV2Contract,
+    StoryboardV2SceneContract,
+    StoryboardV2ShotContract,
+    StoryboardV2ShotGroupContract,
+)
 from app.services.storyboard import (
+    _build_boundary_reference_frames,
     _build_group_prompt,
     _classify_materials,
+    _classify_reference_materials,
     _extract_audio_elements,
     _gen_shot_no,
+    _SubjectReference,
+)
+from app.services.storyboard_quality import (
+    build_shot_group_quality_summary,
+    evaluate_storyboard_quality,
 )
 
 _SHOT_LINE_PREFIX = re.compile(r"^【镜头\d+\s*:\s*[^】]+】")
@@ -73,6 +86,170 @@ def _shot_payload(shot: Shot) -> dict:
         "dialogue_character": shot.dialogue_character,
         "sounds": list(shot.sounds or []),
     }
+
+
+def _structured_shot_after_retime(shot: Shot) -> StoryboardV2ShotContract | None:
+    """更新时间轴后重建 v2 镜头；旧 NULL/未知版本保持原样并跳过质量重算。"""
+
+    raw = shot.structured_data
+    if not isinstance(raw, dict) or raw.get("schema_version") != "storyboard.shot-structure.v1":
+        return None
+    snapshot = dict(raw)
+    snapshot.update(
+        {
+            "display_no": shot.display_no,
+            "start_seconds": shot.start_seconds,
+            "end_seconds": shot.end_seconds,
+        }
+    )
+    contract_payload = {
+        key: value
+        for key, value in snapshot.items()
+        if key not in {"schema_version", "subject_ids_by_ref", "background_ref"}
+    }
+    try:
+        structured_shot = StoryboardV2ShotContract.model_validate(contract_payload)
+    except ValueError:
+        # 历史或手工写入的未知结构不应阻断镜头组合，也不能被清空。
+        return None
+    shot.structured_data = snapshot
+    return structured_shot
+
+
+def _subject_names_by_ref(shots: list[Shot], subjects: list[Subject]) -> dict[str, str]:
+    """利用结构快照中的稳定主体 ID 恢复短引用对应名称。"""
+
+    names_by_id = {str(subject.id): subject.name for subject in subjects}
+    names_by_ref: dict[str, str] = {}
+    for shot in shots:
+        raw = shot.structured_data
+        if not isinstance(raw, dict):
+            continue
+        subject_ids = raw.get("subject_ids_by_ref")
+        if not isinstance(subject_ids, dict):
+            continue
+        for ref, subject_id in subject_ids.items():
+            name = names_by_id.get(str(subject_id))
+            if isinstance(ref, str) and name:
+                names_by_ref.setdefault(ref, name)
+    return names_by_ref
+
+
+def _structured_materials(
+    shots: list[Shot],
+    subjects: list[Subject],
+    *,
+    background: str,
+) -> dict[str, list[dict[str, str]]] | None:
+    """从镜头结构快照恢复 ref -> subject_id，正式组不再退回名称猜测。"""
+    subjects_by_id = {str(subject.id): subject for subject in subjects}
+    reference_facts: dict[str, _SubjectReference] = {}
+    referenced_refs: list[str] = []
+    for shot in shots:
+        raw = shot.structured_data
+        if not isinstance(raw, dict):
+            return None
+        ids_by_ref = raw.get("subject_ids_by_ref")
+        if not isinstance(ids_by_ref, dict):
+            return None
+        for ref, subject_id in ids_by_ref.items():
+            if not isinstance(ref, str):
+                continue
+            subject = subjects_by_id.get(str(subject_id))
+            if subject is None:
+                continue
+            subject_type = "background" if subject.type == "scene" else subject.type
+            reference_facts[ref] = _SubjectReference(
+                ref=ref,
+                subject_id=str(subject.id),
+                name=subject.name,
+                subject_type=subject_type,
+                description="",
+                asset_entry_id=(
+                    str(subject.image_entry_id) if subject.image_entry_id else None
+                ),
+            )
+        referenced_refs.extend(
+            ref
+            for key in ("character_refs", "prop_refs")
+            for ref in (raw.get(key) or [])
+            if isinstance(ref, str)
+        )
+        background_ref = raw.get("background_ref")
+        if isinstance(background_ref, str):
+            referenced_refs.append(background_ref)
+    background_subject_ids = {
+        str(subject.id)
+        for subject in subjects
+        if subject.name == background and subject.type in {"scene", "background"}
+    }
+    referenced_refs[:0] = [
+        ref
+        for ref, fact in reference_facts.items()
+        if fact.subject_id in background_subject_ids
+    ]
+    if not reference_facts:
+        return None
+    return _classify_reference_materials(
+        _ordered_unique(referenced_refs),
+        reference_facts,
+    )
+
+
+def _rebuild_structured_group_state(
+    shots: list[Shot],
+    *,
+    duration_seconds: int,
+    narrative_purpose: str,
+    subjects: list[Subject],
+) -> tuple[dict[str, object], dict[str, object], list[str], bool]:
+    """从全部有效结构快照重算组级指导、告警与首尾边界投影。"""
+
+    structured_shots = [_structured_shot_after_retime(shot) for shot in shots]
+    empty_frames = _build_boundary_reference_frames(None, subject_names_by_ref={})
+    if any(shot is None for shot in structured_shots):
+        return {}, empty_frames, [], False
+    try:
+        group = StoryboardV2ShotGroupContract(
+            group_no="G1",
+            narrative_purpose=narrative_purpose or "保持组合后镜头的叙事连续",
+            duration_seconds=duration_seconds,
+            shots=[shot for shot in structured_shots if shot is not None],
+        )
+        local_contract = StoryboardV2Contract(
+            schema_version="storyboard.v2",
+            scenes=[
+                StoryboardV2SceneContract(
+                    scene_no=1,
+                    background_ref="BG01",
+                    shot_groups=[group],
+                )
+            ],
+        )
+    except ValueError:
+        # 合并器允许的镜头数量可能宽于 v2 建议上限；质量重算不得阻断既有合并。
+        return {}, empty_frames, [], False
+    # 局部合并拿不到整集权威原文段集合，不能用当前组引用自证其存在性。
+    # 这里仍检查组内重复/连续性，但跳过 missing/unknown 的全集判断。
+    report = evaluate_storyboard_quality(local_contract)
+    quality_summary = build_shot_group_quality_summary(group, warnings=report.warnings)
+    reference_frames = _build_boundary_reference_frames(
+        group,
+        subject_names_by_ref=_subject_names_by_ref(shots, subjects),
+    )
+    raw_commands = quality_summary.get("director_commands")
+    commands = (
+        [
+            str(item.get("command"))
+            for item in raw_commands
+            if isinstance(item, dict) and item.get("command")
+        ]
+        if isinstance(raw_commands, list)
+        else []
+    )
+    # 重分组后不能盲目沿用旧组续帧意图；用同一严格规则按新组首尾收紧。
+    # 局部重建无上一组尾镜，因此默认关闭，由全场景收口再计算。
+    return quality_summary, reference_frames, commands, False
 
 
 def _is_final_group(group: ShotGroup) -> bool:
@@ -142,6 +319,8 @@ async def _refresh_group(
     narrative_purpose: str,
     subjects: list[Subject],
     duration_by_shot: dict[str, int],
+    prompt_context: dict[str, object] | None = None,
+    source_storyboard_job_id: str | None = None,
 ) -> None:
     """按组内叙事顺序重建时间轴、Prompt、素材与音频。"""
 
@@ -169,12 +348,28 @@ async def _refresh_group(
         [_shot_payload(shot) for shot in shots],
         subjects,
     )
+    quality_summary, reference_frames, director_commands, is_continuation = (
+        _rebuild_structured_group_state(
+            shots,
+            duration_seconds=cursor,
+            narrative_purpose=narrative_purpose,
+            subjects=subjects,
+        )
+    )
     group.prompt = _build_group_prompt(
         shot_lines=[shot.shot_line for shot in shots],
         referenced_names=referenced_names,
         narrative_purpose=narrative_purpose,
+        director_commands=director_commands,
     )
-    group.materials = _classify_materials(referenced_names, subjects)
+    group.materials = _structured_materials(
+        shots,
+        subjects,
+        background=background,
+    ) or _classify_materials(
+        referenced_names,
+        subjects,
+    )
     group.audio_elements = {
         "characters": [item for item in audio_elements if item.get("type") == "character"],
         "sounds": [item for item in audio_elements if item.get("type") == "sound"],
@@ -182,11 +377,11 @@ async def _refresh_group(
     group.description_text = narrative_purpose
     group.duration_seconds = cursor
     group.video_duration_seconds = cursor
-    group.reference_frames = {
-        "first_frame": None,
-        "last_frame": None,
-        "reference_frame": None,
-    }
+    group.quality_summary = quality_summary
+    group.reference_frames = reference_frames
+    group.is_continuation = is_continuation
+    group.prompt_context = prompt_context
+    group.source_storyboard_job_id = source_storyboard_job_id
 
 
 async def _raise_for_unknown_shots(
@@ -403,6 +598,25 @@ async def merge_shots_into_groups(
                 if source_group_by_id[shot.shot_group_id].description_text
             ]
         )
+        source_bucket_groups = _ordered_unique(
+            [shot.shot_group_id for shot in bucket]
+        )
+        source_job_ids = {
+            source_group_by_id[group_id].source_storyboard_job_id
+            for group_id in source_bucket_groups
+            if source_group_by_id[group_id].source_storyboard_job_id
+        }
+        prompt_contexts = [
+            source_group_by_id[group_id].prompt_context
+            for group_id in source_bucket_groups
+            if isinstance(source_group_by_id[group_id].prompt_context, dict)
+        ]
+        inherited_prompt_context = (
+            dict(prompt_contexts[0] or {})
+            if prompt_contexts and all(item == prompt_contexts[0] for item in prompt_contexts)
+            else None
+        )
+        inherited_source_job_id = next(iter(source_job_ids)) if len(source_job_ids) == 1 else None
         await _refresh_group(
             db,
             group,
@@ -411,6 +625,8 @@ async def merge_shots_into_groups(
             narrative_purpose="；".join(narrative_parts),
             subjects=subjects,
             duration_by_shot=duration_by_shot,
+            prompt_context=inherited_prompt_context,
+            source_storyboard_job_id=inherited_source_job_id,
         )
         created_groups.append(group)
 

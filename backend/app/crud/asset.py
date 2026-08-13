@@ -218,6 +218,7 @@ async def create_subject(
     name: str,
     description: str,
     episode_nos: list[int],
+    visual_style: str | None = None,
 ) -> Subject:
     """手动新增主体，并保证同一剧本内的同名同类唯一。
 
@@ -248,6 +249,7 @@ async def create_subject(
         name=name,
         pipeline_name=name,
         description=description,
+        visual_style=visual_style,
         subject_version=1,
         enrich_version=1,
         name_locked=True,
@@ -321,23 +323,22 @@ async def update_subject(
         "episode_nos",
         "name_locked",
         "description_locked",
+        "visual_style",
     }
     should_bump_version = any(
         key in versioned_fields
-        and value is not None
         and hasattr(subject, key)
         and getattr(subject, key) != value
         for key, value in data.items()
     )
     should_bump_enrich_version = any(
-        key in {"name", "description", "type"}
-        and value is not None
+        key in {"name", "description", "type", "visual_style"}
         and hasattr(subject, key)
         and getattr(subject, key) != value
         for key, value in data.items()
     )
     for key, value in data.items():
-        if value is not None and hasattr(subject, key):
+        if hasattr(subject, key) and (value is not None or key == "visual_style"):
             setattr(subject, key, value)
     if should_bump_version:
         subject.subject_version = current_version + 1
@@ -981,6 +982,7 @@ def serialize_subject(
         subject_type=norm_type,
         subject_type_label=subject_type_label(norm_type),
         subject_description=subject.description,
+        visual_style=getattr(subject, "visual_style", None),
         design_prompt=(
             build_subject_prompt(subject.name, raw_type, subject.description or "")
             if is_visual_subject

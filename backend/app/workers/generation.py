@@ -49,7 +49,13 @@ from app.models.generation_job import GenerationJob
 from app.models.materials import Materials
 from app.models.subject import Subject
 from app.models.task_dispatch_outbox import TaskDispatchOutbox
-from app.providers.image_gen import ImageResult, get_image_provider
+from app.providers.image_gen import (
+    ImageResult,
+    ImageSafetyRejectedError,
+    PromptSoftenLevel,
+    get_image_provider,
+    soften_prompt,
+)
 from app.providers.registry import ProviderError
 from app.providers.storage import get_storage
 from app.schemas.materials import CHARACTER_SHEET_MARKER, LEGACY_CHARACTER_SHEET_MARKERS
@@ -71,6 +77,16 @@ _QUEUED_CHARACTER_SHEET_MARKERS = (
     *LEGACY_CHARACTER_SHEET_MARKERS,
     _LEGACY_SERVICE_CHARACTER_SHEET_MARKER,
 )
+_SAFETY_GENERATION_ATTEMPTS: tuple[PromptSoftenLevel | None, ...] = (
+    None,
+    PromptSoftenLevel.CONSERVATIVE,
+    PromptSoftenLevel.SYMBOLIC,
+)
+_SAFETY_SOFTEN_STRATEGY_VERSION = "image-safety-soften.v1"
+
+
+class _GenerationExecutionStopped(RuntimeError):
+    """租约或输入版本失效；保留预约给权威状态机处理。"""
 
 
 def _safe_log_generation_exception(
@@ -94,9 +110,30 @@ def _safe_log_generation_exception(
 
 def _generation_error_type(exc: Exception) -> str:
     """将可操作的配置错误与运行期供应商/存储错误分开。"""
+    if isinstance(exc, ImageSafetyRejectedError):
+        return "provider_content_safety_rejected"
     if isinstance(exc, ProviderError):
         return "provider_configuration_error"
     return "provider_or_storage_error"
+
+
+def _prompt_sha256(prompt: str) -> str:
+    return hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+
+
+def _safety_retry_metrics(
+    attempts: list[dict[str, str | int]],
+    *,
+    terminal_category: str | None = None,
+) -> dict[str, object]:
+    metrics: dict[str, object] = {
+        "strategy_version": _SAFETY_SOFTEN_STRATEGY_VERSION,
+        "provider_call_count": len(attempts),
+        "attempts": attempts,
+    }
+    if terminal_category is not None:
+        metrics["terminal_category"] = terminal_category
+    return {"content_safety": metrics}
 
 
 def _resolve_job_prompts(input_json: dict[str, Any], prompt: str) -> tuple[str, str]:
@@ -500,6 +537,97 @@ async def _provider_generate_with_heartbeat(
             pass
 
 
+async def _generate_with_safety_softening(
+    db: Any,
+    job: GenerationJob,
+    provider: Any,
+    *,
+    prompt: str,
+    negative_prompt: str,
+    model: str,
+    size: str,
+    aspect: str,
+    count: int,
+    lease_token: str,
+) -> tuple[list[Any], dict[str, object]]:
+    """在同一任务 attempt 内完成最多三次供应商调用。
+
+    调用序列固定为：原始 prompt、moderate/conservative 累积软化、
+    strict/symbolic 累积软化。gentle 是 moderate 的组成部分，但不独占供应商调用，
+    因此总计严格不超过三次。
+    """
+    attempts: list[dict[str, str | int]] = []
+    for call_number, level in enumerate(_SAFETY_GENERATION_ATTEMPTS, start=1):
+        if not await _input_version_is_current(db, job):
+            await db.rollback()
+            raise _GenerationExecutionStopped("generation_input_version_changed")
+        if not await _job_token_is_current(db, job.job_id, lease_token):
+            await db.rollback()
+            raise _GenerationExecutionStopped("generation_lease_lost")
+        if not await _heartbeat_or_stop(db, job.job_id, lease_token):
+            raise _GenerationExecutionStopped("generation_lease_lost")
+
+        effective_prompt = prompt
+        level_name = "original"
+        if level is not None:
+            softened = soften_prompt(prompt, level=level)
+            effective_prompt = softened.prompt
+            level_name = "moderate" if level is PromptSoftenLevel.CONSERVATIVE else "strict"
+        attempt_metrics: dict[str, str | int] = {
+            "call_number": call_number,
+            "level": level_name,
+            "prompt_sha256": _prompt_sha256(effective_prompt),
+        }
+        attempts.append(attempt_metrics)
+        try:
+            results = await _provider_generate_with_heartbeat(
+                provider,
+                prompt=effective_prompt,
+                negative_prompt=negative_prompt,
+                model=model,
+                size=size,
+                aspect=aspect,
+                count=count,
+                job_id=job.job_id,
+                lease_token=lease_token,
+            )
+        except ImageSafetyRejectedError as exc:
+            attempt_metrics["outcome"] = "rejected"
+            attempt_metrics["category"] = exc.category.value
+            if call_number >= len(_SAFETY_GENERATION_ATTEMPTS):
+                setattr(
+                    exc,
+                    "retry_metrics",
+                    _safety_retry_metrics(
+                        attempts,
+                        terminal_category=exc.category.value,
+                    ),
+                )
+                raise
+            if not await _input_version_is_current(db, job):
+                await db.rollback()
+                raise _GenerationExecutionStopped("generation_input_version_changed") from None
+            if not await _job_token_is_current(db, job.job_id, lease_token):
+                await db.rollback()
+                raise _GenerationExecutionStopped("generation_lease_lost") from None
+            if not await _heartbeat_or_stop(db, job.job_id, lease_token):
+                raise _GenerationExecutionStopped("generation_lease_lost") from None
+            continue
+
+        if not await _input_version_is_current(db, job):
+            await db.rollback()
+            raise _GenerationExecutionStopped("generation_input_version_changed")
+        if not await _job_token_is_current(db, job.job_id, lease_token):
+            await db.rollback()
+            raise _GenerationExecutionStopped("generation_lease_lost")
+        if not await _heartbeat_or_stop(db, job.job_id, lease_token):
+            raise _GenerationExecutionStopped("generation_lease_lost")
+        attempt_metrics["outcome"] = "succeeded"
+        return results, _safety_retry_metrics(attempts)
+
+    raise AssertionError("内容安全供应商调用预算不能为空")
+
+
 async def _input_version_is_current(db: Any, job: GenerationJob) -> bool:
     input_json = job.input_json or {}
     subject = await _load_subject_for_candidate(db, job.subject_id)
@@ -620,6 +748,7 @@ async def _fail_generation_with_release(
     *,
     error_type: str,
     retryable: bool,
+    metrics: dict[str, object] | None = None,
 ) -> bool:
     if await _lock_current_generation_job(db, job_id, lease_token) is None:
         await db.rollback()
@@ -640,9 +769,9 @@ async def _fail_generation_with_release(
                 return False
             release_failed = True
     final_error_type = "financial_cleanup" if release_failed else error_type
-    metrics = None
     if release_failed:
         metrics = {
+            **(metrics or {}),
             "financial_cleanup": {
                 "action": "release",
                 "reservation_id": reservation_id,
@@ -775,16 +904,15 @@ async def run_generation_once(
         )
         return
     generated: list[PersistedImage] = []
+    safety_metrics: dict[str, object] = {}
     try:
         # 工厂本身也可能因 provider/storage 配置错误抛异常，必须与实际生成调用
         # 进入同一失败清算边界，避免任务停在 processing 等待租约重投。
         provider = provider or get_image_provider(model)
         storage = storage or get_storage()
-        if not await _job_token_is_current(db, job_id, claim.lease_token):
-            return
-        if not await _heartbeat_or_stop(db, job_id, claim.lease_token):
-            return
-        raw_results = await _provider_generate_with_heartbeat(
+        raw_results, safety_metrics = await _generate_with_safety_softening(
+            db,
+            job,
             provider,
             prompt=prompt,
             negative_prompt=negative_prompt,
@@ -792,11 +920,8 @@ async def run_generation_once(
             size=size,
             aspect=aspect,
             count=count,
-            job_id=job_id,
             lease_token=claim.lease_token,
         )
-        if not await _heartbeat_or_stop(db, job_id, claim.lease_token):
-            return
         normalized = [
             item
             if isinstance(item, ImageResult)
@@ -873,7 +998,11 @@ async def run_generation_once(
             claim.lease_token,
             "succeeded",
             output_json={"imageOutputs": image_outputs, "primaryImageIndex": 0},
-            metrics={"actual_points": actual, "count": len(image_outputs)},
+            metrics={
+                "actual_points": actual,
+                "count": len(image_outputs),
+                **safety_metrics,
+            },
         ):
             await db.rollback()
             await _delete_generated_objects(storage, generated, db)
@@ -898,6 +1027,8 @@ async def run_generation_once(
                 error_type="provider_or_storage_error",
                 retryable=False,
             )
+    except _GenerationExecutionStopped:
+        return
     except Exception as exc:
         _safe_log_generation_exception(
             exc,
@@ -908,6 +1039,7 @@ async def run_generation_once(
         await db.rollback()
         if storage is not None:
             await _delete_generated_objects(storage, generated, db)
+        retry_metrics = getattr(exc, "retry_metrics", None)
         await _fail_generation_with_release(
             db,
             job_id,
@@ -915,6 +1047,7 @@ async def run_generation_once(
             reservation_id,
             error_type=_generation_error_type(exc),
             retryable=False,
+            metrics=retry_metrics if isinstance(retry_metrics, dict) else None,
         )
 
 

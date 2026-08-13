@@ -3,7 +3,7 @@
 import hashlib
 import json
 
-from sqlalchemy import CheckConstraint, ForeignKey, Index, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, CheckConstraint, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -17,13 +17,24 @@ FINAL_SHOT_GROUP_UNIT_PREFIX = "group:"
 def shot_group_content_hash(group: "ShotGroup") -> str:
     """只对会影响视频生成的可编辑字段生成稳定组级指纹。"""
 
-    payload = {
+    payload: dict[str, object] = {
         "audio_elements": group.audio_elements or {},
         "duration_seconds": group.duration_seconds,
         "materials": group.materials or {},
         "prompt": group.prompt or "",
         "video_duration_seconds": group.video_duration_seconds,
     }
+    quality_summary = getattr(group, "quality_summary", None) or {}
+    if quality_summary:
+        payload["quality_summary"] = quality_summary
+    prompt_context = getattr(group, "prompt_context", None) or {}
+    if prompt_context:
+        # 仅纳入脱敏模板/溯源锚点；历史 NULL 组继续保持旧指纹。
+        payload["prompt_context"] = prompt_context
+    # 新字段仅在产生实际语义时进入指纹：默认空报告 / 非续帧仍与上线前哈希
+    # 一致，避免部署后无条件让全部历史视频失效。getattr 同时兼容分步迁移。
+    if bool(getattr(group, "is_continuation", False)):
+        payload["is_continuation"] = True
     canonical = json.dumps(
         payload,
         ensure_ascii=False,
@@ -73,6 +84,30 @@ class ShotGroup(TimestampMixin, Base):
     materials: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
     audio_elements: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
     description_text: Mapped[str] = mapped_column(Text, nullable=False)
+    # 纯规则质量报告与边界/动作拍点摘要。仅用于告警、展示和生成输入指纹，
+    # 不把 warn-only 结果升级成数据库约束。
+    quality_summary: Mapped[dict] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=dict,
+        server_default="{}",
+    )
+    # 生成时使用的结构化引用、模板与 token 绑定上下文；历史镜头组允许为空。
+    prompt_context: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    # True 表示视频应优先承接同场景直接前驱的真实尾帧；默认关闭以兼容历史组。
+    is_continuation: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default="false",
+    )
+    # 生成来源审计锚点；任务删除后保留镜头组并清空引用。
+    source_storyboard_job_id: Mapped[str | None] = mapped_column(
+        String(36),
+        ForeignKey("storyboard_jobs.job_id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
 
     # 形如 group:<id>
     unit_id: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -102,6 +137,8 @@ class ShotGroup(TimestampMixin, Base):
         kwargs.setdefault("reference_image_audit", {})
         kwargs.setdefault("materials", {"character": [], "background": [], "prop": [], "other": []})
         kwargs.setdefault("audio_elements", {"characters": [], "sounds": []})
+        kwargs.setdefault("quality_summary", {})
+        kwargs.setdefault("is_continuation", False)
         super().__init__(**kwargs)
 
 

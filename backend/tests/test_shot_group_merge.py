@@ -5,8 +5,50 @@ from __future__ import annotations
 import os
 import secrets
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
+
+
+def _structured_shot(
+    display_no: int,
+    start: int,
+    end: int,
+    *,
+    start_boundary: dict | None = None,
+    end_boundary: dict | None = None,
+    source_block_ref: str | None = None,
+) -> dict:
+    return {
+        "schema_version": "storyboard.shot-structure.v1",
+        "display_no": display_no,
+        "start_seconds": start,
+        "end_seconds": end,
+        "visual": {
+            "shot_size": "中景",
+            "composition": ["三分法"],
+            "camera_angle": "平视",
+            "camera_movement": "固定",
+            "action": "角色停下并回望",
+            "frame_description": "角色位于画面左侧并回望",
+            "lighting": "冷色侧光",
+            "emotion": "迟疑",
+        },
+        "narrative_purpose": "保持动作连续",
+        "character_refs": ["C01"],
+        "prop_refs": [],
+        "sound_refs": [],
+        "sound_design": "无",
+        "dialogue": None,
+        "source_block_refs": [source_block_ref or f"B{display_no:02d}"],
+        "character_positions": [
+            {"ref": "C01", "position": "左中", "facing": "面朝右"}
+        ],
+        "subject_ids_by_ref": {"C01": "subject-c1"},
+        "background_ref": "BG01",
+        **({"start_boundary": start_boundary} if start_boundary else {}),
+        **({"end_boundary": end_boundary} if end_boundary else {}),
+    }
 
 
 def test_partition_preserves_llm_narrative_boundaries() -> None:
@@ -26,6 +68,241 @@ def test_partition_preserves_llm_narrative_boundaries() -> None:
         ["shot-3", "shot-4"],
     ]
     assert [sum(durations[shot.shot_id] for shot in group) for group in groups] == [5, 4]
+
+
+async def test_refresh_group_retimes_structure_and_rebuilds_quality() -> None:
+    from app.services.shot_group_merge import _refresh_group
+
+    start_boundary = {
+        "positions": [{"ref": "C01", "position": "左中", "facing": "面朝右"}],
+        "visible_state": ["角色刚停下"],
+    }
+    end_boundary = {
+        "positions": [{"ref": "C01", "position": "正中", "facing": "面朝右"}],
+        "visible_state": ["角色完成回望"],
+    }
+    shots = [
+        SimpleNamespace(
+            shot_id="shot-1",
+            shot_group_id="draft-1",
+            scene_no=1,
+            group_no="G1",
+            display_no=1,
+            shot_no="old-1",
+            start_seconds=0,
+            end_seconds=2,
+            shot_line="【镜头1:0s～2s】镜头一",
+            content="镜头一",
+            characters=["阿明"],
+            props=[],
+            sounds=[],
+            dialogue_character="",
+            structured_data=_structured_shot(
+                1,
+                0,
+                2,
+                start_boundary=start_boundary,
+            ),
+        ),
+        SimpleNamespace(
+            shot_id="shot-2",
+            shot_group_id="draft-1",
+            scene_no=1,
+            group_no="G1",
+            display_no=2,
+            shot_no="old-2",
+            start_seconds=2,
+            end_seconds=5,
+            shot_line="【镜头2:2s～5s】镜头二",
+            content="镜头二",
+            characters=["阿明"],
+            props=[],
+            sounds=[],
+            dialogue_character="",
+            structured_data=_structured_shot(
+                2,
+                2,
+                5,
+                end_boundary=end_boundary,
+            ),
+        ),
+    ]
+    group = SimpleNamespace(
+        shot_group_id="final-1",
+        scene_no=1,
+        group_no="G1",
+    )
+    subjects = [
+        SimpleNamespace(
+            id="subject-c1",
+            name="阿明",
+            type="character",
+            image_entry_id=None,
+        )
+    ]
+    empty_result = SimpleNamespace(
+        scalars=lambda: SimpleNamespace(all=lambda: []),
+    )
+    db = SimpleNamespace(execute=AsyncMock(return_value=empty_result))
+
+    await _refresh_group(
+        db,
+        group,
+        shots,
+        background="办公室",
+        narrative_purpose="保持动作连续",
+        subjects=subjects,
+        duration_by_shot={"shot-1": 2, "shot-2": 3},
+    )
+
+    assert shots[0].structured_data["start_seconds"] == 0
+    assert shots[1].structured_data["start_seconds"] == 2
+    assert group.quality_summary["director_commands"][0]["frame_role"] == "first"
+    assert group.quality_summary["director_commands"][1]["frame_role"] == "last"
+    assert group.reference_frames["boundary_projections"]["start"][
+        "prompt_fragment"
+    ].startswith("【入画状态】")
+    assert "【导演指令】" in group.prompt
+    assert group.materials["character"] == [
+        {"ref": "C01", "subject_id": "subject-c1", "name": "阿明"}
+    ]
+
+
+async def test_refresh_group_preserves_storyboard_provenance_anchor() -> None:
+    from app.services.shot_group_merge import _refresh_group
+
+    shot = SimpleNamespace(
+        shot_id="shot-1",
+        shot_group_id="draft-1",
+        scene_no=1,
+        group_no="G1",
+        display_no=1,
+        shot_no="old-1",
+        start_seconds=0,
+        end_seconds=3,
+        shot_line="【镜头1:0s～3s】镜头一",
+        content="镜头一",
+        characters=["阿明"],
+        props=[],
+        sounds=[],
+        dialogue_character="",
+        structured_data=_structured_shot(1, 0, 3),
+    )
+    group = SimpleNamespace(shot_group_id="final-1", scene_no=1, group_no="G1")
+    subject = SimpleNamespace(
+        id="subject-c1",
+        name="阿明",
+        type="character",
+        image_entry_id="asset-c1",
+    )
+    empty_result = SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: []))
+    db = SimpleNamespace(execute=AsyncMock(return_value=empty_result))
+    prompt_context = {
+        "schema": "shot_group.prompt-context.v1",
+        "storyboard_provenance_sha256": "a" * 64,
+    }
+
+    await _refresh_group(
+        db,
+        group,
+        [shot],
+        background="办公室",
+        narrative_purpose="建立空间",
+        subjects=[subject],
+        duration_by_shot={"shot-1": 3},
+        prompt_context=prompt_context,
+        source_storyboard_job_id="job-1",
+    )
+
+    assert group.prompt_context == prompt_context
+    assert group.source_storyboard_job_id == "job-1"
+    assert group.materials["character"][0]["ref"] == "C01"
+
+
+async def test_refresh_group_does_not_self_validate_local_coverage_as_expected() -> None:
+    from app.services.shot_group_merge import _refresh_group
+
+    shot = SimpleNamespace(
+        shot_id="shot-local-coverage",
+        shot_group_id="draft-1",
+        scene_no=1,
+        group_no="G1",
+        display_no=1,
+        shot_no="old-1",
+        start_seconds=0,
+        end_seconds=3,
+        shot_line="【镜头1:0s～3s】镜头一",
+        content="镜头一",
+        characters=["阿明"],
+        props=[],
+        sounds=[],
+        dialogue_character="",
+        structured_data=_structured_shot(1, 0, 3, source_block_ref="B99"),
+    )
+    group = SimpleNamespace(shot_group_id="final-1", scene_no=1, group_no="G1")
+    subject = SimpleNamespace(
+        id="subject-c1",
+        name="阿明",
+        type="character",
+        image_entry_id=None,
+    )
+    empty_result = SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: []))
+    db = SimpleNamespace(execute=AsyncMock(return_value=empty_result))
+
+    await _refresh_group(
+        db,
+        group,
+        [shot],
+        background="办公室",
+        narrative_purpose="局部重算",
+        subjects=[subject],
+        duration_by_shot={"shot-local-coverage": 3},
+    )
+
+    assert group.quality_summary["coverage_block_refs"] == ["B99"]
+    warning_codes = {
+        item["code"] for item in group.quality_summary["warnings"]
+    }
+    assert "coverage_missing_block" not in warning_codes
+    assert "coverage_unknown_block" not in warning_codes
+
+
+async def test_refresh_group_keeps_legacy_null_structure_compatible() -> None:
+    from app.services.shot_group_merge import _refresh_group
+
+    shot = SimpleNamespace(
+        shot_id="legacy-shot",
+        shot_group_id="draft-1",
+        scene_no=1,
+        group_no="G1",
+        display_no=1,
+        shot_no="old-1",
+        start_seconds=0,
+        end_seconds=3,
+        shot_line="【镜头1:0s～3s】旧镜头",
+        content="旧镜头",
+        characters=[],
+        props=[],
+        sounds=[],
+        dialogue_character="",
+        structured_data=None,
+    )
+    group = SimpleNamespace(shot_group_id="final-1", scene_no=1, group_no="G1")
+    db = SimpleNamespace(execute=AsyncMock())
+
+    await _refresh_group(
+        db,
+        group,
+        [shot],
+        background="办公室",
+        narrative_purpose="兼容旧镜头",
+        subjects=[],
+        duration_by_shot={"legacy-shot": 3},
+    )
+
+    assert shot.structured_data is None
+    assert group.quality_summary == {}
+    assert "boundary_projections" not in group.reference_frames
 
 
 @pytest.mark.skipif(

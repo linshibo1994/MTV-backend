@@ -9,7 +9,7 @@
 
 set -Eeuo pipefail
 
-ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 BACKEND_DIR="$ROOT_DIR/backend"
 CONFIG_FILE="${DEPLOY_CONFIG:-}"
 SSH_BASE_OPTS=(-o StrictHostKeyChecking=accept-new -o ServerAliveInterval=30 -o ConnectTimeout=15)
@@ -33,12 +33,21 @@ REDIS_IMAGE="${REDIS_IMAGE:-}"
 RUN_MIGRATIONS="${RUN_MIGRATIONS:-}"
 ALLOW_DATABASE_MIGRATION="${ALLOW_DATABASE_MIGRATION:-}"
 LOG_TAIL="${LOG_TAIL:-}"
+PRODUCTION_CORS_ORIGINS="${PRODUCTION_CORS_ORIGINS:-}"
+API_BIND_ADDRESS="${API_BIND_ADDRESS:-}"
+BOOTSTRAP_ADMIN_USERNAME="${BOOTSTRAP_ADMIN_USERNAME:-}"
+BOOTSTRAP_ADMIN_PASSWORD="${BOOTSTRAP_ADMIN_PASSWORD:-}"
+BOOTSTRAP_ADMIN_CREDITS="${BOOTSTRAP_ADMIN_CREDITS:-}"
+BOOTSTRAP_ADMIN_ENABLED="${BOOTSTRAP_ADMIN_ENABLED:-}"
+ALLOW_INSECURE_HTTP_SESSION="${ALLOW_INSECURE_HTTP_SESSION:-}"
+ENV_SYNC_MODE="${ENV_SYNC_MODE:-}"
 
 CODE_ARCHIVE=""
 IMAGE_ARCHIVE=""
 POSTGRES_ARCHIVE=""
 REDIS_ARCHIVE=""
 LOCAL_BOOT=""
+LOCAL_RUNTIME_ENV=""
 
 info() { echo "[INFO] $*"; }
 ok() { echo "[OK] $*"; }
@@ -57,6 +66,7 @@ MTV 后端远程 Docker 部署
   build                  只在本地构建并校验 linux/amd64 后端镜像
   start                  服务器使用现有镜像启动并强制重建服务
   restart                服务器使用现有镜像重启并强制重建服务
+  sync-env               从本地 backend/.env 生成并安全同步服务器生产 .env
   migrate                服务器执行 Alembic 迁移（需显式允许并确认备份）
   logs [日志选项/服务名] 查看服务器日志，例如：logs -f api
   status                 查看服务器服务状态
@@ -79,13 +89,19 @@ MTV 后端远程 Docker 部署
   DEPLOY_TARGET_PLATFORM      构建平台，默认 linux/amd64
   MTV_INSTALL_ALIYUN_OSS      Docker 构建参数，默认 true
   DEPLOY_PUSH_DEPENDENCY_IMAGES=true  同时上传 PostgreSQL/Redis 镜像归档
-  DEPLOY_RUN_MIGRATIONS=false deploy 时是否执行 Alembic；需同时确认数据库备份
-  DEPLOY_ALLOW_DATABASE_MIGRATION=true  明确允许 deploy 执行迁移
+  DEPLOY_RUN_MIGRATIONS=true  deploy 时是否执行 Alembic，默认执行
+  DEPLOY_ALLOW_DATABASE_MIGRATION=true  是否允许 deploy 执行迁移，默认允许
+  DEPLOY_SYNC_ENV=auto     环境文件同步：auto（仅缺失时首装）、always、never
+  DEPLOY_BOOTSTRAP_ADMIN=true  首次迁移后创建指定管理员并幂等授予初始积分
+  DEPLOY_ALLOW_INSECURE_HTTP_SESSION=true  仅私有 HTTP 验收时允许非 Secure 会话 Cookie
+  MTV_PRODUCTION_CORS_ORIGINS 前端 Origin，默认空列表（禁用跨域）
+  MTV_PRODUCTION_API_BIND_ADDRESS API 绑定地址，默认 127.0.0.1
   MTV_LOG_TAIL                logs 默认行数，默认 200
 
 示例：
   cp scripts/deploy.env.example scripts/deploy.env
   ./scripts/deploy-remote.sh deploy
+  ./scripts/deploy-remote.sh sync-env
   ./scripts/deploy-remote.sh restart
   ./scripts/deploy-remote.sh logs -f api
 EOF
@@ -121,7 +137,7 @@ parse_options() {
     ACTION_ARGS=("$@")
 
     case "$ACTION" in
-        deploy|build|start|restart|migrate|logs|status|stop|help) ;;
+        deploy|build|start|restart|sync-env|migrate|logs|status|stop|help) ;;
         *) die "未知命令：${ACTION}（使用 help 查看用法）" ;;
     esac
     [[ "$ACTION" != "help" ]] || { usage; exit 0; }
@@ -169,6 +185,14 @@ load_config_file() {
             DEPLOY_PUSH_DEPENDENCY_IMAGES|PUSH_DEPENDENCY_IMAGES|MTV_POSTGRES_IMAGE|POSTGRES_IMAGE|\
             MTV_REDIS_IMAGE|REDIS_IMAGE|DEPLOY_RUN_MIGRATIONS|RUN_MIGRATIONS|\
             DEPLOY_ALLOW_DATABASE_MIGRATION|ALLOW_DATABASE_MIGRATION|MTV_LOG_TAIL|LOG_TAIL) ;;
+            MTV_PRODUCTION_CORS_ORIGINS|PRODUCTION_CORS_ORIGINS|\
+            MTV_PRODUCTION_API_BIND_ADDRESS|API_BIND_ADDRESS|\
+            DEPLOY_BOOTSTRAP_ADMIN_USERNAME|BOOTSTRAP_ADMIN_USERNAME|\
+            DEPLOY_BOOTSTRAP_ADMIN_PASSWORD|BOOTSTRAP_ADMIN_PASSWORD|\
+            DEPLOY_BOOTSTRAP_ADMIN_CREDITS|BOOTSTRAP_ADMIN_CREDITS|\
+            DEPLOY_BOOTSTRAP_ADMIN|BOOTSTRAP_ADMIN_ENABLED|\
+            DEPLOY_ALLOW_INSECURE_HTTP_SESSION|ALLOW_INSECURE_HTTP_SESSION|\
+            DEPLOY_SYNC_ENV|ENV_SYNC_MODE) ;;
             *) continue ;;
         esac
         if [[ -z "${!key:-}" ]]; then
@@ -190,9 +214,18 @@ set_defaults() {
     PUSH_DEPENDENCY_IMAGES="${DEPLOY_PUSH_DEPENDENCY_IMAGES:-${PUSH_DEPENDENCY_IMAGES:-true}}"
     POSTGRES_IMAGE="${MTV_POSTGRES_IMAGE:-${POSTGRES_IMAGE:-postgres:16-alpine}}"
     REDIS_IMAGE="${MTV_REDIS_IMAGE:-${REDIS_IMAGE:-redis:7-alpine}}"
-    RUN_MIGRATIONS="${DEPLOY_RUN_MIGRATIONS:-${RUN_MIGRATIONS:-false}}"
-    ALLOW_DATABASE_MIGRATION="${DEPLOY_ALLOW_DATABASE_MIGRATION:-${ALLOW_DATABASE_MIGRATION:-false}}"
+    # 用户已明确要求 deploy 默认完成迁移；生产使用前仍应先完成数据库备份。
+    RUN_MIGRATIONS="${DEPLOY_RUN_MIGRATIONS:-${RUN_MIGRATIONS:-true}}"
+    ALLOW_DATABASE_MIGRATION="${DEPLOY_ALLOW_DATABASE_MIGRATION:-${ALLOW_DATABASE_MIGRATION:-true}}"
     LOG_TAIL="${MTV_LOG_TAIL:-${LOG_TAIL:-200}}"
+    PRODUCTION_CORS_ORIGINS="${MTV_PRODUCTION_CORS_ORIGINS:-${PRODUCTION_CORS_ORIGINS:-[]}}"
+    API_BIND_ADDRESS="${MTV_PRODUCTION_API_BIND_ADDRESS:-${API_BIND_ADDRESS:-127.0.0.1}}"
+    BOOTSTRAP_ADMIN_ENABLED="${DEPLOY_BOOTSTRAP_ADMIN:-${BOOTSTRAP_ADMIN_ENABLED:-false}}"
+    BOOTSTRAP_ADMIN_USERNAME="${DEPLOY_BOOTSTRAP_ADMIN_USERNAME:-${BOOTSTRAP_ADMIN_USERNAME:-}}"
+    BOOTSTRAP_ADMIN_PASSWORD="${DEPLOY_BOOTSTRAP_ADMIN_PASSWORD:-${BOOTSTRAP_ADMIN_PASSWORD:-}}"
+    BOOTSTRAP_ADMIN_CREDITS="${DEPLOY_BOOTSTRAP_ADMIN_CREDITS:-${BOOTSTRAP_ADMIN_CREDITS:-1000000}}"
+    ALLOW_INSECURE_HTTP_SESSION="${DEPLOY_ALLOW_INSECURE_HTTP_SESSION:-${ALLOW_INSECURE_HTTP_SESSION:-false}}"
+    ENV_SYNC_MODE="${DEPLOY_SYNC_ENV:-${ENV_SYNC_MODE:-auto}}"
 }
 
 validate_scalar() {
@@ -225,6 +258,22 @@ validate_settings() {
     case "$RUN_MIGRATIONS" in true|false) ;; *) die "DEPLOY_RUN_MIGRATIONS 只能是 true 或 false" ;; esac
     case "$ALLOW_DATABASE_MIGRATION" in true|false) ;; *) die "DEPLOY_ALLOW_DATABASE_MIGRATION 只能是 true 或 false" ;; esac
     [[ "$LOG_TAIL" =~ ^[0-9]+$ ]] || die "MTV_LOG_TAIL 必须是非负整数"
+    [[ "$PRODUCTION_CORS_ORIGINS" != *$'\n'* && "$PRODUCTION_CORS_ORIGINS" != *$'\r'* ]] || die "MTV_PRODUCTION_CORS_ORIGINS 不能包含换行符"
+    [[ "$API_BIND_ADDRESS" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ || "$API_BIND_ADDRESS" == "::" ]] || die "MTV_PRODUCTION_API_BIND_ADDRESS 必须是 IPv4 地址或 ::"
+    if [[ "$API_BIND_ADDRESS" != "::" ]]; then
+        IFS=. read -r -a api_address_parts <<< "$API_BIND_ADDRESS"
+        for value in "${api_address_parts[@]}"; do
+            [[ "$value" =~ ^[0-9]+$ && "$value" -le 255 ]] || die "MTV_PRODUCTION_API_BIND_ADDRESS 不是有效 IPv4 地址"
+        done
+    fi
+    case "$BOOTSTRAP_ADMIN_ENABLED" in true|false) ;; *) die "DEPLOY_BOOTSTRAP_ADMIN 只能是 true 或 false" ;; esac
+    case "$ALLOW_INSECURE_HTTP_SESSION" in true|false) ;; *) die "DEPLOY_ALLOW_INSECURE_HTTP_SESSION 只能是 true 或 false" ;; esac
+    if [[ "$BOOTSTRAP_ADMIN_ENABLED" == true ]]; then
+        [[ "$BOOTSTRAP_ADMIN_USERNAME" =~ ^[A-Za-z0-9._-]{1,128}$ ]] || die "DEPLOY_BOOTSTRAP_ADMIN_USERNAME 格式无效"
+        [[ ${#BOOTSTRAP_ADMIN_PASSWORD} -ge 1 && ${#BOOTSTRAP_ADMIN_PASSWORD} -le 256 ]] || die "DEPLOY_BOOTSTRAP_ADMIN_PASSWORD 长度必须为 1-256"
+        [[ "$BOOTSTRAP_ADMIN_CREDITS" =~ ^[1-9][0-9]*$ && "$BOOTSTRAP_ADMIN_CREDITS" -le 2147483647 ]] || die "DEPLOY_BOOTSTRAP_ADMIN_CREDITS 必须是 1 到 2147483647 的整数"
+    fi
+    case "$ENV_SYNC_MODE" in auto|always|never) ;; *) die "DEPLOY_SYNC_ENV 只能是 auto、always 或 never" ;; esac
 }
 
 validate_logs_args() {
@@ -296,6 +345,187 @@ sha256_file() {
     fi
 }
 
+read_env_value() {
+    local file="$1"
+    local requested_key="$2"
+
+    awk -v requested_key="$requested_key" '
+        function normalize(line) {
+            sub(/^[[:space:]]+/, "", line)
+            sub(/^export[[:space:]]+/, "", line)
+            return line
+        }
+        {
+            line = normalize($0)
+            if (line !~ /^[A-Za-z_][A-Za-z0-9_]*=/) {
+                next
+            }
+            equal_at = index(line, "=")
+            key = substr(line, 1, equal_at - 1)
+            if (key != requested_key) {
+                next
+            }
+            found++
+            value = substr(line, equal_at + 1)
+        }
+        END {
+            if (found > 1) {
+                print "环境文件存在重复配置：" requested_key > "/dev/stderr"
+                exit 2
+            }
+            sub(/\r$/, "", value)
+            sub(/^[[:space:]]+/, "", value)
+            sub(/[[:space:]]+$/, "", value)
+            if ((value ~ /^".*"$/) || (value ~ /^\047.*\047$/)) {
+                value = substr(value, 2, length(value) - 2)
+            }
+            print value
+        }
+    ' "$file"
+}
+
+random_hex_32() {
+    if command -v openssl >/dev/null 2>&1; then
+        openssl rand -hex 32
+        return
+    fi
+    od -An -N32 -tx1 /dev/urandom | tr -d ' \n'
+}
+
+ensure_local_deploy_secrets() {
+    local state_dir="$ROOT_DIR/.runtime"
+    local secret_file="$state_dir/production-deploy-secrets.env"
+    local secret_temp="${secret_file}.tmp.$$"
+    local key value
+
+    mkdir -p -m 700 "$state_dir"
+    if [[ ! -f "$secret_file" ]]; then
+        umask 077
+        {
+            printf '# 生产部署基础设施密钥；禁止提交或公开。\n'
+            printf 'SESSION_SECRET=%s\n' "$(random_hex_32)"
+            printf 'MTV_POSTGRES_PASSWORD=%s\n' "$(random_hex_32)"
+            printf 'MTV_REDIS_PASSWORD=%s\n' "$(random_hex_32)"
+        } > "$secret_temp"
+        chmod 600 "$secret_temp"
+        mv -f "$secret_temp" "$secret_file"
+        info "已生成本地生产基础设施密钥（保存在被 Git 忽略的 .runtime 目录）"
+    fi
+    chmod 600 "$secret_file"
+    for key in SESSION_SECRET MTV_POSTGRES_PASSWORD MTV_REDIS_PASSWORD; do
+        value="$(read_env_value "$secret_file" "$key")"
+        [[ "$value" =~ ^[0-9a-f]{64}$ ]] || die "本地生产密钥文件中的 $key 无效；为保护既有数据，脚本不会自动覆盖"
+    done
+    LOCAL_SECRET_FILE="$secret_file"
+}
+
+set_env_value() {
+    local env_file="$1"
+    local key="$2"
+    local value="$3"
+    local temp_file
+
+    [[ "$value" != *$'\n'* && "$value" != *$'\r'* ]] || die "环境变量 $key 不能包含换行符"
+    temp_file="$(mktemp "${env_file}.tmp.XXXXXX")"
+    if ! awk -v requested_key="$key" -v replacement="$key=$value" '
+        function assignment_key(line, normalized, equal_at) {
+            normalized = line
+            sub(/^[[:space:]]+/, "", normalized)
+            sub(/^export[[:space:]]+/, "", normalized)
+            if (normalized !~ /^[A-Za-z_][A-Za-z0-9_]*=/) {
+                return ""
+            }
+            equal_at = index(normalized, "=")
+            return substr(normalized, 1, equal_at - 1)
+        }
+        {
+            key = assignment_key($0)
+            if (key == requested_key) {
+                count++
+                if (count == 1) {
+                    print replacement
+                }
+                next
+            }
+            print
+        }
+        END {
+            if (count > 1) {
+                print "环境文件存在重复配置：" requested_key > "/dev/stderr"
+                exit 2
+            }
+            if (count == 0) {
+                print replacement
+            }
+        }
+    ' "$env_file" > "$temp_file"; then
+        rm -f "$temp_file"
+        die "无法更新生产环境配置：$key"
+    fi
+    chmod 600 "$temp_file"
+    mv -f "$temp_file" "$env_file"
+}
+
+normalize_cors_origins() {
+    local origins="$1"
+
+    if [[ "$origins" == http://* || "$origins" == https://* ]]; then
+        [[ "$origins" != *'"'* && "$origins" != *'\\'* && "$origins" != *','* ]] || die "MTV_PRODUCTION_CORS_ORIGINS 格式无效"
+        origins="[\"$origins\"]"
+    fi
+    [[ "$origins" == \[*\] && "$origins" != *'*'* ]] || die "MTV_PRODUCTION_CORS_ORIGINS 必须是非通配符的 Origin 或 JSON 数组"
+    printf '%s' "$origins"
+}
+
+prepare_runtime_env() {
+    local stamp="$1"
+    local cors_origins postgres_password redis_password session_secret
+
+    [[ -f "$BACKEND_DIR/.env" ]] || die "缺少本地配置文件：$BACKEND_DIR/.env"
+    ensure_local_deploy_secrets
+    LOCAL_RUNTIME_ENV="/tmp/mtv-api-runtime-env-${stamp}.env"
+    [[ ! -e "$LOCAL_RUNTIME_ENV" ]] || die "临时生产环境文件已存在：$LOCAL_RUNTIME_ENV"
+    umask 077
+    : > "$LOCAL_RUNTIME_ENV"
+    chmod 600 "$LOCAL_RUNTIME_ENV"
+    cp "$BACKEND_DIR/.env" "$LOCAL_RUNTIME_ENV"
+
+    cors_origins="$(normalize_cors_origins "$PRODUCTION_CORS_ORIGINS")"
+    postgres_password="$(read_env_value "$LOCAL_SECRET_FILE" MTV_POSTGRES_PASSWORD)"
+    redis_password="$(read_env_value "$LOCAL_SECRET_FILE" MTV_REDIS_PASSWORD)"
+    session_secret="$(read_env_value "$LOCAL_SECRET_FILE" SESSION_SECRET)"
+
+    set_env_value "$LOCAL_RUNTIME_ENV" APP_ENV production
+    set_env_value "$LOCAL_RUNTIME_ENV" APP_HOST 0.0.0.0
+    set_env_value "$LOCAL_RUNTIME_ENV" APP_PORT 8000
+    set_env_value "$LOCAL_RUNTIME_ENV" CORS_ORIGINS "$cors_origins"
+    set_env_value "$LOCAL_RUNTIME_ENV" SESSION_SECRET "$session_secret"
+    set_env_value "$LOCAL_RUNTIME_ENV" SESSION_COOKIE_SECURE "$(if [[ "$ALLOW_INSECURE_HTTP_SESSION" == true ]]; then printf false; else printf true; fi)"
+    set_env_value "$LOCAL_RUNTIME_ENV" STORAGE_DRIVER oss
+    set_env_value "$LOCAL_RUNTIME_ENV" STORAGE_ROOT /var/lib/mtv/storage
+    set_env_value "$LOCAL_RUNTIME_ENV" MTV_ALLOW_LOCAL_STORAGE false
+    set_env_value "$LOCAL_RUNTIME_ENV" MTV_INSTALL_ALIYUN_OSS "$INSTALL_ALIYUN_OSS"
+    set_env_value "$LOCAL_RUNTIME_ENV" ALIYUN_OSS_DATA_MIGRATION_CONFIRMED true
+    set_env_value "$LOCAL_RUNTIME_ENV" ALIYUN_OSS_CANARY_CONFIRMED true
+    set_env_value "$LOCAL_RUNTIME_ENV" MTV_LEGACY_STORAGE_HOST_PATH "$DEPLOY_PATH/data/storage"
+    set_env_value "$LOCAL_RUNTIME_ENV" MTV_POSTGRES_USER mtv_app
+    set_env_value "$LOCAL_RUNTIME_ENV" MTV_POSTGRES_PASSWORD "$postgres_password"
+    set_env_value "$LOCAL_RUNTIME_ENV" MTV_POSTGRES_DB mtv
+    set_env_value "$LOCAL_RUNTIME_ENV" MTV_POSTGRES_DATA_DIR "$DEPLOY_PATH/data/postgres"
+    set_env_value "$LOCAL_RUNTIME_ENV" DATABASE_URL "postgresql+asyncpg://mtv_app:${postgres_password}@postgres:5432/mtv"
+    set_env_value "$LOCAL_RUNTIME_ENV" DATABASE_SYNC_URL "postgresql+psycopg2://mtv_app:${postgres_password}@postgres:5432/mtv"
+    set_env_value "$LOCAL_RUNTIME_ENV" MTV_REDIS_PASSWORD "$redis_password"
+    set_env_value "$LOCAL_RUNTIME_ENV" MTV_REDIS_DATA_DIR "$DEPLOY_PATH/data/redis"
+    set_env_value "$LOCAL_RUNTIME_ENV" REDIS_URL "redis://:${redis_password}@redis:6379/0"
+    set_env_value "$LOCAL_RUNTIME_ENV" CELERY_BROKER_URL "redis://:${redis_password}@redis:6379/1"
+    set_env_value "$LOCAL_RUNTIME_ENV" CELERY_RESULT_BACKEND "redis://:${redis_password}@redis:6379/2"
+    set_env_value "$LOCAL_RUNTIME_ENV" MTV_PRODUCTION_IMAGE "$IMAGE_NAME"
+    set_env_value "$LOCAL_RUNTIME_ENV" MTV_POSTGRES_IMAGE "$POSTGRES_IMAGE"
+    set_env_value "$LOCAL_RUNTIME_ENV" MTV_REDIS_IMAGE "$REDIS_IMAGE"
+    set_env_value "$LOCAL_RUNTIME_ENV" MTV_PRODUCTION_API_PORT 8000
+    set_env_value "$LOCAL_RUNTIME_ENV" MTV_PRODUCTION_API_BIND_ADDRESS "$API_BIND_ADDRESS"
+}
+
 validate_local_image() {
     local actual_platform
     actual_platform="$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$IMAGE_NAME" 2>/dev/null || true)"
@@ -325,6 +555,16 @@ build_backend_image() {
     validate_local_image
 }
 
+reuse_local_image() {
+    if [[ "${DEPLOY_REUSE_LOCAL_IMAGE:-false}" != true ]]; then
+        return 1
+    fi
+    require_local_docker
+    docker image inspect "$IMAGE_NAME" >/dev/null 2>&1 || die "DEPLOY_REUSE_LOCAL_IMAGE=true 但本地不存在镜像：$IMAGE_NAME"
+    validate_local_image
+    warn "按 DEPLOY_REUSE_LOCAL_IMAGE=true 复用本地已有镜像；请确认其已包含待部署代码"
+}
+
 prepare_dependency_archive() {
     local image="$1"
     local output_file="$2"
@@ -348,7 +588,7 @@ create_archives() {
     CODE_ARCHIVE="/tmp/mtv-api-code-${stamp}.tar.gz"
     IMAGE_ARCHIVE="/tmp/mtv-api-image-${stamp}.tar"
     LOCAL_BOOT="/tmp/mtv-api-boot-${stamp}.sh"
-    tar -czf "$CODE_ARCHIVE" \
+    COPYFILE_DISABLE=1 tar -czf "$CODE_ARCHIVE" \
         --exclude='backend/.git' \
         --exclude='backend/.venv' \
         --exclude='backend/storage' \
@@ -360,10 +600,23 @@ create_archives() {
         --exclude='backend/*.pyc' \
         --exclude='backend/*.pyo' \
         --exclude='backend/*.egg-info' \
+        --exclude='._*' \
+        --exclude='*/._*' \
+        --exclude='.DS_Store' \
+        --exclude='*/.DS_Store' \
         --exclude='*.env' \
         --exclude='*.env.*' \
         -C "$ROOT_DIR" backend
-    if tar -tzf "$CODE_ARCHIVE" | awk '/(^|\/)\.env($|\.)|(^|\/)[^/]*\.env$/ { found=1 } END { exit found ? 0 : 1 }'; then
+    if tar -tzf "$CODE_ARCHIVE" | awk '
+        {
+            count = split($0, parts, "/")
+            name = parts[count]
+            if (name == ".env" || name ~ /\.env$/ || name ~ /\.env\./) {
+                found = 1
+            }
+        }
+        END { exit found ? 0 : 1 }
+    '; then
         die "代码归档疑似包含环境文件，已中止上传"
     fi
 
@@ -382,8 +635,8 @@ create_archives() {
 
 cleanup_local_files() {
     local file
-    for file in "$CODE_ARCHIVE" "$IMAGE_ARCHIVE" "$POSTGRES_ARCHIVE" "$REDIS_ARCHIVE" "$LOCAL_BOOT"; do
-        [[ -n "$file" && -e "$file" ]] && rm -f -- "$file"
+    for file in "$CODE_ARCHIVE" "$IMAGE_ARCHIVE" "$POSTGRES_ARCHIVE" "$REDIS_ARCHIVE" "$LOCAL_BOOT" "$LOCAL_RUNTIME_ENV"; do
+        [[ -n "$file" && -e "$file" ]] && rm -f "$file"
     done
 }
 
@@ -391,7 +644,7 @@ prepare_auth() {
     local target="${DEPLOY_USER}@${DEPLOY_HOST}"
     [[ -n "$AUTH_MODE" ]] && return
 
-    if ssh -p "$DEPLOY_PORT" "${SSH_BASE_OPTS[@]}" -o BatchMode=yes "$target" -- true >/dev/null 2>&1; then
+    if ssh -p "$DEPLOY_PORT" "${SSH_BASE_OPTS[@]}" -o BatchMode=yes "$target" true >/dev/null 2>&1; then
         AUTH_MODE="key"
         ok "检测到 SSH 公钥免密登录"
         return
@@ -418,17 +671,23 @@ prepare_auth() {
 run_ssh() {
     local remote_command="$1"
     local target="${DEPLOY_USER}@${DEPLOY_HOST}"
+    local bash_command
+
+    # SSH 默认由登录 Shell 解析远端命令；该 Shell 可能是 dash，不支持
+    # pipefail。统一显式使用 Bash，并将完整命令作为单个安全参数传入。
+    quote_arg "$remote_command"
+    bash_command="bash -lc $QUOTED_ARG"
 
     case "$AUTH_MODE" in
         key)
-            ssh -p "$DEPLOY_PORT" "${SSH_BASE_OPTS[@]}" "$target" -- "$remote_command"
+            ssh -p "$DEPLOY_PORT" "${SSH_BASE_OPTS[@]}" "$target" "$bash_command"
             ;;
         sshpass)
             SSHPASS="$DEPLOY_PASSWORD" sshpass -e \
-                ssh -p "$DEPLOY_PORT" "${SSH_BASE_OPTS[@]}" "$target" -- "$remote_command"
+                ssh -p "$DEPLOY_PORT" "${SSH_BASE_OPTS[@]}" "$target" "$bash_command"
             ;;
         expect)
-            EXPECT_REMOTE_COMMAND="$remote_command" \
+            EXPECT_REMOTE_COMMAND="$bash_command" \
             DEPLOY_EXPECT_PASSWORD="$DEPLOY_PASSWORD" \
             DEPLOY_EXPECT_USER="$DEPLOY_USER" \
             DEPLOY_EXPECT_HOST="$DEPLOY_HOST" \
@@ -436,7 +695,7 @@ run_ssh() {
             expect <<'EXPECT_EOF'
 set timeout 1800
 set ssh_args [list ssh -p $env(DEPLOY_EXPECT_PORT) -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=30 -o ConnectTimeout=15]
-lappend ssh_args "$env(DEPLOY_EXPECT_USER)@$env(DEPLOY_EXPECT_HOST)" -- $env(EXPECT_REMOTE_COMMAND)
+lappend ssh_args "$env(DEPLOY_EXPECT_USER)@$env(DEPLOY_EXPECT_HOST)" $env(EXPECT_REMOTE_COMMAND)
 spawn {*}$ssh_args
 expect {
     -re {(?i)are you sure you want to continue connecting} { send "yes\r"; exp_continue }
@@ -491,9 +750,9 @@ EXPECT_EOF
 
 make_boot_script() {
     local remote_path_q env_file_q project_q compose_file_q image_q platform_q
-    local code_archive_q image_archive_q postgres_archive_q redis_archive_q
+    local code_archive_q image_archive_q postgres_archive_q redis_archive_q runtime_env_q runtime_env_sha_q sync_env_q
     local code_sha_q image_sha_q postgres_sha_q redis_sha_q postgres_image_q redis_image_q
-    local run_migrations_q allow_migration_q
+    local run_migrations_q allow_migration_q bootstrap_admin_q admin_username_q admin_password_q admin_credits_q
 
     quote_arg "$DEPLOY_PATH"; remote_path_q="$QUOTED_ARG"
     quote_arg "$REMOTE_ENV_FILE"; env_file_q="$QUOTED_ARG"
@@ -505,6 +764,7 @@ make_boot_script() {
     quote_arg "$IMAGE_ARCHIVE"; image_archive_q="$QUOTED_ARG"
     quote_arg "${POSTGRES_ARCHIVE:-}"; postgres_archive_q="$QUOTED_ARG"
     quote_arg "${REDIS_ARCHIVE:-}"; redis_archive_q="$QUOTED_ARG"
+    quote_arg "${LOCAL_RUNTIME_ENV:-}"; runtime_env_q="$QUOTED_ARG"
     quote_arg "$(sha256_file "$CODE_ARCHIVE")"; code_sha_q="$QUOTED_ARG"
     quote_arg "$(sha256_file "$IMAGE_ARCHIVE")"; image_sha_q="$QUOTED_ARG"
     if [[ -n "$POSTGRES_ARCHIVE" ]]; then
@@ -517,11 +777,25 @@ make_boot_script() {
     else
         redis_sha_q="''"
     fi
+    if [[ -n "$LOCAL_RUNTIME_ENV" ]]; then
+        quote_arg "$(sha256_file "$LOCAL_RUNTIME_ENV")"; runtime_env_sha_q="$QUOTED_ARG"
+        sync_env_q="true"
+    else
+        runtime_env_sha_q="''"
+        sync_env_q="false"
+    fi
     quote_arg "$POSTGRES_IMAGE"; postgres_image_q="$QUOTED_ARG"
     quote_arg "$REDIS_IMAGE"; redis_image_q="$QUOTED_ARG"
     quote_arg "$RUN_MIGRATIONS"; run_migrations_q="$QUOTED_ARG"
     quote_arg "$ALLOW_DATABASE_MIGRATION"; allow_migration_q="$QUOTED_ARG"
+    quote_arg "$BOOTSTRAP_ADMIN_ENABLED"; bootstrap_admin_q="$QUOTED_ARG"
+    quote_arg "$BOOTSTRAP_ADMIN_USERNAME"; admin_username_q="$QUOTED_ARG"
+    quote_arg "$BOOTSTRAP_ADMIN_PASSWORD"; admin_password_q="$QUOTED_ARG"
+    quote_arg "$BOOTSTRAP_ADMIN_CREDITS"; admin_credits_q="$QUOTED_ARG"
 
+    # 启动脚本在本次启用管理员初始化时会暂存一次性口令。先收紧 umask，
+    # 避免重定向创建文件到 chmod 前出现可被其他本机用户读取的窗口。
+    umask 077
     {
         printf '%s\n' '#!/usr/bin/env bash' 'set -Eeuo pipefail'
         printf 'REMOTE_PATH=%s\n' "$remote_path_q"
@@ -534,6 +808,9 @@ make_boot_script() {
         printf 'IMAGE_ARCHIVE=%s\n' "$image_archive_q"
         printf 'POSTGRES_ARCHIVE=%s\n' "$postgres_archive_q"
         printf 'REDIS_ARCHIVE=%s\n' "$redis_archive_q"
+        printf 'RUNTIME_ENV_CANDIDATE=%s\n' "$runtime_env_q"
+        printf 'RUNTIME_ENV_SHA256=%s\n' "$runtime_env_sha_q"
+        printf 'SYNC_ENV=%s\n' "$sync_env_q"
         printf 'CODE_SHA256=%s\n' "$code_sha_q"
         printf 'IMAGE_SHA256=%s\n' "$image_sha_q"
         printf 'POSTGRES_SHA256=%s\n' "$postgres_sha_q"
@@ -542,6 +819,10 @@ make_boot_script() {
         printf 'REDIS_IMAGE=%s\n' "$redis_image_q"
         printf 'RUN_MIGRATIONS=%s\n' "$run_migrations_q"
         printf 'ALLOW_DATABASE_MIGRATION=%s\n' "$allow_migration_q"
+        printf 'BOOTSTRAP_ADMIN_ENABLED=%s\n' "$bootstrap_admin_q"
+        printf 'BOOTSTRAP_ADMIN_USERNAME=%s\n' "$admin_username_q"
+        printf 'BOOTSTRAP_ADMIN_PASSWORD=%s\n' "$admin_password_q"
+        printf 'BOOTSTRAP_ADMIN_CREDITS=%s\n' "$admin_credits_q"
         cat <<'REMOTE_BOOT_BODY'
 
 info() { echo "[INFO] $*"; }
@@ -564,7 +845,7 @@ sha256_file() {
 
 cleanup() {
     local file
-    for file in "$CODE_ARCHIVE" "$IMAGE_ARCHIVE" "$POSTGRES_ARCHIVE" "$REDIS_ARCHIVE" "$0"; do
+    for file in "$CODE_ARCHIVE" "$IMAGE_ARCHIVE" "$POSTGRES_ARCHIVE" "$REDIS_ARCHIVE" "$RUNTIME_ENV_CANDIDATE" "$0"; do
         [[ -n "$file" && -e "$file" ]] && rm -f -- "$file"
     done
     if [[ -n "${STAGING_DIR:-}" && "$STAGING_DIR" == "${TMPDIR:-/tmp}"/mtv-api-staging.* && -d "$STAGING_DIR" ]]; then
@@ -576,8 +857,39 @@ trap cleanup EXIT
 command -v docker >/dev/null 2>&1 || die "远端未安装 Docker"
 docker compose version >/dev/null 2>&1 || die "远端 docker compose 不可用（需要 Compose V2）"
 docker info >/dev/null 2>&1 || die "远端 Docker 守护进程不可用"
-[[ -r "$REMOTE_ENV_FILE" ]] || die "远端环境文件不可读：$REMOTE_ENV_FILE"
 [[ -f "$CODE_ARCHIVE" && -f "$IMAGE_ARCHIVE" ]] || die "远端部署归档不完整"
+
+prepare_runtime_environment() {
+    local candidate="$1"
+    local target="$2"
+    local expected_sha="$3"
+    local target_dir backup temp
+
+    [[ -f "$candidate" ]] || die "待同步的生产环境文件不存在"
+    [[ "$(sha256_file "$candidate")" == "$expected_sha" ]] || die "生产环境文件 SHA-256 校验失败"
+    target_dir="$(dirname -- "$target")"
+    [[ -L "$target_dir" ]] && die "环境文件目录不能是符号链接：$target_dir"
+    mkdir -p -m 700 -- "$target_dir"
+    if [[ -e "$target" && -L "$target" ]]; then
+        die "环境文件不能是符号链接：$target"
+    fi
+    if [[ -f "$target" ]]; then
+        backup="${target}.before-$(date +%Y%m%d%H%M%S)"
+        cp -p -- "$target" "$backup"
+        chmod 600 "$backup"
+        info "已备份原服务器环境文件：$backup"
+    fi
+    temp="${target}.new.$$"
+    install -m 600 -- "$candidate" "$temp"
+    mv -f -- "$temp" "$target"
+    chmod 600 "$target"
+    ok "已同步生产环境文件：$target"
+}
+
+if [[ "$SYNC_ENV" == true ]]; then
+    prepare_runtime_environment "$RUNTIME_ENV_CANDIDATE" "$REMOTE_ENV_FILE" "$RUNTIME_ENV_SHA256"
+fi
+[[ -r "$REMOTE_ENV_FILE" ]] || die "远端环境文件不可读：$REMOTE_ENV_FILE"
 
 [[ "$(sha256_file "$CODE_ARCHIVE")" == "$CODE_SHA256" ]] || die "代码归档 SHA-256 校验失败"
 [[ "$(sha256_file "$IMAGE_ARCHIVE")" == "$IMAGE_SHA256" ]] || die "后端镜像归档 SHA-256 校验失败"
@@ -598,6 +910,9 @@ if [[ -L "$REMOTE_PATH" ]]; then
     die "远端代码目录不能是符号链接：$REMOTE_PATH"
 fi
 mkdir -p "$REMOTE_PATH"
+command -v flock >/dev/null 2>&1 || die "远端缺少 flock，无法阻止并发部署"
+exec 9>"$REMOTE_PATH/.deploy.lock"
+flock -n 9 || die "已有部署或迁移正在执行：$REMOTE_PATH/.deploy.lock"
 if [[ -e "$REMOTE_PATH/backend" && -L "$REMOTE_PATH/backend" ]]; then
     die "远端 backend 目录不能是符号链接：$REMOTE_PATH/backend"
 fi
@@ -706,6 +1021,118 @@ assert payload.get("env") in ("prod", "production"), payload
     die "API 未通过健康检查"
 }
 
+bootstrap_admin_and_credits() {
+    info "初始化管理员账号与积分账户"
+    printf '%s\n' "$BOOTSTRAP_ADMIN_PASSWORD" | compose_run --rm --no-deps -T \
+        -e "MTV_DEPLOY_ADMIN_USERNAME=$BOOTSTRAP_ADMIN_USERNAME" \
+        -e "MTV_DEPLOY_ADMIN_CREDITS=$BOOTSTRAP_ADMIN_CREDITS" \
+        --entrypoint python api -c '
+import asyncio
+import os
+import sys
+import uuid
+
+from sqlalchemy import select
+
+from app.core.database import async_session_factory
+from app.core.security import hash_password
+from app.models.credit import CreditAccount
+from app.models.credit_log import CreditLog
+from app.models.user import User
+
+USERNAME = os.environ["MTV_DEPLOY_ADMIN_USERNAME"]
+PASSWORD = sys.stdin.buffer.readline().decode("utf-8").rstrip("\n")
+CREDITS = int(os.environ["MTV_DEPLOY_ADMIN_CREDITS"])
+GRANT_NAMESPACE = uuid.UUID("de8d4ef3-8aae-49a0-a407-6c6ee006875d")
+
+if not 1 <= len(USERNAME) <= 128:
+    raise RuntimeError("管理员用户名长度必须为 1 到 128")
+if not 1 <= len(PASSWORD) <= 256:
+    raise RuntimeError("管理员密码长度必须为 1 到 256")
+if not 1 <= CREDITS <= 2_147_483_647:
+    raise RuntimeError("管理员初始积分必须为 1 到 2147483647")
+
+async def main() -> None:
+    async with async_session_factory() as db:
+        async with db.begin():
+            user = (
+                await db.execute(
+                    select(User).where(User.username == USERNAME).with_for_update()
+                )
+            ).scalar_one_or_none()
+            if user is None:
+                user = User(
+                    username=USERNAME,
+                    password_hash=hash_password(PASSWORD),
+                    enabled=True,
+                    is_admin=True,
+                    account_type="personal",
+                    can_manage_accounts=False,
+                    management_scope="none",
+                )
+                db.add(user)
+                await db.flush()
+                print("已创建管理员账号")
+            else:
+                print("管理员账号已存在，保留现有密码与权限")
+
+            account = (
+                await db.execute(
+                    select(CreditAccount)
+                    .where(
+                        CreditAccount.owner_type == "user",
+                        CreditAccount.owner_id == user.user_id,
+                    )
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if account is None:
+                account = CreditAccount(
+                    owner_type="user",
+                    owner_id=user.user_id,
+                    org_id=None,
+                    department_id=None,
+                    balance_points=0,
+                    frozen_points=0,
+                    status="active",
+                )
+                db.add(account)
+                await db.flush()
+
+            grant_key = str(uuid.uuid5(GRANT_NAMESPACE, user.user_id))
+            grant_exists = await db.scalar(
+                select(CreditLog.id).where(CreditLog.idempotency_key == grant_key)
+            )
+            if grant_exists is None:
+                account.balance_points += CREDITS
+                db.add(
+                    CreditLog(
+                        account_id=account.id,
+                        actor_user_id=user.user_id,
+                        actor_username=USERNAME,
+                        target_user_id=user.user_id,
+                        target_username=USERNAME,
+                        target_owner_type="user",
+                        target_owner_id=user.user_id,
+                        source_type="deployment_bootstrap",
+                        source_id=grant_key,
+                        idempotency_key=grant_key,
+                        log_type="grant",
+                        points_delta=CREDITS,
+                        frozen_delta=0,
+                        balance_after=account.balance_points,
+                        frozen_after=account.frozen_points,
+                        note="首次生产部署管理员初始积分",
+                    )
+                )
+                print(f"已向管理员账户授予 {CREDITS} 积分")
+            else:
+                print("管理员初始积分已处理，跳过重复授予")
+
+asyncio.run(main())
+'
+}
+
 assert_running() {
     local service="$1"
     compose ps --status running --services | grep -Fx -- "$service" >/dev/null || {
@@ -721,8 +1148,15 @@ if [[ "$RUN_MIGRATIONS" == true ]]; then
     wait_for_health postgres
     wait_for_health redis
     info "停止旧 API、worker、beat 后执行 Alembic 迁移"
-    compose stop api celery-worker celery-beat >/dev/null 2>&1 || true
+    compose stop api celery-worker celery-beat >/dev/null
+    migration_recovery_needed=true
+    trap 'if [[ "${migration_recovery_needed:-false}" == true ]]; then warn "迁移未完成，尝试恢复原有应用容器"; compose_up -d --no-build --remove-orphans api celery-worker celery-beat || true; fi' ERR
     compose_run --rm --no-deps migrate
+    if [[ "$BOOTSTRAP_ADMIN_ENABLED" == true ]]; then
+        bootstrap_admin_and_credits
+    fi
+    migration_recovery_needed=false
+    trap - ERR
 else
     warn "已跳过数据库迁移（DEPLOY_RUN_MIGRATIONS=false）"
 fi
@@ -754,6 +1188,7 @@ upload_and_deploy() {
     local remote_boot="/tmp/$(basename -- "$LOCAL_BOOT")"
     local remote_postgres=""
     local remote_redis=""
+    local remote_runtime_env=""
     local remote_command
 
     if [[ -n "$POSTGRES_ARCHIVE" ]]; then
@@ -761,6 +1196,9 @@ upload_and_deploy() {
     fi
     if [[ -n "$REDIS_ARCHIVE" ]]; then
         remote_redis="/tmp/$(basename -- "$REDIS_ARCHIVE")"
+    fi
+    if [[ -n "$LOCAL_RUNTIME_ENV" ]]; then
+        remote_runtime_env="/tmp/$(basename -- "$LOCAL_RUNTIME_ENV")"
     fi
 
     prepare_auth
@@ -780,6 +1218,10 @@ upload_and_deploy() {
     if [[ -n "$REDIS_ARCHIVE" ]]; then
         info "上传 Redis 镜像归档"
         run_scp "$REDIS_ARCHIVE" "$remote_redis"
+    fi
+    if [[ -n "$LOCAL_RUNTIME_ENV" ]]; then
+        info "上传生产环境文件（不会进入代码归档）"
+        run_scp "$LOCAL_RUNTIME_ENV" "$remote_runtime_env"
     fi
     info "上传远端部署启动脚本"
     run_scp "$LOCAL_BOOT" "$remote_boot"
@@ -823,7 +1265,7 @@ remote_compose_action() {
             remote_command="set -Eeuo pipefail; cd $path_q; test -r $env_q; export MTV_ENV_FILE=$env_q MTV_PRODUCTION_IMAGE=$image_q MTV_POSTGRES_IMAGE=$postgres_image_q MTV_REDIS_IMAGE=$redis_image_q; $prefix config --quiet; $prefix stop api celery-worker celery-beat postgres redis"
             ;;
         migrate)
-            remote_command="set -Eeuo pipefail; cd $path_q; test -r $env_q; export MTV_ENV_FILE=$env_q MTV_PRODUCTION_IMAGE=$image_q MTV_POSTGRES_IMAGE=$postgres_image_q MTV_REDIS_IMAGE=$redis_image_q; test \"${ALLOW_DATABASE_MIGRATION}\" = true || { echo '请设置 DEPLOY_ALLOW_DATABASE_MIGRATION=true，并确认已完成数据库备份' >&2; exit 1; }; docker image inspect $postgres_image_q >/dev/null 2>&1; docker image inspect $redis_image_q >/dev/null 2>&1; $prefix config --quiet; $prefix up --pull never -d --no-build postgres redis; $prefix run --pull never --rm --no-deps migrate"
+            remote_command="set -Eeuo pipefail; cd $path_q; test -r $env_q; export MTV_ENV_FILE=$env_q MTV_PRODUCTION_IMAGE=$image_q MTV_POSTGRES_IMAGE=$postgres_image_q MTV_REDIS_IMAGE=$redis_image_q; test \"${ALLOW_DATABASE_MIGRATION}\" = true || { echo '请设置 DEPLOY_ALLOW_DATABASE_MIGRATION=true，并确认已完成数据库备份' >&2; exit 1; }; command -v flock >/dev/null 2>&1 || { echo '远端缺少 flock，无法阻止并发迁移' >&2; exit 1; }; exec 9>$path_q/.deploy.lock; flock -n 9 || { echo '已有部署或迁移正在执行' >&2; exit 1; }; docker image inspect $image_q >/dev/null 2>&1; docker image inspect $postgres_image_q >/dev/null 2>&1; docker image inspect $redis_image_q >/dev/null 2>&1; $prefix config --quiet; $prefix up --pull never -d --no-build postgres redis; for service in postgres redis; do started=\$SECONDS; while :; do container=\$($prefix ps -q \"\$service\"); health=\$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}missing-healthcheck{{end}}' \"\$container\" 2>/dev/null || true); test \"\$health\" = healthy && break; test \"\$health\" != unhealthy && test \$((SECONDS-started)) -lt 180 || { $prefix logs --tail 100 \"\$service\" >&2 || true; exit 1; }; sleep 2; done; done; $prefix stop api celery-worker celery-beat; migration_recovery_needed=true; trap '$prefix up --pull never -d --no-build --remove-orphans api celery-worker celery-beat >/dev/null 2>&1 || true' ERR; $prefix run --pull never --rm --no-deps migrate; migration_recovery_needed=false; trap - ERR; $prefix up --pull never -d --no-build --force-recreate --remove-orphans api celery-worker celery-beat; $prefix ps postgres redis api celery-worker celery-beat"
             ;;
         logs)
             quote_arg "$LOG_TAIL"; local log_tail_q="$QUOTED_ARG"
@@ -842,7 +1284,27 @@ deploy() {
     [[ "$RUN_MIGRATIONS" != true || "$ALLOW_DATABASE_MIGRATION" == true ]] || {
         die "DEPLOY_RUN_MIGRATIONS=true 时必须同时设置 DEPLOY_ALLOW_DATABASE_MIGRATION=true，并确认已备份数据库"
     }
-    build_backend_image
+    case "$ENV_SYNC_MODE" in
+        always)
+            prepare_runtime_env "$stamp"
+            ;;
+        auto)
+            prepare_auth
+            quote_arg "$REMOTE_ENV_FILE"
+            local remote_env_q="$QUOTED_ARG"
+            # auto 永远不覆盖已存在的服务器 .env；其格式可含 export、引号或注释，
+            # 不能用脆弱的文本匹配决定是否替换。需要更新时请明确使用 sync-env/always。
+            if run_ssh "test ! -e $remote_env_q" >/dev/null 2>&1; then
+                info "远端环境文件不存在，生成首次生产配置"
+                prepare_runtime_env "$stamp"
+            fi
+            ;;
+        never)
+            ;;
+    esac
+    if ! reuse_local_image; then
+        build_backend_image
+    fi
     create_archives "$stamp"
     make_boot_script
     upload_and_deploy "$stamp"
@@ -850,6 +1312,24 @@ deploy() {
 
 build_only() {
     build_backend_image
+}
+
+sync_runtime_env() {
+    local stamp remote_candidate remote_boot
+
+    stamp="$(date +%Y%m%d%H%M%S)-$$"
+    trap cleanup_local_files EXIT
+    prepare_runtime_env "$stamp"
+    prepare_auth
+    quote_arg "$DEPLOY_PATH"
+    run_ssh "mkdir -p $QUOTED_ARG"
+    remote_candidate="/tmp/$(basename -- "$LOCAL_RUNTIME_ENV")"
+    run_scp "$LOCAL_RUNTIME_ENV" "$remote_candidate"
+    quote_arg "$remote_candidate"; local candidate_q="$QUOTED_ARG"
+    quote_arg "$REMOTE_ENV_FILE"; local env_q="$QUOTED_ARG"
+    quote_arg "$(sha256_file "$LOCAL_RUNTIME_ENV")"; local sha_q="$QUOTED_ARG"
+    run_ssh "set -Eeuo pipefail; candidate=$candidate_q; target=$env_q; test -f \"\$candidate\"; if command -v sha256sum >/dev/null 2>&1; then actual=\$(sha256sum \"\$candidate\" | awk '{print \$1}'); elif command -v shasum >/dev/null 2>&1; then actual=\$(shasum -a 256 \"\$candidate\" | awk '{print \$1}'); else actual=\$(openssl dgst -sha256 \"\$candidate\" | awk '{print \$NF}'); fi; test \"\$actual\" = $sha_q; dir=\$(dirname -- \"\$target\"); test ! -L \"\$dir\"; mkdir -p -m 700 -- \"\$dir\"; test ! -L \"\$target\"; if test -f \"\$target\"; then backup=\"\${target}.before-\$(date +%Y%m%d%H%M%S)\"; cp -p -- \"\$target\" \"\$backup\"; chmod 600 \"\$backup\"; fi; install -m 600 -- \"\$candidate\" \"\${target}.new.\$$\"; mv -f -- \"\${target}.new.\$$\" \"\$target\"; rm -f -- \"\$candidate\""
+    ok "生产环境文件已同步到：$REMOTE_ENV_FILE"
 }
 
 parse_options "$@"
@@ -870,6 +1350,10 @@ case "$ACTION" in
     start|restart|migrate|status|stop)
         [[ ${#ACTION_ARGS[@]} -eq 0 ]] || die "$ACTION 不接受额外参数"
         remote_compose_action "$ACTION"
+        ;;
+    sync-env)
+        [[ ${#ACTION_ARGS[@]} -eq 0 ]] || die "sync-env 不接受额外参数"
+        sync_runtime_env
         ;;
     logs)
         remote_compose_action logs "${ACTION_ARGS[@]}"

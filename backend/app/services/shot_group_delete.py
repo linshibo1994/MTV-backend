@@ -30,7 +30,7 @@ from app.services.storage_references import (
 from app.services.task_dispatch import cancel_outbox_task
 from app.services.video_cleanup_policy import has_retryable_video_cleanup_debt
 
-_ACTIVE_VIDEO_STATUSES = frozenset({"starting", "processing"})
+_ACTIVE_VIDEO_STATUSES = frozenset({"waiting_dependency", "starting", "processing"})
 _TERMINAL_VIDEO_STATUSES = frozenset({"succeeded", "failed", "canceled"})
 _ACTIVE_TIMELINE_STATUSES = frozenset({"pending", "ready", "retry", "starting", "processing"})
 

@@ -258,16 +258,16 @@ async def _cleanup_database(url: str) -> None:
 
 
 @asynccontextmanager
-async def _isolated_migration(url: str) -> AsyncIterator[None]:
+async def _isolated_migration(url: str) -> AsyncIterator[str]:
     _run_alembic(url, "upgrade", "head")
-    assert await _database_revision(url) == _REVISION
+    restore_revision = await _database_revision(url)
     await _cleanup_database(url)
     try:
-        yield
+        yield restore_revision
     finally:
         await _cleanup_database(url)
         _run_alembic(url, "upgrade", "head")
-        assert await _database_revision(url) == _REVISION
+        assert await _database_revision(url) == restore_revision
 
 
 @pytest.mark.asyncio
@@ -357,7 +357,7 @@ async def test_mgrouter_downgrade_fails_closed_without_deleting_data(
     mgrouter_row: str,
 ) -> None:
     url = _database_url()
-    async with _isolated_migration(url):
+    async with _isolated_migration(url) as restore_revision:
         connection = await asyncpg.connect(_asyncpg_dsn(url))
         try:
             if mgrouter_row == "provider_config":
@@ -386,7 +386,7 @@ async def test_mgrouter_downgrade_fails_closed_without_deleting_data(
         assert "存在 mgrouter 视频供应商数据，拒绝降级以避免数据丢失" in (
             result.stdout + result.stderr
         )
-        assert await _database_revision(url) == _REVISION
+        assert await _database_revision(url) == restore_revision
 
         connection = await asyncpg.connect(_asyncpg_dsn(url))
         try:

@@ -99,6 +99,7 @@ class SubjectAssetOut(BaseModel):
     subject_type: str  # 统一为 background（scene 归一）
     subject_type_label: str  # 中文标签，background -> "场景"
     subject_description: str | None = None
+    visual_style: Literal["live_action", "anime"] | None = None
     design_prompt: str | None = None
     design_prompt_source: str | None = None
     design_prompt_version: int | None = None
@@ -159,6 +160,7 @@ class SubjectCreateIn(BaseModel):
         min_length=1,
         max_length=1_000,
     )
+    visual_style: Literal["live_action", "anime"] | None = None
 
     @field_validator("name", "description")
     @classmethod
@@ -194,6 +196,7 @@ class SubjectUpdateIn(BaseModel):
     name_locked: bool | None = None
     description_locked: bool | None = None
     expected_subject_version: int | None = Field(default=None, ge=1)
+    visual_style: Literal["live_action", "anime"] | None = None
 
     @field_validator("name", "description")
     @classmethod

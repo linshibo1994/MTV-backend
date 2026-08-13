@@ -1415,6 +1415,7 @@ async def _fail_video_with_release(
     if not await video_crud.heartbeat_video_job(db, job_id, lease_token):
         await db.rollback()
         return
+
     release_failed = bool(reservation_id and _credits_release is None)
     if reservation_id and _credits_release is not None:
         try:
@@ -1432,7 +1433,12 @@ async def _fail_video_with_release(
             if not await video_crud.heartbeat_video_job(db, job_id, lease_token):
                 await db.rollback()
                 return
-    final_error_type = "financial_cleanup" if release_failed or error_type == "financial_cleanup" else error_type
+            # rollback 会撤销本事务内的前驱终态前修改；重新读取权威行并继续。
+    final_error_type = (
+        "financial_cleanup"
+        if release_failed or error_type == "financial_cleanup"
+        else error_type
+    )
     final_error_message = (
         error_message
         if error_message and final_error_type == error_type
@@ -1450,9 +1456,366 @@ async def _fail_video_with_release(
         retryable=retryable or release_failed or final_error_type == "financial_cleanup",
     )
     if finished:
+        await _resolve_continuation_dependents(
+            db,
+            job_id,
+            last_frame_storage_key=None,
+            succeeded=False,
+        )
         await db.commit()
     else:
         await db.rollback()
+
+
+async def _resolve_continuation_dependents(
+    db: Any,
+    predecessor_job_id: str,
+    *,
+    last_frame_storage_key: str | None,
+    succeeded: bool,
+) -> int:
+    """在前驱终态事务中唤醒或失败所有等待子任务。
+
+    子任务等待期间没有 Worker lease，也没有 Outbox 记录；成功时才事务性创建
+    ``video.generate`` Outbox。失败路径以任务行锁和 reservation 状态保证只释放一次。
+    """
+    from sqlalchemy import select
+    from sqlalchemy.orm import noload
+
+    from app.crud import video as video_crud
+    from app.models.shot_group import ShotGroup
+    from app.models.video_generation_job import VideoGenerationJob
+    from app.services.task_dispatch import enqueue_task
+
+    predecessor = (
+        await db.execute(
+            select(VideoGenerationJob)
+            .where(VideoGenerationJob.job_id == predecessor_job_id)
+            .options(noload(VideoGenerationJob.script))
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if predecessor is None:
+        return 0
+    predecessor_group = await db.get(ShotGroup, predecessor.shot_group_id)
+    if predecessor_group is None:
+        return 0
+    dependents = list(
+        (
+            await db.execute(
+                select(VideoGenerationJob)
+                .where(
+                    VideoGenerationJob.predecessor_job_id == predecessor_job_id,
+                    VideoGenerationJob.status == "waiting_dependency",
+                )
+                .options(noload(VideoGenerationJob.script))
+                .order_by(VideoGenerationJob.created_at.asc())
+                .with_for_update()
+            )
+        )
+        .scalars()
+        .all()
+    )
+    resolved = 0
+    for child in dependents:
+        child_group = await db.get(ShotGroup, child.shot_group_id)
+        if (
+            child_group is None
+            or child.script_id != predecessor.script_id
+            or child.episode_id != predecessor.episode_id
+            or child.scene_no != predecessor.scene_no
+            or predecessor_group.script_id != child.script_id
+            or predecessor_group.episode_id != child.episode_id
+            or predecessor_group.scene_no != child.scene_no
+            or int(child_group.group_index or 0) <= 1
+            or int(predecessor_group.group_index or 0)
+            != int(child_group.group_index or 0) - 1
+        ):
+            continue
+        dependency = dict((child.input_json or {}).get("continuation_dependency") or {})
+        frozen_predecessor_group_id = dependency.get("predecessor_shot_group_id")
+        if frozen_predecessor_group_id not in {None, predecessor_group.shot_group_id}:
+            continue
+        frozen_fallback = dependency.get("static_fallback_frame")
+        static_fallback = (
+            frozen_fallback.strip()
+            if isinstance(frozen_fallback, str) and frozen_fallback.strip()
+            else None
+        )
+        if static_fallback is None:
+            # 兼容上线前已处于 waiting_dependency 的任务。解析仅查看当前组
+            # 静态帧与同场景直接前驱的静态尾帧，绝不读取旧视频 Job 产物。
+            from app.services.video_generation import _resolve_continuation_static_fallback
+
+            static_fallback = await _resolve_continuation_static_fallback(db, child_group)
+        real_tail = (
+            last_frame_storage_key.strip()
+            if succeeded
+            and isinstance(last_frame_storage_key, str)
+            and last_frame_storage_key.strip()
+            else None
+        )
+        resolved_first_frame = real_tail or static_fallback
+        if resolved_first_frame:
+            frame_source = "real_tail" if real_tail is not None else "static_fallback"
+            activated = await video_crud.activate_waiting_dependency_job(
+                db,
+                child.job_id,
+                predecessor_job_id=predecessor_job_id,
+                first_frame=resolved_first_frame,
+                frame_source=frame_source,
+                predecessor_terminal_succeeded=succeeded,
+            )
+            if activated is None:
+                continue
+            reference_frames = dict(child_group.reference_frames or {})
+            reference_frames["first_frame"] = resolved_first_frame
+            child_group.reference_frames = reference_frames
+            dispatch = await enqueue_task(
+                db,
+                task_type="video.generate",
+                job_id=child.job_id,
+                attempt=child.attempt,
+                payload={
+                    "job_id": child.job_id,
+                    "script_id": child.script_id,
+                    "episode_id": child.episode_id,
+                    "shot_group_id": child.shot_group_id,
+                    "input_version": child.input_version,
+                },
+            )
+            child.dispatch_id = dispatch.id
+            resolved += 1
+            continue
+
+        reservation_id = child.reservation_id or (child.input_json or {}).get("reservation_id")
+        release_failed = bool(reservation_id and _credits_release is None)
+        if reservation_id and _credits_release is not None:
+            try:
+                await _credits_release(
+                    db,
+                    reservation_id=reservation_id,
+                    reason="dependency_unavailable",
+                    actor_user_id=child.owner_user_id,
+                    commit=False,
+                )
+            except Exception:  # noqa: BLE001 - 不得回滚已完成的前驱终态
+                logger.exception(
+                    "续帧依赖不可用后释放积分失败 child_job_id=%s",
+                    child.job_id,
+                )
+                # credits.release 在 commit=False 时不会自行回滚；与既有视频失败
+                # 闭环一致，标财务清理债务，由 reconciler 按 reservation 权威事实接管。
+                release_failed = True
+        failed = await video_crud.fail_waiting_dependency_job(
+            db,
+            child.job_id,
+            predecessor_job_id=predecessor_job_id,
+            release_failed=release_failed,
+        )
+        if failed is not None:
+            resolved += 1
+            # 多级续帧链必须逐层终止，不能让孙任务永久停在 waiting_dependency。
+            await _resolve_continuation_dependents(
+                db,
+                child.job_id,
+                last_frame_storage_key=None,
+                succeeded=False,
+            )
+    return resolved
+
+
+async def _reconcile_waiting_video_dependency(
+    db: Any,
+    child_job_id: str,
+) -> bool:
+    """补偿一个 waiting_dependency，只信任同场景、group_index-1 的前驱任务。"""
+
+    from sqlalchemy import select
+    from sqlalchemy.orm import noload
+
+    from app.crud import video as video_crud
+    from app.models.shot_group import ShotGroup
+    from app.models.video_generation_job import VideoGenerationJob
+
+    child = (
+        await db.execute(
+            select(VideoGenerationJob)
+            .where(
+                VideoGenerationJob.job_id == child_job_id,
+                VideoGenerationJob.status == "waiting_dependency",
+            )
+            .options(noload(VideoGenerationJob.script))
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if child is None:
+        return False
+    child_group = await db.get(ShotGroup, child.shot_group_id)
+    if child_group is None or int(child_group.group_index or 0) <= 1:
+        # 缺组或首组的历史异常无法在扫描中安全推断，保守保持等待。
+        return False
+    direct_group = (
+        await db.execute(
+            select(ShotGroup).where(
+                ShotGroup.script_id == child.script_id,
+                ShotGroup.episode_id == child.episode_id,
+                ShotGroup.scene_no == child.scene_no,
+                ShotGroup.group_index == int(child_group.group_index) - 1,
+            )
+        )
+    ).scalar_one_or_none()
+    if direct_group is None:
+        return False
+
+    dependency = dict((child.input_json or {}).get("continuation_dependency") or {})
+    frozen_predecessor_group_id = dependency.get("predecessor_shot_group_id")
+    if frozen_predecessor_group_id not in {None, direct_group.shot_group_id}:
+        # 冻结拓扑与当前严格前驱冲突时不猜测、不越过中间镜头组。
+        return False
+
+    predecessor: VideoGenerationJob | None = None
+    if child.predecessor_job_id is not None:
+        predecessor = (
+            await db.execute(
+                select(VideoGenerationJob)
+                .where(VideoGenerationJob.job_id == child.predecessor_job_id)
+                .options(noload(VideoGenerationJob.script))
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        if (
+            predecessor is None
+            or predecessor.script_id != child.script_id
+            or predecessor.episode_id != child.episode_id
+            or predecessor.scene_no != child.scene_no
+            or predecessor.shot_group_id != direct_group.shot_group_id
+        ):
+            return False
+    else:
+        predecessor = (
+            await db.execute(
+                select(VideoGenerationJob)
+                .where(
+                    VideoGenerationJob.script_id == child.script_id,
+                    VideoGenerationJob.episode_id == child.episode_id,
+                    VideoGenerationJob.scene_no == child.scene_no,
+                    VideoGenerationJob.shot_group_id == direct_group.shot_group_id,
+                )
+                .options(noload(VideoGenerationJob.script))
+                .order_by(
+                    VideoGenerationJob.attempt.desc(),
+                    VideoGenerationJob.created_at.desc(),
+                )
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if predecessor is None:
+            # 批量乱序创建仍可能尚未创建前驱任务，下一轮再判定。
+            return False
+        child = await video_crud.bind_waiting_dependency_job(
+            db,
+            child.job_id,
+            predecessor_job_id=predecessor.job_id,
+            predecessor_shot_group_id=direct_group.shot_group_id,
+        )
+        if child is None:
+            return False
+
+    if predecessor.status not in {"succeeded", "failed", "canceled"}:
+        return False
+    tail = (predecessor.output_json or {}).get("last_frame_storage_key")
+    last_frame_storage_key = tail.strip() if isinstance(tail, str) and tail.strip() else None
+    return bool(
+        await _resolve_continuation_dependents(
+            db,
+            predecessor.job_id,
+            last_frame_storage_key=last_frame_storage_key,
+            succeeded=predecessor.status == "succeeded",
+        )
+    )
+
+
+async def reconcile_waiting_video_dependencies(
+    db: Any,
+    *,
+    limit: int = 50,
+) -> list[str]:
+    """周期扫描依赖等待任务；每个 child 独立事务，单行异常不阻塞整批。"""
+
+    from app.crud import video as video_crud
+
+    if not callable(getattr(db, "execute", None)):
+        return []
+    candidates = await video_crud.list_waiting_dependency_jobs(db, limit=limit)
+    candidate_ids = [row.job_id for row in candidates]
+    # 释放列表查询事务和 ORM 快照；后续每个 child 都重新判权并提交。
+    await db.rollback()
+    recovered: list[str] = []
+    for child_job_id in candidate_ids:
+        try:
+            if await _reconcile_waiting_video_dependency(db, child_job_id):
+                await db.commit()
+                recovered.append(child_job_id)
+            else:
+                await db.rollback()
+        except Exception as exc:  # noqa: BLE001 - 下一轮继续补偿，不扩大故障面
+            await _best_effort_rollback(
+                db,
+                job_id=child_job_id,
+                stage="waiting_dependency_reconcile",
+            )
+            logger.exception(
+                "续帧依赖补偿失败，保留等待状态 child_job_id=%s error_type=%s",
+                child_job_id,
+                exc.__class__.__name__,
+            )
+    return recovered
+
+
+async def _resolve_continuation_dependents_best_effort(
+    db: Any,
+    predecessor_job_id: str,
+    *,
+    last_frame_storage_key: str | None,
+    succeeded: bool,
+) -> int:
+    """非关键后置处理；失败不得把前驱已确定的终态反转。
+
+    Worker 测试可注入只实现提交/回滚的最小会话，此时没有可查询的依赖行，
+    直接跳过。真实会话异常则记录风险并交给依赖补偿扫描处理；调用方仍可提交
+    已完成的视频终态与积分结算。
+    """
+
+    if not callable(getattr(db, "execute", None)):
+        logger.debug(
+            "视频会话不支持依赖查询，跳过续帧后置处理 job_id=%s",
+            predecessor_job_id,
+        )
+        return 0
+    try:
+        resolved = await _resolve_continuation_dependents(
+            db,
+            predecessor_job_id,
+            last_frame_storage_key=last_frame_storage_key,
+            succeeded=succeeded,
+        )
+        await db.commit()
+        return resolved
+    except Exception as exc:  # noqa: BLE001 - 前驱终态和已结算产物优先
+        await _best_effort_rollback(
+            db,
+            job_id=predecessor_job_id,
+            stage="continuation_dependency_followup",
+        )
+        logger.exception(
+            "续帧依赖后置处理失败，保留前驱终态等待补偿 job_id=%s "
+            "succeeded=%s error_type=%s",
+            predecessor_job_id,
+            succeeded,
+            exc.__class__.__name__,
+        )
+        return 0
 
 
 async def run_video_generation_once(
@@ -1798,7 +2161,14 @@ async def run_video_generation_once(
             job_id,
             claim.lease_token,
             "succeeded",
-            output_json=output_json,
+            output_json={
+                **output_json,
+                **(
+                    {"last_frame_storage_key": last_frame_storage_key}
+                    if last_frame_storage_key
+                    else {}
+                ),
+            },
             metrics=metrics,
         )
         if not finished:
@@ -1820,6 +2190,12 @@ async def run_video_generation_once(
             return
         final_commit_attempted = True
         await db.commit()
+        await _resolve_continuation_dependents_best_effort(
+            db,
+            job_id,
+            last_frame_storage_key=last_frame_storage_key,
+            succeeded=True,
+        )
     except (SoftTimeLimitExceeded, TimeLimitExceeded):
         await _best_effort_rollback(
             db,
@@ -2243,6 +2619,12 @@ async def _resolve_execution_first_frame(db: Any, job: Any, input_json: dict) ->
 
     from app.models.shot_group import ShotGroup
     from app.services.video_generation import _resolve_first_frame
+
+    # 续帧任务必须使用与 predecessor_job_id 同事务冻结的真实尾帧，不能在排队后
+    # 被前驱的更晚 attempt 或人工编辑悄悄替换。
+    if input_json.get("is_continuation") is True:
+        frozen_first_frame = input_json.get("first_frame")
+        return frozen_first_frame if isinstance(frozen_first_frame, str) else None
 
     shot_group = (
         await db.execute(
@@ -3676,10 +4058,16 @@ async def reconcile_stale_video_jobs(db: Any, *, limit: int = 50) -> list[str]:
         provider_submission_requires_manual_review,
     )
 
-    await reconcile_video_attempt_cleanup_debts(db, limit=limit)
+    if callable(getattr(db, "execute", None)):
+        await reconcile_video_attempt_cleanup_debts(db, limit=limit)
+    waiting_recovered = (
+        await reconcile_waiting_video_dependencies(db, limit=limit)
+        if callable(getattr(db, "rollback", None))
+        else []
+    )
     current = datetime.now(UTC)
     stale = await video_crud.list_stale_processing_jobs(db, lease_seconds=_LEASE_SECONDS, limit=limit)
-    recovered: list[str] = []
+    recovered: list[str] = list(waiting_recovered)
     for job in stale:
         provider_key = str(getattr(job, "provider_key", "") or "")
         attempt = int(getattr(job, "attempt", 0) or 0)

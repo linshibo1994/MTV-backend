@@ -10,12 +10,23 @@ GPT image 模型恒返回 b64_json（无 url 回退）。size 档位用 1536x102
 from __future__ import annotations
 
 import base64
-from typing import Literal
+from typing import Literal, cast
 
-from openai import AsyncOpenAI
+from openai import (
+    AsyncOpenAI,
+    BadRequestError,
+    ContentFilterFinishReasonError,
+    UnprocessableEntityError,
+)
 
 from app.core.config import settings
-from app.providers.image_gen import ImageResult, prompt_with_negative_constraints
+from app.providers.image_gen import (
+    ImageResult,
+    ImageSafetyCategory,
+    ImageSafetyRejectedError,
+    classify_image_safety_code,
+    prompt_with_negative_constraints,
+)
 from app.providers.registry import ProviderConfigurationError
 
 OpenAIImageSize = Literal[
@@ -90,12 +101,38 @@ class OpenAIImageGenProvider:
         n = max(count, 1)
         effective_prompt = prompt_with_negative_constraints(prompt, negative_prompt)
         try:
-            resp = await client.images.generate(
-                model=use_model,
-                prompt=effective_prompt,
-                size=openai_size,
-                n=n,
-            )
+            try:
+                resp = await client.images.generate(
+                    model=use_model,
+                    prompt=effective_prompt,
+                    size=openai_size,
+                    n=n,
+                )
+            except ContentFilterFinishReasonError:
+                raise ImageSafetyRejectedError(
+                    provider="openai",
+                    category=ImageSafetyCategory.SAFETY,
+                    code="content_filter",
+                ) from None
+            except (BadRequestError, UnprocessableEntityError) as exc:
+                body = cast(dict[str, object], exc.body) if isinstance(exc.body, dict) else {}
+                raw_error = body.get("error")
+                error = (
+                    cast(dict[str, object], raw_error)
+                    if isinstance(raw_error, dict)
+                    else body
+                )
+                classification = classify_image_safety_code(error.get("code"))
+                if classification is None:
+                    classification = classify_image_safety_code(error.get("type"))
+                if classification is None:
+                    raise
+                category, code = classification
+                raise ImageSafetyRejectedError(
+                    provider="openai",
+                    category=category,
+                    code=code,
+                ) from None
         finally:
             await client.close()
 

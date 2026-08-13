@@ -147,12 +147,42 @@ def include_first_frame(references: AggregatedReferences, first_frame: str | Non
         return
     if any(image.get("storage_key") == first_frame for image in references.reference_images):
         return
+    if len(references.reference_image_refs) != len(references.reference_images):
+        references.reference_image_refs = [
+            {
+                "token": f"图{index}",
+                "ref": None,
+                "name": (
+                    references.reference_image_names[index - 1]
+                    if index <= len(references.reference_image_names)
+                    else f"参考图{index}"
+                ),
+                "category": (
+                    references.reference_image_categories[index - 1]
+                    if index <= len(references.reference_image_categories)
+                    else "other"
+                ),
+                "subject_id": None,
+                "asset_entry_id": None,
+            }
+            for index in range(1, len(references.reference_images) + 1)
+        ]
     references.reference_images.insert(0, {
         "kind": "storage", "storage_key": first_frame, "mime_type": "image/png",
         "size_bytes": None, "sha256": hashlib.sha256(first_frame.encode()).hexdigest(),
     })
     references.reference_image_names.insert(0, "首帧参考")
     references.reference_image_categories.insert(0, "first_frame")
+    references.reference_image_refs.insert(0, {
+        "token": "图1",
+        "ref": None,
+        "name": "首帧参考",
+        "category": "first_frame",
+        "subject_id": None,
+        "asset_entry_id": None,
+    })
+    for index, reference in enumerate(references.reference_image_refs, start=1):
+        reference["token"] = f"图{index}"
 
 
 def current_audit_state(stored: dict | None, references: AggregatedReferences) -> dict:

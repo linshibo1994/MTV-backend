@@ -22,6 +22,7 @@ from app.services.reference_image_audit import (
     audit_references,
     current_audit_state,
     ensure_references_approved,
+    include_first_frame,
     public_audit_state,
     reference_image_hash,
 )
@@ -77,6 +78,26 @@ def test_reference_image_audit_without_images_does_not_block() -> None:
     references = AggregatedReferences()
     assert current_audit_state({}, references)["status"] == "not_required"
     assert ensure_references_approved({}, references)["status"] == "not_required"
+
+
+def test_include_first_frame_rebinds_tokens_to_final_image_order() -> None:
+    references = _references()
+    references.reference_image_names = ["阿明"]
+    references.reference_image_categories = ["character"]
+    references.reference_image_refs = [
+        {
+            "token": "图1",
+            "ref": "C01",
+            "name": "阿明",
+            "category": "character",
+            "subject_id": "subject-1",
+            "asset_entry_id": "asset-1",
+        }
+    ]
+    include_first_frame(references, "frames/previous.png")
+    assert [item["token"] for item in references.reference_image_refs] == ["图1", "图2"]
+    assert references.reference_image_refs[0]["category"] == "first_frame"
+    assert references.reference_image_refs[1]["ref"] == "C01"
 
 
 async def test_local_reference_audit_reports_missing_public_url(monkeypatch) -> None:

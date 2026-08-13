@@ -35,15 +35,22 @@ from app.core.errors import BadRequestError, ConflictError, ForbiddenError
 from app.crud import video as video_crud
 from app.models.episode import Episode
 from app.models.script import Script
+from app.models.shot import Shot
 from app.models.shot_group import ShotGroup, shot_group_content_hash
 from app.models.video_generation_job import (
     VIDEO_IDEMPOTENCY_KEY_MAX_LENGTH,
     is_video_job_manual_review,
 )
+from app.providers.prompt_adapter import PromptAdaptationError, adapt_prompt
 from app.providers.video_gen import (
     VideoCancellationOutcome,
     VideoCancellationResult,
     get_video_provider,
+)
+from app.services.prompt_template import (
+    PromptTemplateSnapshot,
+    render_prompt_template_with_fallback,
+    resolve_prompt_template,
 )
 from app.services.reference_aggregator import aggregate_references
 from app.services.reference_image_audit import (
@@ -51,8 +58,10 @@ from app.services.reference_image_audit import (
     ensure_references_approved,
     include_first_frame,
 )
+from app.services.reference_tokens import bind_reference_tokens_to_prompt
 from app.services.runtime_models import resolve_video_model
 from app.services.task_dispatch import cancel_outbox_task, enqueue_task
+from app.services.video_prompt import append_boundary_facts, compose_video_prompt
 from app.services.video_remote_cancellation import (
     merge_pending_provider_cancellation,
     merge_video_task_checkpoint_lease_authority,
@@ -198,9 +207,7 @@ async def create_video_job(
     if shot_group.unit_id != unit_id:
         raise ConflictError("请先完成镜头组合并，再创建视频生成任务")
 
-    prompt_text = _ensure_constraint_lock(
-        client_prompt if client_prompt is not None else shot_group.prompt or ""
-    )
+    base_prompt = client_prompt if client_prompt is not None else shot_group.prompt or ""
 
     # 等待镜头组锁期间，另一个事务可能已建立同 key 映射，锁后必须重新读取。
     existing = await _resolve_idempotent_job(
@@ -212,8 +219,15 @@ async def create_video_job(
     active_job = await video_crud.find_active_job_by_unit(db, unit_id)
     if active_job is not None:
         active_input = active_job.input_json or {}
-        active_prompt = active_input.get("prompt")
-        if client_prompt is not None and active_prompt != prompt_text:
+        active_source_prompt = active_input.get("base_prompt")
+        if active_source_prompt is None:
+            active_source_prompt = active_input.get("source_prompt")
+        if active_source_prompt is None:
+            active_source_prompt = active_input.get("prompt")
+        if client_prompt is not None and not _prompt_contains_base(
+            active_source_prompt,
+            base_prompt,
+        ):
             raise ConflictError("该镜头组已有使用不同提示词的生成任务，请等待完成或取消后重试")
         if style_id is not None and active_input.get("style_id") != style_id:
             raise ConflictError("该镜头组已有使用不同风格的生成任务，请等待完成或取消后重试")
@@ -230,11 +244,54 @@ async def create_video_job(
             job=active_job,
         )
 
+    predecessor_job: VideoGenerationJob | None = None
+    predecessor_group: ShotGroup | None = None
+    predecessor_last_frame: str | None = None
+    continuation_static_fallback: str | None = None
+    waiting_for_dependency = False
+    dependency_unavailable = False
+    if bool(getattr(shot_group, "is_continuation", False)):
+        predecessor_group = await _resolve_direct_predecessor(db, shot_group)
+        # 静态回退在任务创建事务中冻结。它只来自当前组显式参考帧或同场景
+        # 直接前驱的静态尾帧，不查询任何历史视频任务，避免把旧 attempt 的
+        # 抽帧误认成当前直接前驱的权威真实尾帧。
+        continuation_static_fallback = await _resolve_continuation_static_fallback(
+            db,
+            shot_group,
+            predecessor=predecessor_group,
+        )
+        if predecessor_group is None:
+            dependency_unavailable = continuation_static_fallback is None
+        else:
+            predecessor_job = await _latest_predecessor_video_job(db, predecessor_group)
+            frozen_last_frame = (
+                (predecessor_job.output_json or {}).get("last_frame_storage_key")
+                if predecessor_job is not None
+                else None
+            )
+            predecessor_last_frame = (
+                frozen_last_frame if isinstance(frozen_last_frame, str) else None
+            )
+            if predecessor_job is None:
+                # 批量接口可能按任意顺序提交。先创建 child 时保持无租约等待，
+                # 待直接前驱任务创建后再在同事务绑定 predecessor_job_id。
+                waiting_for_dependency = True
+            elif predecessor_job.status in {"failed", "canceled"}:
+                dependency_unavailable = continuation_static_fallback is None
+            elif predecessor_job.status == "succeeded" and not predecessor_last_frame:
+                dependency_unavailable = continuation_static_fallback is None
+            elif predecessor_job.status != "succeeded":
+                waiting_for_dependency = True
+
     # 3. 汇聚参考图 + 参考音频
     aggregated = await aggregate_references(db, shot_group_id)
 
     # 4. 首尾帧链式衔接：取上一组 last_frame 作为当前组首帧参考（doc 06 §10.3）
-    first_frame = await _resolve_first_frame(db, shot_group)
+    first_frame = (
+        predecessor_last_frame or continuation_static_fallback
+        if bool(getattr(shot_group, "is_continuation", False))
+        else await _resolve_first_frame(db, shot_group)
+    )
     if first_frame:
         # 持久化到当前组 reference_frames.first_frame
         await _persist_first_frame(db, shot_group, first_frame)
@@ -255,16 +312,71 @@ async def create_video_job(
 
     provider_key = runtime_video_model.task_provider_key
     model = runtime_video_model.model
+    reference_token_map = _freeze_reference_token_map(aggregated)
+    prompt_text = bind_reference_tokens_to_prompt(base_prompt, reference_token_map)
+    camera_movement, structured_prompt_shots = await _load_structured_video_prompt_context(
+        db,
+        shot_group_id,
+    )
+    if structured_prompt_shots:
+        try:
+            prompt_text = compose_video_prompt(
+                prompt_text,
+                camera_movement=camera_movement,
+                shots=structured_prompt_shots,
+                duration_seconds=shot_group.duration_seconds,
+            )
+        except ValueError:
+            # 历史人工写入的未知结构不能阻断视频主链；只跳过增强，不记录正文。
+            logger.warning(
+                "视频结构提示增强失败，保留基础提示词 shot_group_id=%s",
+                shot_group_id,
+            )
+    boundary_fragments = _boundary_prompt_fragments(shot_group.reference_frames)
+    prompt_text = append_boundary_facts(prompt_text, boundary_fragments)
+    prompt_text, constraint_snapshot = await _resolve_video_constraint_prompt(db, prompt_text)
+    try:
+        adapted = adapt_prompt(
+            prompt_text,
+            provider=runtime_video_model.provider,
+            model=model,
+        )
+    except PromptAdaptationError:
+        raise BadRequestError("视频提示词无法适配当前供应商") from None
+    adapted_prompt_hash = hashlib.sha256(adapted.text.encode("utf-8")).hexdigest()
 
     # 6. 构造 input_json 并落库任务
     # prompt 兜底：约束锁9条属上游 enrich/分镜产物，video 模块仅透传；但上游漏写
     # 时补齐，保证传入 provider 的 prompt 含约束段（doc06 §8.1）。
     input_json = {
         "model": model,
-        "prompt": prompt_text,
+        # prompt 保持为 worker 实际提交文本；source_prompt 单独保留适配前快照，
+        # 让重试不受能力矩阵或 active 模板后续变更影响。
+        "prompt": adapted.text,
+        "base_prompt": base_prompt,
+        "source_prompt": prompt_text,
+        "adapted_prompt": adapted.text,
+        "adapted_prompt_sha256": adapted_prompt_hash,
+        "adapter_version": adapted.adapter_version,
+        "prompt_adapter": {
+            "provider": adapted.provider,
+            "model": adapted.model,
+            "version": adapted.adapter_version,
+            "syntax": adapted.prompt_syntax,
+            "truncated": adapted.truncated,
+            "original_characters": adapted.original_characters,
+            "adapted_characters": adapted.adapted_characters,
+            "adapted_prompt_sha256": adapted_prompt_hash,
+        },
+        "constraint_prompt_template": constraint_snapshot.public_metadata(),
         "style_id": style_id,
         "reference_images": aggregated.reference_images,
         "reference_image_names": aggregated.reference_image_names,
+        "reference_image_refs": list(
+            getattr(aggregated, "reference_image_refs", []) or []
+        ),
+        "reference_token_map": reference_token_map,
+        "boundary_prompt_fragments": boundary_fragments,
         "reference_audios": aggregated.reference_audios,
         "reference_audio_names": aggregated.reference_audio_names,
         "reference_videos": [],
@@ -276,6 +388,34 @@ async def create_video_job(
         "missing_subjects": aggregated.missing_subjects,
         "missing_audio": aggregated.missing_audio,
         "duration_seconds": shot_group.duration_seconds,
+        "is_continuation": bool(getattr(shot_group, "is_continuation", False)),
+        "continuation_dependency": (
+            {
+                "state": (
+                    "unavailable"
+                    if dependency_unavailable
+                    else "waiting"
+                    if waiting_for_dependency
+                    else "ready"
+                ),
+                "predecessor_shot_group_id": (
+                    predecessor_group.shot_group_id if predecessor_group is not None else None
+                ),
+                "predecessor_job_id": (
+                    predecessor_job.job_id if predecessor_job is not None else None
+                ),
+                "static_fallback_frame": continuation_static_fallback,
+                "frame_source": (
+                    "real_tail"
+                    if predecessor_last_frame
+                    else "static_fallback"
+                    if continuation_static_fallback and not waiting_for_dependency
+                    else None
+                ),
+            }
+            if bool(getattr(shot_group, "is_continuation", False))
+            else None
+        ),
         "shot_group_version": {
             "episode_version": int(episode.episode_version or 1),
             "shot_group_updated_at": shot_group.updated_at.isoformat()
@@ -307,6 +447,10 @@ async def create_video_job(
             attempt=attempt,
             reservation_id=None,
             input_json=input_json,
+            initial_status=("waiting_dependency" if waiting_for_dependency else "starting"),
+            predecessor_job_id=(
+                predecessor_job.job_id if predecessor_job is not None else None
+            ),
         )
         await video_crud.bind_idempotency_request(
             db,
@@ -314,6 +458,10 @@ async def create_video_job(
             idempotency_key=idempotency_key,
             request_hash=request_hash,
             job_id=job.job_id,
+        )
+        bound_waiting_children = await video_crud.bind_waiting_dependents_to_predecessor_job(
+            db,
+            job,
         )
 
         # 7. 积分 reserve（source_id=job_id 幂等；冻结量=price_video_gen_frozen）
@@ -332,20 +480,52 @@ async def create_video_job(
             job.reservation_id = reservation_id
             input_json["reservation_id"] = reservation_id
 
-        dispatch = await enqueue_task(
-            db,
-            task_type="video.generate",
-            job_id=job.job_id,
-            attempt=job.attempt,
-            payload={
-                "job_id": job.job_id,
-                "script_id": script_id,
-                "episode_id": episode_id,
-                "shot_group_id": shot_group_id,
-                "input_version": job.input_version,
-            },
-        )
-        job.dispatch_id = dispatch.id
+        if dependency_unavailable:
+            if reservation_id:
+                from app.services.credits import release as _credits_release
+
+                await _credits_release(
+                    db,
+                    reservation_id=reservation_id,
+                    reason="dependency_unavailable",
+                    actor_user_id=user_id,
+                    commit=False,
+                )
+            job.status = "failed"
+            job.progress_stage = "dependency_unavailable"
+            job.progress_message = "同场景直接前驱未提供可用真实尾帧"
+            job.error_type = "dependency_unavailable"
+            job.error_message = "dependency_unavailable"
+            job.finished_at = datetime.now(UTC)
+            job.retryable = False
+
+        if bound_waiting_children and job.status in {"failed", "canceled"}:
+            # 正常批量中首个非续帧前驱不会走到这里；该分支覆盖依赖链中间节点
+            # 在创建时已确定不可用的场景，并保证后继 reservation 不会永久冻结。
+            from app.workers.video_generation import _resolve_continuation_dependents
+
+            await _resolve_continuation_dependents(
+                db,
+                job.job_id,
+                last_frame_storage_key=None,
+                succeeded=False,
+            )
+
+        if not waiting_for_dependency and not dependency_unavailable:
+            dispatch = await enqueue_task(
+                db,
+                task_type="video.generate",
+                job_id=job.job_id,
+                attempt=job.attempt,
+                payload={
+                    "job_id": job.job_id,
+                    "script_id": script_id,
+                    "episode_id": episode_id,
+                    "shot_group_id": shot_group_id,
+                    "input_version": job.input_version,
+                },
+            )
+            job.dispatch_id = dispatch.id
         # updated_at 由数据库侧 onupdate 生成；flush 后会被 SQLAlchemy 标记为过期。
         # 提交前定向刷新，避免响应序列化在同步属性访问中触发异步隐式查询。
         await db.flush()
@@ -401,7 +581,7 @@ async def cancel_video_job(
         raise ConflictError("任务不属于该剧本")
     if job.status == "canceled":
         return job
-    if job.status not in ("starting", "processing"):
+    if job.status not in ("waiting_dependency", "starting", "processing"):
         raise ConflictError(f"任务当前状态 {job.status}，不可取消")
     if provider_submission_is_unresolved(job.output_json, job.metrics):
         raise ConflictError("远端提交状态未知，任务需保持冻结并等待人工核对")
@@ -454,7 +634,7 @@ async def cancel_video_job(
             update(VideoGenerationJob)
             .where(
                 VideoGenerationJob.job_id == job_id,
-                VideoGenerationJob.status.in_(("starting", "processing")),
+                VideoGenerationJob.status.in_(("waiting_dependency", "starting", "processing")),
                 VideoGenerationJob.lease_token == job.lease_token,
             )
             .values(
@@ -535,6 +715,7 @@ async def cancel_video_job(
                     job_id,
                     provider_task_id,
                 )
+                await _resolve_canceled_continuation_dependents_independently(job_id)
                 return authoritative
             canceled = await _load_authoritative_canceled_job(
                 script_id=script_id,
@@ -548,7 +729,10 @@ async def cancel_video_job(
                 provider_task_id,
                 primary_error_type or "cas_not_applied",
             )
+            await _resolve_canceled_continuation_dependents_independently(job_id)
             return canceled or job
+
+    await _resolve_canceled_continuation_dependents_independently(job_id)
 
     # 重新读取返回最新状态
     r2 = await db.execute(
@@ -683,6 +867,30 @@ async def _best_effort_cancel_rollback(
             "视频取消事务回滚失败 job_id=%s stage=%s error=%s",
             job_id,
             stage,
+            type(exc).__name__,
+        )
+
+
+async def _resolve_canceled_continuation_dependents_independently(job_id: str) -> None:
+    """独立清理 canceled 前驱的等待子任务，不影响取消与远端补偿主闭环。"""
+
+    from app.core.database import async_session_factory
+    from app.workers.video_generation import _resolve_continuation_dependents
+
+    try:
+        async with async_session_factory() as cleanup_db:
+            await _resolve_continuation_dependents(
+                cleanup_db,
+                job_id,
+                last_frame_storage_key=None,
+                succeeded=False,
+            )
+            await cleanup_db.commit()
+    except Exception as exc:  # noqa: BLE001 - canceled 终态与远端取消结果优先
+        logger.warning(
+            "独立清理续帧依赖失败，保留 waiting_dependency 等待补偿 "
+            "job_id=%s error=%s",
+            job_id,
             type(exc).__name__,
         )
 
@@ -952,9 +1160,9 @@ async def _bind_existing_job(
 async def _resolve_first_frame(db: AsyncSession, shot_group: ShotGroup) -> str | None:
     """取上一镜头组的 reference_frames.last_frame 作为当前组首帧参考。
 
-    上一组定义：同剧本/分集/场景，group_no 顺序在当前组之前，且已生成尾帧
-    （reference_frames.last_frame 非空）的最近一组。无则返回 None（首组无首帧）。
-    doc 06 §10.3 尾帧 → 首帧衔接。
+    普通镜头组兼容历史行为：使用同场景更早且已有尾帧的最近一组。
+    ``is_continuation`` 镜头组必须使用同场景 group_index 的直接前驱；直接前驱
+    缺少尾帧时返回 None，绝不跳过中间组寻找更早素材。
     """
     if not shot_group.group_no:
         return None
@@ -966,7 +1174,14 @@ async def _resolve_first_frame(db: AsyncSession, shot_group: ShotGroup) -> str |
     )
     result = await db.execute(stmt)
     candidates = list(result.scalars().all())
-    # 取 group_no 严格小于当前且 last_frame 非空的最近一组
+    if bool(getattr(shot_group, "is_continuation", False)):
+        predecessor = await _resolve_direct_predecessor(db, shot_group)
+        if predecessor is None:
+            return None
+        last_frame = (predecessor.reference_frames or {}).get("last_frame")
+        return str(last_frame) if last_frame else None
+
+    # 普通组取 group_no 严格小于当前且 last_frame 非空的最近一组，保持旧行为。
     cur_no = _natural_group_number(shot_group.group_no)
     prev_groups = [
         g for g in candidates if g.group_no and _natural_group_number(g.group_no) < cur_no
@@ -978,6 +1193,77 @@ async def _resolve_first_frame(db: AsyncSession, shot_group: ShotGroup) -> str |
         if last_frame:
             return str(last_frame)
     return None
+
+
+def _safe_static_frame(reference_frames: object, key: str) -> str | None:
+    """从 reference_frames 安全读取非空静态帧键，拒绝容器等异常旧数据。"""
+
+    if not isinstance(reference_frames, dict):
+        return None
+    value = reference_frames.get(key)
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    return normalized or None
+
+
+async def _resolve_continuation_static_fallback(
+    db: AsyncSession,
+    shot_group: ShotGroup,
+    *,
+    predecessor: ShotGroup | None = None,
+) -> str | None:
+    """解析续帧真实尾帧不可用时的确定性静态回退。
+
+    优先使用当前组已有 ``first_frame`` / ``reference_frame``，最后才使用同场景
+    直接前驱的静态 ``last_frame``。绝不越过直接前驱，也不读取历史视频 Job 输出。
+    """
+
+    own_frames = shot_group.reference_frames
+    for key in ("first_frame", "reference_frame"):
+        if frame := _safe_static_frame(own_frames, key):
+            return frame
+
+    direct_predecessor = predecessor
+    if direct_predecessor is None:
+        direct_predecessor = await _resolve_direct_predecessor(db, shot_group)
+    if direct_predecessor is None:
+        return None
+    return _safe_static_frame(direct_predecessor.reference_frames, "last_frame")
+
+
+async def _resolve_direct_predecessor(
+    db: AsyncSession,
+    shot_group: ShotGroup,
+) -> ShotGroup | None:
+    """返回同场景严格直接前驱，不以“已有尾帧”作为过滤条件。"""
+    if int(shot_group.group_index or 0) <= 1:
+        return None
+    result = await db.execute(
+        select(ShotGroup).where(
+            ShotGroup.script_id == shot_group.script_id,
+            ShotGroup.episode_id == shot_group.episode_id,
+            ShotGroup.scene_no == shot_group.scene_no,
+            ShotGroup.group_index == int(shot_group.group_index) - 1,
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def _latest_predecessor_video_job(
+    db: AsyncSession,
+    predecessor: ShotGroup,
+) -> "VideoGenerationJob | None":
+    from app.models.video_generation_job import VideoGenerationJob
+
+    result = await db.execute(
+        select(VideoGenerationJob)
+        .where(VideoGenerationJob.shot_group_id == predecessor.shot_group_id)
+        .options(noload(VideoGenerationJob.script))
+        .order_by(VideoGenerationJob.attempt.desc(), VideoGenerationJob.created_at.desc())
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
 
 
 async def _persist_first_frame(
@@ -998,19 +1284,145 @@ _CONSTRAINT_LOCK_TEXT = (
     "语音清晰，情感表达贴合角色性格，台词与唇形/动作精准对位。"
     "禁止出现任何形式的字幕。"
 )
+_VIDEO_CONSTRAINT_TEMPLATE_KEY = "video.constraint_lock"
 
 
-def _ensure_constraint_lock(prompt: str) -> str:
+def _prompt_contains_base(stored_prompt: object, base_prompt: str) -> bool:
+    """兼容新旧任务判断显式提示词；不依赖当前 active 模板内容。"""
+    if not isinstance(stored_prompt, str):
+        return False
+    normalized = base_prompt.strip()
+    return stored_prompt == normalized or stored_prompt.startswith(f"{normalized}\n")
+
+
+async def _resolve_video_constraint_prompt(
+    db: AsyncSession,
+    prompt: str,
+) -> tuple[str, PromptTemplateSnapshot]:
+    """冻结本次使用的约束模板快照；查询或渲染失败均回退内置常量。"""
+    snapshot = await resolve_prompt_template(
+        db,
+        _VIDEO_CONSTRAINT_TEMPLATE_KEY,
+        fallback=_CONSTRAINT_LOCK_TEXT,
+    )
+    rendered_constraint, used_snapshot = render_prompt_template_with_fallback(
+        snapshot,
+        {},
+        fallback=_CONSTRAINT_LOCK_TEXT,
+    )
+    return _ensure_constraint_lock(prompt, constraint_text=rendered_constraint), used_snapshot
+
+
+def _freeze_reference_token_map(aggregated: Any) -> dict[str, dict[str, str | None]]:
+    """按最终模型图片顺序冻结 token→实体/资产映射。"""
+    images = list(getattr(aggregated, "reference_images", []) or [])
+    refs = list(getattr(aggregated, "reference_image_refs", []) or [])
+    names = list(getattr(aggregated, "reference_image_names", []) or [])
+    categories = list(getattr(aggregated, "reference_image_categories", []) or [])
+    frozen: dict[str, dict[str, str | None]] = {}
+    for index, image in enumerate(images, start=1):
+        raw_ref = refs[index - 1] if index <= len(refs) and isinstance(refs[index - 1], dict) else {}
+        token = f"图{index}"
+        frozen[token] = {
+            "ref": raw_ref.get("ref") if isinstance(raw_ref.get("ref"), str) else None,
+            "name": (
+                raw_ref.get("name")
+                if isinstance(raw_ref.get("name"), str)
+                else names[index - 1] if index <= len(names) else f"参考图{index}"
+            ),
+            "category": (
+                raw_ref.get("category")
+                if isinstance(raw_ref.get("category"), str)
+                else categories[index - 1] if index <= len(categories) else "other"
+            ),
+            "subject_id": (
+                raw_ref.get("subject_id")
+                if isinstance(raw_ref.get("subject_id"), str)
+                else None
+            ),
+            "asset_entry_id": (
+                raw_ref.get("asset_entry_id")
+                if isinstance(raw_ref.get("asset_entry_id"), str)
+                else None
+            ),
+            "sha256": image.get("sha256") if isinstance(image.get("sha256"), str) else None,
+        }
+    return frozen
+
+
+def _boundary_prompt_fragments(reference_frames: object) -> list[str]:
+    """从持久化边界快照读取首/尾独立投影；历史或损坏 JSON 安全忽略。"""
+
+    if not isinstance(reference_frames, dict):
+        return []
+    projections = reference_frames.get("boundary_projections")
+    if not isinstance(projections, dict):
+        return []
+    fragments: list[str] = []
+    for role in ("start", "end"):
+        projection = projections.get(role)
+        if not isinstance(projection, dict):
+            continue
+        fragment = projection.get("prompt_fragment")
+        if isinstance(fragment, str) and fragment.strip():
+            fragments.append(fragment.strip())
+    return fragments
+
+
+async def _load_structured_video_prompt_context(
+    db: AsyncSession,
+    shot_group_id: str,
+) -> tuple[str | None, list[dict[str, object]]]:
+    """从 v2 结构快照构造无自由文本解析的运镜与主体时长输入。"""
+    result = await db.execute(
+        select(Shot)
+        .where(Shot.shot_group_id == shot_group_id)
+        .order_by(Shot.display_no, Shot.shot_id)
+    )
+    snapshots: list[dict[str, object]] = []
+    camera_movement: str | None = None
+    for shot in result.scalars().all():
+        raw = shot.structured_data
+        if not isinstance(raw, dict):
+            continue
+        visual = raw.get("visual")
+        if not isinstance(visual, dict):
+            continue
+        movement = visual.get("camera_movement")
+        if camera_movement is None and isinstance(movement, str) and movement.strip():
+            camera_movement = movement.strip()
+        snapshot: dict[str, object] = {
+            "display_no": shot.display_no,
+            "start_seconds": shot.start_seconds,
+            "end_seconds": shot.end_seconds,
+            "characters": list(shot.characters or []),
+            "visual": dict(visual),
+        }
+        snapshots.append(snapshot)
+    return camera_movement, snapshots
+
+
+def _ensure_constraint_lock(
+    prompt: str,
+    *,
+    constraint_text: str = _CONSTRAINT_LOCK_TEXT,
+) -> str:
     """若 prompt 未含【约束】段则追加约束锁9条兜底文本（doc06 §8.1）。
 
     video 模块仅透传上游 enrich 产出的 prompt；此处仅作上游漏写兜底，
     不替代 enrich 阶段的 12 段落扩展（doc06 §12 LLM-3，属上游职责）。
     """
     if not prompt:
-        return _CONSTRAINT_LOCK_TEXT
-    if _CONSTRAINT_LOCK_TEXT in prompt:
+        return constraint_text
+    if constraint_text in prompt:
         return prompt
-    return f"{prompt}\n{_CONSTRAINT_LOCK_TEXT}"
+    # 分镜模板和视频模板可能使用不同正文，但它们都以受控标题开始。
+    # 视频侧必须只有一个权威约束段：若上游已带旧/分镜约束，替换该尾段，
+    # 避免把第二个【约束】追加到真实 group.prompt。
+    heading_index = prompt.rfind("【约束】")
+    if heading_index >= 0:
+        return f"{prompt[:heading_index].rstrip()}\n{constraint_text}"
+    return f"{prompt}\n{constraint_text}"
 
 
 def _natural_group_number(group_no: str | None) -> int:

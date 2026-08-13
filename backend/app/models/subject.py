@@ -35,6 +35,8 @@ class Subject(UUIDPKMixin, TimestampMixin, Base):
         default=lambda context: str(context.get_current_parameters().get("name") or ""),
     )
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # 实体级渲染媒介覆盖；空值继承 Script.visual_style。
+    visual_style: Mapped[str | None] = mapped_column(String(32), nullable=True)
     subject_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     enrich_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     # 人工修改后锁定；流水线只能生成差异建议，不能静默覆盖。

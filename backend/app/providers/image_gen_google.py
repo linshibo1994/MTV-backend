@@ -11,7 +11,12 @@ from google import genai
 from google.genai import types as gtypes
 
 from app.core.config import settings
-from app.providers.image_gen import ImageResult, prompt_with_negative_constraints
+from app.providers.image_gen import (
+    ImageResult,
+    ImageSafetyRejectedError,
+    classify_image_safety_code,
+    prompt_with_negative_constraints,
+)
 from app.providers.registry import ProviderConfigurationError
 
 
@@ -49,9 +54,23 @@ class GoogleImageGenProvider:
         )
 
         # 从候选内容中提取首个图片 part 的二进制数据；可空响应 fail closed。
+        prompt_feedback = getattr(response, "prompt_feedback", None)
+        block_reason = getattr(prompt_feedback, "block_reason", None)
+        block_reason_value = getattr(block_reason, "value", block_reason)
+        classification = classify_image_safety_code(block_reason_value)
+        if classification is not None:
+            category, code = classification
+            raise ImageSafetyRejectedError(provider="gemini", category=category, code=code)
+
         candidates = getattr(response, "candidates", None)
         if not candidates:
             raise RuntimeError("Nano Banana 返回内容为空，无法解析图片")
+        finish_reason = getattr(candidates[0], "finish_reason", None)
+        finish_reason_value = getattr(finish_reason, "value", finish_reason)
+        classification = classify_image_safety_code(finish_reason_value)
+        if classification is not None:
+            category, code = classification
+            raise ImageSafetyRejectedError(provider="gemini", category=category, code=code)
         content = getattr(candidates[0], "content", None)
         parts = getattr(content, "parts", None)
         if not parts:

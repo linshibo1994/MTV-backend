@@ -12,6 +12,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from app.schemas.storyboard_contracts import ShotBoundary, StoryboardV2ShotContract
+
 # ---------------------------------------------------------------------------
 # 基础出参
 # ---------------------------------------------------------------------------
@@ -40,6 +42,86 @@ class StoryboardFieldsOut(BaseModel):
     sound_design: str | None = None
 
 
+class ShotStructuredDataOut(StoryboardV2ShotContract):
+    """持久化的 storyboard.v2 单镜快照；历史镜头可为空。"""
+
+    schema_version: Literal["storyboard.shot-structure.v1"]
+    subject_ids_by_ref: dict[str, str] = Field(default_factory=dict)
+    background_ref: str | None = None
+
+    def __init__(self, **data: Any) -> None:
+        """保留继承合约的严格字段，同时允许 Pydantic 的动态构造调用。"""
+
+        super().__init__(**data)
+
+
+class QualityWarningOut(BaseModel):
+    """不阻断生成的纯规则质量告警。"""
+
+    code: str
+    path: str
+    message: str
+    severity: Literal["warning"] = "warning"
+    details: dict[str, Any] = Field(default_factory=dict)
+
+
+class DirectorCommandOut(BaseModel):
+    """服务端按最终组内顺序派生的镜头职责与动作拍点。"""
+
+    frame_role: Literal["single", "first", "key", "last"]
+    action_beat: Literal["trigger", "peak", "aftermath"]
+    must_categories: list[str] = Field(default_factory=list)
+    preferred_categories: list[str] = Field(default_factory=list)
+    reason_tags: list[str] = Field(default_factory=list)
+    command: str
+
+
+class BoundarySnapshotOut(BaseModel):
+    """组首/尾的可见事实快照。"""
+
+    boundary_role: Literal["start", "end"]
+    facts: ShotBoundary
+
+
+class BoundaryProjectionOut(BaseModel):
+    """供关键帧生成消费的单边界投影。"""
+
+    prompt_fragment: str
+    snapshot: BoundarySnapshotOut
+
+
+class BoundaryProjectionsOut(BaseModel):
+    start: BoundaryProjectionOut | None = None
+    end: BoundaryProjectionOut | None = None
+
+
+class ChainFrameLocationOut(BaseModel):
+    """不含资源主键与素材路径的镜头组位置。"""
+
+    scene_no: int = Field(ge=1)
+    group_no: str = Field(min_length=1, max_length=32)
+    group_index: int | None = Field(default=None, ge=1)
+
+
+class ChainFrameDiagnosticOut(BaseModel):
+    """首尾帧衔接的脱敏结构化诊断。"""
+
+    code: str = Field(min_length=1, max_length=80)
+    severity: Literal["warning", "error"]
+    location: ChainFrameLocationOut
+    predecessor_location: ChainFrameLocationOut | None = None
+
+
+class ShotGroupQualitySummaryOut(BaseModel):
+    """镜头组持久化的确定性质量摘要。"""
+
+    version: Literal[1]
+    director_commands: list[DirectorCommandOut] = Field(default_factory=list)
+    coverage_block_refs: list[str] = Field(default_factory=list)
+    boundary_snapshots: dict[str, BoundarySnapshotOut] = Field(default_factory=dict)
+    warnings: list[QualityWarningOut] = Field(default_factory=list)
+
+
 class ShotOut(StoryboardFieldsOut):
     """镜头 — 分镜最细粒度。"""
 
@@ -60,6 +142,12 @@ class ShotOut(StoryboardFieldsOut):
     props: list[str] = Field(default_factory=list)
     sounds: list[str] = Field(default_factory=list)
     dialogue_character: str = ""
+    structured_data: ShotStructuredDataOut | None = None
+
+    def __init__(self, **data: Any) -> None:
+        """允许 CRUD 展开动态展示字段，同时保留结构快照的严格出参类型。"""
+
+        super().__init__(**data)
 
 
 class ReferenceFramesOut(BaseModel):
@@ -70,6 +158,11 @@ class ReferenceFramesOut(BaseModel):
     first_frame: str | None = None
     last_frame: str | None = None
     reference_frame: str | None = None
+    boundary_projections: BoundaryProjectionsOut | None = None
+    chain_diagnostics: list[ChainFrameDiagnosticOut] = Field(
+        default_factory=list,
+        max_length=64,
+    )
 
 
 class ReferenceImageAuditOut(BaseModel):
@@ -86,6 +179,7 @@ class MaterialItemOut(BaseModel):
     """素材主体引用，兼容旧字符串输入在 CRUD 层归一化。"""
 
     name: str
+    ref: str | None = None
     subject_id: str | None = None
     asset_entry_id: str | None = None
 
@@ -114,10 +208,12 @@ class ShotGroupHierarchyOut(BaseModel):
     group_no: str
     prompt: str | None = None
     duration_seconds: int | None = None
+    is_continuation: bool = False
     narrative_purpose: str | None = None
     materials: MaterialsOut | None = None
     audio_elements: list[dict[str, Any]] = Field(default_factory=list)
     reference_frames: ReferenceFramesOut | None = None
+    quality_summary: ShotGroupQualitySummaryOut | None = None
     shots: list[ShotOut] = Field(default_factory=list)
 
 
@@ -164,6 +260,7 @@ class ShotGroupWorkbenchOut(BaseModel):
     prompt: str | None = None
     duration_seconds: int | None = None
     video_duration_seconds: int | None = None
+    is_continuation: bool = False
     materials: MaterialsOut | None = None
     audio_elements: list[dict[str, Any]] = Field(default_factory=list)
     shot_ids: list[str] = Field(default_factory=list)
@@ -171,6 +268,7 @@ class ShotGroupWorkbenchOut(BaseModel):
     shot_nos: list[str] = Field(default_factory=list)
     description_text: str | None = None
     reference_frames: ReferenceFramesOut | None = None
+    quality_summary: ShotGroupQualitySummaryOut | None = None
     reference_image_audit: ReferenceImageAuditOut
     content_hash: str = Field(min_length=64, max_length=64)
     updated_at: datetime
@@ -274,6 +372,7 @@ class ShotGroupUpdateIn(BaseModel):
 
     expected_episode_version: int = Field(..., ge=1)
     duration_seconds: int | None = Field(default=None, ge=3, le=15)
+    is_continuation: bool | None = None
     prompt: str | None = Field(default=None, min_length=1, max_length=32000)
     materials: ShotGroupMaterialsIn | None = None
     audio_elements: list[ShotGroupAudioElementIn] | None = Field(
@@ -295,6 +394,7 @@ class ShotGroupUpdateIn(BaseModel):
     def require_edit_field(self) -> ShotGroupUpdateIn:
         editable_fields = {
             "duration_seconds",
+            "is_continuation",
             "prompt",
             "materials",
             "audio_elements",
@@ -303,6 +403,8 @@ class ShotGroupUpdateIn(BaseModel):
             raise ValueError("至少提交一个镜头组编辑字段")
         if "duration_seconds" in self.model_fields_set and self.duration_seconds is None:
             raise ValueError("duration_seconds 不得为 null")
+        if "is_continuation" in self.model_fields_set and self.is_continuation is None:
+            raise ValueError("is_continuation 不得为 null")
         if "prompt" in self.model_fields_set and self.prompt is None:
             raise ValueError("prompt 不得为 null")
         if "materials" in self.model_fields_set and self.materials is None:
@@ -365,6 +467,7 @@ class StoryboardStatusOut(BaseModel):
     progress_message: str | None = None
     error_message: str | None = None
     detail: dict | None = None
+    provenance: dict | None = None
 
 
 class StoryboardJobListOut(BaseModel):

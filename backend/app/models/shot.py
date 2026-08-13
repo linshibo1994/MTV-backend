@@ -40,5 +40,8 @@ class Shot(Base):
     props: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
     sounds: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
     dialogue_character: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    # storyboard.v2 的结构化单一事实源快照。迁移上线前/历史数据允许为空；
+    # 展示字段仍保留 content/description/shot_line 以兼容既有客户端。
+    structured_data: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 
     shot_group = relationship("ShotGroup", back_populates="shots")

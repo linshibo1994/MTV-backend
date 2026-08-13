@@ -12,6 +12,10 @@ llm_anthropic.py（Claude）。缺 key 时抛 RuntimeError，由调用方捕获�
 
 from __future__ import annotations
 
+import ast
+import json
+import math
+import re
 from typing import Protocol, runtime_checkable
 
 from app.providers.registry import ProviderError
@@ -27,8 +31,17 @@ class LLMResponseContractError(ProviderError):
 class LLMJSONResponseError(ProviderError, ValueError):
     """结构化响应不是可用 JSON 对象，只携带脱敏形态信息。"""
 
-    def __init__(self, category: str, *, kind: str, content_length: int = 0) -> None:
+    def __init__(
+        self,
+        category: str,
+        *,
+        kind: str,
+        content_length: int = 0,
+        repair_attempted: bool = False,
+    ) -> None:
         super().__init__("LLM 供应商返回了无效的 JSON 正文")
+        # 仅供服务端指标使用，不进入对外 diagnostic，避免改变既有错误契约。
+        self.repair_attempted = repair_attempted
         if content_length <= 0:
             length_bucket = "0"
         elif content_length <= 128:
@@ -46,6 +59,278 @@ class LLMJSONResponseError(ProviderError, ValueError):
                 "top_level_kind": "invalid_json" if category == "invalid_json" else kind,
             },
         }
+
+
+_MARKDOWN_FENCE_RE = re.compile(
+    r"^\s*```(?:json|javascript|python)?[ \t]*\r?\n?(.*?)\r?\n?```\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+_OUTSIDE_STRING_TRANSLATION = {
+    "：": ":",
+    "，": ",",
+    "｛": "{",
+    "｝": "}",
+    "［": "[",
+    "］": "]",
+}
+_CURLY_QUOTE_PAIRS = {"“": ("\"", "”"), "‘": ("'", "’")}
+
+
+def _strip_markdown_fence(text: str) -> str:
+    """仅剥离完整包裹正文的 Markdown 代码围栏。"""
+    candidate = text.strip()
+    match = _MARKDOWN_FENCE_RE.fullmatch(candidate)
+    return match.group(1).strip() if match is not None else candidate
+
+
+def _normalize_json_like_punctuation(text: str) -> str:
+    """只在字符串外归一化全角标点，并把弯引号识别为字符串边界。"""
+    output: list[str] = []
+    quote: str | None = None
+    curved_closer: str | None = None
+    escaped = False
+    for char in text:
+        if quote is not None:
+            if curved_closer is not None and char == curved_closer:
+                output.append(quote)
+                quote = None
+                curved_closer = None
+                escaped = False
+                continue
+            output.append(char)
+            if curved_closer is not None:
+                continue
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            continue
+
+        curved = _CURLY_QUOTE_PAIRS.get(char)
+        if curved is not None:
+            quote, curved_closer = curved
+            output.append(quote)
+        elif char in {"\"", "'"}:
+            quote = char
+            output.append(char)
+        else:
+            output.append(_OUTSIDE_STRING_TRANSLATION.get(char, char))
+    return "".join(output)
+
+
+def _quote_bare_object_keys(text: str) -> str:
+    """为对象中的 ASCII 裸键补双引号，不修改任何字符串内容。"""
+    output: list[str] = []
+    index = 0
+    quote: str | None = None
+    escaped = False
+    length = len(text)
+    while index < length:
+        char = text[index]
+        output.append(char)
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            index += 1
+            continue
+        if char in {"\"", "'"}:
+            quote = char
+            index += 1
+            continue
+        if char not in {"{", ","}:
+            index += 1
+            continue
+
+        cursor = index + 1
+        while cursor < length and text[cursor].isspace():
+            output.append(text[cursor])
+            cursor += 1
+        key_start = cursor
+        if cursor < length and (text[cursor].isalpha() or text[cursor] == "_"):
+            cursor += 1
+            while cursor < length and (text[cursor].isalnum() or text[cursor] in {"_", "-"}):
+                cursor += 1
+            key = text[key_start:cursor]
+            colon = cursor
+            while colon < length and text[colon].isspace():
+                colon += 1
+            if colon < length and text[colon] == ":":
+                output.append(json.dumps(key, ensure_ascii=False))
+                output.append(text[cursor:colon + 1])
+                index = colon + 1
+                continue
+        output.append(text[key_start:cursor])
+        index = cursor
+    return "".join(output)
+
+
+def _remove_trailing_commas(text: str) -> str:
+    """移除对象或数组结束符前的尾逗号，不触碰字符串内容。"""
+    output: list[str] = []
+    quote: str | None = None
+    escaped = False
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if quote is not None:
+            output.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            index += 1
+            continue
+        if char in {"\"", "'"}:
+            quote = char
+            output.append(char)
+            index += 1
+            continue
+        if char == ",":
+            cursor = index + 1
+            while cursor < len(text) and text[cursor].isspace():
+                cursor += 1
+            if cursor < len(text) and text[cursor] in {"}", "]"}:
+                index += 1
+                continue
+        output.append(char)
+        index += 1
+    return "".join(output)
+
+
+def _repair_json_like(text: str) -> str:
+    """对常见 LLM JSON 标点偏差执行确定性、无代码执行的保守修复。"""
+    normalized = _normalize_json_like_punctuation(_strip_markdown_fence(text))
+    return _remove_trailing_commas(_quote_bare_object_keys(normalized))
+
+
+def repair_json_like(text: str) -> str:
+    """公开的 JSON-like 修复入口；保留私有同名能力供 Provider 内部复用。"""
+    return _repair_json_like(text)
+
+
+def _parse_python_literal(text: str) -> object:
+    """仅通过 ``ast.literal_eval`` 解析 Python 字面量，不执行表达式。"""
+    return ast.literal_eval(text)
+
+
+def _parse_python_call_kwargs(text: str) -> dict[str, object]:
+    """解析 ``Result(a=1)`` 形态；仅接受关键字字面量，绝不执行调用。"""
+    expression = ast.parse(text, mode="eval").body
+    if (
+        not isinstance(expression, ast.Call)
+        or not isinstance(expression.func, ast.Name)
+        or expression.args
+        or expression.func.id.startswith("_")
+    ):
+        raise ValueError("不是安全的关键字调用形态")
+    result: dict[str, object] = {}
+    for keyword in expression.keywords:
+        if keyword.arg is None or keyword.arg in result:
+            raise ValueError("关键字参数非法或重复")
+        result[keyword.arg] = ast.literal_eval(keyword.value)
+    return result
+
+
+def _is_json_value(value: object) -> bool:
+    # 迭代遍历避免供应商构造的深层结构触发 Python 递归上限。
+    pending = [value]
+    while pending:
+        current = pending.pop()
+        if current is None or isinstance(current, (str, bool, int)):
+            continue
+        if isinstance(current, float):
+            if math.isfinite(current):
+                continue
+            return False
+        if isinstance(current, list):
+            pending.extend(current)
+            continue
+        if isinstance(current, dict):
+            if any(not isinstance(key, str) for key in current):
+                return False
+            pending.extend(current.values())
+            continue
+        return False
+    return True
+
+
+def _require_json_object(
+    value: object,
+    *,
+    kind: str,
+    content_length: int,
+    repair_attempted: bool,
+) -> dict:
+    if not isinstance(value, dict):
+        raise LLMJSONResponseError(
+            "non_object_json",
+            kind=type(value).__name__,
+            content_length=content_length,
+            repair_attempted=repair_attempted,
+        )
+    if not _is_json_value(value):
+        raise LLMJSONResponseError(
+            "invalid_json",
+            kind=kind,
+            content_length=content_length,
+            repair_attempted=repair_attempted,
+        )
+    return value
+
+
+def parse_json_object(text: str, *, kind: str = "text") -> dict:
+    """把供应商正文解析为 JSON 对象，按安全兜底链逐级收敛。
+
+    顺序为标准 JSON、保守标点修复、Python 字面量、仅关键字调用形态。
+    所有 Python 兜底均通过 AST 字面量解析，禁止执行任意表达式。
+    """
+    candidate = _strip_markdown_fence(text)
+    try:
+        return _require_json_object(
+            json.loads(candidate),
+            kind=kind,
+            content_length=len(candidate),
+            repair_attempted=False,
+        )
+    except json.JSONDecodeError:
+        pass
+
+    repaired = repair_json_like(candidate)
+    try:
+        return _require_json_object(
+            json.loads(repaired),
+            kind=kind,
+            content_length=len(candidate),
+            repair_attempted=True,
+        )
+    except json.JSONDecodeError:
+        pass
+
+    for parser in (_parse_python_literal, _parse_python_call_kwargs):
+        try:
+            parsed = parser(repaired)
+        except (SyntaxError, ValueError, TypeError, MemoryError, RecursionError):
+            continue
+        return _require_json_object(
+            parsed,
+            kind=kind,
+            content_length=len(candidate),
+            repair_attempted=True,
+        )
+    raise LLMJSONResponseError(
+        "invalid_json",
+        kind=kind,
+        content_length=len(candidate),
+        repair_attempted=True,
+    ) from None
 
 
 def require_non_empty_chat_content(content: object) -> str:

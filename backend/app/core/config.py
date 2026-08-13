@@ -154,6 +154,9 @@ class Settings(BaseSettings):
     price_enrich_per_subject: int = 5
     price_image_gen: int = 30
     price_storyboard_per_episode: int = 50
+    # 成功分镜的输入溯源批量校验默认关闭；开启后仅告警，不阻断恢复任务。
+    storyboard_provenance_audit_enabled: bool = False
+    storyboard_provenance_audit_batch_size: int = Field(default=50, ge=1, le=500)
     price_video_gen: int = 900
     # 剧本分集主体提取的模型并发上限，避免串行等待同时限制供应商压力。
     pipeline_extract_concurrency: int = Field(default=4, ge=1, le=16)
@@ -172,6 +175,9 @@ class Settings(BaseSettings):
     # 权限（08§1.3 矩阵"可配置"项）
     # Editor 审核资产(REVIEW)默认禁止，部署侧可经环境变量放开
     editor_can_review: bool = False
+    # auto_link 保持历史流水线立即发布；manual 将首次发现的主体保留为候选，
+    # 只有人工确认后才写入 Subject 单一事实源。
+    subject_candidate_review_mode: Literal["auto_link", "manual"] = "auto_link"
 
     @model_validator(mode="after")
     def resolve_provider_fallbacks(self) -> "Settings":

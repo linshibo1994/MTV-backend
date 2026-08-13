@@ -73,7 +73,8 @@ services:
     # 审核下载令牌位于短期 query bearer 中，生产禁止 Uvicorn 记录完整请求目标。
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --proxy-headers --forwarded-allow-ips=* --no-access-log
     ports:
-      - "127.0.0.1:${MTV_PRODUCTION_API_PORT:-8000}:8000"
+      # 默认仅绑定本机；需要由独立前端跨端口访问时，可在生产 .env 显式设为 0.0.0.0。
+      - "${MTV_PRODUCTION_API_BIND_ADDRESS:-127.0.0.1}:${MTV_PRODUCTION_API_PORT:-8000}:8000"
     volumes:
       - type: bind
         source: ${MTV_LEGACY_STORAGE_HOST_PATH:-/var/lib/mtv/storage}

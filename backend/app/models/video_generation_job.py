@@ -44,7 +44,8 @@ class VideoGenerationJob(TimestampMixin, Base):
         ),
         UniqueConstraint("unit_id", "attempt", name="uq_video_generation_jobs_unit_attempt"),
         CheckConstraint(
-            "status IN ('starting', 'processing', 'succeeded', 'failed', 'canceled')",
+            "status IN "
+            "('waiting_dependency', 'starting', 'processing', 'succeeded', 'failed', 'canceled')",
             name="ck_video_jobs_status",
         ),
         CheckConstraint("progress >= 0 AND progress <= 100", name="ck_video_jobs_progress_range"),
@@ -79,6 +80,12 @@ class VideoGenerationJob(TimestampMixin, Base):
     attempt: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     reservation_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     dispatch_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    predecessor_job_id: Mapped[str | None] = mapped_column(
+        String(36),
+        ForeignKey("video_generation_jobs.job_id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     scene_no: Mapped[int] = mapped_column(Integer, nullable=False)
     # 形如 group:<shot_group_id>
     unit_id: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -88,7 +95,7 @@ class VideoGenerationJob(TimestampMixin, Base):
     provider_key: Mapped[str] = mapped_column(String(32), nullable=False)
     # all_reference（可扩展）
     job_type: Mapped[str] = mapped_column(String(32), nullable=False)
-    # starting | processing | succeeded | failed | canceled
+    # waiting_dependency | starting | processing | succeeded | failed | canceled
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="starting")
     progress: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     progress_stage: Mapped[str | None] = mapped_column(String(64), nullable=True)

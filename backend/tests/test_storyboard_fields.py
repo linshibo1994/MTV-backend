@@ -245,6 +245,199 @@ def test_shot_hierarchy_projects_scene_and_draft_group_fields() -> None:
     asyncio.run(scenario())
 
 
+def test_quality_hierarchy_schemas_accept_typed_v2_state() -> None:
+    from app.schemas.shot import (
+        ReferenceFramesOut,
+        ShotGroupQualitySummaryOut,
+        ShotStructuredDataOut,
+    )
+
+    structured = ShotStructuredDataOut.model_validate(
+        {
+            "schema_version": "storyboard.shot-structure.v1",
+            "display_no": 1,
+            "start_seconds": 0,
+            "end_seconds": 3,
+            "visual": {
+                "shot_size": "中景",
+                "composition": ["三分法"],
+                "camera_angle": "平视",
+                "camera_movement": "固定",
+                "action": "角色停下",
+                "frame_description": "角色位于画面左侧",
+                "lighting": "冷色侧光",
+                "emotion": "迟疑",
+            },
+            "narrative_purpose": "承接动作",
+            "character_refs": ["C01"],
+            "prop_refs": [],
+            "sound_refs": [],
+            "sound_design": "无",
+            "dialogue": None,
+            "subject_ids_by_ref": {"C01": "subject-c1"},
+        }
+    )
+    quality = ShotGroupQualitySummaryOut.model_validate(
+        {
+            "version": 1,
+            "director_commands": [
+                {
+                    "frame_role": "single",
+                    "action_beat": "peak",
+                    "must_categories": ["continuity"],
+                    "preferred_categories": [],
+                    "reason_tags": ["group_entry"],
+                    "command": "【导演指令】镜头职责=single",
+                }
+            ],
+            "coverage_block_refs": [],
+            "boundary_snapshots": {},
+            "warnings": [],
+        }
+    )
+    frames = ReferenceFramesOut.model_validate(
+        {
+            "boundary_projections": {
+                "start": {
+                    "prompt_fragment": "【入画状态】人物位置与朝向=阿明:左中、面朝右",
+                    "snapshot": {
+                        "boundary_role": "start",
+                        "facts": {
+                            "positions": [
+                                {"ref": "C01", "position": "左中", "facing": "面朝右"}
+                            ]
+                        },
+                    },
+                }
+            }
+        }
+    )
+
+    assert structured.subject_ids_by_ref == {"C01": "subject-c1"}
+    assert quality.director_commands[0].frame_role == "single"
+    assert frames.boundary_projections is not None
+    assert frames.boundary_projections.start is not None
+
+
+def test_hierarchy_endpoint_enrichment_projects_persisted_quality_state() -> None:
+    from app.api.v1.shots import _enrich_hierarchy_quality
+    from app.schemas.shot import (
+        ReferenceFramesOut,
+        SceneHierarchyOut,
+        ShotGroupHierarchyOut,
+        ShotHierarchyOut,
+        ShotOut,
+    )
+
+    hierarchy = ShotHierarchyOut(
+        episode_id="episode-1",
+        episode_version=1,
+        scenes=[
+            SceneHierarchyOut(
+                scene_no=1,
+                groups=[
+                    ShotGroupHierarchyOut(
+                        shot_group_id="group-1",
+                        scene_no=1,
+                        group_no="G1",
+                        reference_frames=ReferenceFramesOut(),
+                        shots=[
+                            ShotOut(
+                                shot_id="shot-1",
+                                scene_no=1,
+                                shot_group_id="group-1",
+                                group_no="G1",
+                                shot_no="2x2x2x2x2x",
+                                display_no=1,
+                            )
+                        ],
+                    )
+                ],
+            )
+        ],
+    )
+    quality = {
+        "version": 1,
+        "director_commands": [
+            {
+                "frame_role": "single",
+                "action_beat": "peak",
+                "must_categories": [],
+                "preferred_categories": [],
+                "reason_tags": [],
+                "command": "【导演指令】镜头职责=single",
+            }
+        ],
+        "coverage_block_refs": ["B01"],
+        "boundary_snapshots": {},
+        "warnings": [],
+    }
+    boundary = {
+        "positions": [{"ref": "C01", "position": "左中", "facing": "面朝右"}]
+    }
+    reference_frames = {
+        "first_frame": None,
+        "last_frame": None,
+        "reference_frame": None,
+        "boundary_projections": {
+            "start": {
+                "prompt_fragment": "【入画状态】人物位置与朝向=阿明:左中、面朝右",
+                "snapshot": {"boundary_role": "start", "facts": boundary},
+            }
+        },
+    }
+    structured = {
+        "schema_version": "storyboard.shot-structure.v1",
+        "display_no": 1,
+        "start_seconds": 0,
+        "end_seconds": 3,
+        "visual": {
+            "shot_size": "中景",
+            "composition": ["三分法"],
+            "camera_angle": "平视",
+            "camera_movement": "固定",
+            "action": "角色停下",
+            "frame_description": "角色位于画面左侧",
+            "lighting": "冷色侧光",
+            "emotion": "迟疑",
+        },
+        "narrative_purpose": "承接动作",
+        "character_refs": ["C01"],
+        "prop_refs": [],
+        "sound_refs": [],
+        "sound_design": "无",
+        "dialogue": None,
+    }
+
+    class _Rows:
+        def __init__(self, rows: list[tuple]) -> None:
+            self._rows = rows
+
+        def all(self) -> list[tuple]:
+            return self._rows
+
+    db = SimpleNamespace(
+        execute=AsyncMock(
+            side_effect=[
+                _Rows([("group-1", quality, reference_frames)]),
+                _Rows([("shot-1", structured)]),
+            ]
+        )
+    )
+
+    async def scenario() -> None:
+        result = await _enrich_hierarchy_quality(db, hierarchy)
+        group = result.scenes[0].groups[0]
+        assert group.quality_summary is not None
+        assert group.quality_summary.coverage_block_refs == ["B01"]
+        assert group.reference_frames is not None
+        assert group.reference_frames.boundary_projections is not None
+        assert group.shots[0].structured_data is not None
+        assert group.shots[0].structured_data.schema_version == "storyboard.shot-structure.v1"
+
+    asyncio.run(scenario())
+
+
 def test_breakdown_endpoint_projects_parsed_shot_and_group_fields(monkeypatch) -> None:
     from app.api.v1 import scripts as scripts_api
 

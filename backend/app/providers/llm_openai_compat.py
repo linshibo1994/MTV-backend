@@ -16,7 +16,6 @@ chat 为标准 chat.completions 多轮调用。
 
 from __future__ import annotations
 
-import json
 import sys
 from typing import Literal
 
@@ -28,7 +27,7 @@ from openai import (
     RateLimitError,
 )
 
-from app.providers.llm import LLMJSONResponseError, require_non_empty_chat_content
+from app.providers.llm import parse_json_object, require_non_empty_chat_content
 from app.providers.registry import ProviderConfigurationError
 
 LLMVendor = Literal["openai", "openai_compatible", "deepseek", "bailian", "gemini"]
@@ -180,23 +179,7 @@ class OpenAICompatLLMProvider:
             else:
                 raise RuntimeError(f"LLM 供应商调用失败 status={status_code}") from None
         content = response.choices[0].message.content or ""
-        # 去除部分厂商偶发的 markdown 代码块包裹
-        stripped = content.strip()
-        if stripped.startswith("```"):
-            stripped = stripped.split("```", 2)
-            stripped = stripped[1] if len(stripped) >= 2 else content
-        try:
-            parsed = json.loads(stripped)
-            if isinstance(parsed, dict):
-                return parsed
-            kind = type(parsed).__name__
-            raise LLMJSONResponseError(
-                "non_object_json", kind=kind, content_length=len(stripped)
-            )
-        except json.JSONDecodeError:
-            raise LLMJSONResponseError(
-                "invalid_json", kind="text", content_length=len(stripped)
-            ) from None
+        return parse_json_object(content, kind="text")
 
     async def chat(
         self,

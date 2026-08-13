@@ -87,5 +87,7 @@ class StoryboardJob(TimestampMixin, Base):
     error_message: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     # {scenes, shot_groups, shots} 生成计数 / {reservation_id} 积分预约
     detail: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    # 只保存不可逆哈希与不可变模板版本；不得保存剧本或完整 prompt 原文。
+    input_provenance: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 
     script = relationship("Script", lazy="selectin")

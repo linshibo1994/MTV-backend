@@ -33,6 +33,8 @@ class AggregatedReferences:
     subject_id_map: dict[str, str] = field(default_factory=dict)
     # 参考图类别，与 reference_images/reference_image_names 一一对应。
     reference_image_categories: list[str] = field(default_factory=list)
+    # 最终图片顺序对应的稳定 token 绑定；与 reference_images 一一对应。
+    reference_image_refs: list[dict[str, str | None]] = field(default_factory=list)
     # 参考音频（配音素材，结构同参考图）
     reference_audios: list[dict] = field(default_factory=list)
     reference_audio_names: list[str] = field(default_factory=list)
@@ -46,6 +48,7 @@ class MaterialReference:
     category: str
     subject_id: str | None = None
     asset_entry_id: str | None = None
+    reference_ref: str | None = None
 
 
 @dataclass(frozen=True)
@@ -97,10 +100,12 @@ def _parse_material_references(materials: dict | None) -> list[MaterialReference
             if isinstance(item, dict):
                 subject_id = item.get("subject_id") or item.get("subjectId")
                 asset_entry_id = item.get("asset_entry_id") or item.get("assetEntryId")
+                reference_ref = item.get("ref") or item.get("reference_ref") or item.get("short_ref")
                 label = str(item.get("name") or item.get("subject_name") or subject_id or "")
             elif isinstance(item, str):
                 subject_id = None
                 asset_entry_id = None
+                reference_ref = None
                 label = item
             else:
                 continue
@@ -117,6 +122,11 @@ def _parse_material_references(materials: dict | None) -> list[MaterialReference
                     category=key,
                     subject_id=subject_id,
                     asset_entry_id=asset_entry_id,
+                    reference_ref=(
+                        str(reference_ref).strip()
+                        if isinstance(reference_ref, str) and reference_ref.strip()
+                        else None
+                    ),
                 )
             )
     return refs
@@ -367,6 +377,16 @@ async def aggregate_references(
         })
         result.reference_image_names.append(ref.label)
         result.reference_image_categories.append(ref.category)
+        result.reference_image_refs.append(
+            {
+                "token": f"图{len(result.reference_images)}",
+                "ref": ref.reference_ref,
+                "name": ref.label,
+                "category": ref.category,
+                "subject_id": subject.id,
+                "asset_entry_id": entry.id,
+            }
+        )
         result.subject_id_map[f"{ref.category}:{ref.label}"] = subject.id
 
     # ===== 参考音频：audio_elements 角色名 → approved audio AssetEntry =====

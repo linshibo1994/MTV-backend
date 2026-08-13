@@ -16,7 +16,6 @@ ToolUseBlock.input 即为 dict，比提示词约束更可靠。chat 取 text 块
 
 from __future__ import annotations
 
-import json
 from typing import Any
 
 import httpx
@@ -25,6 +24,7 @@ from app.core.config import settings
 from app.providers.llm import (
     LLMJSONResponseError,
     LLMResponseContractError,
+    parse_json_object,
     require_non_empty_chat_content,
 )
 from app.providers.registry import ProviderConfigurationError
@@ -167,30 +167,17 @@ class AnthropicLLMProvider:
                 if isinstance(inp, dict):
                     return inp
                 if isinstance(inp, str):
-                    try:
-                        parsed = json.loads(inp)
-                        if isinstance(parsed, dict):
-                            return parsed
-                        raise LLMJSONResponseError(
-                            "non_object_json", kind=type(parsed).__name__, content_length=len(inp)
-                        )
-                    except json.JSONDecodeError:
-                        raise LLMJSONResponseError(
-                            "invalid_json", kind="tool_input", content_length=len(inp)
-                        ) from None
+                    return parse_json_object(inp, kind="tool_input")
         # 退化：模型未调用工具时尝试从 text 块解析 JSON
         for block in data.get("content", []):
             if block.get("type") == "text":
                 try:
-                    parsed = json.loads(block.get("text", ""))
-                    if isinstance(parsed, dict):
-                        return parsed
-                    raise LLMJSONResponseError(
-                        "non_object_json", kind=type(parsed).__name__, content_length=len(block.get("text", ""))
-                    )
-                except json.JSONDecodeError:
+                    return parse_json_object(block.get("text", ""), kind="text")
+                except LLMJSONResponseError as exc:
+                    if exc.diagnostic.get("category") != "invalid_json":
+                        raise
                     continue
-        raise LLMJSONResponseError("invalid_json", kind="empty")
+        return parse_json_object("", kind="empty")
 
     async def chat(
         self,

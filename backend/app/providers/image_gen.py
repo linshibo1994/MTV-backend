@@ -15,8 +15,182 @@ get_image_provider(model) 路由策略（模型别名优先 + .env 未知模型�
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Protocol, runtime_checkable
+
+from app.providers.registry import ProviderError
+
+
+class ImageSafetyCategory(StrEnum):
+    """可跨供应商审计的最小内容安全分类。"""
+
+    SAFETY = "safety"
+    BLOCKLIST = "blocklist"
+    PROHIBITED_CONTENT = "prohibited_content"
+    IMAGE_SAFETY = "image_safety"
+    PRIVACY = "privacy"
+
+
+class ImageSafetyRejectedError(ProviderError):
+    """供应商明确因内容安全拒绝，且没有可用图片结果。
+
+    异常只保存规范化厂商、稳定分类和脱敏代码，不保存原始响应或用户提示词。
+    """
+
+    def __init__(
+        self,
+        *,
+        provider: str,
+        category: ImageSafetyCategory,
+        code: str,
+    ) -> None:
+        normalized_provider = provider.strip().lower()
+        normalized_code = _normalize_safety_token(code)
+        if not normalized_provider or not normalized_code:
+            raise ValueError("内容安全拒绝必须包含规范化厂商与稳定代码")
+        self.provider = normalized_provider
+        self.category = category
+        self.code = normalized_code
+        super().__init__(
+            f"image_generation_safety_rejected:{normalized_provider}:{category.value}:{normalized_code}"
+        )
+
+
+class PromptSoftenLevel(StrEnum):
+    """确定性的递进软化等级；Worker 后续可按顺序调度。"""
+
+    GENTLE = "gentle"
+    CONSERVATIVE = "conservative"
+    SYMBOLIC = "symbolic"
+
+
+@dataclass(frozen=True)
+class SoftenedPrompt:
+    prompt: str
+    level: PromptSoftenLevel
+    strategy_version: str
+    changed: bool
+
+
+_SOFTEN_STRATEGY_VERSION = "image-safety-soften.v1"
+_PROTECTED_TOKEN_PATTERN = re.compile(r"\{\{[^{}]+\}\}|\{[^{}]+\}|<[^<>]+>")
+_SOFTEN_REPLACEMENTS: dict[PromptSoftenLevel, tuple[tuple[str, str], ...]] = {
+    PromptSoftenLevel.GENTLE: (
+        ("鲜血淋漓", "克制的受伤痕迹"),
+        ("血肉模糊", "含蓄的受伤表现"),
+        ("大量鲜血", "少量非写实红色痕迹"),
+        ("喷血", "以镜外反应表现受伤"),
+        ("砍头", "镜外表现角色倒下"),
+        ("断肢", "用遮挡表现严重受伤"),
+        ("裸露", "穿着得体且完整遮挡"),
+    ),
+    PromptSoftenLevel.CONSERVATIVE: (
+        ("鲜血", "非写实红色痕迹"),
+        ("流血", "受伤后的克制反应"),
+        ("尸体", "静止倒地的人物剪影"),
+        ("杀死", "使其失去行动能力"),
+        ("杀害", "使其退出冲突"),
+        ("枪击", "画外冲突与声光反应"),
+        ("刺穿", "被击中后的动作反应"),
+        ("裸体", "穿着完整且得体"),
+    ),
+    PromptSoftenLevel.SYMBOLIC: (
+        ("血", "象征性的红色光影"),
+        ("死亡", "以空镜和人物反应暗示离场"),
+        ("死去", "以空镜和人物反应暗示离场"),
+        ("暴力", "非写实、无伤口细节的戏剧冲突"),
+        ("攻击", "克制且非接触式的对峙"),
+        ("搏斗", "剪影化、非接触式的动作对峙"),
+        ("情色", "克制、得体且无裸露的情感表达"),
+        ("性爱", "含蓄且无身体细节的亲密氛围"),
+    ),
+}
+_SOFTEN_LEVEL_ORDER = (
+    PromptSoftenLevel.GENTLE,
+    PromptSoftenLevel.CONSERVATIVE,
+    PromptSoftenLevel.SYMBOLIC,
+)
+
+_SAFETY_CODE_CATEGORY: dict[str, ImageSafetyCategory] = {
+    "content_filter": ImageSafetyCategory.SAFETY,
+    "content_policy_violation": ImageSafetyCategory.SAFETY,
+    "safety": ImageSafetyCategory.SAFETY,
+    "blocklist": ImageSafetyCategory.BLOCKLIST,
+    "prohibited_content": ImageSafetyCategory.PROHIBITED_CONTENT,
+    "image_prohibited_content": ImageSafetyCategory.PROHIBITED_CONTENT,
+    "image_safety": ImageSafetyCategory.IMAGE_SAFETY,
+    "data_inspection_failed": ImageSafetyCategory.SAFETY,
+    "inappropriate_content": ImageSafetyCategory.SAFETY,
+    "input_data_inspection_failed": ImageSafetyCategory.SAFETY,
+    "output_data_inspection_failed": ImageSafetyCategory.SAFETY,
+    "privacy_information": ImageSafetyCategory.PRIVACY,
+}
+
+
+def _normalize_safety_token(value: str) -> str:
+    snake_case = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", value.strip())
+    normalized = re.sub(r"[^a-z0-9._-]+", "_", snake_case.lower())
+    return normalized.strip("_")[:128]
+
+
+def classify_image_safety_code(value: object) -> tuple[ImageSafetyCategory, str] | None:
+    """仅从稳定结构化代码识别内容安全拒绝，不读取自由错误消息。"""
+    if not isinstance(value, str):
+        return None
+    normalized = _normalize_safety_token(value)
+    if not normalized:
+        return None
+    normalized_parts = tuple(part for part in normalized.replace("-", "_").split(".") if part)
+    for candidate, category in _SAFETY_CODE_CATEGORY.items():
+        if candidate in normalized_parts or normalized == candidate:
+            return category, normalized
+    return None
+
+
+def soften_prompt(
+    prompt: str,
+    *,
+    level: PromptSoftenLevel | str,
+) -> SoftenedPrompt:
+    """纯确定性地软化已知高风险描写，并严格保护模板占位符。
+
+    本函数不判断输入是否违规，也不发起 LLM/网络调用；只有捕获到明确的
+    ``ImageSafetyRejectedError`` 后，Worker 才应按等级逐次调用。
+    """
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise ValueError("待软化提示词不能为空")
+    try:
+        normalized_level = PromptSoftenLevel(level)
+    except ValueError as exc:
+        raise ValueError(f"不支持的软化等级: {level}") from exc
+    protected_tokens = tuple(_PROTECTED_TOKEN_PATTERN.findall(prompt))
+    selected_level_index = _SOFTEN_LEVEL_ORDER.index(normalized_level)
+
+    def _soften_unprotected(match: re.Match[str]) -> str:
+        text = match.group(0)
+        for current_level in _SOFTEN_LEVEL_ORDER[: selected_level_index + 1]:
+            for source, replacement in _SOFTEN_REPLACEMENTS[current_level]:
+                text = text.replace(source, replacement)
+        return text
+
+    parts = _PROTECTED_TOKEN_PATTERN.split(prompt)
+    softened_parts: list[str] = []
+    token_iterator = iter(protected_tokens)
+    for index, part in enumerate(parts):
+        softened_parts.append(re.sub(r"[\s\S]+", _soften_unprotected, part))
+        if index < len(parts) - 1:
+            softened_parts.append(next(token_iterator))
+    softened = "".join(softened_parts)
+    if tuple(_PROTECTED_TOKEN_PATTERN.findall(softened)) != protected_tokens:
+        raise ValueError("软化策略不得修改模板占位符")
+    return SoftenedPrompt(
+        prompt=softened,
+        level=normalized_level,
+        strategy_version=_SOFTEN_STRATEGY_VERSION,
+        changed=softened != prompt,
+    )
 
 
 @dataclass(frozen=True)

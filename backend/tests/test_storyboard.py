@@ -11,7 +11,7 @@ import logging
 import traceback
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from fastapi import HTTPException
@@ -463,6 +463,141 @@ def test_prompt_contains_all_nine_constraints() -> None:
     assert len(PROMPT_CONSTRAINTS) == 9
     for index, constraint in enumerate(PROMPT_CONSTRAINTS, start=1):
         assert f"{index}. {constraint}" in prompt
+
+
+def test_group_prompt_uses_compressed_director_commands_without_full_constraint_lock() -> None:
+    from app.services.storyboard import PROMPT_CONSTRAINTS, _build_group_prompt
+
+    prompt = _build_group_prompt(
+        ["【镜头1:0s～3s】画面"],
+        ["阿明"],
+        "建立冲突",
+        director_commands=["【导演指令】镜头职责=single"],
+    )
+
+    assert "【导演指令】镜头职责=single" in prompt
+    assert "【约束】" not in prompt
+    assert all(constraint not in prompt for constraint in PROMPT_CONSTRAINTS)
+
+
+def test_group_prompt_template_switches_only_render_variables_for_v2_summary() -> None:
+    from app.services.prompt_template import fallback_snapshot
+    from app.services.storyboard import CONSTRAINT_LOCK, _build_group_prompt
+
+    template = fallback_snapshot(
+        "storyboard.group",
+        "{{ shot_lines }}|{{ director_commands }}|{{ constraint_lock }}",
+    )
+
+    structured = _build_group_prompt(
+        ["镜头行"],
+        ["阿明"],
+        "建立冲突",
+        director_commands=["  【导演指令】镜头职责=single  "],
+        group_template=template,
+    )
+    legacy = _build_group_prompt(
+        ["镜头行"],
+        ["阿明"],
+        "建立冲突",
+        group_template=template,
+    )
+
+    assert structured == "镜头行|【导演指令】镜头职责=single\n|"
+    assert CONSTRAINT_LOCK not in structured
+    assert legacy == f"镜头行||{CONSTRAINT_LOCK}"
+    assert template.source == "fallback"
+    assert template.version == 0
+
+
+async def test_selected_scene_audition_block_only_includes_selected_current_plan() -> None:
+    from app.services.storyboard import _selected_scene_audition_block
+
+    selected = SimpleNamespace(
+        scene_no=2,
+        selected_plan_id="plan-b",
+        plans=[
+            {
+                "plan_id": "plan-a",
+                "name": "未选方案",
+                "audience_knowledge_timing": "旧一",
+                "alignment_target": "旧二",
+                "performance_space": "旧三",
+                "strongest_image": "旧四",
+                "landing": "旧五",
+                "tradeoff": "旧六",
+            },
+            {
+                "plan_id": "plan-b",
+                "name": "确认方案",
+                "audience_knowledge_timing": "答案一",
+                "alignment_target": "答案二",
+                "performance_space": "答案三",
+                "strongest_image": "答案四",
+                "landing": "答案五",
+                "tradeoff": "答案六",
+            },
+        ],
+    )
+    result = SimpleNamespace(
+        scalars=lambda: SimpleNamespace(all=lambda: [selected]),
+    )
+    db = SimpleNamespace(execute=AsyncMock(return_value=result))
+
+    block = await _selected_scene_audition_block(
+        db,
+        script_id="script-1",
+        episode_id="episode-1",
+        input_version=7,
+    )
+
+    assert "确认方案" in block
+    assert all(f"答案{suffix}" in block for suffix in "一二三四五六")
+    assert "未选方案" not in block
+    statement = db.execute.await_args.args[0]
+    assert "scene_auditions.input_version" in str(statement)
+    assert "scene_auditions.status" in str(statement)
+
+
+async def test_storyboard_prompt_bundle_falls_back_per_invalid_runtime_template() -> None:
+    from app.services import storyboard as storyboard_service
+    from app.services.prompt_template import PromptTemplateSnapshot, fallback_snapshot
+
+    broken = PromptTemplateSnapshot(
+        key="storyboard.description",
+        template_id="template-broken",
+        version=9,
+        content_sha256="a" * 64,
+        content="{{ missing_variable }}",
+        source="database",
+    )
+    fallbacks = {
+        "storyboard.system": storyboard_service._SYSTEM_PROMPT,
+        "storyboard.user": storyboard_service._USER_PROMPT_TEMPLATE_FALLBACK,
+        "storyboard.description": storyboard_service._DESCRIPTION_TEMPLATE_FALLBACK,
+        "storyboard.shot": storyboard_service._SHOT_TEMPLATE_FALLBACK,
+        "storyboard.group": storyboard_service._GROUP_TEMPLATE_FALLBACK,
+        "storyboard.constraint": storyboard_service.CONSTRAINT_LOCK,
+    }
+    snapshots = {
+        key: fallback_snapshot(key, content)
+        for key, content in fallbacks.items()
+    }
+    snapshots["storyboard.description"] = broken
+    db = SimpleNamespace()
+    with patch.object(
+        storyboard_service,
+        "resolve_prompt_bundle",
+        AsyncMock(return_value=snapshots),
+    ):
+        context = await storyboard_service._resolve_storyboard_prompt_context(
+            db,
+            default_user_prompt="用户正文",
+        )
+
+    assert context.user_prompt == "用户正文"
+    assert context.templates["storyboard.description"].source == "fallback"
+    assert context.templates["storyboard.description"].version == 0
 
 
 def test_storyboard_prompt_uses_short_subject_refs_without_server_ids() -> None:
@@ -1055,6 +1190,103 @@ def test_storyboard_prompt_and_response_schema_require_integer_continuous_timing
     assert '"enum": ["storyboard.v2"]' in provider_schema
 
 
+def test_storyboard_prompt_numbers_script_blocks_and_requires_explicit_coverage() -> None:
+    from app.services import storyboard as storyboard_service
+
+    prompt = storyboard_service._build_user_prompt(
+        SimpleNamespace(
+            episode_no=1,
+            title="第一集",
+            script_text="阿明推门进入。\n\n小林抬头回应。",
+        ),
+        [],
+    )
+
+    assert "[B01] 阿明推门进入。" in prompt
+    assert "[B02] 小林抬头回应。" in prompt
+    assert '"source_block_refs": ["B01"]' in prompt
+    assert '"omitted_source_blocks": []' in prompt
+    assert "source_block_refs 指明落实的 Bxx" in storyboard_service._SYSTEM_PROMPT
+
+
+def test_normalize_provider_continuity_moves_quality_fields_out_of_visual() -> None:
+    from app.services import storyboard as storyboard_service
+
+    payload = _valid_storyboard_v2_payload()
+    shot = payload["scenes"][0]["shot_groups"][0]["shots"][0]
+    shot["visual"]["source_block_refs"] = ["B01"]
+    shot["visual"]["character_positions"] = [
+        {"ref": "C01", "position": "左中", "facing": "面朝右"}
+    ]
+    references = _subject_references()
+
+    validated = storyboard_service._validate_provider_payload_result(
+        payload,
+        subject_catalog=_subject_catalog(),
+        subject_reference_names={ref: item.name for ref, item in references.items()},
+        subject_reference_types={ref: item.subject_type for ref, item in references.items()},
+    )
+
+    assert validated.v2_contract is not None
+    normalized = validated.v2_contract.scenes[0].shot_groups[0].shots[0]
+    assert normalized.source_block_refs == ["B01"]
+    assert normalized.character_positions[0].position == "左中"
+
+
+def test_v2_quality_state_persists_structured_shot_group_and_boundaries() -> None:
+    from app.services import storyboard as storyboard_service
+
+    payload = _valid_storyboard_v2_payload()
+    first, second = payload["scenes"][0]["shot_groups"][0]["shots"]
+    first["source_block_refs"] = ["B01"]
+    second["source_block_refs"] = ["B02"]
+    first["start_boundary"] = {
+        "positions": [{"ref": "C01", "position": "左中", "facing": "面朝右"}],
+        "visible_state": ["阿明刚推开门"],
+    }
+    second["end_boundary"] = {
+        "positions": [{"ref": "C02", "position": "右中", "facing": "面朝左"}],
+        "visible_state": ["小林抬头"],
+    }
+    references = _subject_references()
+    validated = storyboard_service._validate_provider_payload_result(
+        payload,
+        subject_catalog=_subject_catalog(),
+        subject_reference_names={ref: item.name for ref, item in references.items()},
+        subject_reference_types={ref: item.subject_type for ref, item in references.items()},
+    )
+    assert validated.v2_contract is not None
+    report = storyboard_service.evaluate_storyboard_quality(
+        validated.v2_contract,
+        expected_source_blocks=["B01", "B02"],
+    )
+    source_group = validated.v2_contract.scenes[0].shot_groups[0]
+    quality = storyboard_service.build_shot_group_quality_summary(
+        source_group,
+        warnings=storyboard_service._warnings_for_group(
+            report,
+            scene_index=0,
+            group_index=0,
+        ),
+    )
+    frames = storyboard_service._build_boundary_reference_frames(
+        source_group,
+        subject_names_by_ref={ref: item.name for ref, item in references.items()},
+    )
+    structured = storyboard_service.build_shot_structured_data(
+        source_group.shots[0],
+        subject_ids_by_ref={"C01": "subject-c1"},
+    )
+
+    assert report.coverage.coverage_ratio == 1.0
+    assert structured["schema_version"] == "storyboard.shot-structure.v1"
+    assert structured["source_block_refs"] == ["B01"]
+    assert quality["director_commands"][0]["frame_role"] == "first"
+    assert frames["boundary_projections"]["start"]["prompt_fragment"].startswith(
+        "【入画状态】"
+    )
+
+
 async def test_invalid_provider_contract_does_not_delete_old_storyboard(monkeypatch) -> None:
     from app.schemas.pipeline_contracts import ProviderContractError
     from app.services import storyboard as storyboard_service
@@ -1267,6 +1499,7 @@ def test_subject_reference_catalog_excludes_archived_duplicate_and_binds_same_na
     )
     assert materials["character"] == [
         {
+            "ref": character_ref,
             "subject_id": "character-current",
             "asset_entry_id": "image-character",
             "name": "同名",
@@ -1274,6 +1507,7 @@ def test_subject_reference_catalog_excludes_archived_duplicate_and_binds_same_na
     ]
     assert materials["prop"] == [
         {
+            "ref": prop_ref,
             "subject_id": "prop-current",
             "asset_entry_id": "image-prop",
             "name": "同名",
@@ -1694,6 +1928,28 @@ async def test_storyboard_job_list_total_counts_all_rows(monkeypatch) -> None:
     assert out.total == 3
 
 
+async def test_storyboard_job_list_returns_successful_empty_state(monkeypatch) -> None:
+    """尚未创建任务是正常列表状态，供页面无异常地发现最新任务。"""
+    from app.api.v1 import shots
+
+    user = SimpleNamespace(user_id="user-1", enabled=True)
+    monkeypatch.setattr(shots, "_validate_script_episode", AsyncMock())
+    monkeypatch.setattr(shots, "list_jobs_for_episode", AsyncMock(return_value=[]))
+    monkeypatch.setattr(shots, "count_jobs_for_episode", AsyncMock(return_value=0))
+
+    out = await shots.list_storyboard_jobs(
+        "script-1",
+        "episode-1",
+        limit=1,
+        offset=0,
+        db=SimpleNamespace(),
+        user=user,
+    )
+
+    assert out.items == []
+    assert out.total == 0
+
+
 async def test_storyboard_claim_lease_cas_and_cancel() -> None:
     from app.crud.storyboard import cancel_job, claim_job, complete_job
 
@@ -1973,6 +2229,107 @@ async def test_worker_delegates_generation_to_independent_heartbeat(monkeypatch)
     generate_with_heartbeat.assert_awaited_once_with(db, job, "token-current")
 
 
+async def test_worker_persists_quality_report_in_terminal_detail(monkeypatch) -> None:
+    from app.workers import storyboard as storyboard_worker
+
+    report = {
+        "version": 1,
+        "status": "warning",
+        "warnings": [{"code": "coverage_missing_block"}],
+    }
+    job = SimpleNamespace(
+        job_id="job-quality",
+        script_id="script-1",
+        episode_id="episode-1",
+        input_version=7,
+        input_client_save_seq=4,
+        status="running",
+        lease_token="token-current",
+        canceled_at=None,
+        reservation_id=None,
+        detail={},
+        triggered_by_user_id="user-1",
+    )
+    episode = SimpleNamespace(episode_version=7, client_save_seq=4)
+    db = SimpleNamespace(rollback=AsyncMock(), commit=AsyncMock())
+    complete = AsyncMock(return_value=True)
+    monkeypatch.setattr(storyboard_worker, "_load_episode", AsyncMock(return_value=episode))
+    monkeypatch.setattr(
+        storyboard_worker,
+        "_generate_storyboard_with_heartbeat",
+        AsyncMock(
+            return_value={
+                "scenes": 1,
+                "shot_groups": 1,
+                "shots": 2,
+                "quality_report": report,
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        storyboard_worker,
+        "_lock_current_storyboard_job",
+        AsyncMock(return_value=job),
+    )
+    monkeypatch.setattr(storyboard_worker, "complete_job", complete)
+
+    await storyboard_worker._run_claimed_storyboard_job(db, job, "token-current")
+
+    assert complete.await_args.kwargs["detail"]["quality_report"] == report
+
+
+async def test_worker_persists_input_provenance_before_terminal_cas(monkeypatch) -> None:
+    from app.workers import storyboard as storyboard_worker
+
+    job = SimpleNamespace(
+        job_id="job-provenance",
+        script_id="script-1",
+        episode_id="episode-1",
+        input_version=7,
+        input_client_save_seq=4,
+        input_provenance=None,
+        status="running",
+        lease_token="token-current",
+        canceled_at=None,
+        reservation_id=None,
+        detail={},
+        triggered_by_user_id="user-1",
+    )
+    episode = SimpleNamespace(episode_version=7, client_save_seq=4)
+    db = SimpleNamespace(rollback=AsyncMock(), commit=AsyncMock())
+    provenance = {"schema": "storyboard.provenance.v1"}
+    observed: list[object] = []
+
+    async def complete(*args, **kwargs):
+        observed.append(job.input_provenance)
+        return True
+
+    monkeypatch.setattr(storyboard_worker, "_load_episode", AsyncMock(return_value=episode))
+    monkeypatch.setattr(
+        storyboard_worker,
+        "_generate_storyboard_with_heartbeat",
+        AsyncMock(
+            return_value={
+                "scenes": 1,
+                "shot_groups": 1,
+                "shots": 2,
+                "input_provenance": provenance,
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        storyboard_worker,
+        "_lock_current_storyboard_job",
+        AsyncMock(return_value=job),
+    )
+    monkeypatch.setattr(storyboard_worker, "complete_job", complete)
+
+    await storyboard_worker._run_claimed_storyboard_job(db, job, "token-current")
+
+    assert observed == [provenance]
+    db.commit.assert_awaited_once()
+
+
 def test_storyboard_heartbeat_renews_in_independent_short_transactions(monkeypatch) -> None:
     from app.workers import storyboard as storyboard_worker
 
@@ -2136,6 +2493,46 @@ async def test_dispatch_reconciler_ignores_running_job_with_live_lease() -> None
     assert "storyboard_jobs.heartbeat_at" not in where_sql
     assert "storyboard_jobs.lease_until" in where_sql
     assert "storyboard_jobs.status = %(status_2)s" in where_sql
+
+
+async def test_dispatch_reconciler_optionally_audits_succeeded_provenance(monkeypatch) -> None:
+    from app.workers import storyboard as storyboard_worker
+
+    job = SimpleNamespace(job_id="job-stale")
+
+    class Result:
+        def __init__(self, values):
+            self.values = values
+
+        def scalars(self):
+            return self
+
+        def all(self):
+            return self.values
+
+    db = SimpleNamespace(
+        execute=AsyncMock(side_effect=[Result([]), Result([job])]),
+    )
+    report = SimpleNamespace(status="stale", mismatches=("episode_script_sha256",))
+    validate = AsyncMock(return_value=report)
+    monkeypatch.setattr(
+        storyboard_worker.settings,
+        "storyboard_provenance_audit_enabled",
+        True,
+    )
+    monkeypatch.setattr(
+        storyboard_worker.settings,
+        "storyboard_provenance_audit_batch_size",
+        7,
+    )
+    monkeypatch.setattr(storyboard_worker, "validate_storyboard_provenance", validate)
+
+    recovered = await storyboard_worker.reconcile_storyboard_dispatches(db)
+
+    assert recovered == 0
+    validate.assert_awaited_once_with(db, "job-stale")
+    audit_statement = db.execute.await_args_list[1].args[0]
+    assert "storyboard_jobs.status" in str(audit_statement)
 
 
 async def test_worker_failure_path_does_not_release_or_mark_failed_for_stale_token(monkeypatch) -> None:

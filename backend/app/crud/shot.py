@@ -31,6 +31,7 @@ from app.schemas.shot import (
     SceneHierarchyOut,
     SceneWorkbenchOut,
     ShotGroupHierarchyOut,
+    ShotGroupQualitySummaryOut,
     ShotGroupWorkbenchOut,
     ShotHierarchyOut,
     ShotOut,
@@ -52,11 +53,46 @@ def _to_reference_frames(reference_frames: dict | None) -> ReferenceFramesOut | 
     """将 JSONB 字典转为 ReferenceFramesOut。"""
     if reference_frames is None:
         return None
-    return ReferenceFramesOut(
-        first_frame=reference_frames.get("first_frame"),
-        last_frame=reference_frames.get("last_frame"),
-        reference_frame=reference_frames.get("reference_frame"),
-    )
+    try:
+        return ReferenceFramesOut.model_validate(reference_frames)
+    except ValueError:
+        # 边界投影是可选增强；历史或人工写入的未知形状不能影响基础帧读取。
+        fallback: dict[str, object] = {
+            "first_frame": (
+                reference_frames.get("first_frame")
+                if isinstance(reference_frames.get("first_frame"), str)
+                else None
+            ),
+            "last_frame": (
+                reference_frames.get("last_frame")
+                if isinstance(reference_frames.get("last_frame"), str)
+                else None
+            ),
+            "reference_frame": (
+                reference_frames.get("reference_frame")
+                if isinstance(reference_frames.get("reference_frame"), str)
+                else None
+            ),
+        }
+        diagnostics = reference_frames.get("chain_diagnostics")
+        if isinstance(diagnostics, list):
+            fallback["chain_diagnostics"] = diagnostics
+        try:
+            return ReferenceFramesOut.model_validate(fallback)
+        except ValueError:
+            # 未知新版诊断形状也不能阻断历史三类基础帧返回。
+            fallback.pop("chain_diagnostics", None)
+            return ReferenceFramesOut.model_validate(fallback)
+
+
+def _to_quality_summary(quality_summary: object) -> ShotGroupQualitySummaryOut | None:
+    """严格解析新版摘要，同时让历史未知 JSON 安全降级为空。"""
+    if not isinstance(quality_summary, dict) or not quality_summary:
+        return None
+    try:
+        return ShotGroupQualitySummaryOut.model_validate(quality_summary)
+    except ValueError:
+        return None
 
 
 def _to_materials(materials: dict | None) -> MaterialsOut | None:
@@ -87,6 +123,7 @@ def _normalise_material_items(items: object) -> list[MaterialItemOut]:
             normalised.append(
                 MaterialItemOut(
                     name=str(item["name"]),
+                    ref=item.get("ref"),
                     subject_id=item.get("subject_id"),
                     asset_entry_id=item.get("asset_entry_id"),
                 )
@@ -294,6 +331,7 @@ async def get_shot_hierarchy(
                     group_no=g.group_no,
                     prompt=g.prompt,
                     duration_seconds=g.duration_seconds,
+                    is_continuation=bool(getattr(g, "is_continuation", False)),
                     narrative_purpose=(g.description_text or "").strip() or None,
                     materials=_to_materials(g.materials),
                     audio_elements=_normalise_audio_elements(g.audio_elements),
@@ -445,6 +483,7 @@ async def get_video_workbench(
                     prompt=g.prompt,
                     duration_seconds=g.duration_seconds,
                     video_duration_seconds=g.video_duration_seconds,
+                    is_continuation=bool(getattr(g, "is_continuation", False)),
                     materials=_to_materials(g.materials),
                     audio_elements=_normalise_audio_elements(g.audio_elements),
                     shot_ids=[s.shot_id for s in sorted_shots],
@@ -452,6 +491,9 @@ async def get_video_workbench(
                     shot_nos=[s.shot_no for s in sorted_shots],
                     description_text=g.description_text,
                     reference_frames=_to_reference_frames(g.reference_frames),
+                    quality_summary=_to_quality_summary(
+                        getattr(g, "quality_summary", None)
+                    ),
                     reference_image_audit=ReferenceImageAuditOut(**public_audit_state(audit_state)),
                     content_hash=shot_group_content_hash(g),
                     updated_at=g.updated_at,

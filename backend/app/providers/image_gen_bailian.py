@@ -24,7 +24,11 @@ from urllib.parse import urlsplit
 import httpx
 
 from app.core.config import settings
-from app.providers.image_gen import ImageResult
+from app.providers.image_gen import (
+    ImageResult,
+    ImageSafetyRejectedError,
+    classify_image_safety_code,
+)
 from app.providers.registry import ProviderConfigurationError
 from app.schemas.materials import (
     CHARACTER_SHEET_MARKER,
@@ -41,6 +45,38 @@ _MAX_SUBMIT_ATTEMPTS = 5
 _MAX_RETRY_DELAY_SECONDS = 20.0
 _STYLE_RENDER_CONSTRAINT_MARKER = "【风格渲染约束】"
 _LEGACY_CHARACTER_SHEET_MARKER = "【人物设定图服务端构图硬约束】"
+
+
+def _raise_if_safety_rejected(payload: object) -> None:
+    """只按百炼结构化 ``code`` 字段识别审核拒绝。"""
+    if not isinstance(payload, dict):
+        return
+    candidates = [payload.get("code")]
+    for wrapper_name in ("error", "output"):
+        wrapper = payload.get(wrapper_name)
+        if isinstance(wrapper, dict):
+            candidates.extend((wrapper.get("code"), wrapper.get("finish_reason")))
+    for candidate in candidates:
+        classification = classify_image_safety_code(candidate)
+        if classification is None:
+            continue
+        category, code = classification
+        raise ImageSafetyRejectedError(provider="bailian", category=category, code=code)
+
+
+def _classify_response_safety(response: object) -> None:
+    """响应非 JSON 时保持原错误路径，不把解析失败伪装成审核拒绝。"""
+    status_code = getattr(response, "status_code", None)
+    if status_code not in {200, 400, 422}:
+        return
+    json_method = getattr(response, "json", None)
+    if not callable(json_method):
+        return
+    try:
+        payload = json_method()
+    except (TypeError, ValueError):
+        return
+    _raise_if_safety_rejected(payload)
 
 # Qwen Image 2.0 支持自定义宽高；以下 2K 值采用百炼官方推荐分辨率。
 # 1K 值使用该 API 的常用低分辨率档，均为 16 的倍数并保持相同宽高比。
@@ -329,6 +365,7 @@ class BailianImageGenProvider:
             headers=headers,
             body=body,
         )
+        _classify_response_safety(submit)
         if submit.status_code != 200:
             raise RuntimeError(f"百炼 Qwen Image 文生图失败 status={submit.status_code}")
         urls = _extract_multimodal_urls(submit.json())
@@ -373,6 +410,7 @@ class BailianImageGenProvider:
             headers=headers,
             body=body,
         )
+        _classify_response_safety(submit)
         if submit.status_code != 200:
             raise RuntimeError(f"通义万相文生图提交失败 status={submit.status_code}")
         task_id = (submit.json().get("output") or {}).get("task_id")
@@ -393,8 +431,11 @@ class BailianImageGenProvider:
         while True:
             resp = await http.get(f"{base_url}/api/v1/tasks/{task_id}", headers=poll_headers)
             if resp.status_code != 200:
+                _classify_response_safety(resp)
                 raise RuntimeError(f"通义万相轮询失败 status={resp.status_code}")
-            data = resp.json().get("output") or {}
+            payload = resp.json()
+            _raise_if_safety_rejected(payload)
+            data = payload.get("output") or {}
             status = (data.get("task_status") or "").upper()
             if status == "SUCCEEDED":
                 results = data.get("results") or []

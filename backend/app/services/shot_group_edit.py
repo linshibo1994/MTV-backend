@@ -23,7 +23,7 @@ from app.models.video_generation_job import (
 )
 from app.services.shot_group_merge import _rewrite_shot_line
 
-_ACTIVE_VIDEO_STATUSES = ("starting", "processing")
+_ACTIVE_VIDEO_STATUSES = ("waiting_dependency", "starting", "processing")
 _PROMPT_TIMELINE_PATTERN = re.compile(r"【镜头\s*(?P<display_no>\d+)\s*:\s*\d+\s*s\s*[～~\-—至]\s*\d+\s*s】")
 _MATERIAL_KEYS = ("character", "background", "prop", "other")
 
@@ -248,6 +248,7 @@ async def update_shot_group(
     expected_episode_version: int,
     fields_set: set[str],
     duration_seconds: int | None = None,
+    is_continuation: bool | None = None,
     prompt: str | None = None,
     materials: dict[str, list[dict[str, Any]]] | None = None,
     audio_elements: list[dict[str, Any]] | None = None,
@@ -326,6 +327,12 @@ async def update_shot_group(
             or duration_seconds != group.video_duration_seconds
         )
 
+    continuation_changed = (
+        "is_continuation" in fields_set
+        and is_continuation is not None
+        and bool(is_continuation) != bool(group.is_continuation)
+    )
+
     candidate_prompt = group.prompt
     if "prompt" in fields_set:
         assert prompt is not None
@@ -380,7 +387,13 @@ async def update_shot_group(
     audio_changed = (
         normalised_audio is not None and normalised_audio != group.audio_elements
     )
-    if not (duration_changed or prompt_changed or materials_changed or audio_changed):
+    if not (
+        duration_changed
+        or continuation_changed
+        or prompt_changed
+        or materials_changed
+        or audio_changed
+    ):
         return ShotGroupUpdateResult(
             episode_version=episode.episode_version,
             changed_fields=(),
@@ -414,6 +427,10 @@ async def update_shot_group(
         group.duration_seconds = duration_seconds
         group.video_duration_seconds = duration_seconds
         changed_fields.append("duration_seconds")
+    if continuation_changed:
+        assert is_continuation is not None
+        group.is_continuation = is_continuation
+        changed_fields.append("is_continuation")
 
     final_prompt: str = (
         prompt

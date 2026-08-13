@@ -44,6 +44,7 @@ from app.models.episode import Episode
 from app.models.storyboard_job import StoryboardJob
 from app.models.task_dispatch_outbox import TaskDispatchOutbox
 from app.services import storyboard as storyboard_service
+from app.services.storyboard_provenance import validate_storyboard_provenance
 from app.services.task_dispatch import enqueue_task
 from app.workers.async_runtime import (
     WorkerAsyncRuntimeStopping,
@@ -200,6 +201,7 @@ async def _generate_storyboard_with_heartbeat(
             job.episode_id,
             expected_episode_version=job.input_version,
             expected_client_save_seq=job.input_client_save_seq,
+            source_storyboard_job_id=job.job_id,
         )
     )
     heartbeat_task = asyncio.create_task(
@@ -253,6 +255,10 @@ async def _run_claimed_storyboard_job(db, job: StoryboardJob, lease_token: str) 
             await db.rollback()
         raise RuntimeError("storyboard lease CAS failed")
     job = locked_job
+    input_provenance = result.get("input_provenance")
+    if isinstance(input_provenance, dict):
+        # 与最终状态 CAS、分镜实体和积分结算共用同一事务；失败统一回滚。
+        job.input_provenance = input_provenance
     reservation_id = _job_reservation_id(job)
     if settle is not None and reservation_id:
         await settle(
@@ -268,6 +274,9 @@ async def _run_claimed_storyboard_job(db, job: StoryboardJob, lease_token: str) 
         "shots": result.get("shots", 0),
         "reservation_id": reservation_id,
     }
+    quality_report = result.get("quality_report")
+    if isinstance(quality_report, dict):
+        detail["quality_report"] = quality_report
     if not await complete_job(db, job.job_id, lease_token, status="succeeded", detail=detail):
         if hasattr(db, "rollback"):
             await db.rollback()
@@ -506,6 +515,27 @@ async def reconcile_storyboard_dispatches(
             outbox.lease_until = None
             outbox.available_at = current
             recovered += 1
+    if settings.storyboard_provenance_audit_enabled:
+        audit_jobs = list(
+            (
+                await db.execute(
+                    select(StoryboardJob)
+                    .where(StoryboardJob.status == "succeeded")
+                    .order_by(StoryboardJob.finished_at.desc())
+                    .limit(settings.storyboard_provenance_audit_batch_size)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for audit_job in audit_jobs:
+            report = await validate_storyboard_provenance(db, audit_job.job_id)
+            if report.status == "stale":
+                logger.warning(
+                    "分镜输入溯源已过期 job_id=%s mismatches=%s",
+                    audit_job.job_id,
+                    list(report.mismatches),
+                )
     return recovered
 
 

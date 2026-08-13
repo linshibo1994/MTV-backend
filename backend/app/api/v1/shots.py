@@ -42,15 +42,20 @@ from app.crud.storyboard import (
 from app.models.credit import CreditAccount
 from app.models.episode import Episode
 from app.models.script import Script
+from app.models.shot import Shot
+from app.models.shot_group import ShotGroup
 from app.models.storyboard_job import STORYBOARD_IDEMPOTENCY_KEY_MAX_LENGTH, StoryboardJob
 from app.models.task_dispatch_outbox import TaskDispatchOutbox
 from app.models.user import User
 from app.schemas.shot import (
     CoverOut,
     GenerateStoryboardResponse,
+    ReferenceFramesOut,
     ShotGroupMergeIn,
+    ShotGroupQualitySummaryOut,
     ShotGroupUpdateIn,
     ShotHierarchyOut,
+    ShotStructuredDataOut,
     StoryboardJobEditIn,
     StoryboardJobListOut,
     StoryboardStatusOut,
@@ -66,6 +71,7 @@ from app.services.shot_group_delete import (
 )
 from app.services.shot_group_edit import update_shot_group
 from app.services.shot_group_merge import merge_shots_into_group
+from app.services.storyboard_provenance import validate_storyboard_provenance
 from app.services.task_dispatch import enqueue_task
 
 logger = logging.getLogger(__name__)
@@ -73,6 +79,88 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 STORYBOARD_OUTBOX_TASK_TYPE = "storyboard.generate"
+
+
+async def _enrich_hierarchy_quality(
+    db: AsyncSession,
+    hierarchy: ShotHierarchyOut,
+) -> ShotHierarchyOut:
+    """补齐 CRUD 兼容投影未携带的 v2 结构快照与质量摘要。"""
+
+    groups = [group for scene in hierarchy.scenes for group in scene.groups]
+    shots = [
+        shot
+        for scene in hierarchy.scenes
+        for shot in (
+            [item for group in scene.groups for item in group.shots]
+            + list(scene.ungrouped_shots)
+        )
+    ]
+    if groups:
+        group_rows = (
+            await db.execute(
+                select(
+                    ShotGroup.shot_group_id,
+                    ShotGroup.quality_summary,
+                    ShotGroup.reference_frames,
+                ).where(
+                    ShotGroup.episode_id == hierarchy.episode_id,
+                    ShotGroup.shot_group_id.in_([group.shot_group_id for group in groups]),
+                )
+            )
+        ).all()
+        group_data = {
+            str(group_id): (quality_summary, reference_frames)
+            for group_id, quality_summary, reference_frames in group_rows
+        }
+        for group in groups:
+            quality_summary, reference_frames = group_data.get(
+                group.shot_group_id,
+                (None, None),
+            )
+            if isinstance(quality_summary, dict) and quality_summary:
+                try:
+                    group.quality_summary = ShotGroupQualitySummaryOut.model_validate(
+                        quality_summary
+                    )
+                except ValueError:
+                    # 兼容迁移前或人工写入的未知 JSON 形状。
+                    group.quality_summary = None
+            boundary_projections = (
+                reference_frames.get("boundary_projections")
+                if isinstance(reference_frames, dict)
+                else None
+            )
+            if isinstance(boundary_projections, dict):
+                current = group.reference_frames.model_dump() if group.reference_frames else {}
+                current["boundary_projections"] = boundary_projections
+                try:
+                    group.reference_frames = ReferenceFramesOut.model_validate(current)
+                except ValueError:
+                    # 非法扩展键不影响历史首帧、尾帧和参考帧读取。
+                    pass
+
+    if shots:
+        shot_rows = (
+            await db.execute(
+                select(Shot.shot_id, Shot.structured_data)
+                .join(ShotGroup, ShotGroup.shot_group_id == Shot.shot_group_id)
+                .where(
+                    ShotGroup.episode_id == hierarchy.episode_id,
+                    Shot.shot_id.in_([shot.shot_id for shot in shots]),
+                )
+            )
+        ).all()
+        structured_by_id = {str(shot_id): data for shot_id, data in shot_rows}
+        for shot in shots:
+            raw = structured_by_id.get(shot.shot_id)
+            if isinstance(raw, dict):
+                try:
+                    shot.structured_data = ShotStructuredDataOut.model_validate(raw)
+                except ValueError:
+                    # 历史未知结构不破坏整个层级响应。
+                    shot.structured_data = None
+    return hierarchy
 
 
 def _require_idempotency_key(raw: str) -> str:
@@ -130,6 +218,12 @@ def _job_status_out(job) -> StoryboardStatusOut:
         error_message=job.error_message,
         detail=job.detail,
     )
+
+
+def _provenance_public_out(report) -> dict[str, object]:
+    """只暴露新鲜度与差异字段名，不返回任何输入正文或主体目录。"""
+
+    return report.as_dict()
 
 
 # ---------------------------------------------------------------------------
@@ -438,7 +532,11 @@ async def storyboard_job_detail(
     job = await _get_authorized_storyboard_job(
         db, user, script_id, episode_id, job_id, action=Action.READ
     )
-    return _job_status_out(job)
+    out = _job_status_out(job)
+    out.provenance = _provenance_public_out(
+        await validate_storyboard_provenance(db, job_id)
+    )
+    return out
 
 
 @router.patch(
@@ -559,7 +657,8 @@ async def shot_hierarchy(
 ) -> ShotHierarchyOut:
     """获取分镜层级结构。"""
     await _validate_script_episode(db, user, script_id, episode_id)
-    return await get_shot_hierarchy(db, script_id, episode_id)
+    hierarchy = await get_shot_hierarchy(db, script_id, episode_id)
+    return await _enrich_hierarchy_quality(db, hierarchy)
 
 
 @router.post(
@@ -650,6 +749,7 @@ async def edit_shot_group(
         expected_episode_version=payload.expected_episode_version,
         fields_set=fields_set,
         duration_seconds=payload.duration_seconds,
+        is_continuation=payload.is_continuation,
         prompt=payload.prompt,
         materials=(
             payload.materials.model_dump(exclude_none=True)

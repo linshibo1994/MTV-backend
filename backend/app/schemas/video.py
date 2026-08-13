@@ -32,6 +32,7 @@ class VideoJobOut(BaseModel):
     attempt: int | None = None
     reservation_id: str | None = None
     dispatch_id: str | None = None
+    predecessor_job_id: str | None = None
     scene_no: int
     unit_id: str
     unit_runtime_key: str

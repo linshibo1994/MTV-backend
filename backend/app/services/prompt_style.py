@@ -376,6 +376,51 @@ def apply_style(
     return positive, str(style["negative_prompt"])
 
 
+def apply_style_definition(
+    style: dict,
+    prompt: str,
+    target: str,
+    *,
+    subject_type: str | None = None,
+    visual_style: str | None = None,
+) -> tuple[str, str]:
+    """应用内置或数据库画风定义，并把渲染媒介作为独立维度注入。
+
+    数据库 ArtStyle 通过同一字典契约进入本函数，避免维护
+    ``visual_style × style`` 的 16 份重复模板。
+    """
+
+    if target not in style.get("target", []):
+        return prompt, ""
+    style_id = str(style.get("id") or "")
+    if find_style(style_id) is not None:
+        positive, negative = apply_style(
+            style_id,
+            prompt,
+            target,
+            subject_type=subject_type,
+        )
+    else:
+        template = str(style.get("prompt_template") or "{prompt}")
+        positive = template.replace("{prompt}", prompt)
+        negative = str(style.get("negative_prompt") or "")
+    medium = visual_style or style.get("visual_style")
+    return apply_visual_style_dimension(positive, str(medium) if medium else None), negative
+
+
+def apply_visual_style_dimension(prompt: str, visual_style: str | None) -> str:
+    """独立注入写实/动画媒介，不复制具体美术风格模板。"""
+
+    medium = visual_style
+    medium_prompt = {
+        "live_action": "live-action physical production, real camera and practical materials",
+        "anime": "animated production medium, designed linework and controlled animation shading",
+    }.get(str(medium))
+    if medium_prompt and medium_prompt not in prompt:
+        return f"{medium_prompt}, {prompt}"
+    return prompt
+
+
 async def optimize_prompt(
     raw_prompt: str,
     style_id: str | None,

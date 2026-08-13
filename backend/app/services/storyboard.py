@@ -16,8 +16,9 @@ from __future__ import annotations
 import inspect
 import json
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import cast
+from typing import TypeGuard, cast
 
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -27,6 +28,7 @@ from app.core.ids import new_id
 from app.models.asset_entry import AssetEntry
 from app.models.episode import Episode
 from app.models.scene import Scene
+from app.models.scene_audition import SceneAudition
 from app.models.shot import Shot
 from app.models.shot_group import DRAFT_SHOT_GROUP_UNIT_PREFIX, ShotGroup
 from app.models.subject import Subject
@@ -41,15 +43,80 @@ from app.schemas.storyboard_contracts import (
     StoryboardContract,
     StoryboardContractValidationError,
     StoryboardV2Contract,
+    StoryboardV2SceneContract,
+    StoryboardV2ShotContract,
+    StoryboardV2ShotGroupContract,
     storyboard_contract_diagnostic,
     validate_storyboard_contract,
     validate_storyboard_v2_contract,
+)
+from app.services.boundary_projection import project_boundary
+from app.services.optional_query import (
+    can_fallback_from_optional_query,
+    execute_optional_query,
+)
+from app.services.prompt_template import (
+    PromptTemplateSnapshot,
+    render_prompt_template,
+    render_prompt_template_with_fallback,
+    resolve_prompt_bundle,
+)
+from app.services.storyboard_provenance import (
+    build_storyboard_provenance,
+    storyboard_provenance_sha256,
+)
+from app.services.storyboard_quality import (
+    QualityReport,
+    QualityWarning,
+    ScriptBlock,
+    build_script_blocks,
+    build_shot_group_quality_summary,
+    build_shot_structured_data,
+    evaluate_storyboard_quality,
 )
 
 logger = logging.getLogger(__name__)
 
 _STORYBOARD_CONTRACT_MAX_ATTEMPTS = 2
 _STORYBOARD_REPAIR_PAYLOAD_MAX_CHARS = 120_000
+
+_CHAIN_LAST_FRAME_MISSING = "chain_last_frame_missing"
+_CHAIN_LINK_BROKEN = "chain_link_broken"
+_CONTINUATION_PREDECESSOR_LAST_FRAME_UNAVAILABLE = (
+    "continuation_predecessor_last_frame_unavailable"
+)
+_OWNED_CHAIN_DIAGNOSTIC_CODES = frozenset(
+    {
+        _CHAIN_LAST_FRAME_MISSING,
+        _CHAIN_LINK_BROKEN,
+        _CONTINUATION_PREDECESSOR_LAST_FRAME_UNAVAILABLE,
+    }
+)
+
+
+class ChainFrameUpdateResult(int):
+    """链帧更新结果；保持历史 ``int`` 返回值兼容并附带脱敏诊断。"""
+
+    updated: int
+    diagnostics: list[dict[str, object]]
+
+    def __new__(
+        cls,
+        updated: int,
+        diagnostics: list[dict[str, object]],
+    ) -> ChainFrameUpdateResult:
+        result = super().__new__(cls, updated)
+        result.updated = updated
+        result.diagnostics = [dict(item) for item in diagnostics]
+        return result
+
+    def model_dump(self) -> dict[str, object]:
+        """提供与 API/测试常用模型一致的字典形态。"""
+
+        return {
+            "updated": self.updated,
+            "diagnostics": [dict(item) for item in self.diagnostics],
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -94,6 +161,13 @@ SHOT_LINE_TEMPLATE = (
     "台词类型是【{dialogue_kind}】"
 )
 
+_STORYBOARD_SYSTEM_TEMPLATE_KEY = "storyboard.system"
+_STORYBOARD_USER_TEMPLATE_KEY = "storyboard.user"
+_STORYBOARD_DESCRIPTION_TEMPLATE_KEY = "storyboard.description"
+_STORYBOARD_SHOT_TEMPLATE_KEY = "storyboard.shot"
+_STORYBOARD_GROUP_TEMPLATE_KEY = "storyboard.group"
+_STORYBOARD_CONSTRAINT_TEMPLATE_KEY = "storyboard.constraint"
+
 
 # ---------------------------------------------------------------------------
 # LLM Prompt 构造
@@ -113,6 +187,9 @@ Episode -> Scene（连续时空段落）-> Shot Group（3~15 秒叙事单元）-
 6. 剧本中的对白、旁白和内心独白必须逐字保留；不得增删或改写。无语言内容时 dialogue 必须为 null。
 7. 只可引用输入目录中的短引用；不得输出主体名称、subject_id、asset_entry_id，也不得创造新资产。
 8. 不要输出 content、description 或 shot_line；这些派生字段由服务端生成。
+9. 每镜用 source_block_refs 指明落实的 Bxx 原文段；无法落实的段只能在根级 omitted_source_blocks 声明并给出原因。
+10. 用 start_boundary/end_boundary 记录镜头起止时刻可见的人物位置、朝向、视线、手部、道具与状态；不可见事实留空。
+11. character_positions 使用九宫格位置与受控朝向；audience_visibility 明确事实现在展示或暂缓揭示，暂缓时给出触发条件与保护方法。
 
 ## 受控摄影词表
 - shot_size: {'/'.join(SHOT_SIZE_VALUES)}
@@ -138,9 +215,49 @@ Episode -> Scene（连续时空段落）-> Shot Group（3~15 秒叙事单元）-
 4. 用户提示会给出由剧本字数推导的“本集覆盖度下限”（最少镜头数/组数/场数/总秒数），这是下限不是目标；实际产出应达到或超过该下限，低于下限会被判定为不合格并要求重做。
 5. 禁止用“一个全景镜 + 长 duration_seconds”敷衍整场戏；duration_seconds 上限 15 秒，长戏必须拆成多个 3~15 秒的镜头组。
 6. 不得为凑数量注水无叙事作用的装饰镜头；每镜只承载一个主要动作或信息变化。
+7. 用户提示中的每个 Bxx 必须出现在至少一个镜头的 source_block_refs，或出现在根级 omitted_source_blocks 并说明原因。
 
 只输出符合 JSON Schema 的 JSON 对象，不要 markdown 或解释文字。
 """
+
+_USER_PROMPT_TEMPLATE_FALLBACK = "{{ default_prompt }}"
+_DESCRIPTION_TEMPLATE_FALLBACK = (
+    "在【{{ background }}】中采用【{{ camera }}】拍摄视角，"
+    "画面主体【{{ characters }}】的关键动作是【{{ action }}】，"
+    "整体表现的画面是【{{ scene }}】，"
+    "表达了【{{ emotion }}】，"
+    "整体画面的光影效果是【{{ lighting }}】，"
+    "整个镜头的叙事目的是【{{ narrative_purpose }}】。"
+)
+_SHOT_TEMPLATE_FALLBACK = (
+    "【镜头{{ n }}:{{ start }}s～{{ end }}s】场景是{{ scene }}，"
+    "{{ shot_scale }}·{{ camera }}，{{ camera_movement }}，"
+    "{{ lighting }}，{{ action }}，{{ emotion }}，{{ characters }}:{{ dialogue }}，"
+    "构图是【{{ composition }}】，声音设计是【{{ sound_design }}】，"
+    "台词类型是【{{ dialogue_kind }}】"
+)
+_GROUP_TEMPLATE_FALLBACK = (
+    "{{ shot_lines }}\n【角色】{{ referenced_names }}\n"
+    "【叙事目的】{{ narrative_purpose }}\n"
+    "{{ director_commands }}{{ constraint_lock }}"
+)
+
+
+@dataclass(frozen=True)
+class _StoryboardPromptContext:
+    system_prompt: str
+    user_prompt: str
+    constraint_lock: str
+    templates: Mapping[str, PromptTemplateSnapshot]
+
+
+@dataclass(frozen=True)
+class _StoryboardResolvedInput:
+    """一次分镜任务冻结的全部提示词输入与脱敏溯源。"""
+
+    prompts: _StoryboardPromptContext
+    script_blocks: list[ScriptBlock]
+    provenance: dict[str, object]
 
 
 @dataclass(frozen=True)
@@ -229,12 +346,28 @@ def _check_coverage(
                 shot_count += len(group.shots)
                 total_duration += group.duration_seconds
     else:
-        for scene in validated.contract.scenes:
+        contract_scenes = getattr(validated.contract, "scenes", None)
+        if contract_scenes is None:
+            # 部分调用方（以及历史测试替身）只实现 model_dump；兼容该稳定协议，
+            # 同时不放宽正式 Pydantic 合约的校验。
+            dumped_contract = validated.contract.model_dump()
+            contract_scenes = dumped_contract.get("scenes", [])
+        for v1_scene in contract_scenes:
+            if isinstance(v1_scene, dict):
+                groups = v1_scene.get("shot_groups", [])
+            else:
+                groups = v1_scene.shot_groups
             scene_count += 1
-            for group in scene.shot_groups:
+            for v1_group in groups:
+                if isinstance(v1_group, dict):
+                    shots = v1_group.get("shots", [])
+                    duration = v1_group.get("duration_seconds", 0)
+                else:
+                    shots = v1_group.shots
+                    duration = v1_group.duration_seconds
                 group_count += 1
-                shot_count += len(group.shots)
-                total_duration += group.duration_seconds
+                shot_count += len(shots)
+                total_duration += int(duration)
     return _CoverageReport(
         shot_count=shot_count,
         group_count=group_count,
@@ -324,6 +457,9 @@ def _build_user_prompt(
     episode: Episode,
     subjects: list[Subject],
     references: dict[str, _SubjectReference] | None = None,
+    *,
+    script_blocks: list[ScriptBlock] | None = None,
+    director_plan_block: str = "",
 ) -> str:
     """构造 v2 用户提示；示例只表达形状，真实引用以目录为准。"""
     reference_catalog = references or _build_subject_reference_catalog(
@@ -336,16 +472,28 @@ def _build_user_prompt(
         reference_catalog,
     )
     script_text = episode.script_text or ""
+    source_blocks = build_script_blocks(script_text) if script_blocks is None else script_blocks
+    script_block_text = "\n\n".join(
+        f"[{block.block_ref}] {block.text}" for block in source_blocks
+    ) or "（无剧本内容）"
     script_chars = len(script_text.strip())
     min_shots, min_groups, min_scenes, min_duration = _coverage_minimums(script_text)
+    director_plan_section = (
+        f"\n## 已确认导演方案\n以下方案已由用户确认，分镜必须落实其六维选择。\n"
+        f"{director_plan_block}\n"
+        if director_plan_block
+        else ""
+    )
     return f"""请为以下分集生成 storyboard.v2 分镜。
 
 ## 分集
 - 集号：第 {episode.episode_no} 集
 - 标题：{episode.title}
 
-## 剧本原文
-{script_text or '(无剧本内容)'}
+## 剧本原文落实表
+以下 Bxx 是服务端生成的稳定段落编号。每镜必须在 source_block_refs 中列出其落实的段落；
+确实无法拍摄或有意省略的段落必须写入根级 omitted_source_blocks，并说明 reason。
+{script_block_text}
 
 ## 本集覆盖度下限（由剧本 {script_chars} 字推导，必须达到或超过）
 - 最少：{min_shots} 镜 / {min_groups} 组 / {min_scenes} 场 / 总时长 {min_duration} 秒。
@@ -355,6 +503,7 @@ def _build_user_prompt(
 ## 当前分集可引用主体目录
 格式为：短引用 | 类型 | 名称 | 描述 | 参考图状态。JSON 中只能填写短引用。
 {subject_block}
+{director_plan_section}
 
 ## JSON 形状示例
 下面的 BG01/C01/P01/S01 只是形状示例；若目录不存在该引用，不得使用。
@@ -385,10 +534,23 @@ def _build_user_prompt(
                 "emotion": "紧张、试探"
               }},
               "narrative_purpose": "交代人物进入空间并触发对视",
+              "source_block_refs": ["B01"],
               "character_refs": ["C01"],
               "prop_refs": ["P01"],
               "sound_refs": ["S01"],
               "sound_design": "门轴轻响，室内环境声短暂停顿",
+              "start_boundary": {{
+                "positions": [{{"ref": "C01", "position": "左中", "facing": "面朝右"}}],
+                "visible_state": ["角色手握门把"]
+              }},
+              "end_boundary": {{
+                "positions": [{{"ref": "C01", "position": "正中", "facing": "面朝右"}}],
+                "visible_state": ["角色已停在门口"]
+              }},
+              "character_positions": [
+                {{"ref": "C01", "position": "正中", "facing": "面朝右"}}
+              ],
+              "audience_visibility": [],
               "dialogue": {{
                 "speaker_ref": "C01",
                 "text": "逐字保留的原台词",
@@ -410,6 +572,7 @@ def _build_user_prompt(
                 "emotion": "迟疑"
               }},
               "narrative_purpose": "用反应镜承接前一镜并强化冲突",
+              "source_block_refs": ["B01"],
               "character_refs": ["C01"],
               "prop_refs": [],
               "sound_refs": [],
@@ -420,7 +583,8 @@ def _build_user_prompt(
         }}
       ]
     }}
-  ]
+  ],
+  "omitted_source_blocks": []
 }}
 
 ## 输出前自检（逐条核对，任一不满足必须在同一回答内重新规划至达标后再输出最终 JSON）
@@ -431,9 +595,231 @@ def _build_user_prompt(
 - scene_no、group_no、display_no 是否连续；
 - 时码是否全部为整数、连续且与组时长一致；
 - 所有短引用是否存在且类型正确；
+- 每个 Bxx 是否恰好被镜头落实，或在根级 omitted_source_blocks 中说明省略原因；
+- 每镜起止边界、角色九宫格位置/朝向与观众可见性是否按可见事实填写；
 - 每镜是否都有明确景别、构图、机位、运镜、动作、光线、情绪和叙事目的；
 - 相邻镜头的动作、视线、空间和情绪是否自然承接。
 """
+
+
+async def _selected_scene_audition_block(
+    db: AsyncSession,
+    *,
+    script_id: str,
+    episode_id: str,
+    input_version: int,
+) -> str:
+    """只读取当前输入版本已确认的导演方案，并渲染六维答案。"""
+    try:
+        result = await execute_optional_query(
+            db,
+            select(SceneAudition)
+            .where(
+                SceneAudition.script_id == script_id,
+                SceneAudition.episode_id == episode_id,
+                SceneAudition.input_version == input_version,
+                SceneAudition.status == "selected",
+                SceneAudition.selected_plan_id.is_not(None),
+            )
+            .order_by(SceneAudition.scene_no, SceneAudition.id)
+        )
+    except Exception as exc:
+        if not can_fallback_from_optional_query(exc):
+            raise
+        # 灰度升级或最小测试数据库尚未包含导演选案表时，保持历史生成路径。
+        logger.warning("读取已确认导演方案失败，按未选案继续 episode_id=%s", episode_id)
+        return ""
+    dimensions = (
+        ("audience_knowledge_timing", "观众知情时机"),
+        ("alignment_target", "对齐对象"),
+        ("performance_space", "表演空间"),
+        ("strongest_image", "最强画面"),
+        ("landing", "落点"),
+        ("tradeoff", "损失"),
+    )
+    blocks: list[str] = []
+    for audition in result.scalars().all():
+        selected = next(
+            (
+                plan
+                for plan in audition.plans or []
+                if isinstance(plan, dict)
+                and str(plan.get("plan_id") or "") == audition.selected_plan_id
+            ),
+            None,
+        )
+        if selected is None:
+            continue
+        plan_name = _safe_template_text(str(selected.get("name") or "已确认方案"))
+        lines = [f"### 场 {audition.scene_no} · {plan_name}"]
+        for key, label in dimensions:
+            raw_value = selected.get(key)
+            if isinstance(raw_value, str) and raw_value.strip():
+                lines.append(f"- {label}：{_safe_template_text(raw_value)}")
+        if len(lines) == len(dimensions) + 1:
+            blocks.append("\n".join(lines))
+    return "\n\n".join(blocks)
+
+
+def _prompt_template_metadata(
+    templates: Mapping[str, PromptTemplateSnapshot],
+) -> dict[str, dict[str, object]]:
+    return {
+        key: dict(snapshot.public_metadata())
+        for key, snapshot in sorted(templates.items())
+    }
+
+
+async def _resolve_storyboard_prompt_context(
+    db: AsyncSession,
+    *,
+    default_user_prompt: str,
+) -> _StoryboardPromptContext:
+    fallbacks = {
+        _STORYBOARD_SYSTEM_TEMPLATE_KEY: _SYSTEM_PROMPT,
+        _STORYBOARD_USER_TEMPLATE_KEY: _USER_PROMPT_TEMPLATE_FALLBACK,
+        _STORYBOARD_DESCRIPTION_TEMPLATE_KEY: _DESCRIPTION_TEMPLATE_FALLBACK,
+        _STORYBOARD_SHOT_TEMPLATE_KEY: _SHOT_TEMPLATE_FALLBACK,
+        _STORYBOARD_GROUP_TEMPLATE_KEY: _GROUP_TEMPLATE_FALLBACK,
+        _STORYBOARD_CONSTRAINT_TEMPLATE_KEY: CONSTRAINT_LOCK,
+    }
+    templates = await resolve_prompt_bundle(db, fallbacks)
+    system_prompt, system_snapshot = render_prompt_template_with_fallback(
+        templates[_STORYBOARD_SYSTEM_TEMPLATE_KEY],
+        {},
+        fallback=_SYSTEM_PROMPT,
+    )
+    user_prompt, user_snapshot = render_prompt_template_with_fallback(
+        templates[_STORYBOARD_USER_TEMPLATE_KEY],
+        {"default_prompt": default_user_prompt},
+        fallback=_USER_PROMPT_TEMPLATE_FALLBACK,
+    )
+    constraint_lock, constraint_snapshot = render_prompt_template_with_fallback(
+        templates[_STORYBOARD_CONSTRAINT_TEMPLATE_KEY],
+        {},
+        fallback=CONSTRAINT_LOCK,
+    )
+    actual = dict(templates)
+    actual[_STORYBOARD_SYSTEM_TEMPLATE_KEY] = system_snapshot
+    actual[_STORYBOARD_USER_TEMPLATE_KEY] = user_snapshot
+    actual[_STORYBOARD_CONSTRAINT_TEMPLATE_KEY] = constraint_snapshot
+    # 在调用供应商前，用完整变量集合预渲染派生模板。若活动版本不可渲染，
+    # 立即回退并冻结实际使用的快照，避免落库中途才发现版本不可用。
+    _, description_snapshot = render_prompt_template_with_fallback(
+        actual[_STORYBOARD_DESCRIPTION_TEMPLATE_KEY],
+        {
+            "background": "场景",
+            "camera": "平视",
+            "characters": "角色",
+            "action": "动作",
+            "scene": "画面",
+            "emotion": "情绪",
+            "lighting": "光影",
+            "narrative_purpose": "叙事目的",
+        },
+        fallback=_DESCRIPTION_TEMPLATE_FALLBACK,
+    )
+    _, shot_snapshot = render_prompt_template_with_fallback(
+        actual[_STORYBOARD_SHOT_TEMPLATE_KEY],
+        {
+            "n": 1,
+            "start": 0,
+            "end": 3,
+            "scene": "场景",
+            "shot_scale": "中景",
+            "camera": "平视",
+            "camera_movement": "固定",
+            "lighting": "光影",
+            "action": "动作",
+            "emotion": "情绪",
+            "characters": "角色",
+            "dialogue": "台词",
+            "composition": "三分法",
+            "sound_design": "环境音",
+            "dialogue_kind": "dialogue",
+        },
+        fallback=_SHOT_TEMPLATE_FALLBACK,
+    )
+    _, group_snapshot = render_prompt_template_with_fallback(
+        actual[_STORYBOARD_GROUP_TEMPLATE_KEY],
+        {
+            "shot_lines": "镜头行",
+            "referenced_names": "角色",
+            "narrative_purpose": "叙事目的",
+            "director_commands": "",
+            "constraint_lock": constraint_lock,
+        },
+        fallback=_GROUP_TEMPLATE_FALLBACK,
+    )
+    actual[_STORYBOARD_DESCRIPTION_TEMPLATE_KEY] = description_snapshot
+    actual[_STORYBOARD_SHOT_TEMPLATE_KEY] = shot_snapshot
+    actual[_STORYBOARD_GROUP_TEMPLATE_KEY] = group_snapshot
+    return _StoryboardPromptContext(
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        constraint_lock=constraint_lock,
+        templates=actual,
+    )
+
+
+def _subject_provenance_snapshot(subject: Subject) -> dict[str, object]:
+    return {
+        "subject_id": str(subject.id),
+        "type": subject.type,
+        "subject_version": int(getattr(subject, "subject_version", 1) or 1),
+        "enrich_version": int(getattr(subject, "enrich_version", 1) or 1),
+        "is_active": bool(getattr(subject, "is_active", True)),
+        "episode_nos": list(subject.episode_nos or []),
+    }
+
+
+async def _resolve_storyboard_input(
+    db: AsyncSession,
+    *,
+    script_id: str,
+    episode: Episode,
+    subjects: list[Subject],
+    subject_references: Mapping[str, _SubjectReference],
+) -> _StoryboardResolvedInput:
+    """冻结本次任务的模板 bundle、选案提示与不可逆输入锚点。"""
+    script_blocks = build_script_blocks(episode.script_text or "")
+    director_plan_block = await _selected_scene_audition_block(
+        db,
+        script_id=script_id,
+        episode_id=episode.episode_id,
+        input_version=int(episode.episode_version),
+    )
+    default_user_prompt = _build_user_prompt(
+        episode,
+        subjects,
+        dict(subject_references),
+        script_blocks=script_blocks,
+        director_plan_block=director_plan_block,
+    )
+    prompts = await _resolve_storyboard_prompt_context(
+        db,
+        default_user_prompt=default_user_prompt,
+    )
+    subject_by_id = {str(subject.id): subject for subject in subjects}
+    catalog = [
+        _subject_provenance_snapshot(subject_by_id[reference.subject_id])
+        for reference in subject_references.values()
+        if reference.subject_id in subject_by_id
+    ]
+    provenance = build_storyboard_provenance(
+        episode_script=episode.script_text or "",
+        episode_version=int(episode.episode_version),
+        client_save_seq=int(getattr(episode, "client_save_seq", 0) or 0),
+        subject_catalog=catalog,
+        system_prompt=prompts.system_prompt,
+        user_prompt=prompts.user_prompt,
+        prompt_templates=_prompt_template_metadata(prompts.templates),
+    )
+    return _StoryboardResolvedInput(
+        prompts=prompts,
+        script_blocks=script_blocks,
+        provenance=provenance,
+    )
 
 
 _UNSUPPORTED_PROVIDER_SCHEMA_KEYS = frozenset(
@@ -496,19 +882,129 @@ def _build_group_prompt(
     shot_lines: list[str],
     referenced_names: list[str],
     narrative_purpose: str,
+    *,
+    director_commands: list[str] | None = None,
+    group_template: PromptTemplateSnapshot | None = None,
+    constraint_lock: str = CONSTRAINT_LOCK,
 ) -> str:
     """构造镜头组组合 prompt。
 
-    结构: 多镜头分时段行 + 【角色】+【叙事目的】+【约束】(9条)
+    storyboard.v2 已从结构事实派生导演指令时只发送压缩摘要；历史 v1
+    或结构快照缺失时才追加完整约束锁。模板快照本身保持不变，只切换
+    本次渲染的变量值，确保 provenance 仍能准确指向实际解析的模板版本。
     """
     lines_block = "\n".join(shot_lines)
     characters_block = "、".join(referenced_names)
+    normalized_director_commands = [
+        command.strip() for command in (director_commands or []) if command.strip()
+    ]
+    director_block = "\n".join(normalized_director_commands)
+    if director_block:
+        director_block += "\n"
+    constraint_block = "" if director_block else constraint_lock
+    variables = {
+        "shot_lines": lines_block,
+        "referenced_names": characters_block,
+        "narrative_purpose": narrative_purpose,
+        "director_commands": director_block,
+        "constraint_lock": constraint_block,
+    }
+    if group_template is not None:
+        return render_prompt_template(group_template, variables)
     return (
         f"{lines_block}\n"
         f"【角色】{characters_block}\n"
         f"【叙事目的】{narrative_purpose}\n"
-        f"{CONSTRAINT_LOCK}"
+        f"{director_block}"
+        f"{constraint_block}"
     )
+
+
+def _warnings_for_group(
+    report: QualityReport,
+    *,
+    scene_index: int,
+    group_index: int,
+) -> list[QualityWarning]:
+    """截取组内告警；场景级连续性告警同步附到该场景各组。"""
+
+    scene_path = f"scenes[{scene_index}]"
+    group_path = f"{scene_path}.shot_groups[{group_index}]"
+    return [
+        warning
+        for warning in report.warnings
+        if warning.path.startswith(group_path)
+        or warning.path == scene_path
+        or warning.path.startswith(f"{scene_path}.shots[")
+    ]
+
+
+_CONTINUATION_CAMERA_MOVEMENTS = frozenset({"固定", "推镜"})
+_CONTINUATION_BREAK_WORDS = ("跑开", "转身", "背对", "离开画面", "出画")
+
+
+def _strict_continuation_flags(scene: StoryboardV2SceneContract) -> list[bool]:
+    """对新生成镜头组做保守的续帧收紧。
+
+    只有 Provider 显式提出续帧，且组内全部为固定/推镜，上组尾镜无明显
+    离场或转身，本组首镜人物不超出上组尾镜人物时才启用。
+    """
+
+    flags: list[bool] = []
+    previous_last: StoryboardV2ShotContract | None = None
+    for group in scene.shot_groups:
+        first = group.shots[0]
+        movements_ok = all(
+            shot.visual.camera_movement in _CONTINUATION_CAMERA_MOVEMENTS
+            for shot in group.shots
+        )
+        previous_ok = previous_last is not None and not any(
+            word in previous_last.visual.frame_description
+            or word in previous_last.visual.action
+            for word in _CONTINUATION_BREAK_WORDS
+        )
+        subjects_ok = previous_last is not None and set(first.character_refs).issubset(
+            previous_last.character_refs
+        )
+        flags.append(bool(group.is_continuation and movements_ok and previous_ok and subjects_ok))
+        previous_last = group.shots[-1]
+    return flags
+
+
+def _build_boundary_reference_frames(
+    group: StoryboardV2ShotGroupContract | None,
+    *,
+    subject_names_by_ref: dict[str, str],
+) -> dict[str, object]:
+    """把组首/尾的结构边界投影到 reference_frames，旧帧键始终保留。"""
+
+    frames: dict[str, object] = {
+        "first_frame": None,
+        "last_frame": None,
+        "reference_frame": None,
+    }
+    if group is None:
+        return frames
+    projections: dict[str, object] = {}
+    start = project_boundary(
+        group.shots[0].start_boundary,
+        role="start",
+        subject_names=subject_names_by_ref,
+    )
+    end = project_boundary(
+        group.shots[-1].end_boundary,
+        role="end",
+        subject_names=subject_names_by_ref,
+    )
+    for role, projection in (("start", start), ("end", end)):
+        if projection is not None:
+            projections[role] = {
+                "prompt_fragment": projection.prompt_fragment,
+                "snapshot": projection.snapshot,
+            }
+    if projections:
+        frames["boundary_projections"] = projections
+    return frames
 
 
 # ---------------------------------------------------------------------------
@@ -571,7 +1067,7 @@ def _classify_reference_materials(
         subject = references.get(ref)
         if subject is None or subject.subject_type == "sound":
             continue
-        item = {"subject_id": subject.subject_id, "name": subject.name}
+        item = {"ref": ref, "subject_id": subject.subject_id, "name": subject.name}
         if subject.asset_entry_id is not None:
             item["asset_entry_id"] = subject.asset_entry_id
         bucket = subject.subject_type
@@ -728,6 +1224,8 @@ def _render_v2_contract(
     contract: StoryboardV2Contract,
     *,
     subject_reference_names: dict[str, str],
+    description_template: PromptTemplateSnapshot | None = None,
+    shot_template: PromptTemplateSnapshot | None = None,
 ) -> StoryboardContract:
     """把 v2 单一事实源确定性渲染为现有 v1 持久化形态。"""
     scenes: list[dict] = []
@@ -755,32 +1253,42 @@ def _render_v2_contract(
                 lighting = _safe_template_text(visual.lighting)
                 emotion = _safe_template_text(visual.emotion)
                 narrative_purpose = _safe_template_text(shot.narrative_purpose)
-                description = DESCRIPTION_TEMPLATE.format(
-                    background=_safe_template_text(background),
-                    camera=visual.camera_angle,
-                    characters=_safe_template_text(character_text),
-                    action=action,
-                    scene=frame_description,
-                    emotion=emotion,
-                    lighting=lighting,
-                    narrative_purpose=narrative_purpose,
+                description_variables = {
+                    "background": _safe_template_text(background),
+                    "camera": visual.camera_angle,
+                    "characters": _safe_template_text(character_text),
+                    "action": action,
+                    "scene": frame_description,
+                    "emotion": emotion,
+                    "lighting": lighting,
+                    "narrative_purpose": narrative_purpose,
+                }
+                description = (
+                    render_prompt_template(description_template, description_variables)
+                    if description_template is not None
+                    else DESCRIPTION_TEMPLATE.format(**description_variables)
                 )
-                shot_line = SHOT_LINE_TEMPLATE.format(
-                    n=shot.display_no,
-                    start=shot.start_seconds,
-                    end=shot.end_seconds,
-                    scene=_safe_shot_line_text(background),
-                    shot_scale=visual.shot_size,
-                    camera=visual.camera_angle,
-                    camera_movement=visual.camera_movement,
-                    lighting=_safe_shot_line_text(lighting),
-                    action=_safe_shot_line_text(action),
-                    emotion=_safe_shot_line_text(emotion),
-                    characters=_safe_shot_line_text(character_text),
-                    dialogue=dialogue_text,
-                    composition="、".join(visual.composition),
-                    sound_design=_safe_template_text(shot.sound_design),
-                    dialogue_kind=dialogue_kind,
+                shot_variables = {
+                    "n": shot.display_no,
+                    "start": shot.start_seconds,
+                    "end": shot.end_seconds,
+                    "scene": _safe_shot_line_text(background),
+                    "shot_scale": visual.shot_size,
+                    "camera": visual.camera_angle,
+                    "camera_movement": visual.camera_movement,
+                    "lighting": _safe_shot_line_text(lighting),
+                    "action": _safe_shot_line_text(action),
+                    "emotion": _safe_shot_line_text(emotion),
+                    "characters": _safe_shot_line_text(character_text),
+                    "dialogue": dialogue_text,
+                    "composition": "、".join(visual.composition),
+                    "sound_design": _safe_template_text(shot.sound_design),
+                    "dialogue_kind": dialogue_kind,
+                }
+                shot_line = (
+                    render_prompt_template(shot_template, shot_variables)
+                    if shot_template is not None
+                    else SHOT_LINE_TEMPLATE.format(**shot_variables)
                 )
                 shots.append(
                     {
@@ -823,7 +1331,7 @@ def _render_v2_contract(
         ) from exc
 
 
-def _is_int(value: object) -> bool:
+def _is_int(value: object) -> TypeGuard[int]:
     """严格整数判定；bool 不视作整数，避免把 True/False 误当 1/0。"""
     return isinstance(value, int) and not isinstance(value, bool)
 
@@ -958,6 +1466,11 @@ _SHOT_ONLY_FIELDS = frozenset(
         "sound_refs",
         "sound_design",
         "dialogue",
+        "source_block_refs",
+        "start_boundary",
+        "end_boundary",
+        "character_positions",
+        "audience_visibility",
     }
 )
 
@@ -1316,6 +1829,8 @@ def _validate_provider_payload_result(
     subject_catalog: dict[str, str],
     subject_reference_names: dict[str, str],
     subject_reference_types: dict[str, str],
+    description_template: PromptTemplateSnapshot | None = None,
+    shot_template: PromptTemplateSnapshot | None = None,
 ) -> _ValidatedStoryboard:
     """按版本验证 Provider 响应，并保留 v2 的稳定引用事实。"""
     _normalize_provider_continuity(
@@ -1340,6 +1855,8 @@ def _validate_provider_payload_result(
             contract=_render_v2_contract(
                 v2_contract,
                 subject_reference_names=subject_reference_names,
+                description_template=description_template,
+                shot_template=shot_template,
             ),
             v2_contract=v2_contract,
         )
@@ -1449,6 +1966,8 @@ async def _call_llm_with_contract_result(
     subject_catalog: dict[str, str],
     *,
     subject_references: dict[str, _SubjectReference] | None = None,
+    description_template: PromptTemplateSnapshot | None = None,
+    shot_template: PromptTemplateSnapshot | None = None,
 ) -> _ValidatedStoryboard:
     """首答后最多做一次定向修复，避免三次整集盲重试。"""
     references = subject_references or {}
@@ -1478,6 +1997,8 @@ async def _call_llm_with_contract_result(
                 subject_catalog=subject_catalog,
                 subject_reference_names=reference_names,
                 subject_reference_types=reference_types,
+                description_template=description_template,
+                shot_template=shot_template,
             )
         except StoryboardContractValidationError as exc:
             last_diagnostic = exc.diagnostic
@@ -1552,6 +2073,7 @@ async def generate_storyboard(
     *,
     expected_episode_version: int | None = None,
     expected_client_save_seq: int | None = None,
+    source_storyboard_job_id: str | None = None,
 ) -> dict:
     """LLM-5 分镜生成主流程。
 
@@ -1609,8 +2131,20 @@ async def generate_storyboard(
             "分镜生成兜底：分集缺少场景主体，已自动补建默认场景 script_id=%s episode_id=%s",
             script_id, episode_id,
         )
-    system_prompt = _SYSTEM_PROMPT
-    user_prompt = _build_user_prompt(episode, subjects, subject_references)
+    resolved_input = await _resolve_storyboard_input(
+        db,
+        script_id=script_id,
+        episode=episode,
+        subjects=subjects,
+        subject_references=subject_references,
+    )
+    prompt_context = resolved_input.prompts
+    system_prompt = prompt_context.system_prompt
+    user_prompt = prompt_context.user_prompt
+    script_blocks = resolved_input.script_blocks
+    provenance = resolved_input.provenance
+    provenance_sha256 = storyboard_provenance_sha256(provenance)
+    template_metadata = _prompt_template_metadata(prompt_context.templates)
 
     catalog = _subject_catalog(subjects, episode.episode_no)
 
@@ -1620,6 +2154,8 @@ async def generate_storyboard(
         user_prompt,
         catalog,
         subject_references=subject_references,
+        description_template=prompt_context.templates[_STORYBOARD_DESCRIPTION_TEMPLATE_KEY],
+        shot_template=prompt_context.templates[_STORYBOARD_SHOT_TEMPLATE_KEY],
     )
 
     # 4.5 覆盖度软校验：若镜头数远低于剧本规模，用原 prompt（含剧本）+ 覆盖强调
@@ -1639,6 +2175,10 @@ async def generate_storyboard(
                 emphasis_user,
                 catalog,
                 subject_references=subject_references,
+                description_template=prompt_context.templates[
+                    _STORYBOARD_DESCRIPTION_TEMPLATE_KEY
+                ],
+                shot_template=prompt_context.templates[_STORYBOARD_SHOT_TEMPLATE_KEY],
             )
         except ProviderContractError:
             logger.warning("覆盖度重生成结构校验失败，回退首答 best-effort")
@@ -1654,6 +2194,14 @@ async def generate_storyboard(
                     retry_coverage.shot_count, retry_coverage.min_shots,
                 )
 
+    quality_report = (
+        evaluate_storyboard_quality(
+            validated.v2_contract,
+            expected_source_blocks=script_blocks,
+        )
+        if validated.v2_contract is not None
+        else None
+    )
     contract = validated.contract
     scenes_data = contract.model_dump()["scenes"]
 
@@ -1693,6 +2241,9 @@ async def generate_storyboard(
             validated.v2_contract.scenes[scene_index]
             if validated.v2_contract is not None
             else None
+        )
+        continuation_flags = (
+            _strict_continuation_flags(source_scene) if source_scene is not None else []
         )
         scene_no = scene_data["scene_no"]
         background = scene_data["background"]
@@ -1749,10 +2300,34 @@ async def generate_storyboard(
             if background and background not in all_referenced:
                 all_referenced.insert(0, background)
 
+            group_quality_summary = (
+                build_shot_group_quality_summary(
+                    source_group,
+                    warnings=_warnings_for_group(
+                        quality_report,
+                        scene_index=scene_index,
+                        group_index=group_index,
+                    ),
+                )
+                if source_group is not None and quality_report is not None
+                else {}
+            )
+            raw_director_commands = group_quality_summary.get("director_commands")
             group_prompt = _build_group_prompt(
                 shot_lines=shot_lines,
                 referenced_names=all_referenced,
                 narrative_purpose=narrative_purpose,
+                director_commands=(
+                    [
+                        str(item.get("command"))
+                        for item in raw_director_commands
+                        if isinstance(item, dict) and item.get("command")
+                    ]
+                    if isinstance(raw_director_commands, list)
+                    else None
+                ),
+                group_template=prompt_context.templates[_STORYBOARD_GROUP_TEMPLATE_KEY],
+                constraint_lock=prompt_context.constraint_lock,
             )
 
             if source_group is not None and source_scene is not None:
@@ -1787,6 +2362,12 @@ async def generate_storyboard(
             unit_id = f"{DRAFT_SHOT_GROUP_UNIT_PREFIX}{shot_group_id}"
             unit_runtime_key = f"{episode_id}:{scene_no}:draft:{shot_group_id}"
 
+            reference_frames = _build_boundary_reference_frames(
+                source_group,
+                subject_names_by_ref={
+                    ref: item.name for ref, item in subject_references.items()
+                },
+            )
             shot_group = ShotGroup(
                 shot_group_id=shot_group_id,
                 script_id=script_id,
@@ -1800,11 +2381,7 @@ async def generate_storyboard(
                 # 按组顺序回填 — 上一组 last_frame -> 下一组 first_frame,
                 # 保证相邻镜头组视觉连续。链式衔接逻辑归 T8 实现。
                 # 钩子: update_chain_frames(db, episode_id) 见本模块末尾。
-                reference_frames={
-                    "first_frame": None,
-                    "last_frame": None,
-                    "reference_frame": None,
-                },
+                reference_frames=reference_frames,
                 duration_seconds=duration_seconds,
                 video_duration_seconds=duration_seconds,
                 materials=materials,
@@ -1813,14 +2390,32 @@ async def generate_storyboard(
                     "sounds": [item for item in audio_elements if item.get("type") == "sound"],
                 },
                 description_text=narrative_purpose,
+                quality_summary=group_quality_summary,
+                prompt_context={
+                    "schema": "shot_group.prompt-context.v1",
+                    "source_storyboard_job_id": source_storyboard_job_id,
+                    "storyboard_provenance_sha256": provenance_sha256,
+                    "prompt_templates": template_metadata,
+                },
+                is_continuation=(
+                    continuation_flags[group_index]
+                    if group_index < len(continuation_flags)
+                    else False
+                ),
                 unit_id=unit_id,
                 unit_runtime_key=unit_runtime_key,
+                source_storyboard_job_id=source_storyboard_job_id,
             )
             db.add(shot_group)
             total_groups += 1
 
             # 创建 Shot
-            for sd in shots_data:
+            for shot_index, sd in enumerate(shots_data):
+                persisted_source_shot = (
+                    source_group.shots[shot_index]
+                    if source_group is not None
+                    else None
+                )
                 shot = Shot(
                     shot_id=new_id(),
                     scene_no=scene_no,
@@ -1837,6 +2432,20 @@ async def generate_storyboard(
                     props=list(sd.get("props", []) or []),
                     sounds=list(sd.get("sounds", []) or []),
                     dialogue_character=sd.get("dialogue_character", "") or "",
+                    structured_data=(
+                        build_shot_structured_data(
+                            persisted_source_shot,
+                            subject_ids_by_ref={
+                                ref: item.subject_id
+                                for ref, item in subject_references.items()
+                            },
+                            background_ref=(
+                                source_scene.background_ref if source_scene is not None else None
+                            ),
+                        )
+                        if persisted_source_shot is not None
+                        else None
+                    ),
                 )
                 db.add(shot)
                 total_shots += 1
@@ -1851,13 +2460,18 @@ async def generate_storyboard(
         script_id, episode_id, total_scenes, total_groups, total_shots,
     )
 
-    return {
+    result: dict[str, object] = {
         "script_id": script_id,
         "episode_id": episode_id,
         "scenes": total_scenes,
         "shot_groups": total_groups,
         "shots": total_shots,
     }
+    if quality_report is not None:
+        result["quality_report"] = quality_report.as_dict()
+    if source_storyboard_job_id is not None:
+        result["input_provenance"] = provenance
+    return result
 
 
 async def _cleanup_existing_storyboard(db: AsyncSession, episode_id: str) -> None:
@@ -1906,45 +2520,194 @@ async def _cleanup_existing_storyboard(db: AsyncSession, episode_id: str) -> Non
     )
 
 
+def _chain_frame_location(group: ShotGroup) -> dict[str, object]:
+    """返回不含主键、路径或素材键的最小镜头组位置。"""
+
+    raw_group_index = getattr(group, "group_index", None)
+    group_index = (
+        raw_group_index
+        if isinstance(raw_group_index, int) and raw_group_index >= 1
+        else None
+    )
+    raw_group_no = str(getattr(group, "group_no", "") or "").strip()
+    group_no = raw_group_no or (
+        f"G{group_index}" if group_index is not None else "unknown"
+    )
+    return {
+        "scene_no": int(group.scene_no),
+        "group_no": group_no,
+        "group_index": group_index,
+    }
+
+
+def _chain_frame_diagnostic(
+    code: str,
+    group: ShotGroup,
+    *,
+    predecessor: ShotGroup | None = None,
+) -> dict[str, object]:
+    """构造可持久化的脱敏诊断，不暴露素材键和内部资源 ID。"""
+
+    diagnostic: dict[str, object] = {
+        "code": code,
+        "severity": "warning",
+        "location": _chain_frame_location(group),
+    }
+    if predecessor is not None:
+        diagnostic["predecessor_location"] = _chain_frame_location(predecessor)
+    return diagnostic
+
+
+def _valid_chain_frame(value: object) -> str | None:
+    """只接受非空字符串帧键；历史异常 JSON 不参与链式传递。"""
+
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    return normalized or None
+
+
+def _preserved_chain_diagnostics(frames: Mapping[str, object]) -> list[object]:
+    """移除本服务拥有的旧诊断，同时保留未来版本写入的未知诊断。"""
+
+    raw = frames.get("chain_diagnostics")
+    if not isinstance(raw, list):
+        return []
+    preserved: list[object] = []
+    for item in raw:
+        if isinstance(item, Mapping) and item.get("code") in _OWNED_CHAIN_DIAGNOSTIC_CODES:
+            continue
+        preserved.append(item)
+    return preserved
+
+
+def _is_direct_chain_predecessor(
+    predecessor: ShotGroup | None,
+    current: ShotGroup,
+) -> bool:
+    """仅同场景、相邻 group_index 才构成可回填的直接前驱。"""
+
+    if predecessor is None or int(predecessor.scene_no) != int(current.scene_no):
+        return False
+    previous_index = getattr(predecessor, "group_index", None)
+    current_index = getattr(current, "group_index", None)
+    return (
+        isinstance(previous_index, int)
+        and isinstance(current_index, int)
+        and previous_index >= 1
+        and current_index == previous_index + 1
+    )
+
+
 async def update_chain_frames(
     db: AsyncSession, episode_id: str
-) -> int:
+) -> ChainFrameUpdateResult:
     """首尾帧链式衔接钩子 (跨模块, 供 T8 视频生成 worker 调用)。
 
     按 scene_no/group_no 顺序遍历该分集所有镜头组, 将上一组 reference_frames.last_frame
     回填为下一组 reference_frames.first_frame, 实现相邻镜头组视觉连续 (04§1.15 / 02§5.4.3 / T8.5)。
 
     本钩子仅做衔接回填, 实际帧内容由 T8 视频生成 worker 在每组生成完成后写入 last_frame。
-    返回回填的组数。
+    返回值仍是 ``int`` 子类以兼容旧调用，并通过 ``diagnostics`` 暴露本次发现的
+    脱敏结构化问题；同一诊断也写入对应组的 ``reference_frames.chain_diagnostics``。
 
     跨模块依赖标注: 链式衔接的具体调用时序由 T8 worker 在每组视频生成成功后触发。
     """
     groups_result = await db.execute(
         select(ShotGroup)
         .where(ShotGroup.episode_id == episode_id)
-        .order_by(ShotGroup.scene_no, ShotGroup.group_no)
+        .order_by(ShotGroup.scene_no, ShotGroup.group_index, ShotGroup.group_no)
     )
     groups = groups_result.scalars().all()
     updated = 0
-    prev_last_frame: str | None = None
-    for g in groups:
-        frames = dict(g.reference_frames or {})
-        # 上一组 last_frame -> 本组 first_frame
-        if prev_last_frame is not None and not frames.get("first_frame"):
-            frames["first_frame"] = prev_last_frame
-            g.reference_frames = frames
+    dirty = False
+    diagnostics: list[dict[str, object]] = []
+    previous: ShotGroup | None = None
+    for group in groups:
+        original_frames = group.reference_frames
+        frames: dict[str, object] = (
+            dict(original_frames) if isinstance(original_frames, Mapping) else {}
+        )
+        group_diagnostics: list[dict[str, object]] = []
+        current_first_frame = _valid_chain_frame(frames.get("first_frame"))
+        current_last_frame = _valid_chain_frame(frames.get("last_frame"))
+        direct_predecessor = (
+            previous if _is_direct_chain_predecessor(previous, group) else None
+        )
+        predecessor_last_frame = (
+            _valid_chain_frame((direct_predecessor.reference_frames or {}).get("last_frame"))
+            if direct_predecessor is not None
+            and isinstance(direct_predecessor.reference_frames, Mapping)
+            else None
+        )
+
+        if current_last_frame is None:
+            group_diagnostics.append(
+                _chain_frame_diagnostic(_CHAIN_LAST_FRAME_MISSING, group)
+            )
+
+        has_prior_group_in_scene = (
+            previous is not None and int(previous.scene_no) == int(group.scene_no)
+        )
+        chain_source_unavailable = (
+            has_prior_group_in_scene
+            and (direct_predecessor is None or predecessor_last_frame is None)
+        )
+        if chain_source_unavailable and current_first_frame is None:
+            group_diagnostics.append(
+                _chain_frame_diagnostic(
+                    _CHAIN_LINK_BROKEN,
+                    group,
+                    predecessor=previous,
+                )
+            )
+
+        is_continuation = bool(getattr(group, "is_continuation", False))
+        if is_continuation and (
+            direct_predecessor is None or predecessor_last_frame is None
+        ):
+            group_diagnostics.append(
+                _chain_frame_diagnostic(
+                    _CONTINUATION_PREDECESSOR_LAST_FRAME_UNAVAILABLE,
+                    group,
+                    predecessor=previous if has_prior_group_in_scene else None,
+                )
+            )
+
+        if predecessor_last_frame is not None and current_first_frame is None:
+            frames["first_frame"] = predecessor_last_frame
             updated += 1
-        # 推进: 当前组的 last_frame 作为下一组的 first_frame
-        prev_last_frame = frames.get("last_frame")
-    if updated:
+
+        preserved_diagnostics = _preserved_chain_diagnostics(frames)
+        merged_diagnostics = [*preserved_diagnostics, *group_diagnostics]
+        if merged_diagnostics:
+            frames["chain_diagnostics"] = merged_diagnostics
+        else:
+            frames.pop("chain_diagnostics", None)
+
+        if frames != original_frames:
+            group.reference_frames = frames
+            dirty = True
+        diagnostics.extend(group_diagnostics)
+        for diagnostic in group_diagnostics:
+            logger.warning(
+                "镜头组链帧诊断 code=%s severity=%s location=%s predecessor_location=%s",
+                diagnostic["code"],
+                diagnostic["severity"],
+                diagnostic["location"],
+                diagnostic.get("predecessor_location"),
+            )
+        previous = group
+
+    if dirty:
         await db.flush()
-    return updated
+    return ChainFrameUpdateResult(updated, diagnostics)
 
 
 __all__ = [
     "generate_storyboard",
     "update_chain_frames",
+    "ChainFrameUpdateResult",
     "CONSTRAINT_LOCK",
     "DESCRIPTION_TEMPLATE",
 ]
-

@@ -11,6 +11,7 @@ import re
 from typing import Annotated, Literal
 
 from pydantic import (
+    AliasChoices,
     BaseModel,
     ConfigDict,
     Field,
@@ -133,6 +134,38 @@ SubjectRef = Annotated[
         pattern=r"^[A-Z]{1,5}\d{2,10}$",
     ),
 ]
+CoverageBlockRef = Annotated[
+    str,
+    StringConstraints(
+        strict=True,
+        strip_whitespace=True,
+        max_length=8,
+        pattern=r"^B0*[1-9]\d{0,5}$",
+    ),
+]
+
+Position9Grid = Literal[
+    "左上",
+    "正上",
+    "右上",
+    "左中",
+    "正中",
+    "右中",
+    "左下",
+    "正下",
+    "右下",
+]
+FacingDirection = Literal[
+    "面朝左",
+    "面朝右",
+    "面朝镜头",
+    "背对镜头",
+    "侧身左",
+    "侧身右",
+]
+ActionBeat = Literal["trigger", "peak", "aftermath"]
+CoverageStatus = Literal["covered", "partial", "repeated"]
+AudienceVisibilityStatus = Literal["show_now", "withhold_now"]
 
 
 class StrictStoryboardModel(BaseModel):
@@ -201,6 +234,8 @@ class StoryboardV2VisualContract(StrictStoryboardModel):
     camera_angle: CameraAngle
     camera_movement: CameraMovement
     action: LongText
+    # 显式值是动作拍点的唯一 Provider 事实；缺失时服务端按动作与组内位置派生。
+    action_beat: ActionBeat | None = None
     frame_description: LongText
     lighting: ShortText
     emotion: ShortText
@@ -219,6 +254,95 @@ class StoryboardV2DialogueContract(StrictStoryboardModel):
     kind: Literal["dialogue", "voice_over", "inner_monologue"]
 
 
+class CharacterPosition(StrictStoryboardModel):
+    """角色在单镜画面中的可验证空间位置。"""
+
+    ref: SubjectRef
+    position: Position9Grid | None = None
+    facing: FacingDirection | None = None
+
+
+class BoundaryHands(StrictStoryboardModel):
+    """边界时刻双手的可见状态；未入画的手保持为空。"""
+
+    left: ShortText | None = None
+    right: ShortText | None = None
+
+
+class ShotBoundary(StrictStoryboardModel):
+    """镜头起止时刻的可见事实快照。
+
+    所有字段均可选，允许旧 Provider 继续输出原有 storyboard.v2。边界语义
+    不一致由质量规则产生告警，不在 Pydantic 层阻断整集生成。
+    """
+
+    positions: list[CharacterPosition] = Field(default_factory=list, max_length=20)
+    pose_balance: ShortText | None = None
+    gaze: ShortText | None = None
+    hands: BoundaryHands | None = None
+    held_props: list[SubjectRef] = Field(default_factory=list, max_length=20)
+    visible_state: list[ShortText] = Field(default_factory=list, max_length=20)
+
+
+class AudienceVisibilityItem(StrictStoryboardModel):
+    """一个叙事事实在当前镜头对观众的披露权限。"""
+
+    fact: ShortText
+    # ``status`` 是新合约的权威字段；``permission`` 仅作为旧响应输入别名。
+    status: AudienceVisibilityStatus = Field(
+        validation_alias=AliasChoices("status", "permission")
+    )
+    evidence: list[ShortText] = Field(default_factory=list, max_length=5)
+    reveal_trigger: ShortText | None = None
+    protection_method: ShortText | None = None
+    rationale: ShortText | None = None
+
+    @model_validator(mode="after")
+    def withheld_fact_requires_trigger(self) -> AudienceVisibilityItem:
+        if self.status == "withhold_now" and self.reveal_trigger is None:
+            raise StoryboardSemanticValidationError(
+                "withhold_now_requires_reveal_trigger",
+                "scenes[].shot_groups[].shots[].audience_visibility[].reveal_trigger",
+            )
+        return self
+
+    @property
+    def permission(self) -> AudienceVisibilityStatus:
+        """兼容仍读取旧 Python 属性名的内部调用方。"""
+
+        return self.status
+
+
+class CoverageSourceRange(StrictStoryboardModel):
+    """原文片段内的可选字符范围，采用左闭右开区间。"""
+
+    char_start: int = Field(ge=0)
+    char_end: int = Field(ge=1)
+
+    @model_validator(mode="after")
+    def end_must_follow_start(self) -> CoverageSourceRange:
+        if self.char_end <= self.char_start:
+            raise ValueError("char_end must be greater than char_start")
+        return self
+
+
+class CoverageItem(StrictStoryboardModel):
+    """一镜对某个原文段的结构化落实记录。"""
+
+    block_ref: CoverageBlockRef
+    status: CoverageStatus
+    source_range: CoverageSourceRange | None = None
+    summary: ShortText | None = None
+    repeat_reason: ShortText | None = None
+
+
+class OmittedSourceBlock(StrictStoryboardModel):
+    """未落实到任何镜头的剧本段及其显式省略原因。"""
+
+    block_ref: CoverageBlockRef
+    reason: ShortText | None = None
+
+
 class StoryboardV2ShotContract(StrictStoryboardModel):
     display_no: int = Field(ge=1)
     start_seconds: int = Field(ge=0)
@@ -230,6 +354,12 @@ class StoryboardV2ShotContract(StrictStoryboardModel):
     sound_refs: list[SubjectRef] = Field(max_length=20)
     sound_design: ShortText
     dialogue: StoryboardV2DialogueContract | None
+    source_block_refs: list[CoverageBlockRef] = Field(default_factory=list, max_length=20)
+    coverage: list[CoverageItem] = Field(default_factory=list, max_length=20)
+    start_boundary: ShotBoundary | None = None
+    end_boundary: ShotBoundary | None = None
+    character_positions: list[CharacterPosition] = Field(default_factory=list, max_length=20)
+    audience_visibility: list[AudienceVisibilityItem] = Field(default_factory=list, max_length=5)
 
     @model_validator(mode="after")
     def dialogue_speaker_must_be_visible(self) -> StoryboardV2ShotContract:
@@ -247,6 +377,8 @@ class StoryboardV2ShotGroupContract(StrictStoryboardModel):
     group_no: str
     narrative_purpose: ShortText
     duration_seconds: int = Field(ge=3, le=15)
+    # 显式续帧意图；服务端仍会用严格连续性规则收紧，默认关闭兼容历史响应。
+    is_continuation: bool = False
     # 单镜头组也是合法的 3～15 秒视频单元。保留上限以避免把整场戏塞入
     # 一个生成请求；建议性“多镜头”由 prompt 引导，而不应造成任务失败。
     shots: list[StoryboardV2ShotContract] = Field(min_length=1, max_length=5)
@@ -263,6 +395,8 @@ class StoryboardV2Contract(StrictStoryboardModel):
 
     schema_version: Literal["storyboard.v2"]
     scenes: list[StoryboardV2SceneContract] = Field(min_length=1)
+    # 省略的原文段没有对应 Shot，因此必须位于根级，不能挂在镜头字段上。
+    omitted_source_blocks: list[OmittedSourceBlock] = Field(default_factory=list, max_length=200)
 
     @model_validator(mode="after")
     def _validate_continuity(self) -> StoryboardV2Contract:
@@ -352,6 +486,7 @@ _DIAGNOSTIC_FIELDS = frozenset(
         "group_no",
         "narrative_purpose",
         "duration_seconds",
+        "is_continuation",
         "shots",
         "display_no",
         "content",
@@ -377,9 +512,42 @@ _DIAGNOSTIC_FIELDS = frozenset(
         "camera_angle",
         "camera_movement",
         "action",
+        "action_beat",
         "frame_description",
         "lighting",
         "emotion",
+        "source_block_refs",
+        "coverage",
+        "status",
+        "source_range",
+        "char_start",
+        "char_end",
+        "summary",
+        "repeat_reason",
+        "omitted_source_blocks",
+        "block_ref",
+        "reason",
+        "start_boundary",
+        "end_boundary",
+        "positions",
+        "character_positions",
+        "ref",
+        "position",
+        "facing",
+        "pose_balance",
+        "gaze",
+        "hands",
+        "left",
+        "right",
+        "held_props",
+        "visible_state",
+        "audience_visibility",
+        "fact",
+        "permission",
+        "evidence",
+        "reveal_trigger",
+        "protection_method",
+        "rationale",
     }
 )
 
@@ -551,6 +719,18 @@ def validate_storyboard_v2_contract(
             for shot in group.shots:
                 for ref in shot.character_refs:
                     require_reference(ref, {"character"}, "character_refs")
+                for position in shot.character_positions:
+                    require_reference(position.ref, {"character"}, "character_positions")
+                for boundary_name, boundary in (
+                    ("start_boundary", shot.start_boundary),
+                    ("end_boundary", shot.end_boundary),
+                ):
+                    if boundary is None:
+                        continue
+                    for position in boundary.positions:
+                        require_reference(position.ref, {"character"}, f"{boundary_name}.positions")
+                    for ref in boundary.held_props:
+                        require_reference(ref, {"prop"}, f"{boundary_name}.held_props")
                 if shot.dialogue is not None:
                     speaker_ref = shot.dialogue.speaker_ref
                     if speaker_ref is not None:
@@ -568,12 +748,25 @@ def validate_storyboard_v2_contract(
 
 
 __all__ = [
+    "ActionBeat",
+    "AudienceVisibilityItem",
+    "AudienceVisibilityStatus",
+    "BoundaryHands",
     "CAMERA_ANGLE_VALUES",
     "CAMERA_MOVEMENT_VALUES",
+    "CharacterPosition",
     "COMPOSITION_VALUES",
+    "CoverageBlockRef",
+    "CoverageItem",
+    "CoverageSourceRange",
+    "CoverageStatus",
     "DESCRIPTION_RE",
+    "FacingDirection",
+    "OmittedSourceBlock",
+    "Position9Grid",
     "SHOT_LINE_RE",
     "SHOT_SIZE_VALUES",
+    "ShotBoundary",
     "StoryboardContract",
     "StoryboardContractValidationError",
     "StoryboardSceneContract",

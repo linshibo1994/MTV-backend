@@ -51,6 +51,10 @@ class CreateJobIn(BaseModel):
         description="客户端可编辑的最终生图提示词；缺省时兼容旧客户端并回退服务端 enrich",
     )
     style_id: str | None = Field(None, description="风格 ID")
+    art_style_id: str | None = Field(None, description="项目动态画风 ID，优先于 style_id")
+    visual_style: Literal["live_action", "anime"] | None = Field(
+        None, description="媒介维度；请求 > 主体 > 剧本 > 系统默认"
+    )
     model: ImageModelName = Field("qwen-image-2.0", description="生图模型")
     size: str = Field("2k", description="尺寸，如 2k")
     aspect: str = Field("auto", description="比例；auto 按主体类型选择，或显式传入 16:9、3:4 等")
@@ -80,6 +84,8 @@ class BatchCreateJobIn(BaseModel):
         None,
         description="每个主体的风格 ID，键为 subject_id；单项优先于兼容字段 style_id",
     )
+    art_style_id: str | None = Field(None, description="项目动态画风 ID")
+    visual_style: Literal["live_action", "anime"] | None = None
     model: ImageModelName = Field("qwen-image-2.0", description="生图模型")
     size: str = Field("2k", description="尺寸，如 2k")
     aspect: str = Field("auto", description="比例；auto 按主体类型选择，或显式传入 16:9、3:4 等")

@@ -10,11 +10,13 @@ from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.core.ids import new_id
 from app.crud import asset as asset_crud
 from app.crud.script import replace_parent_subjects, replace_subjects
 from app.models.episode import Episode
 from app.models.subject import Subject
+from app.models.subject_candidate import SubjectCandidate
 from app.schemas.pipeline_contracts import (
     MergeOutput,
     PipelineSubject,
@@ -28,6 +30,7 @@ from app.services.pipeline import (
     input_episode_is_current,
     set_stage,
 )
+from app.services.subject_candidate_evidence import normalize_candidate_evidence
 
 # ---- 提示词骨架（06 文档第 12.2 节）----
 _SYSTEM = (
@@ -293,6 +296,58 @@ async def _prepare_staged_subjects(
     return staged
 
 
+async def _record_new_subject_candidates(
+    db: AsyncSession,
+    *,
+    script_id: str,
+    staged_subjects: list[dict],
+    source_run_id: str | None,
+    auto_link: bool,
+) -> list[SubjectCandidate]:
+    """幂等记录本轮首次识别的主体；自动模式也保留 linked 审计事实。"""
+
+    created: list[SubjectCandidate] = []
+    for item in staged_subjects:
+        if item.get("base_subject_version") is not None:
+            continue
+        subject_id = item.get("id")
+        candidate_conditions = [
+            SubjectCandidate.script_id == script_id,
+            SubjectCandidate.subject_type == item["type"],
+            SubjectCandidate.pipeline_name == item["name"],
+        ]
+        if auto_link:
+            candidate_conditions.append(SubjectCandidate.source_run_id == source_run_id)
+        else:
+            candidate_conditions.append(SubjectCandidate.status == "pending")
+        existing = (
+            await db.execute(
+                select(SubjectCandidate).where(*candidate_conditions)
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            created.append(existing)
+            continue
+        candidate = SubjectCandidate(
+            id=new_id(),
+            script_id=script_id,
+            source_run_id=source_run_id,
+            subject_type=item["type"],
+            name=item["name"],
+            pipeline_name=item["name"],
+            description=item.get("description"),
+            aliases=[],
+            episode_nos=item.get("episode_nos") or [],
+            evidence=normalize_candidate_evidence(item.get("evidence")),
+            status="linked" if auto_link else "pending",
+            version=2 if auto_link else 1,
+            linked_subject_id=subject_id if auto_link else None,
+        )
+        db.add(candidate)
+        created.append(candidate)
+    return created
+
+
 async def run_merge(
     db: AsyncSession,
     script_id: str,
@@ -444,7 +499,23 @@ async def run_merge(
         staged_subjects,
         source_run_id=run_id,
     )
-    await replace_subjects(db, script_id, staged_subjects)
+    manual_review = settings.subject_candidate_review_mode == "manual"
+    published_subjects = (
+        [item for item in staged_subjects if item.get("base_subject_version") is not None]
+        if manual_review
+        else staged_subjects
+    )
+    # 先发布正式主体，再写 linked 候选审计。否则同批第二次查询触发
+    # autoflush 时，候选可能先于其 linked_subject_id 对应主体落库而违反 FK。
+    await replace_subjects(db, script_id, published_subjects)
+    if run_id is not None or manual_review:
+        await _record_new_subject_candidates(
+            db,
+            script_id=script_id,
+            staged_subjects=staged_subjects,
+            source_run_id=run_id,
+            auto_link=not manual_review,
+        )
     if run_id is not None:
         # 父分组属于派生产物；子主体已更新时不能继续引用上一轮的分组。
         await replace_parent_subjects(db, script_id, [])
@@ -453,6 +524,8 @@ async def run_merge(
         "input_version": input_version,
         "input_client_save_seq": input_client_save_seq,
         "merge_mode": merge_mode,
+        "subject_review_mode": settings.subject_candidate_review_mode,
+        "pending_candidate_count": len(staged_subjects) - len(published_subjects),
     }
     if fallback_reason is not None:
         stage_detail["fallback_reason"] = fallback_reason
@@ -464,9 +537,14 @@ async def run_merge(
         detail=stage_detail,
     )
     if run_id is not None:
-        return {
+        result: dict[str, Any] = {
             "count": len(staged_subjects),
-            "subjects": staged_subjects,
+            "subjects": published_subjects,
             "subjects_published": True,
         }
+        # 默认 auto_link 模式继续返回历史形状；只有真正进入人工等待态时才暴露数量。
+        pending_candidate_count = len(staged_subjects) - len(published_subjects)
+        if pending_candidate_count:
+            result["pending_candidate_count"] = pending_candidate_count
+        return result
     return len(staged_subjects)

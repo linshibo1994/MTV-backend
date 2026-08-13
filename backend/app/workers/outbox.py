@@ -147,6 +147,20 @@ def publish_outbox_payload(task_type: str, payload: dict) -> Any:
         from app.workers import timeline_render as timeline_worker
 
         return timeline_worker.render_timeline_task.s(payload["job_id"]).apply_async()
+    if task_type == "scene_audition.generate":
+        from app.workers import scene_audition as scene_audition_worker
+
+        return scene_audition_worker.generate_scene_audition_task.s(
+            payload["job_id"],
+            payload.get("attempt"),
+        ).apply_async()
+    if task_type == "art_style.extract":
+        from app.workers import art_style_extraction as art_style_worker
+
+        return art_style_worker.extract_art_style_task.s(
+            payload["job_id"],
+            payload["attempt"],
+        ).apply_async()
     if task_type != "pipeline.dag":
         raise ValueError("未知 outbox task_type")
     from app.workers.pipeline import (

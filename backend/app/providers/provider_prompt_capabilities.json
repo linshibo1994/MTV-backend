@@ -1,0 +1,72 @@
+{
+  "schema_version": 1,
+  "adapter_version": "video-prompt-adapter.v1",
+  "counting_unit": "unicode_codepoint",
+  "providers": {
+    "openai": {
+      "prompt_syntax": "plain",
+      "max_prompt_characters": null,
+      "supports_motion_phrases": true,
+      "supports_character_reference": false,
+      "supports_reference_images": true,
+      "supports_reference_audio": false,
+      "supports_first_frame": true,
+      "model_overrides": []
+    },
+    "gemini": {
+      "prompt_syntax": "plain",
+      "max_prompt_characters": null,
+      "supports_motion_phrases": true,
+      "supports_character_reference": true,
+      "supports_reference_images": true,
+      "supports_reference_audio": false,
+      "supports_first_frame": true,
+      "model_overrides": []
+    },
+    "bailian": {
+      "prompt_syntax": "plain",
+      "max_prompt_characters": 800,
+      "supports_motion_phrases": true,
+      "supports_character_reference": true,
+      "supports_reference_images": true,
+      "supports_reference_audio": true,
+      "supports_first_frame": true,
+      "model_overrides": [
+        {
+          "exact_models": ["happyhorse-1.0-i2v", "happyhorse-1.1-i2v"],
+          "max_prompt_characters": 2500
+        }
+      ]
+    },
+    "volcengine": {
+      "prompt_syntax": "ark_content",
+      "max_prompt_characters": null,
+      "supports_motion_phrases": true,
+      "supports_character_reference": true,
+      "supports_reference_images": true,
+      "supports_reference_audio": true,
+      "supports_first_frame": true,
+      "model_overrides": []
+    },
+    "neolink": {
+      "prompt_syntax": "ark_content",
+      "max_prompt_characters": null,
+      "supports_motion_phrases": true,
+      "supports_character_reference": true,
+      "supports_reference_images": true,
+      "supports_reference_audio": true,
+      "supports_first_frame": true,
+      "model_overrides": []
+    },
+    "mgrouter": {
+      "prompt_syntax": "aicc_content",
+      "max_prompt_characters": null,
+      "supports_motion_phrases": true,
+      "supports_character_reference": true,
+      "supports_reference_images": true,
+      "supports_reference_audio": true,
+      "supports_first_frame": true,
+      "model_overrides": []
+    }
+  }
+}

@@ -20,7 +20,7 @@ from app.models.video_provider import VideoProviderConfig
 # 任务处于以下状态时视为「活动中」，幂等去重时复用而非新建。
 # 以 doc04 §1.19 的 starting/processing 为准；旧 doc02 的 pending/running 不再使用，
 # 前端若按旧枚举匹配需显式映射为 starting/processing。
-_ACTIVE_STATUSES = ("starting", "processing")
+_ACTIVE_STATUSES = ("waiting_dependency", "starting", "processing")
 
 # 终态：一旦进入这些状态，进度更新不得再覆盖（cancel 与 worker 收尾互不覆盖 canceled↔succeeded）。
 _TERMINAL_STATUSES = ("succeeded", "failed", "canceled")
@@ -95,11 +95,15 @@ async def create_video_job(
     attempt: int,
     reservation_id: str | None,
     input_json: dict,
+    initial_status: str = "starting",
+    predecessor_job_id: str | None = None,
 ) -> VideoGenerationJob:
-    """创建视频生成任务，初始 status=starting、progress=0。
+    """创建视频生成任务，初始状态可为 starting 或 waiting_dependency。
 
     积分 reserve 由 service 层负责，CRUD 只落库。
     """
+    if initial_status not in {"starting", "waiting_dependency"}:
+        raise ValueError("无效视频任务初始状态")
     job = VideoGenerationJob(
         job_id=new_id(),
         script_id=script_id,
@@ -116,10 +120,11 @@ async def create_video_job(
         input_version=input_version,
         attempt=attempt,
         reservation_id=reservation_id,
-        status="starting",
+        predecessor_job_id=predecessor_job_id,
+        status=initial_status,
         progress=0,
-        progress_stage=None,
-        progress_message=None,
+        progress_stage=("waiting_dependency" if initial_status == "waiting_dependency" else None),
+        progress_message=("等待同场景直接前驱生成真实尾帧" if initial_status == "waiting_dependency" else None),
         error_message=None,
         input_json=input_json,
         output_json=None,
@@ -422,6 +427,279 @@ async def claim_job_lease(
     lease_seconds: int = 900,
 ) -> bool:
     return await claim_video_job(db, job_id, owner=owner, lease_seconds=lease_seconds) is not None
+
+
+async def activate_waiting_dependency_job(
+    db: AsyncSession,
+    job_id: str,
+    *,
+    predecessor_job_id: str,
+    first_frame: str,
+    frame_source: str = "real_tail",
+    predecessor_terminal_succeeded: bool = True,
+) -> VideoGenerationJob | None:
+    """以版本 CAS 将等待任务转为 starting，不创建 Worker lease。"""
+    if frame_source not in {"real_tail", "static_fallback"}:
+        raise ValueError("无效续帧来源")
+    normalized_first_frame = first_frame.strip()
+    if not normalized_first_frame:
+        raise ValueError("续帧首帧不能为空")
+    current = await _lock_video_job_for_update(db, job_id)
+    if current is None:
+        return None
+    if (
+        current.status != "waiting_dependency"
+        or current.predecessor_job_id != predecessor_job_id
+        or current.lease_owner is not None
+        or current.lease_token is not None
+        or current.lease_until is not None
+    ):
+        return None
+    expected_version = int(current.version or 0)
+    input_json = dict(current.input_json or {})
+    input_json["first_frame"] = normalized_first_frame
+    dependency = dict(input_json.get("continuation_dependency") or {})
+    dependency.update(
+        {
+            "state": "ready",
+            "predecessor_job_id": predecessor_job_id,
+            "frame_source": frame_source,
+        }
+    )
+    if frame_source == "real_tail":
+        dependency["last_frame_storage_key"] = normalized_first_frame
+        dependency.pop("predecessor_terminal_succeeded", None)
+    else:
+        dependency.update(
+            {
+                "static_fallback_frame": normalized_first_frame,
+                "predecessor_terminal_succeeded": predecessor_terminal_succeeded,
+            }
+        )
+        dependency.pop("last_frame_storage_key", None)
+    input_json["continuation_dependency"] = dependency
+    result = cast(
+        CursorResult[Any],
+        await db.execute(
+            update(VideoGenerationJob)
+            .where(
+                VideoGenerationJob.job_id == job_id,
+                VideoGenerationJob.status == "waiting_dependency",
+                VideoGenerationJob.predecessor_job_id == predecessor_job_id,
+                VideoGenerationJob.version == expected_version,
+                VideoGenerationJob.lease_owner.is_(None),
+                VideoGenerationJob.lease_token.is_(None),
+                VideoGenerationJob.lease_until.is_(None),
+            )
+            .values(
+                status="starting",
+                progress_stage="dependency_ready",
+                progress_message=(
+                    "前驱真实尾帧不可用，使用冻结静态帧等待生成"
+                    if frame_source == "static_fallback"
+                    else "前驱真实尾帧已就绪，等待生成"
+                ),
+                input_json=input_json,
+                version=VideoGenerationJob.version + 1,
+            )
+        ),
+    )
+    await db.flush()
+    if result.rowcount != 1:
+        return None
+    await db.refresh(current)
+    return current
+
+
+async def fail_waiting_dependency_job(
+    db: AsyncSession,
+    job_id: str,
+    *,
+    predecessor_job_id: str,
+    release_failed: bool = False,
+) -> VideoGenerationJob | None:
+    """以版本 CAS 写依赖失败终态；积分释放由调用方在同事务执行。"""
+    current = await _lock_video_job_for_update(db, job_id)
+    if current is None:
+        return None
+    error_type = "financial_cleanup" if release_failed else "dependency_unavailable"
+    if (
+        current.status != "waiting_dependency"
+        or current.predecessor_job_id != predecessor_job_id
+        or current.lease_owner is not None
+        or current.lease_token is not None
+        or current.lease_until is not None
+    ):
+        return None
+    expected_version = int(current.version or 0)
+    input_json = dict(current.input_json or {})
+    dependency = dict(input_json.get("continuation_dependency") or {})
+    dependency.update(
+        {
+            "state": "unavailable",
+            "predecessor_job_id": predecessor_job_id,
+        }
+    )
+    input_json["continuation_dependency"] = dependency
+    result = cast(
+        CursorResult[Any],
+        await db.execute(
+            update(VideoGenerationJob)
+            .where(
+                VideoGenerationJob.job_id == job_id,
+                VideoGenerationJob.status == "waiting_dependency",
+                VideoGenerationJob.predecessor_job_id == predecessor_job_id,
+                VideoGenerationJob.version == expected_version,
+                VideoGenerationJob.lease_owner.is_(None),
+                VideoGenerationJob.lease_token.is_(None),
+                VideoGenerationJob.lease_until.is_(None),
+            )
+            .values(
+                status="failed",
+                progress_stage=error_type,
+                progress_message=(
+                    "依赖不可用，等待释放冻结积分"
+                    if release_failed
+                    else "同场景直接前驱未提供可用真实尾帧"
+                ),
+                error_type=error_type,
+                error_message=error_type,
+                retryable=release_failed,
+                finished_at=datetime.now(UTC),
+                input_json=input_json,
+                version=VideoGenerationJob.version + 1,
+            )
+        ),
+    )
+    await db.flush()
+    if result.rowcount != 1:
+        return None
+    await db.refresh(current)
+    return current
+
+
+async def list_waiting_dependency_jobs(
+    db: AsyncSession,
+    *,
+    limit: int = 50,
+) -> list[VideoGenerationJob]:
+    """列出待补偿的依赖任务；扫描本身不加租约、不改变状态。"""
+
+    result = await db.execute(
+        select(VideoGenerationJob)
+        .where(VideoGenerationJob.status == "waiting_dependency")
+        .options(noload(VideoGenerationJob.script))
+        .order_by(VideoGenerationJob.updated_at.asc(), VideoGenerationJob.job_id.asc())
+        .limit(limit)
+    )
+    return list(result.scalars().all())
+
+
+async def bind_waiting_dependency_job(
+    db: AsyncSession,
+    job_id: str,
+    *,
+    predecessor_job_id: str,
+    predecessor_shot_group_id: str,
+) -> VideoGenerationJob | None:
+    """以版本 CAS 将无绑定等待任务绑定到已核验的同场景直接前驱任务。"""
+
+    current = await _lock_video_job_for_update(db, job_id)
+    if current is None or current.status != "waiting_dependency":
+        return None
+    if current.predecessor_job_id == predecessor_job_id:
+        return current
+    if (
+        current.predecessor_job_id is not None
+        or current.lease_owner is not None
+        or current.lease_token is not None
+        or current.lease_until is not None
+    ):
+        return None
+    input_json = dict(current.input_json or {})
+    dependency = dict(input_json.get("continuation_dependency") or {})
+    frozen_predecessor_group_id = dependency.get("predecessor_shot_group_id")
+    if frozen_predecessor_group_id not in {None, predecessor_shot_group_id}:
+        return None
+    dependency.update(
+        {
+            "state": "waiting",
+            "predecessor_shot_group_id": predecessor_shot_group_id,
+            "predecessor_job_id": predecessor_job_id,
+        }
+    )
+    input_json["continuation_dependency"] = dependency
+    expected_version = int(current.version or 0)
+    result = cast(
+        CursorResult[Any],
+        await db.execute(
+            update(VideoGenerationJob)
+            .where(
+                VideoGenerationJob.job_id == job_id,
+                VideoGenerationJob.status == "waiting_dependency",
+                VideoGenerationJob.predecessor_job_id.is_(None),
+                VideoGenerationJob.version == expected_version,
+                VideoGenerationJob.lease_owner.is_(None),
+                VideoGenerationJob.lease_token.is_(None),
+                VideoGenerationJob.lease_until.is_(None),
+            )
+            .values(
+                predecessor_job_id=predecessor_job_id,
+                input_json=input_json,
+                version=VideoGenerationJob.version + 1,
+            )
+        ),
+    )
+    await db.flush()
+    if result.rowcount != 1:
+        return None
+    await db.refresh(current)
+    return current
+
+
+async def bind_waiting_dependents_to_predecessor_job(
+    db: AsyncSession,
+    predecessor: VideoGenerationJob,
+) -> list[VideoGenerationJob]:
+    """把乱序批量创建产生的未绑定 child 绑定到刚创建的直接前驱任务。
+
+    只检查同剧本、分集和场景的等待行，并在 Python 中核对冻结的前驱镜头组 ID，
+    避免依赖 PostgreSQL JSON 运算而破坏 SQLite 专项测试。
+    """
+    candidates = list(
+        (
+            await db.execute(
+                select(VideoGenerationJob)
+                .where(
+                    VideoGenerationJob.script_id == predecessor.script_id,
+                    VideoGenerationJob.episode_id == predecessor.episode_id,
+                    VideoGenerationJob.scene_no == predecessor.scene_no,
+                    VideoGenerationJob.status == "waiting_dependency",
+                    VideoGenerationJob.predecessor_job_id.is_(None),
+                )
+                .options(noload(VideoGenerationJob.script))
+                .order_by(VideoGenerationJob.created_at.asc())
+                .with_for_update()
+            )
+        )
+        .scalars()
+        .all()
+    )
+    bound: list[VideoGenerationJob] = []
+    for child in candidates:
+        input_json = dict(child.input_json or {})
+        dependency = dict(input_json.get("continuation_dependency") or {})
+        if dependency.get("predecessor_shot_group_id") != predecessor.shot_group_id:
+            continue
+        updated = await bind_waiting_dependency_job(
+            db,
+            child.job_id,
+            predecessor_job_id=predecessor.job_id,
+            predecessor_shot_group_id=predecessor.shot_group_id,
+        )
+        if updated is not None:
+            bound.append(updated)
+    return bound
 
 
 async def heartbeat_video_job(

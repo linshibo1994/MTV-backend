@@ -55,7 +55,7 @@ from app.services.video_cleanup_policy import has_retryable_video_cleanup_debt
 logger = logging.getLogger(__name__)
 
 _VIDEO_ACTIVE_STATUSES = frozenset(
-    {"pending", "ready", "retry", "starting", "processing"}
+    {"pending", "ready", "retry", "waiting_dependency", "starting", "processing"}
 )
 _STORYBOARD_ACTIVE_STATUSES = frozenset({"pending", "ready", "retry", "running"})
 _PIPELINE_ACTIVE_STATUSES = frozenset({"pending", "ready", "retry", "running"})
@@ -161,6 +161,8 @@ async def create_script(
     scope: str,
     user: User,
     *,
+    visual_style: str | None = None,
+    unify_style: bool = True,
     commit: bool = True,
 ) -> Script:
     active_org_id = getattr(user, "active_org_id", None)
@@ -174,6 +176,8 @@ async def create_script(
         owner_user_id=user.user_id,
         org_id=active_org_id if scope == "team" else None,
         created_by_user_id=user.user_id,
+        visual_style=visual_style,
+        unify_style=unify_style,
     )
     db.add(script)
     # 团队项目：创建者为 owner 成员
@@ -199,12 +203,20 @@ async def create_script(
 async def rename_script(
     db: AsyncSession,
     script: Script,
-    title: str,
+    title: str | None,
     *,
+    visual_style: str | None = None,
+    visual_style_provided: bool = False,
+    unify_style: bool | None = None,
     commit: bool = True,
 ) -> Script:
     """重命名剧本，并允许调用方把审计纳入同一事务。"""
-    script.title = title
+    if title is not None:
+        script.title = title
+    if visual_style_provided:
+        script.visual_style = visual_style
+    if unify_style is not None:
+        script.unify_style = unify_style
     if commit:
         await db.commit()
         await db.refresh(script)
@@ -231,6 +243,8 @@ async def copy_script(
         target_title,
         target_scope,
         user,
+        visual_style=source.visual_style,
+        unify_style=source.unify_style,
         commit=False,
     )
     episodes = await list_episodes(db, source.id)

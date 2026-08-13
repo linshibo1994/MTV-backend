@@ -557,6 +557,51 @@ async def test_video_request_uses_irreversible_storage_attempt_id(monkeypatch) -
     assert expected_attempt_id in finished[0]["output_json"]["video_storage_key"]
 
 
+async def test_successful_video_is_not_reversed_when_dependency_followup_fails(
+    monkeypatch,
+) -> None:
+    """续帧唤醒是后置动作，异常不得触发成功视频的失败补偿。"""
+
+    from app.workers import video_generation as worker
+
+    _, finished = _install_video_run_fakes(
+        monkeypatch,
+        worker,
+        lease_token="dependency-followup-token",
+        heartbeat=True,
+    )
+    fail_release = AsyncMock()
+    monkeypatch.setattr(worker, "_fail_video_with_release", fail_release)
+    monkeypatch.setattr(
+        worker,
+        "_resolve_continuation_dependents",
+        AsyncMock(side_effect=ConnectionError("dependency database unavailable")),
+    )
+
+    class Provider:
+        async def generate(self, _request, _on_progress=None):
+            return SimpleNamespace(
+                video_storage_key="generate_images/video/job-attempt.followup.mp4",
+                provider_job_id="provider-followup",
+                metrics={},
+            )
+
+    db = _RunDB()
+    await worker.run_video_generation_once(
+        db,
+        "job-attempt",
+        owner="worker-a",
+        provider=Provider(),
+        extract_last_frame=AsyncMock(return_value="generate_images/video/frames/tail.png"),
+    )
+
+    assert finished and finished[0]["output_json"]["video_storage_key"].endswith(
+        "followup.mp4"
+    )
+    assert db.commits == 2
+    fail_release.assert_not_awaited()
+
+
 @pytest.mark.parametrize("attempt_scoped", [True, False])
 async def test_lost_video_lease_only_deletes_own_attempt_output(
     monkeypatch,
