@@ -13,6 +13,7 @@ audio_elements 需配音角色
 
 from __future__ import annotations
 
+import copy
 import inspect
 import json
 import logging
@@ -21,6 +22,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TypeGuard, cast
 
+from pydantic import ValidationError
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -283,10 +285,15 @@ class _ValidatedStoryboard:
 
     ``v2_contract`` 使资产绑定能一直使用稳定短引用，不会在不同类型同名
     主体之间二次按名称猜测。历史 v1 响应则为 ``None``。
+
+    ``salvaged`` 标记该结果是否经本地兜底降级（丢弃了部分违规镜头/组/场），
+    供 quality_report 向前端提示降级。``dropped_shot_count`` 记录丢弃的镜头数。
     """
 
     contract: StoryboardContract
     v2_contract: StoryboardV2Contract | None
+    salvaged: bool = False
+    dropped_shot_count: int = 0
 
 
 # 覆盖度软门阈值：边界抖动时不反复触发重生成。0.8 表示实际值达到下限 80%
@@ -2145,19 +2152,21 @@ def _normalize_shot_fields(
                 if key not in shot:
                     shot[key] = visual[key]
                 del visual[key]
-        # 枚举收敛：shot_size/camera_angle/camera_movement 非法则补中性默认
-        if "shot_size" in visual:
-            visual["shot_size"] = _coerce_enum(
-                visual["shot_size"], _SHOT_SIZE_SET, _DEFAULT_SHOT_SIZE
-            )
-        if "camera_angle" in visual:
-            visual["camera_angle"] = _coerce_enum(
-                visual["camera_angle"], _CAMERA_ANGLE_SET, _DEFAULT_CAMERA_ANGLE
-            )
-        if "camera_movement" in visual:
-            visual["camera_movement"] = _coerce_enum(
-                visual["camera_movement"], _CAMERA_MOVEMENT_SET, _DEFAULT_CAMERA_MOVEMENT
-            )
+        # 枚举收敛：shot_size/camera_angle/camera_movement 缺失时补中性默认，
+        # 存在但非法时 coerce 补默认；与 composition 回填一致，避免仅缺枚举键
+        # 的镜头在严格校验抛 missing 后被 salvage 整条删除（本可补默认保留）。
+        visual.setdefault("shot_size", _DEFAULT_SHOT_SIZE)
+        visual["shot_size"] = _coerce_enum(
+            visual["shot_size"], _SHOT_SIZE_SET, _DEFAULT_SHOT_SIZE
+        )
+        visual.setdefault("camera_angle", _DEFAULT_CAMERA_ANGLE)
+        visual["camera_angle"] = _coerce_enum(
+            visual["camera_angle"], _CAMERA_ANGLE_SET, _DEFAULT_CAMERA_ANGLE
+        )
+        visual.setdefault("camera_movement", _DEFAULT_CAMERA_MOVEMENT)
+        visual["camera_movement"] = _coerce_enum(
+            visual["camera_movement"], _CAMERA_MOVEMENT_SET, _DEFAULT_CAMERA_MOVEMENT
+        )
         # 构图：过滤非法枚举、去重、截断到 3；全部非法时补默认
         composition = visual.get("composition")
         if isinstance(composition, list):
@@ -2450,6 +2459,359 @@ def _validate_provider_payload_result(
     ) from exc
 
 
+# ---------------------------------------------------------------------------
+# 本地兜底降级 (salvage)：归一化 + 严格校验仍失败时，丢弃违规条目保留可用部分
+# ---------------------------------------------------------------------------
+
+_SALVAGE_MAX_ROUNDS = 8
+
+
+def _payload_looks_like_v2(payload: dict) -> bool:
+    """判断 payload 是否为 v2 形态（含 background_ref 或显式 schema_version）。"""
+    if payload.get("schema_version") == "storyboard.v2":
+        return True
+    scenes = payload.get("scenes")
+    if isinstance(scenes, list):
+        return any(
+            isinstance(scene, dict) and "background_ref" in scene
+            for scene in scenes
+        )
+    return False
+
+
+def _parse_v2_error_loc(
+    loc: tuple[object, ...],
+) -> tuple[int | None, int | None, int | None, str | None]:
+    """从 Pydantic ValidationError loc 提取层级索引与末段字段名。
+
+    返回 (scene_idx, group_idx, shot_idx, leaf_field)。
+    loc 形如 ("scenes", 0, "shot_groups", 0, "shots", 1, "visual", "shot_size")。
+    """
+    scene_idx: int | None = None
+    group_idx: int | None = None
+    shot_idx: int | None = None
+    leaf: str | None = None
+    parts = list(loc)
+    i = 0
+    while i < len(parts):
+        part = parts[i]
+        next_part = parts[i + 1] if i + 1 < len(parts) else None
+        if part == "scenes" and isinstance(next_part, int):
+            scene_idx = next_part
+            i += 2
+        elif part == "shot_groups" and isinstance(next_part, int):
+            group_idx = next_part
+            i += 2
+        elif part == "shots" and isinstance(next_part, int):
+            shot_idx = next_part
+            i += 2
+        else:
+            if i == len(parts) - 1:
+                leaf = str(part)
+            i += 1
+    return scene_idx, group_idx, shot_idx, leaf
+
+
+def _truncate_oversized_groups(payload: dict, *, max_shots: int = 5) -> int:
+    """把每组超过 max_shots 的镜头截断到前 max_shots 条，返回截断数。"""
+    truncated = 0
+    scenes = payload.get("scenes")
+    if not isinstance(scenes, list):
+        return 0
+    for scene in scenes:
+        if not isinstance(scene, dict):
+            continue
+        groups = scene.get("shot_groups")
+        if not isinstance(groups, list):
+            continue
+        for group in groups:
+            if not isinstance(group, dict):
+                continue
+            shots = group.get("shots")
+            if isinstance(shots, list) and len(shots) > max_shots:
+                truncated += len(shots) - max_shots
+                del shots[max_shots:]
+    return truncated
+
+
+def _prune_empty_v2_entries(payload: dict) -> int:
+    """删除空 shots 组、空 groups 场、空 scenes；返回被删除的镜头数。"""
+    removed_shots = 0
+    scenes = payload.get("scenes")
+    if not isinstance(scenes, list):
+        return 0
+    for scene in scenes:
+        if not isinstance(scene, dict):
+            continue
+        groups = scene.get("shot_groups")
+        if not isinstance(groups, list):
+            continue
+        survivors: list = []
+        for group in groups:
+            if not isinstance(group, dict):
+                continue
+            shots = group.get("shots")
+            if isinstance(shots, list) and shots:
+                survivors.append(group)
+            elif isinstance(shots, list):
+                removed_shots += len(shots)
+        scene["shot_groups"] = survivors
+    # 删除空场景
+    payload["scenes"] = [
+        scene for scene in scenes
+        if isinstance(scene, dict)
+        and isinstance(scene.get("shot_groups"), list)
+        and scene["shot_groups"]
+    ]
+    return removed_shots
+
+
+def _apply_v2_salvage_removals(payload: dict, errors: list[dict]) -> int:
+    """根据 ValidationError 的 loc 定位并剔除违规条目，返回被剔除的镜头数。
+
+    按粒度从细到粗：能定位到 shot 则删 shot，否则删 group，再否则删 scene。
+    列表索引从大到小删除以避免移位。
+    """
+    scenes = payload.get("scenes")
+    if not isinstance(scenes, list):
+        return 0
+
+    shots_to_remove: set[tuple[int, int, int]] = set()
+    groups_to_remove: set[tuple[int, int]] = set()
+    scenes_to_remove: set[int] = set()
+
+    for error in errors:
+        loc = tuple(error.get("loc", ()))
+        scene_idx, group_idx, shot_idx, leaf = _parse_v2_error_loc(loc)
+
+        if scene_idx is None:
+            # 根级错误（如 scenes min_length），无法定向剔除
+            continue
+
+        # shots 列表本身的约束：too_long 已被预截断处理；too_short（空）删组
+        if leaf == "shots" and shot_idx is None:
+            if group_idx is not None:
+                groups_to_remove.add((scene_idx, group_idx))
+            continue
+        # shot_groups 列表本身的约束（空）删场
+        if leaf == "shot_groups" and group_idx is None:
+            scenes_to_remove.add(scene_idx)
+            continue
+
+        if shot_idx is not None and group_idx is not None:
+            shots_to_remove.add((scene_idx, group_idx, shot_idx))
+        elif group_idx is not None:
+            groups_to_remove.add((scene_idx, group_idx))
+        else:
+            scenes_to_remove.add(scene_idx)
+
+    removed = 0
+    # 按 scene -> group -> shot 从大到小删除避免移位
+    for scene_idx, group_idx, shot_idx in sorted(
+        shots_to_remove, key=lambda t: (t[0], t[1], t[2]), reverse=True
+    ):
+        if scene_idx >= len(scenes):
+            continue
+        scene = scenes[scene_idx]
+        if not isinstance(scene, dict):
+            continue
+        groups = scene.get("shot_groups")
+        if not isinstance(groups, list) or group_idx >= len(groups):
+            continue
+        group = groups[group_idx]
+        if not isinstance(group, dict):
+            continue
+        shots = group.get("shots")
+        if isinstance(shots, list) and shot_idx < len(shots):
+            shots.pop(shot_idx)
+            removed += 1
+
+    for scene_idx, group_idx in sorted(
+        groups_to_remove, key=lambda t: (t[0], t[1]), reverse=True
+    ):
+        if scene_idx >= len(scenes):
+            continue
+        scene = scenes[scene_idx]
+        if not isinstance(scene, dict):
+            continue
+        groups = scene.get("shot_groups")
+        if isinstance(groups, list) and group_idx < len(groups):
+            group = groups[group_idx]
+            shot_count = len(group.get("shots", [])) if isinstance(group, dict) else 0
+            groups.pop(group_idx)
+            removed += shot_count
+
+    for scene_idx in sorted(scenes_to_remove, reverse=True):
+        if scene_idx < len(scenes):
+            scene = scenes[scene_idx]
+            shot_count = sum(
+                len(g.get("shots", []))
+                for g in scene.get("shot_groups", [])
+                if isinstance(g, dict)
+            ) if isinstance(scene, dict) else 0
+            scenes.pop(scene_idx)
+            removed += shot_count
+
+    removed += _prune_empty_v2_entries(payload)
+    return removed
+
+
+def _brute_force_remove_one_shot(
+    payload: dict,
+    *,
+    subject_reference_types: dict[str, str],
+    subject_reference_names: dict[str, str],
+) -> int:
+    """逐镜试探剔除：找到第一个能使完整校验通过的剔除。
+
+    用于无法通过 loc 定位的错误（如引用类型不匹配）。返回 0 或 1。
+    成功时把剔除后的 payload 内容写回原 payload（原地替换）。
+    """
+    scenes = payload.get("scenes")
+    if not isinstance(scenes, list):
+        return 0
+    for scene_idx in range(len(scenes)):
+        scene = scenes[scene_idx]
+        if not isinstance(scene, dict):
+            continue
+        groups = scene.get("shot_groups")
+        if not isinstance(groups, list):
+            continue
+        for group_idx in range(len(groups)):
+            group = groups[group_idx]
+            if not isinstance(group, dict):
+                continue
+            shots = group.get("shots")
+            if not isinstance(shots, list) or not shots:
+                continue
+            for shot_idx in range(len(shots)):
+                candidate = copy.deepcopy(payload)
+                cand_scenes = candidate.get("scenes")
+                if not isinstance(cand_scenes, list):
+                    continue
+                cand_scene = cand_scenes[scene_idx]
+                if not isinstance(cand_scene, dict):
+                    continue
+                cand_groups = cand_scene.get("shot_groups")
+                if not isinstance(cand_groups, list):
+                    continue
+                cand_group = cand_groups[group_idx]
+                if not isinstance(cand_group, dict):
+                    continue
+                cand_shots = cand_group.get("shots")
+                if not isinstance(cand_shots, list) or shot_idx >= len(cand_shots):
+                    continue
+                cand_shots.pop(shot_idx)
+                _normalize_provider_continuity(
+                    candidate,
+                    subject_reference_names=subject_reference_names,
+                    subject_reference_types=subject_reference_types,
+                )
+                _truncate_oversized_groups(candidate)
+                try:
+                    StoryboardV2Contract.model_validate(candidate)
+                    validate_storyboard_v2_contract(candidate, subject_reference_types)
+                except (ValidationError, StoryboardContractValidationError):
+                    continue
+                # 成功：把 candidate 写回 payload
+                payload.clear()
+                payload.update(candidate)
+                return 1
+    return 0
+
+
+def _salvage_v2_contract(
+    payload: dict,
+    *,
+    subject_catalog: dict[str, str],
+    subject_reference_names: dict[str, str],
+    subject_reference_types: dict[str, str],
+    description_template: PromptTemplateSnapshot | None = None,
+    shot_template: PromptTemplateSnapshot | None = None,
+) -> _ValidatedStoryboard | None:
+    """纯本地兜底降级：丢弃归一化后仍违反严格模型的镜头/组/场，保留可用条目。
+
+    不引入新的 LLM 调用（慢源）；仅基于已有 payload 做确定性剔除与重编。
+    复用 _normalize_provider_continuity（重编号/重时码/引用收敛/枚举兜底），
+    对 model_validate 抛出的 ValidationError 按 loc 逐条剔除坏的 shot/group/scene，
+    每轮重跑归一化再校验。全空（0 场或 0 镜）时返回 None，由调用方抛
+    ProviderContractError（真正失败）。
+    """
+    salvaged = copy.deepcopy(payload)
+    _normalize_provider_continuity(
+        salvaged,
+        subject_reference_names=subject_reference_names,
+        subject_reference_types=subject_reference_types,
+    )
+    salvaged.setdefault("schema_version", "storyboard.v2")
+    pre_truncated = _truncate_oversized_groups(salvaged)
+    dropped = pre_truncated
+
+    for _ in range(_SALVAGE_MAX_ROUNDS):
+        scenes = salvaged.get("scenes")
+        if not isinstance(scenes, list) or not scenes:
+            return None
+        # 先做结构校验（拿到带索引的 loc）
+        try:
+            StoryboardV2Contract.model_validate(salvaged)
+        except ValidationError as exc:
+            errors = [dict(error) for error in exc.errors(include_url=False)]
+            removed = _apply_v2_salvage_removals(salvaged, errors)
+            if removed == 0:
+                # 无法通过 loc 定位：逐镜试探剔除
+                removed = _brute_force_remove_one_shot(
+                    salvaged,
+                    subject_reference_types=subject_reference_types,
+                    subject_reference_names=subject_reference_names,
+                )
+                if removed == 0:
+                    return None
+            dropped += removed
+            _normalize_provider_continuity(
+                salvaged,
+                subject_reference_names=subject_reference_names,
+                subject_reference_types=subject_reference_types,
+            )
+            _truncate_oversized_groups(salvaged)
+            continue
+        # 结构校验通过，做引用类型校验
+        try:
+            v2_contract = validate_storyboard_v2_contract(
+                salvaged, subject_reference_types
+            )
+        except StoryboardContractValidationError:
+            removed = _brute_force_remove_one_shot(
+                salvaged,
+                subject_reference_types=subject_reference_types,
+                subject_reference_names=subject_reference_names,
+            )
+            if removed == 0:
+                return None
+            dropped += removed
+            _normalize_provider_continuity(
+                salvaged,
+                subject_reference_names=subject_reference_names,
+                subject_reference_types=subject_reference_types,
+            )
+            _truncate_oversized_groups(salvaged)
+            continue
+        # 全部通过
+        if not salvaged.get("scenes"):
+            return None
+        return _ValidatedStoryboard(
+            contract=_render_v2_contract(
+                v2_contract,
+                subject_reference_names=subject_reference_names,
+                description_template=description_template,
+                shot_template=shot_template,
+            ),
+            v2_contract=v2_contract,
+            salvaged=True,
+            dropped_shot_count=dropped,
+        )
+    return None
+
+
 def _validate_provider_payload(
     payload: dict,
     *,
@@ -2615,6 +2977,23 @@ async def _call_llm_with_contract_result(
             # Provider 未能解析出 JSON 时只再尝试一次原始请求。
             continue
         break
+    # 兜底降级：首答 + 定向修复仍无法通过严格校验时，尝试纯本地 salvage。
+    # 仅对 v2 形态的 dict payload 生效（v1 历史路径与非 dict 响应不参与）。
+    if payload is not None and _payload_looks_like_v2(payload):
+        salvaged = _salvage_v2_contract(
+            payload,
+            subject_catalog=subject_catalog,
+            subject_reference_names=reference_names,
+            subject_reference_types=reference_types,
+            description_template=description_template,
+            shot_template=shot_template,
+        )
+        if salvaged is not None:
+            logger.warning(
+                "分镜合约校验失败后走 salvage 兜底，丢弃 %d 条镜头，保留可用条目",
+                salvaged.dropped_shot_count,
+            )
+            return salvaged
     raise ProviderContractError(
         f"供应商响应在 {_STORYBOARD_CONTRACT_MAX_ATTEMPTS} 次总预算内"
         "不符合 StoryboardV2Contract 合约",
@@ -3046,7 +3425,14 @@ async def generate_storyboard(
         "shots": total_shots,
     }
     if quality_report is not None:
-        result["quality_report"] = quality_report.as_dict()
+        quality_dict = quality_report.as_dict()
+        if validated.salvaged:
+            quality_dict["salvaged"] = True
+            quality_dict["dropped_shot_count"] = validated.dropped_shot_count
+        result["quality_report"] = quality_dict
+    elif validated.salvaged:
+        result["salvaged"] = True
+        result["dropped_shot_count"] = validated.dropped_shot_count
     if source_storyboard_job_id is not None:
         result["input_provenance"] = provenance
     return result

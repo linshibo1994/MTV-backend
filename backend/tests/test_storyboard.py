@@ -2877,3 +2877,309 @@ def test_docker_compose_declares_worker_and_beat_topology() -> None:
     assert "celery-beat:" in compose
     assert "celery -A app.workers.celery_app worker -l info" in compose
     assert "celery -A app.workers.celery_app beat -l info" in compose
+
+
+# ---------------------------------------------------------------------------
+# salvage 兜底降级测试
+# ---------------------------------------------------------------------------
+
+
+def _salvage_test_payload_with_one_bad_shot() -> dict:
+    """v2 payload：第 1 条 shot 缺 visual（归一化无法凭空补），第 2 条合法。"""
+    payload = _valid_storyboard_v2_payload()
+    # 删除第 1 条 shot 的整个 visual 字段，制造归一化无法消除的硬失败
+    del payload["scenes"][0]["shot_groups"][0]["shots"][0]["visual"]
+    return payload
+
+
+def _salvage_test_payload_with_six_shots() -> dict:
+    """v2 payload：单组 6 条 shot（超过 max_length=5），且第 3 条 visual 缺必填。"""
+    payload = _valid_storyboard_v2_payload()
+    group = payload["scenes"][0]["shot_groups"][0]
+    # 组时长放大到 15 秒以容纳 6 条 shot
+    group["duration_seconds"] = 15
+    # 复制合法 shot 模板追加 4 条（总共 6 条），并重排时码
+    template = {
+        "display_no": 3,
+        "start_seconds": 6,
+        "end_seconds": 8,
+        "visual": {
+            "shot_size": "中景",
+            "composition": ["三分法"],
+            "camera_angle": "平视",
+            "camera_movement": "固定",
+            "action": "角色转身",
+            "frame_description": "角色转身看向窗外",
+            "lighting": "自然光",
+            "emotion": "沉思",
+        },
+        "narrative_purpose": "过渡情绪",
+        "character_refs": ["C01"],
+        "prop_refs": [],
+        "sound_refs": [],
+        "sound_design": "环境白噪",
+        "dialogue": None,
+    }
+    for i in range(4):
+        shot = {
+            **template,
+            "display_no": 3 + i,
+            "start_seconds": 6 + i * 2,
+            "end_seconds": 8 + i * 2,
+        }
+        group["shots"].append(shot)
+    # 第 3 条 shot 的 visual 缺 shot_size；归一化会对缺失枚举键补中性默认（中景），
+    # 故该镜头经归一化后存活，不进入 salvage 删除路径。
+    del group["shots"][2]["visual"]["shot_size"]
+    return payload
+
+
+def _all_bad_salvage_test_payload() -> dict:
+    """v2 payload：所有 shot 都缺 visual，salvage 后全空。"""
+    payload = _valid_storyboard_v2_payload()
+    for shot in payload["scenes"][0]["shot_groups"][0]["shots"]:
+        del shot["visual"]
+    return payload
+
+
+def test_salvage_v2_contract_drops_bad_shot_and_keeps_good_ones() -> None:
+    """salvage 应丢弃缺 visual 的坏镜头，保留可用镜头并重编时码。"""
+    from app.services import storyboard as storyboard_service
+
+    payload = _salvage_test_payload_with_one_bad_shot()
+    result = storyboard_service._salvage_v2_contract(
+        payload,
+        subject_catalog=_subject_catalog(),
+        subject_reference_names={
+            ref: item.name for ref, item in _subject_references().items()
+        },
+        subject_reference_types={
+            ref: item.subject_type for ref, item in _subject_references().items()
+        },
+    )
+    assert result is not None
+    assert result.salvaged is True
+    assert result.dropped_shot_count >= 1
+    # 剩余 1 条可用镜头
+    group = result.v2_contract.scenes[0].shot_groups[0]
+    assert len(group.shots) == 1
+    # 时码被重铺：从 0 开始
+    assert group.shots[0].start_seconds == 0
+    assert group.shots[0].end_seconds == group.duration_seconds
+    # contract（v1 渲染形态）可正常 dump
+    scenes = result.contract.model_dump()["scenes"]
+    assert len(scenes) == 1
+
+
+def test_salvage_v2_contract_truncates_oversized_group_and_drops_bad_shot() -> None:
+    """salvage 应把超过 5 条的组截断到 5，并丢弃缺必填字段的坏镜头。"""
+    from app.services import storyboard as storyboard_service
+
+    payload = _salvage_test_payload_with_six_shots()
+    result = storyboard_service._salvage_v2_contract(
+        payload,
+        subject_catalog=_subject_catalog(),
+        subject_reference_names={
+            ref: item.name for ref, item in _subject_references().items()
+        },
+        subject_reference_types={
+            ref: item.subject_type for ref, item in _subject_references().items()
+        },
+    )
+    assert result is not None
+    assert result.salvaged is True
+    group = result.v2_contract.scenes[0].shot_groups[0]
+    # 截断后最多 5 条，且至少丢弃了 1 条（坏 shot 或超出的第 6 条）
+    assert len(group.shots) <= 5
+    assert result.dropped_shot_count >= 1
+
+
+def test_salvage_v2_contract_returns_none_when_all_shots_bad() -> None:
+    """所有 shot 都违规时 salvage 全空，返回 None，由调用方抛 ProviderContractError。"""
+    from app.services import storyboard as storyboard_service
+
+    payload = _all_bad_salvage_test_payload()
+    result = storyboard_service._salvage_v2_contract(
+        payload,
+        subject_catalog=_subject_catalog(),
+        subject_reference_names={
+            ref: item.name for ref, item in _subject_references().items()
+        },
+        subject_reference_types={
+            ref: item.subject_type for ref, item in _subject_references().items()
+        },
+    )
+    assert result is None
+
+
+def test_normalize_shot_fields_fills_missing_enum_with_default() -> None:
+    """归一化应对缺失的必填枚举键补中性默认，避免该镜头被严格校验/salvage 删除。
+
+    缺失 shot_size/camera_angle/camera_movement 比存在非法值更易修复，应当与
+    composition 回填一致地补默认保留镜头，而非整条丢弃。
+    """
+    from app.services import storyboard as storyboard_service
+
+    payload = _valid_storyboard_v2_payload()
+    shot = payload["scenes"][0]["shot_groups"][0]["shots"][0]
+    # 仅删除三个枚举键，其余 visual 字段保留合法
+    del shot["visual"]["shot_size"]
+    del shot["visual"]["camera_angle"]
+    del shot["visual"]["camera_movement"]
+    storyboard_service._normalize_provider_continuity(
+        payload,
+        subject_reference_names={
+            ref: item.name for ref, item in _subject_references().items()
+        },
+        subject_reference_types={
+            ref: item.subject_type for ref, item in _subject_references().items()
+        },
+    )
+    visual = payload["scenes"][0]["shot_groups"][0]["shots"][0]["visual"]
+    assert visual["shot_size"] == storyboard_service._DEFAULT_SHOT_SIZE
+    assert visual["camera_angle"] == storyboard_service._DEFAULT_CAMERA_ANGLE
+    assert visual["camera_movement"] == storyboard_service._DEFAULT_CAMERA_MOVEMENT
+    # 缺枚举键的镜头现在应直接通过严格校验，无需进入 salvage
+    contract = storyboard_service.StoryboardV2Contract.model_validate(payload)
+    assert contract.scenes[0].shot_groups[0].shots[0].visual.shot_size == (
+        storyboard_service._DEFAULT_SHOT_SIZE
+    )
+
+
+async def test_call_llm_with_contract_result_salvages_instead_of_raising(
+    monkeypatch,
+) -> None:
+    """_call_llm_with_contract_result 在合约校验失败时应走 salvage 而非抛 ProviderContractError。"""
+    from app.services import storyboard as storyboard_service
+
+    bad_payload = _salvage_test_payload_with_one_bad_shot()
+    call_llm = AsyncMock(return_value=bad_payload)
+    monkeypatch.setattr(storyboard_service, "_call_llm", call_llm)
+
+    result = await storyboard_service._call_llm_with_contract_result(
+        "system",
+        "user",
+        _subject_catalog(),
+        subject_references=_subject_references(),
+    )
+    # salvage 成功，不抛异常
+    assert result.salvaged is True
+    assert result.dropped_shot_count >= 1
+    # 保留 1 条可用镜头
+    group = result.v2_contract.scenes[0].shot_groups[0]
+    assert len(group.shots) == 1
+    # 两次 LLM 调用（首答 + 定向修复），salvage 不引入额外 LLM 调用
+    assert call_llm.await_count == 2
+
+
+async def test_call_llm_with_contract_result_raises_when_salvage_empty(
+    monkeypatch,
+) -> None:
+    """salvage 后一条可用镜头都没有时仍抛 ProviderContractError。"""
+    from app.schemas.pipeline_contracts import ProviderContractError
+    from app.services import storyboard as storyboard_service
+
+    all_bad = _all_bad_salvage_test_payload()
+    monkeypatch.setattr(storyboard_service, "_call_llm", AsyncMock(return_value=all_bad))
+
+    with pytest.raises(ProviderContractError):
+        await storyboard_service._call_llm_with_contract_result(
+            "system",
+            "user",
+            _subject_catalog(),
+            subject_references=_subject_references(),
+        )
+
+
+async def test_generate_storyboard_marks_salvaged_in_quality_report(
+    monkeypatch,
+) -> None:
+    """salvage 成功后 generate_storyboard 的 quality_report 应标注 salvaged=True。"""
+    from app.services import storyboard as storyboard_service
+
+    bad_payload = _salvage_test_payload_with_one_bad_shot()
+    monkeypatch.setattr(
+        storyboard_service, "_call_llm", AsyncMock(return_value=bad_payload)
+    )
+    monkeypatch.setattr(
+        storyboard_service, "_cleanup_existing_storyboard", AsyncMock()
+    )
+
+    episode = SimpleNamespace(
+        episode_id="episode-1",
+        script_id="script-1",
+        episode_no=1,
+        title="第一集",
+        script_text="阿明进入办公室和小林对话。",
+        episode_version=7,
+        client_save_seq=0,
+    )
+    subjects = [
+        SimpleNamespace(
+            id="subject-bg", name="办公室", type="background",
+            episode_nos=[1], description="", image_entry_id="img-bg",
+            is_active=True,
+        ),
+        SimpleNamespace(
+            id="subject-c1", name="阿明", type="character",
+            episode_nos=[1], description="", image_entry_id="img-c1",
+            is_active=True,
+        ),
+        SimpleNamespace(
+            id="subject-c2", name="小林", type="character",
+            episode_nos=[1], description="", image_entry_id="img-c2",
+            is_active=True,
+        ),
+        SimpleNamespace(
+            id="subject-p1", name="钥匙", type="prop",
+            episode_nos=[1], description="", image_entry_id="img-p1",
+            is_active=True,
+        ),
+        SimpleNamespace(
+            id="subject-s1", name="门响", type="sound",
+            episode_nos=[1], description="", image_entry_id="img-s1",
+            is_active=True,
+        ),
+    ]
+
+    class _Scalars:
+        def __init__(self, values):
+            self._values = values
+
+        def all(self):
+            return self._values
+
+    class _Result:
+        def __init__(self, scalar=None, scalars=None):
+            self._scalar = scalar
+            self._scalars = scalars or []
+
+        def scalar_one_or_none(self):
+            return self._scalar
+
+        def scalars(self):
+            return _Scalars(self._scalars)
+
+    # db.execute 调用序列：
+    # 0: episode 查询  1: subjects 查询
+    # 2: _selected_scene_audition_block（可选查询，空结果即可）
+    # 3: resolve_prompt_bundle（可选查询，空结果走内置回退）
+    # 4: fresh_episode 校验
+    # 之后 _extract_audio_elements_from_references 因 audio_refs 为空不会触发 db.execute
+    db = SimpleNamespace(
+        execute=AsyncMock(side_effect=[
+            _Result(episode),
+            _Result(scalars=subjects),
+            _Result(scalars=[]),
+            _Result(scalars=[]),
+            _Result(episode),
+        ]),
+        flush=AsyncMock(),
+        add=lambda _: None,
+    )
+
+    result = await storyboard_service.generate_storyboard(
+        db, "script-1", "episode-1", expected_episode_version=7
+    )
+    assert result["quality_report"]["salvaged"] is True
+    assert result["quality_report"]["dropped_shot_count"] >= 1
