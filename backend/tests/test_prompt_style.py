@@ -82,6 +82,35 @@ def test_apply_style_uses_asset_safe_cyberpunk_direction_for_subject_design() ->
     assert "low detail" in negative
 
 
+def test_apply_style_front_loads_comic_book_priority_for_structured_subject_design() -> None:
+    raw_prompt = build_subject_prompt(
+        "钱王",
+        "character",
+        "吴越国君主，中年男性，头戴王冠，身穿华贵王袍。"
+        "皮肤纹理、发丝、织锦和玉石需要清晰可辨，使用 85mm 人像视角与白色摄影棚背景。",
+    )
+
+    positive, negative = apply_style(
+        "comic-book",
+        raw_prompt,
+        "image",
+        subject_type="character",
+    )
+
+    priority, remaining = positive.split("\n\n", 1)
+    assert priority.startswith("【风格优先级】")
+    assert "unmistakable 2D American comic-book illustration" in priority
+    assert "halftone texture" in priority
+    assert "must remain visually dominant" in priority
+    assert remaining.startswith(raw_prompt)
+    assert positive.count("【风格优先级】") == 1
+    assert positive.count("【风格渲染约束】") == 1
+    assert strip_image_style(positive) == raw_prompt
+    assert "photorealistic" in negative
+    assert "live action" in negative
+    assert "camera photograph" in negative
+
+
 def test_apply_style_replaces_existing_style_for_real_scene_and_is_idempotent() -> None:
     raw_prompt = build_subject_prompt(
         "贫困乡村院落",
@@ -272,9 +301,9 @@ async def test_optimize_prompt_includes_selected_style_context() -> None:
 
     system = provider.chat.await_args.kwargs["system"]
     assert "目标风格：美漫" in system
-    assert "dynamic American comic-book panel" in system
+    assert "unmistakable 2D American comic-book illustration" in system
     assert "禁止加入这些冲突特征：photorealistic" in system
-    assert result["optimized_prompt"].startswith("dynamic American comic-book panel")
+    assert result["optimized_prompt"].startswith("unmistakable 2D American comic-book illustration")
     assert result["negative_prompt"].startswith("photorealistic")
 
 
@@ -551,6 +580,50 @@ async def test_generation_jobs_persist_style_id_and_include_it_in_idempotency(
             payload=batch_payload.model_copy(update={"style_id": "cinematic"}),
             idempotency_key="style-batch",
         )
+
+
+@pytest.mark.asyncio
+async def test_optimized_structured_prompt_keeps_comic_book_priority_until_job_creation(monkeypatch) -> None:
+    from app.services import generation as generation_service
+    from tests.test_generation import _AsyncSessionAdapter, _create_payload, _make_db, _seed
+
+    _, raw = _make_db()
+    seeded = _seed(raw)
+    db = _AsyncSessionAdapter(raw)
+    monkeypatch.setattr(generation_service, "enqueue_task", AsyncMock())
+    raw_prompt = build_subject_prompt(
+        "钱王",
+        "character",
+        "吴越国君主，中年男性，头戴王冠，身穿华贵王袍。"
+        "需要保留皮肤纹理、发丝、织锦和玉石的细节，使用白色摄影棚背景。",
+    )
+
+    optimized = await optimize_prompt(raw_prompt, "comic-book", "image")
+    assert optimized["optimized_prompt"] == raw_prompt
+    assert optimized["style_id"] == "comic-book"
+
+    job = await generation_service.create_generation_job(
+        db,
+        user=seeded.user,
+        payload=_create_payload(
+            prompt=optimized["optimized_prompt"],
+            style_id=optimized["style_id"],
+            model="qwen-image-2.0",
+            aspect="3:4",
+            count=1,
+        ),
+        idempotency_key="optimized-structured-comic-book",
+    )
+
+    final_prompt = job.input_json["resolved_prompts"]["final"]
+    priority, _ = final_prompt.split("\n\n", 1)
+    assert priority.startswith("【风格优先级】")
+    assert "unmistakable 2D American comic-book illustration" in priority
+    assert "must remain visually dominant" in priority
+    assert "【人物设定图构图硬约束 v2】" in final_prompt
+    assert job.input_json["style_id"] == "comic-book"
+    assert "photorealistic" in job.input_json["negative_prompt"]
+    assert "live action" in job.input_json["negative_prompt"]
 
 
 @pytest.mark.asyncio

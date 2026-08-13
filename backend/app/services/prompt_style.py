@@ -146,15 +146,17 @@ STYLE_CATALOG: list[dict] = [
         "name_zh": "美漫",
         "target": ["image"],
         "prompt_template": (
-            "dynamic American comic-book panel, {prompt}, confident ink contours, "
-            "controlled cross-hatching, bold spot colors, dramatic foreshortening, energetic panel composition"
+            "unmistakable 2D American comic-book illustration, {prompt}, bold confident ink contours, "
+            "controlled cross-hatching and halftone texture, flat graphic spot-color planes, "
+            "dramatic foreshortening, energetic panel composition, never photorealistic or live-action"
         ),
         "negative_prompt": (
-            "photorealistic, soft watercolor, anime proportions, weak linework, flat staging, "
-            "muddy colors, illegible lettering, watermark"
+            "photorealistic, live action, camera photograph, realistic skin pores, soft watercolor, "
+            "anime proportions, weak linework, flat staging, muddy colors, illegible lettering, watermark"
         ),
         "default_prompt": (
-            "a dynamic comic-book panel with bold inks, dramatic perspective, and controlled spot colors"
+            "an unmistakable 2D American comic-book illustration with bold inks, halftone texture, "
+            "dramatic perspective, and controlled spot colors"
         ),
         "best_for": ["英雄动作", "冲突场面", "分镜概念"],
     },
@@ -192,8 +194,10 @@ _SUBJECT_DESIGN_STYLE_CORES = {
         "selective high-detail rendering"
     ),
     "comic-book": (
-        "American comic-book rendering, confident ink contours, controlled cross-hatching, "
-        "bold spot colors, consistent production-design detail"
+        "unmistakable 2D American comic-book illustration, bold confident ink contours, "
+        "controlled cross-hatching and halftone texture, flat graphic spot-color planes, "
+        "graphic cel-style shadow shapes; the comic-book illustration treatment must remain visually "
+        "dominant across every view and must never become photorealistic or live-action"
     ),
 }
 
@@ -214,19 +218,19 @@ _SUBJECT_DESIGN_PRESENTATION_DIRECTIONS = {
 
 _SUBJECT_DESIGN_FACT_LOCKS = {
     "character": (
-        "The selected rendering medium and visual style override any conflicting medium or style wording "
-        "above; preserve every required view, pose, composition, clean background, physical relationship, "
-        "and all identity, period, clothing, and prop facts above."
+        "The selected rendering medium and visual style are mandatory and override any conflicting medium "
+        "or style wording anywhere in this prompt; preserve every required view, pose, composition, clean "
+        "background, physical relationship, and all identity, period, clothing, and prop facts."
     ),
     "scene": (
-        "The selected rendering medium and visual style override any conflicting medium or style wording "
-        "above; preserve the full-frame composition, spatial layout, architecture, materials, location, "
-        "period, time, weather, and all scene facts above."
+        "The selected rendering medium and visual style are mandatory and override any conflicting medium "
+        "or style wording anywhere in this prompt; preserve the full-frame composition, spatial layout, "
+        "architecture, materials, location, period, time, weather, and all scene facts."
     ),
     "prop": (
-        "The selected rendering medium and visual style override any conflicting medium or style wording "
-        "above; preserve every required view, product-sheet composition, physical support, scale, "
-        "construction, materials, period, and all prop facts above."
+        "The selected rendering medium and visual style are mandatory and override any conflicting medium "
+        "or style wording anywhere in this prompt; preserve every required view, product-sheet composition, "
+        "physical support, scale, construction, materials, period, and all prop facts."
     ),
 }
 
@@ -238,8 +242,13 @@ _SUBJECT_DESIGN_NEGATIVE_CONFLICTS = {
 }
 
 _STYLE_RENDER_CONSTRAINT_MARKER = "【风格渲染约束】"
+_STYLE_PRIORITY_CONSTRAINT_MARKER = "【风格优先级】"
 _STYLE_RENDER_CONSTRAINT_PATTERN = re.compile(
     rf"{re.escape(_STYLE_RENDER_CONSTRAINT_MARKER)}.*?(?=【[^】\r\n]+】|\Z)",
+    re.DOTALL,
+)
+_STYLE_PRIORITY_CONSTRAINT_PATTERN = re.compile(
+    rf"{re.escape(_STYLE_PRIORITY_CONSTRAINT_MARKER)}.*?(?=【[^】\r\n]+】|\Z)",
     re.DOTALL,
 )
 
@@ -316,6 +325,7 @@ def strip_image_style(prompt: str) -> str:
         if len(matches) != 1:
             break
         normalized = matches[0]
+    normalized = _STYLE_PRIORITY_CONSTRAINT_PATTERN.sub("", normalized)
     normalized = _STYLE_RENDER_CONSTRAINT_PATTERN.sub("", normalized)
     return re.sub(r"\n{3,}", "\n\n", normalized).strip()
 
@@ -360,8 +370,12 @@ def apply_style(
         style_core = _subject_design_style_core(style)
         presentation = _SUBJECT_DESIGN_PRESENTATION_DIRECTIONS[resolved_subject_type]
         fact_lock = _SUBJECT_DESIGN_FACT_LOCKS[resolved_subject_type]
+        priority = (
+            f"{_STYLE_PRIORITY_CONSTRAINT_MARKER}所选渲染风格为最高优先级，必须主导整张图的每个视图："
+            f"{style_core}. 不得被本提示词中其他相冲突的媒介或风格描述替代。"
+        )
         positive = (
-            f"{base_prompt}\n\n{_STYLE_RENDER_CONSTRAINT_MARKER}"
+            f"{priority}\n\n{base_prompt}\n\n{_STYLE_RENDER_CONSTRAINT_MARKER}"
             f"{style_core}, {presentation}. {fact_lock}"
         )
         negative_parts = [

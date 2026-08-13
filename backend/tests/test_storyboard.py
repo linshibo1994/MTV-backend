@@ -329,6 +329,82 @@ def test_storyboard_v2_voice_over_without_speaker_preserves_kind_and_multiline_t
     assert fields.dialogue_kind == "voice_over"
 
 
+@pytest.mark.parametrize(
+    ("raw_dialogue", "expected_text", "expected_kind", "expected_speaker"),
+    [
+        # Provider 仅返回字符串时，保留台词并按当前可见角色推断为角色对白。
+        ("  我们谈谈  ", "我们谈谈", "dialogue", "C01"),
+        # 常见别名与 model_type 扩展键应被映射/丢弃，不得触发 extra_forbidden。
+        (
+            {
+                "content": "先坐下。",
+                "speaker_name": "阿明",
+                "model_type": "spoken",
+                "emotion": "private provider field",
+            },
+            "先坐下。",
+            "dialogue",
+            "C01",
+        ),
+        # 旁白类型允许没有 speaker_ref，并保留多行台词。
+        (
+            {"utterance": "第一句旁白\n第二句旁白", "type": "narration"},
+            "第一句旁白\n第二句旁白",
+            "voice_over",
+            None,
+        ),
+    ],
+)
+def test_storyboard_v2_dialogue_provider_shapes_are_normalized(
+    raw_dialogue: object,
+    expected_text: str,
+    expected_kind: str,
+    expected_speaker: str | None,
+) -> None:
+    """兼容供应商对白字符串/别名对象，同时严格丢弃未知字段。"""
+
+    from app.services import storyboard as storyboard_service
+
+    payload = _valid_storyboard_v2_payload()
+    payload["scenes"][0]["shot_groups"][0]["shots"][0]["dialogue"] = raw_dialogue
+    references = _subject_references()
+    validated = storyboard_service._validate_provider_payload_result(
+        payload,
+        subject_catalog=_subject_catalog(),
+        subject_reference_names={ref: item.name for ref, item in references.items()},
+        subject_reference_types={ref: item.subject_type for ref, item in references.items()},
+    )
+
+    assert validated.v2_contract is not None
+    dialogue = validated.v2_contract.scenes[0].shot_groups[0].shots[0].dialogue
+    assert dialogue is not None
+    assert dialogue.text == expected_text
+    assert dialogue.kind == expected_kind
+    assert dialogue.speaker_ref == expected_speaker
+
+
+@pytest.mark.parametrize("raw_dialogue", [None, 123, [], {"text": 123, "model_type": "dialogue"}])
+def test_storyboard_v2_dialogue_invalid_shapes_become_null(
+    raw_dialogue: object,
+) -> None:
+    """没有可确认台词文本时降为 null，避免伪造台词或触发 model_type。"""
+
+    from app.services import storyboard as storyboard_service
+
+    payload = _valid_storyboard_v2_payload()
+    payload["scenes"][0]["shot_groups"][0]["shots"][0]["dialogue"] = raw_dialogue
+    references = _subject_references()
+    validated = storyboard_service._validate_provider_payload_result(
+        payload,
+        subject_catalog=_subject_catalog(),
+        subject_reference_names={ref: item.name for ref, item in references.items()},
+        subject_reference_types={ref: item.subject_type for ref, item in references.items()},
+    )
+
+    assert validated.v2_contract is not None
+    assert validated.v2_contract.scenes[0].shot_groups[0].shots[0].dialogue is None
+
+
 def test_storyboard_v2_dialogue_requires_visible_character_speaker() -> None:
     from app.schemas.storyboard_contracts import validate_storyboard_v2_contract
 
@@ -950,6 +1026,56 @@ def test_normalize_provider_continuity_coerces_invalid_enums() -> None:
     # 归一化成功即证明非法枚举已收敛为合法默认值（否则 literal_error）
     shot = contract.scenes[0].shot_groups[0].shots[0]
     assert "平视" in shot.description
+
+
+def test_normalize_provider_continuity_coerces_nested_position_aliases() -> None:
+    """百炼返回中英文空间枚举变体时应收敛为合约值，不再触发 literal_error。"""
+    from app.services import storyboard as storyboard_service
+
+    references = _subject_references()
+    payload = _valid_storyboard_v2_payload()
+    shot = payload["scenes"][0]["shot_groups"][0]["shots"][0]
+    shot["character_positions"] = [
+        {"ref": "C01", "position": "top-left", "facing": "facing-right"},
+        {"ref": "阿明", "position": "center", "facing": "front-facing"},
+        {"ref": "C01", "position": "diagonal-ish", "facing": "unknown-facing"},
+    ]
+    shot["start_boundary"] = {
+        "positions": [
+            {"ref": "C01", "position": "middle-right", "facing": "back-to-camera"}
+        ],
+        "unexpected_provider_field": "must be removed",
+    }
+    shot["end_boundary"] = {
+        "positions": [
+            {"ref": "C01", "position": "bottom-center", "facing": "profile-left"}
+        ]
+    }
+    payload["omitted_source_blocks"] = [
+        {"block_ref": "B1", "reason": "重复定场"},
+        {"block_ref": "not-a-block", "reason": "drop"},
+    ]
+
+    validated = storyboard_service._validate_provider_payload_result(
+        payload,
+        subject_catalog=_subject_catalog(),
+        subject_reference_names={ref: item.name for ref, item in references.items()},
+        subject_reference_types={ref: item.subject_type for ref, item in references.items()},
+    )
+    assert validated.v2_contract is not None
+    normalized = validated.v2_contract.scenes[0].shot_groups[0].shots[0]
+    assert [(item.position, item.facing) for item in normalized.character_positions] == [
+        ("左上", "面朝右"),
+        ("正中", "面朝镜头"),
+        (None, None),
+    ]
+    assert normalized.start_boundary is not None
+    assert normalized.start_boundary.positions[0].position == "右中"
+    assert normalized.start_boundary.positions[0].facing == "背对镜头"
+    assert normalized.end_boundary is not None
+    assert normalized.end_boundary.positions[0].position == "正下"
+    assert normalized.end_boundary.positions[0].facing == "侧身左"
+    assert validated.contract.scenes[0].shot_groups[0].shots[0].description
 
 
 def test_normalize_provider_continuity_repairs_dialogue_speaker_visibility() -> None:
@@ -2109,6 +2235,35 @@ def test_storyboard_failure_diagnostic_redacts_unknown_paths_and_response_kinds(
         )
     )
     assert unsafe_semantic_code.diagnostic is None
+
+
+def test_storyboard_failure_diagnostic_preserves_nested_storyboard_paths() -> None:
+    from app.core.job_state import PipelineFailure
+    from app.schemas.pipeline_contracts import ProviderContractError
+
+    failure = PipelineFailure.from_exception(
+        ProviderContractError(
+            "private",
+            diagnostic={
+                "version": 1,
+                "category": "schema_validation",
+                "schema": "StoryboardV2Contract",
+                "validation": {
+                    "error_count": 2,
+                    "codes": ["literal_error"],
+                    "paths": [
+                        "scenes[].shot_groups[].shots[].start_boundary.positions[].facing",
+                        "scenes[].shot_groups[].shots[].character_positions[].position",
+                    ],
+                },
+            },
+        )
+    )
+    assert failure.diagnostic is not None
+    assert failure.diagnostic["validation"]["paths"] == [
+        "scenes[].shot_groups[].shots[].start_boundary.positions[].facing",
+        "scenes[].shot_groups[].shots[].character_positions[].position",
+    ]
 
 
 async def test_worker_checks_input_version_before_provider_and_before_commit(monkeypatch) -> None:

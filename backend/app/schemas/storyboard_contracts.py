@@ -144,6 +144,17 @@ CoverageBlockRef = Annotated[
     ),
 ]
 
+POSITION9_GRID_VALUES = (
+    "左上",
+    "正上",
+    "右上",
+    "左中",
+    "正中",
+    "右中",
+    "左下",
+    "正下",
+    "右下",
+)
 Position9Grid = Literal[
     "左上",
     "正上",
@@ -155,6 +166,14 @@ Position9Grid = Literal[
     "正下",
     "右下",
 ]
+FACING_DIRECTION_VALUES = (
+    "面朝左",
+    "面朝右",
+    "面朝镜头",
+    "背对镜头",
+    "侧身左",
+    "侧身右",
+)
 FacingDirection = Literal[
     "面朝左",
     "面朝右",
@@ -762,8 +781,10 @@ __all__ = [
     "CoverageStatus",
     "DESCRIPTION_RE",
     "FacingDirection",
+    "FACING_DIRECTION_VALUES",
     "OmittedSourceBlock",
     "Position9Grid",
+    "POSITION9_GRID_VALUES",
     "SHOT_LINE_RE",
     "SHOT_SIZE_VALUES",
     "ShotBoundary",

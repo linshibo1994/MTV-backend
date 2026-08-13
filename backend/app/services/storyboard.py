@@ -16,6 +16,7 @@ from __future__ import annotations
 import inspect
 import json
 import logging
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TypeGuard, cast
@@ -39,6 +40,8 @@ from app.schemas.storyboard_contracts import (
     CAMERA_ANGLE_VALUES,
     CAMERA_MOVEMENT_VALUES,
     COMPOSITION_VALUES,
+    FACING_DIRECTION_VALUES,
+    POSITION9_GRID_VALUES,
     SHOT_SIZE_VALUES,
     StoryboardContract,
     StoryboardContractValidationError,
@@ -1441,6 +1444,145 @@ _SHOT_SIZE_SET = frozenset(SHOT_SIZE_VALUES)
 _COMPOSITION_SET = frozenset(COMPOSITION_VALUES)
 _CAMERA_ANGLE_SET = frozenset(CAMERA_ANGLE_VALUES)
 _CAMERA_MOVEMENT_SET = frozenset(CAMERA_MOVEMENT_VALUES)
+_POSITION9_GRID_SET = frozenset(POSITION9_GRID_VALUES)
+_FACING_DIRECTION_SET = frozenset(FACING_DIRECTION_VALUES)
+
+# 百炼等 OpenAI 兼容端点通常只保证 JSON 语法，不保证 Literal 枚举。
+# 位置与朝向是可选的质量事实：只接受字段专属的明确别名，无法确认时留空，
+# 避免把一个猜测的默认位置写进分镜并误导后续链帧校验。
+_POSITION9_GRID_ALIASES = {
+    "左上角": "左上",
+    "左上方": "左上",
+    "top-left": "左上",
+    "upper-left": "左上",
+    "top left": "左上",
+    "upper left": "左上",
+    "正上方": "正上",
+    "上中": "正上",
+    "中上": "正上",
+    "top-center": "正上",
+    "top-middle": "正上",
+    "upper-center": "正上",
+    "upper-middle": "正上",
+    "center-top": "正上",
+    "center top": "正上",
+    "右上角": "右上",
+    "右上方": "右上",
+    "top-right": "右上",
+    "upper-right": "右上",
+    "top right": "右上",
+    "upper right": "右上",
+    "中左": "左中",
+    "左中间": "左中",
+    "左侧中部": "左中",
+    "左侧中间": "左中",
+    "middle-left": "左中",
+    "center-left": "左中",
+    "mid-left": "左中",
+    "left-center": "左中",
+    "left-middle": "左中",
+    "left center": "左中",
+    "left middle": "左中",
+    "中央": "正中",
+    "中心": "正中",
+    "画面中央": "正中",
+    "正中间": "正中",
+    "center": "正中",
+    "centre": "正中",
+    "center-center": "正中",
+    "middle-center": "正中",
+    "middle": "正中",
+    "中右": "右中",
+    "右中间": "右中",
+    "右侧中部": "右中",
+    "右侧中间": "右中",
+    "middle-right": "右中",
+    "center-right": "右中",
+    "mid-right": "右中",
+    "right-center": "右中",
+    "right-middle": "右中",
+    "right center": "右中",
+    "right middle": "右中",
+    "左下角": "左下",
+    "左下方": "左下",
+    "bottom-left": "左下",
+    "lower-left": "左下",
+    "bottom left": "左下",
+    "lower left": "左下",
+    "正下方": "正下",
+    "下中": "正下",
+    "中下": "正下",
+    "bottom-center": "正下",
+    "bottom-middle": "正下",
+    "lower-center": "正下",
+    "lower-middle": "正下",
+    "center-bottom": "正下",
+    "center bottom": "正下",
+    "右下角": "右下",
+    "右下方": "右下",
+    "bottom-right": "右下",
+    "lower-right": "右下",
+    "bottom right": "右下",
+    "lower right": "右下",
+}
+_FACING_DIRECTION_ALIASES = {
+    "朝左": "面朝左",
+    "面向左": "面朝左",
+    "面朝左侧": "面朝左",
+    "facing-left": "面朝左",
+    "facing left": "面朝左",
+    "looking-left": "面朝左",
+    "looking left": "面朝左",
+    "left-facing": "面朝左",
+    "left facing": "面朝左",
+    "朝右": "面朝右",
+    "面向右": "面朝右",
+    "面朝右侧": "面朝右",
+    "facing-right": "面朝右",
+    "facing right": "面朝右",
+    "looking-right": "面朝右",
+    "looking right": "面朝右",
+    "right-facing": "面朝右",
+    "right facing": "面朝右",
+    "正面": "面朝镜头",
+    "面向镜头": "面朝镜头",
+    "面向相机": "面朝镜头",
+    "看镜头": "面朝镜头",
+    "facing-camera": "面朝镜头",
+    "facing camera": "面朝镜头",
+    "front-facing": "面朝镜头",
+    "front facing": "面朝镜头",
+    "looking-at-camera": "面朝镜头",
+    "looking at camera": "面朝镜头",
+    "toward-camera": "面朝镜头",
+    "toward camera": "面朝镜头",
+    "towards-camera": "面朝镜头",
+    "towards camera": "面朝镜头",
+    "背面": "背对镜头",
+    "背向镜头": "背对镜头",
+    "背向相机": "背对镜头",
+    "背对相机": "背对镜头",
+    "back-facing": "背对镜头",
+    "back facing": "背对镜头",
+    "back-to-camera": "背对镜头",
+    "back to camera": "背对镜头",
+    "away-from-camera": "背对镜头",
+    "away from camera": "背对镜头",
+    "左侧身": "侧身左",
+    "侧身向左": "侧身左",
+    "profile-left": "侧身左",
+    "profile left": "侧身左",
+    "left-profile": "侧身左",
+    "left profile": "侧身左",
+    "右侧身": "侧身右",
+    "侧身向右": "侧身右",
+    "profile-right": "侧身右",
+    "profile right": "侧身右",
+    "right-profile": "侧身右",
+    "right profile": "侧身右",
+}
+_POSITION9_GRID_ALIASES.update({value: value for value in _POSITION9_GRID_SET})
+_FACING_DIRECTION_ALIASES.update({value: value for value in _FACING_DIRECTION_SET})
 
 # 镜头级字段与视觉字段白名单，用于归位模型错放的字段（镜头字段误入 visual 或反之）。
 _VISUAL_FIELDS = frozenset(
@@ -1450,6 +1592,7 @@ _VISUAL_FIELDS = frozenset(
         "camera_angle",
         "camera_movement",
         "action",
+        "action_beat",
         "frame_description",
         "lighting",
         "emotion",
@@ -1480,6 +1623,206 @@ def _coerce_enum(value: object, allowed: frozenset, default: str) -> str:
     if isinstance(value, str) and value in allowed:
         return value
     return default
+
+
+def _alias_key(value: str) -> str:
+    """将英文别名的大小写、下划线和空白差异收敛为可比较键。"""
+
+    return " ".join(value.strip().casefold().replace("_", "-").split())
+
+
+def _normalize_optional_enum(
+    value: object,
+    *,
+    allowed: frozenset[str],
+    aliases: dict[str, str],
+) -> str | None:
+    """归一化可选枚举；无法确认时返回 None，不制造虚假事实。"""
+
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip()
+    if candidate in allowed:
+        return candidate
+    normalized = _alias_key(candidate)
+    for alias, canonical in aliases.items():
+        if _alias_key(alias) == normalized:
+            return canonical
+    return None
+
+
+def _normalize_block_ref(value: object) -> str | None:
+    """把 B1/B01 等稳定片段引用规范为 Bxx；未知引用直接丢弃。"""
+
+    if not isinstance(value, str):
+        return None
+    match = re.fullmatch(r"b0*([1-9]\d{0,5})", value.strip(), flags=re.IGNORECASE)
+    if match is None:
+        return None
+    return f"B{int(match.group(1)):02d}"
+
+
+def _normalize_character_position(
+    value: object,
+    *,
+    name_to_ref: dict[str, str],
+    valid_refs: set[str],
+    subject_reference_types: dict[str, str],
+) -> dict[str, str] | None:
+    """归一化单个角色空间事实，并丢弃无法确认的条目。"""
+
+    if not isinstance(value, dict):
+        return None
+    ref = _normalize_ref_value(
+        value.get("ref"), name_to_ref=name_to_ref, valid_refs=valid_refs
+    )
+    if (
+        not isinstance(ref, str)
+        or ref not in valid_refs
+        or subject_reference_types.get(ref) != "character"
+    ):
+        return None
+    normalized: dict[str, str] = {"ref": ref}
+    position = _normalize_optional_enum(
+        value.get("position"),
+        allowed=_POSITION9_GRID_SET,
+        aliases=_POSITION9_GRID_ALIASES,
+    )
+    facing = _normalize_optional_enum(
+        value.get("facing"),
+        allowed=_FACING_DIRECTION_SET,
+        aliases=_FACING_DIRECTION_ALIASES,
+    )
+    if position is not None:
+        normalized["position"] = position
+    if facing is not None:
+        normalized["facing"] = facing
+    return normalized
+
+
+def _normalize_boundary(
+    value: object,
+    *,
+    name_to_ref: dict[str, str],
+    valid_refs: set[str],
+    subject_reference_types: dict[str, str],
+) -> dict[str, object] | None:
+    """清理起止边界的可选事实，避免供应商扩展字段触发严格 extra 校验。"""
+
+    if not isinstance(value, dict):
+        return None
+    normalized: dict[str, object] = {}
+    positions = value.get("positions")
+    if isinstance(positions, list):
+        normalized["positions"] = [
+            item
+            for raw in positions[:20]
+            if (item := _normalize_character_position(
+                raw,
+                name_to_ref=name_to_ref,
+                valid_refs=valid_refs,
+                subject_reference_types=subject_reference_types,
+            ))
+            is not None
+        ]
+    for key in ("pose_balance", "gaze"):
+        text = _truncate_text(value.get(key), _SHORT_TEXT_MAX)
+        if isinstance(text, str) and text.strip():
+            normalized[key] = text
+    hands = value.get("hands")
+    if isinstance(hands, dict):
+        normalized_hands: dict[str, str] = {}
+        for key in ("left", "right"):
+            text = _truncate_text(hands.get(key), _SHORT_TEXT_MAX)
+            if isinstance(text, str) and text.strip():
+                normalized_hands[key] = text
+        if normalized_hands:
+            normalized["hands"] = normalized_hands
+    held_props = value.get("held_props")
+    if isinstance(held_props, list):
+        normalized["held_props"] = _normalize_ref_list(
+            held_props,
+            name_to_ref=name_to_ref,
+            valid_refs=valid_refs,
+            subject_reference_types=subject_reference_types,
+            expected_type="prop",
+        )[:20]
+    visible_state = value.get("visible_state")
+    if isinstance(visible_state, list):
+        normalized["visible_state"] = [
+            text
+            for raw in visible_state[:20]
+            if isinstance(text := _truncate_text(raw, _SHORT_TEXT_MAX), str)
+            and text.strip()
+        ]
+    return normalized
+
+
+def _normalize_coverage_items(items: object) -> list[dict[str, object]]:
+    """过滤 Coverage 中的非法片段和未知扩展字段；质量规则仍由服务端评估。"""
+
+    if not isinstance(items, list):
+        return []
+    status_aliases = {
+        "covered": "covered",
+        "已落实": "covered",
+        "partial": "partial",
+        "部分落实": "partial",
+        "repeated": "repeated",
+        "重复": "repeated",
+    }
+    result: list[dict[str, object]] = []
+    for raw in items[:20]:
+        if not isinstance(raw, dict):
+            continue
+        block_ref = _normalize_block_ref(raw.get("block_ref"))
+        raw_status = raw.get("status")
+        status = status_aliases.get(raw_status) if isinstance(raw_status, str) else None
+        if block_ref is None or status is None:
+            continue
+        item: dict[str, object] = {"block_ref": block_ref, "status": status}
+        source_range = raw.get("source_range")
+        if isinstance(source_range, dict):
+            start = source_range.get("char_start")
+            end = source_range.get("char_end")
+            if (
+                isinstance(start, int)
+                and not isinstance(start, bool)
+                and isinstance(end, int)
+                and not isinstance(end, bool)
+                and start >= 0
+                and end > start
+            ):
+                item["source_range"] = {"char_start": start, "char_end": end}
+        for key in ("summary", "repeat_reason"):
+            text = _truncate_text(raw.get(key), _SHORT_TEXT_MAX)
+            if isinstance(text, str) and text.strip():
+                item[key] = text
+        result.append(item)
+    return result
+
+
+def _normalize_omitted_source_blocks(payload: dict) -> None:
+    """清理根级 omitted_source_blocks，防止一次坏引用消耗修复预算。"""
+
+    raw_items = payload.get("omitted_source_blocks")
+    if not isinstance(raw_items, list):
+        if "omitted_source_blocks" in payload:
+            payload["omitted_source_blocks"] = []
+        return
+    normalized: list[dict[str, object]] = []
+    for raw in raw_items[:200]:
+        if not isinstance(raw, dict):
+            continue
+        block_ref = _normalize_block_ref(raw.get("block_ref"))
+        if block_ref is None:
+            continue
+        item: dict[str, object] = {"block_ref": block_ref}
+        reason = _truncate_text(raw.get("reason"), _SHORT_TEXT_MAX)
+        if isinstance(reason, str) and reason.strip():
+            item["reason"] = reason
+        normalized.append(item)
+    payload["omitted_source_blocks"] = normalized
 
 
 def _truncate_text(value: object, limit: int) -> str | None:
@@ -1573,6 +1916,199 @@ def _normalize_ref_list(
             result.append(normalized)
             seen.add(normalized)
     return result
+
+
+_DIALOGUE_ALLOWED_FIELDS = frozenset({"speaker_ref", "text", "kind"})
+_DIALOGUE_TEXT_ALIASES = (
+    "text",
+    "dialogue",
+    "content",
+    "line",
+    "utterance",
+    "speech",
+    "value",
+    "台词",
+    "对白",
+    "旁白",
+)
+_DIALOGUE_SPEAKER_ALIASES = (
+    "speaker_ref",
+    "speaker",
+    "speaker_id",
+    "speaker_name",
+    "character_ref",
+    "character",
+    "role",
+    "actor",
+    "说话人",
+    "角色",
+)
+_DIALOGUE_KIND_ALIASES: dict[str, str] = {
+    "dialogue": "dialogue",
+    "dialog": "dialogue",
+    "spoken": "dialogue",
+    "conversation": "dialogue",
+    "character dialogue": "dialogue",
+    "character_dialogue": "dialogue",
+    "对白": "dialogue",
+    "对话": "dialogue",
+    "台词": "dialogue",
+    "voice over": "voice_over",
+    "voice-over": "voice_over",
+    "voiceover": "voice_over",
+    "narration": "voice_over",
+    "narrator": "voice_over",
+    "offscreen": "voice_over",
+    "off-screen": "voice_over",
+    "旁白": "voice_over",
+    "画外音": "voice_over",
+    "inner monologue": "inner_monologue",
+    "inner-monologue": "inner_monologue",
+    "innervoice": "inner_monologue",
+    "inner voice": "inner_monologue",
+    "thought": "inner_monologue",
+    "thoughts": "inner_monologue",
+    "monologue": "inner_monologue",
+    "独白": "inner_monologue",
+    "内心独白": "inner_monologue",
+    "内心": "inner_monologue",
+    "心声": "inner_monologue",
+}
+_DIALOGUE_KIND_ALIASES.update(
+    {
+        "dialogue": "dialogue",
+        "voice_over": "voice_over",
+        "inner_monologue": "inner_monologue",
+    }
+)
+
+
+def _normalize_dialogue_kind(value: object, *, has_character_speaker: bool) -> str:
+    """把 Provider 的台词类型别名收敛到 v2 的三个受控值。"""
+
+    if isinstance(value, str):
+        candidate = value.strip()
+        # ``_alias_key`` 将大小写、下划线和连字符差异收敛到同一比较键。
+        normalized_key = _alias_key(candidate)
+        for alias, normalized in _DIALOGUE_KIND_ALIASES.items():
+            if _alias_key(alias) == normalized_key:
+                return normalized
+    # 有角色且没有明确的旁白类型时，字符串对白按角色对白处理；否则视为旁白。
+    return "dialogue" if has_character_speaker else "voice_over"
+
+
+def _dialogue_scalar(value: object) -> str | None:
+    """仅接受字符串标量，避免把对象/数字伪造为台词文本。"""
+
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    return text or None
+
+
+def _dialogue_ref_candidate(value: object) -> object:
+    """从常见的 speaker 对象形态提取稳定引用或主体名称。"""
+
+    if not isinstance(value, dict):
+        return value
+    for key in (
+        "speaker_ref",
+        "character_ref",
+        "ref",
+        "id",
+        "speaker_id",
+        "name",
+        "speaker_name",
+        "character",
+    ):
+        candidate = value.get(key)
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate
+    return None
+
+
+def _normalize_dialogue_value(
+    value: object,
+    *,
+    shot: dict,
+    name_to_ref: dict[str, str],
+    valid_refs: set[str],
+    subject_reference_types: dict[str, str],
+) -> dict[str, object] | None:
+    """兼容 Provider 对白形态，同时只输出严格合约允许的字段。
+
+    百炼等兼容端点有时把 ``dialogue`` 输出成纯字符串，或使用
+    ``content/speaker_name/model_type`` 等别名。这里仅提取可确认的字符串
+    语义和主体引用，未知键、嵌套数组及非字符串值全部丢弃，避免
+    ``model_type``/``extra_forbidden`` 直接阻断整集分镜。
+    """
+
+    if value is None:
+        return None
+
+    raw_text: object = None
+    raw_speaker: object = None
+    raw_kind: object = None
+    if isinstance(value, str):
+        raw_text = value
+    elif isinstance(value, dict):
+        # 优先采用规范键；别名按固定顺序读取，避免 Provider 同时返回多份事实。
+        for key in _DIALOGUE_TEXT_ALIASES:
+            candidate = value.get(key)
+            if isinstance(candidate, str):
+                raw_text = candidate
+                break
+        for key in _DIALOGUE_SPEAKER_ALIASES:
+            if key in value:
+                raw_speaker = value.get(key)
+                break
+        for key in ("kind", "type", "dialogue_type", "model_type", "mode", "category", "台词类型", "类型"):
+            if key in value:
+                raw_kind = value.get(key)
+                break
+    else:
+        # 非字符串/对象的 dialogue 没有可安全保留的台词语义。
+        return None
+
+    text = _dialogue_scalar(raw_text)
+    if text is None:
+        return None
+    text = _truncate_text(text, _LONG_TEXT_MAX)
+
+    speaker = _normalize_ref_value(
+        _dialogue_ref_candidate(raw_speaker),
+        name_to_ref=name_to_ref,
+        valid_refs=valid_refs,
+    )
+    if not (
+        isinstance(speaker, str)
+        and speaker in valid_refs
+        and subject_reference_types.get(speaker) in {"character", "sound"}
+    ):
+        speaker = None
+
+    character_refs = shot.get("character_refs")
+    has_character_speaker = (
+        isinstance(speaker, str)
+        and subject_reference_types.get(speaker) == "character"
+    )
+    if not has_character_speaker and isinstance(character_refs, list):
+        has_character_speaker = any(
+            isinstance(ref, str) and subject_reference_types.get(ref) == "character"
+            for ref in character_refs
+        )
+    kind = _normalize_dialogue_kind(raw_kind, has_character_speaker=has_character_speaker)
+    normalized: dict[str, object] = {
+        "speaker_ref": speaker,
+        "text": text,
+        "kind": kind,
+    }
+    # 使用固定顺序便于日志、缓存和回归测试保持稳定；集合仅用于表达白名单。
+    return {
+        key: normalized[key]
+        for key in ("speaker_ref", "text", "kind")
+        if key in _DIALOGUE_ALLOWED_FIELDS
+    }
 
 
 def _normalize_shot_fields(
@@ -1681,17 +2217,58 @@ def _normalize_shot_fields(
             subject_reference_types=subject_reference_types,
             expected_type="sound",
         )
-    dialogue = shot.get("dialogue")
-    if isinstance(dialogue, dict):
-        if dialogue.get("text") is not None:
-            dialogue["text"] = _truncate_text(dialogue["text"], _LONG_TEXT_MAX)
-        kind = dialogue.get("kind")
-        speaker = dialogue.get("speaker_ref")
-        if speaker is not None:
-            speaker = _normalize_ref_value(
-                speaker, name_to_ref=name_to_ref, valid_refs=valid_refs
+    if "source_block_refs" in shot:
+        raw_source_refs = shot.get("source_block_refs")
+        if isinstance(raw_source_refs, list):
+            source_refs: list[str] = []
+            for raw_ref in raw_source_refs[:20]:
+                block_ref = _normalize_block_ref(raw_ref)
+                if block_ref is not None and block_ref not in source_refs:
+                    source_refs.append(block_ref)
+            shot["source_block_refs"] = source_refs
+        else:
+            shot["source_block_refs"] = []
+    if "coverage" in shot:
+        shot["coverage"] = _normalize_coverage_items(shot.get("coverage"))
+    for boundary_name in ("start_boundary", "end_boundary"):
+        if boundary_name in shot:
+            shot[boundary_name] = _normalize_boundary(
+                shot.get(boundary_name),
+                name_to_ref=name_to_ref,
+                valid_refs=valid_refs,
+                subject_reference_types=subject_reference_types,
             )
-            dialogue["speaker_ref"] = speaker
+    if "character_positions" in shot:
+        raw_positions = shot.get("character_positions")
+        shot["character_positions"] = (
+            [
+                item
+                for raw in raw_positions[:20]
+                if (item := _normalize_character_position(
+                    raw,
+                    name_to_ref=name_to_ref,
+                    valid_refs=valid_refs,
+                    subject_reference_types=subject_reference_types,
+                ))
+                is not None
+            ]
+            if isinstance(raw_positions, list)
+            else []
+        )
+    if "dialogue" in shot:
+        dialogue = _normalize_dialogue_value(
+            shot.get("dialogue"),
+            shot=shot,
+            name_to_ref=name_to_ref,
+            valid_refs=valid_refs,
+            subject_reference_types=subject_reference_types,
+        )
+        shot["dialogue"] = dialogue
+    else:
+        dialogue = None
+    if isinstance(dialogue, dict):
+        kind = dialogue["kind"]
+        speaker = dialogue["speaker_ref"]
         # dialogue/inner_monologue 要求 speaker 是当前镜头可见角色；模型常漏列或写错，
         # 这里确定性收敛避免 model_validator(dialogue_speaker_must_be_visible) 抛 value_error。
         if kind in {"dialogue", "inner_monologue"}:
@@ -1783,6 +2360,7 @@ def _normalize_provider_continuity(
     )
     if isinstance(payload, dict) and is_v2_payload:
         payload["schema_version"] = "storyboard.v2"
+        _normalize_omitted_source_blocks(payload)
     for scene_index, scene in enumerate(scenes, start=1):
         if not isinstance(scene, dict):
             continue
