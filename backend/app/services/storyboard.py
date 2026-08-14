@@ -13,13 +13,14 @@ audio_elements 需配音角色
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import inspect
 import json
 import logging
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TypeGuard, cast
 
 from pydantic import ValidationError
@@ -263,6 +264,7 @@ class _StoryboardResolvedInput:
     prompts: _StoryboardPromptContext
     script_blocks: list[ScriptBlock]
     provenance: dict[str, object]
+    director_plan_block: str = ""
 
 
 @dataclass(frozen=True)
@@ -829,6 +831,7 @@ async def _resolve_storyboard_input(
         prompts=prompts,
         script_blocks=script_blocks,
         provenance=provenance,
+        director_plan_block=director_plan_block,
     )
 
 
@@ -3019,6 +3022,387 @@ async def _call_llm_with_contract(
 
 
 # ---------------------------------------------------------------------------
+# 按场景拆分生成：避免一次性整集 LLM 调用超时
+# 流程：场景划分(轻量LLM) → 逐场景生成 shot_groups → 合并 renumber → 整集契约校验+渲染
+# 连续性友好：时码 per-group(每组从0)、group_no 每场从 G1、display_no 每组从1；
+# scene_no 全局连续由合并层 renumber 保证。
+# ---------------------------------------------------------------------------
+
+
+_SCENE_SPLIT_MAX_SCENES = 30
+_SCENE_GEN_CONCURRENCY = 5
+
+
+@dataclass(frozen=True)
+class _ScenePlan:
+    scene_no: int
+    background_ref: str
+    source_block_refs: list[str]
+    narrative_purpose: str
+    estimated_groups: int
+
+
+def _build_scene_split_user_prompt(
+    episode: Episode,
+    subject_block: str,
+    script_block_text: str,
+    script_chars: int,
+    min_coverage: tuple[int, int, int, int],
+) -> str:
+    min_shots, min_groups, min_scenes, min_duration = min_coverage
+    return f"""请为以下分集做场景划分，只输出场景骨架，不要生成镜头。
+
+## 分集
+- 集号：第 {episode.episode_no} 集
+- 标题：{episode.title}
+
+## 剧本原文落实表（Bxx 为稳定段落编号）
+{script_block_text}
+
+## 本集可引用主体目录
+{subject_block}
+
+## 场景划分规则
+- 场景、地点、日夜、时间或连续叙事段落变化时新建场景；离开后再回到同一地点也要新建场景。
+- 每个新场景最多用 1~2 个镜头完成定场。
+- 每个 Bxx 段必须落入某 scene 的 source_block_refs，或写入根级 omitted_source_blocks 并说明 reason。
+- background_ref 必须是目录中 background/scene 类型引用（如 BG01）。
+- scene_no 从 1 连续递增；场景总数不超过 {_SCENE_SPLIT_MAX_SCENES}。
+- estimated_groups 为该场景预估镜头组数（每场至少 1 组，叙事主体场景 2~5 组）。
+
+## 覆盖度下限（整集，由剧本 {script_chars} 字推导）
+- 最少：{min_shots} 镜 / {min_groups} 组 / {min_scenes} 场 / 总时长 {min_duration} 秒。
+- 划分时保证场景总数 ≥ {min_scenes}，且各场景预估镜头数之和 ≥ {min_shots}。
+
+## 输出 JSON
+{{
+  "scenes": [
+    {{"scene_no": 1, "background_ref": "BG01", "source_block_refs": ["B01","B02"], "narrative_purpose": "...", "estimated_groups": 3}}
+  ],
+  "omitted_source_blocks": []
+}}
+只输出符合上述结构的 JSON，不要 markdown 或解释。
+"""
+
+
+def _build_scene_user_prompt(
+    episode: Episode,
+    plan: _ScenePlan,
+    scene_blocks_text: str,
+    subject_block: str,
+    prev_tail: str,
+    director_plan_section: str,
+) -> str:
+    prev_section = (
+        f"\n## 上一场景末镜上下文（保持人物位置/朝向连续）\n{prev_tail}\n"
+        if prev_tail
+        else ""
+    )
+    return f"""请为以下单个场景生成 storyboard.v2 镜头组。只输出本场景，scene_no 固定为 1。
+
+## 分集
+- 集号：第 {episode.episode_no} 集
+- 标题：{episode.title}
+- 当前场景：第 {plan.scene_no} 场（输出时 scene_no 固定写 1）
+- 场景背景引用：{plan.background_ref}
+- 场景叙事目的：{plan.narrative_purpose}
+
+## 本场景剧本段（须全部覆盖到镜头）
+{scene_blocks_text}
+{director_plan_section}{prev_section}
+## 本集可引用主体目录
+{subject_block}
+
+## 输出要求
+- 只输出本场景一个 scene，schema_version 为 storyboard.v2。
+- shot_groups 的 group_no 从 G1 连续；每组 1~5 镜；duration_seconds 为 3~15 整数秒。
+- 每组内 display_no 从 1 连续，start_seconds 从 0 累进，相邻区间首尾相接，末镜 end_seconds == duration_seconds。
+- 对白/旁白/内心独白逐字保留在 dialogue.text，无语言内容时 dialogue 为 null。
+- source_block_refs 指明本场景落实的 Bxx 段；character_refs/prop_refs/sound_refs 只能引用目录短引用。
+- 起止边界、角色九宫格位置/朝向按可见事实填写；与上一场景末镜保持人物位置/朝向连续。
+
+## 输出 JSON
+{{
+  "schema_version": "storyboard.v2",
+  "scenes": [
+    {{"scene_no": 1, "background_ref": "{plan.background_ref}", "shot_groups": [{{"group_no": "G1", "narrative_purpose": "...", "duration_seconds": 6, "shots": [{{"display_no": 1, "start_seconds": 0, "end_seconds": 3, "visual": {{"shot_size": "...", "composition": ["..."], "camera_angle": "...", "camera_movement": "...", "action": "...", "frame_description": "...", "lighting": "...", "emotion": "..."}}, "narrative_purpose": "...", "source_block_refs": ["Bxx"], "character_refs": [], "prop_refs": [], "sound_refs": [], "sound_design": "...", "start_boundary": {{"positions": [], "visible_state": []}}, "end_boundary": {{"positions": [], "visible_state": []}}, "character_positions": [], "audience_visibility": [], "dialogue": null}}]}}]}}
+  ],
+  "omitted_source_blocks": []
+}}
+只输出符合结构的 JSON，不要 markdown 或解释。
+"""
+
+
+async def _split_scenes_into_plans(
+    system_prompt: str,
+    episode: Episode,
+    subject_block: str,
+    script_block_text: str,
+    script_chars: int,
+    min_coverage: tuple[int, int, int, int],
+    subject_references: Mapping[str, _SubjectReference],
+    script_blocks: list[ScriptBlock],
+) -> tuple[list[_ScenePlan], list[dict]]:
+    """一次轻量 LLM 调用产出场景大纲（最多 2 次尝试，校验 Bxx 全覆盖）。"""
+    split_user = _build_scene_split_user_prompt(
+        episode, subject_block, script_block_text, script_chars, min_coverage
+    )
+    bg_refs = {
+        ref
+        for ref, item in subject_references.items()
+        if item.subject_type in ("background", "scene")
+    }
+    all_block_refs = {b.block_ref for b in script_blocks}
+    last_err: ProviderContractError | None = None
+    for attempt in range(1, 3):
+        payload = await _call_llm(system_prompt, split_user)
+        try:
+            return _parse_scene_split_payload(payload, bg_refs, all_block_refs)
+        except ProviderContractError as exc:
+            last_err = exc
+            logger.warning("场景划分响应校验失败 attempt=%d/2: %s", attempt, exc)
+            continue
+    raise last_err or ProviderContractError("场景划分失败", diagnostic=None)
+
+
+def _parse_scene_split_payload(
+    payload: object,
+    bg_refs: set[str],
+    all_block_refs: set[str],
+) -> tuple[list[_ScenePlan], list[dict]]:
+    """解析并校验场景划分响应：背景类型、非空 refs、数量上限、Bxx 全覆盖。"""
+    if not isinstance(payload, dict):
+        raise ProviderContractError("场景划分响应非 JSON 对象", diagnostic=None)
+    scenes_raw = payload.get("scenes")
+    if not isinstance(scenes_raw, list) or not scenes_raw:
+        raise ProviderContractError("场景划分响应缺少 scenes 数组", diagnostic=None)
+    if len(scenes_raw) > _SCENE_SPLIT_MAX_SCENES:
+        raise ProviderContractError(
+            f"场景划分数 {len(scenes_raw)} 超上限 {_SCENE_SPLIT_MAX_SCENES}",
+            diagnostic=None,
+        )
+    plans: list[_ScenePlan] = []
+    covered: set[str] = set()
+    for idx, sc in enumerate(scenes_raw, start=1):
+        if not isinstance(sc, dict):
+            raise ProviderContractError(f"场景划分第 {idx} 项非对象", diagnostic=None)
+        bg = sc.get("background_ref")
+        if not isinstance(bg, str) or bg not in bg_refs:
+            raise ProviderContractError(
+                f"场景划分第 {idx} 项 background_ref 非法或非背景类型: {bg!r}",
+                diagnostic=None,
+            )
+        refs = sc.get("source_block_refs") or []
+        if not isinstance(refs, list) or not all(isinstance(r, str) for r in refs):
+            raise ProviderContractError(
+                f"场景划分第 {idx} 项 source_block_refs 非法", diagnostic=None
+            )
+        if not refs:
+            raise ProviderContractError(
+                f"场景划分第 {idx} 项 source_block_refs 为空", diagnostic=None
+            )
+        unknown = [r for r in refs if r not in all_block_refs]
+        if unknown:
+            raise ProviderContractError(
+                f"场景划分第 {idx} 项 source_block_refs 含未知段落: {unknown}",
+                diagnostic=None,
+            )
+        covered.update(refs)
+        try:
+            est = max(1, int(sc.get("estimated_groups") or 1))
+        except (TypeError, ValueError):
+            est = 1
+        plans.append(
+            _ScenePlan(
+                scene_no=idx,
+                background_ref=bg,
+                source_block_refs=list(refs),
+                narrative_purpose=str(sc.get("narrative_purpose") or "")[:500],
+                estimated_groups=est,
+            )
+        )
+    omitted = payload.get("omitted_source_blocks") or []
+    if not isinstance(omitted, list):
+        omitted = []
+    omitted = [o for o in omitted if isinstance(o, dict)]
+    omitted_refs = {
+        o.get("block_ref") for o in omitted if isinstance(o.get("block_ref"), str)
+    }
+    missing = all_block_refs - covered - omitted_refs
+    for m in sorted(missing):
+        omitted.append({"block_ref": m, "reason": "场景划分未分配，自动省略"})
+    return plans, omitted
+
+
+async def _generate_scene_contract(
+    system_prompt: str,
+    episode: Episode,
+    plan: _ScenePlan,
+    scene_blocks_text: str,
+    subject_block: str,
+    prev_tail: str,
+    director_plan_section: str,
+    subject_catalog: dict[str, str],
+    subject_references: dict[str, _SubjectReference],
+    description_template: PromptTemplateSnapshot | None,
+    shot_template: PromptTemplateSnapshot | None,
+) -> _ValidatedStoryboard:
+    """单场景调 LLM 生成 shot_groups，复用契约校验（payload 为单 scene，scene_no=1）。"""
+    scene_user = _build_scene_user_prompt(
+        episode, plan, scene_blocks_text, subject_block, prev_tail, director_plan_section
+    )
+    return await _call_llm_with_contract_result(
+        system_prompt,
+        scene_user,
+        subject_catalog,
+        subject_references=subject_references,
+        description_template=description_template,
+        shot_template=shot_template,
+    )
+
+
+async def _generate_storyboard_by_scenes(
+    episode: Episode,
+    subjects: list[Subject],
+    subject_references: Mapping[str, _SubjectReference],
+    prompt_context: _StoryboardPromptContext,
+    script_blocks: list[ScriptBlock],
+    subject_catalog: dict[str, str],
+    director_plan_block: str,
+) -> _ValidatedStoryboard:
+    """按场景拆分生成：场景划分 → 逐场景生成 → 合并 renumber → 整集契约校验+渲染。"""
+    system_prompt = prompt_context.system_prompt
+    description_template = prompt_context.templates[_STORYBOARD_DESCRIPTION_TEMPLATE_KEY]
+    shot_template = prompt_context.templates[_STORYBOARD_SHOT_TEMPLATE_KEY]
+    references = dict(subject_references)
+    reference_names = {ref: item.name for ref, item in references.items()}
+    reference_types = {ref: item.subject_type for ref, item in references.items()}
+
+    script_text = episode.script_text or ""
+    script_block_text = (
+        "\n\n".join(f"[{b.block_ref}] {b.text}" for b in script_blocks) or "（无剧本内容）"
+    )
+    min_coverage = _coverage_minimums(script_text)
+    subject_block = _build_subject_list_block(subjects, episode.episode_no, references)
+    director_plan_section = (
+        f"\n## 已确认导演方案\n以下方案已由用户确认，分镜必须落实其六维选择。\n"
+        f"{director_plan_block}\n"
+        if director_plan_block
+        else ""
+    )
+
+    # 1) 场景划分（轻量 LLM 调用，2 次重试 + Bxx 全覆盖校验）
+    plans, split_omitted = await _split_scenes_into_plans(
+        system_prompt,
+        episode,
+        subject_block,
+        script_block_text,
+        len(script_text.strip()),
+        min_coverage,
+        references,
+        script_blocks,
+    )
+    logger.info("分镜按场景拆分：共 %d 个场景", len(plans))
+
+    block_by_ref = {b.block_ref: b for b in script_blocks}
+
+    # 2) 并行逐场景生成（跨场景连续性由 _normalize_provider_continuity 后处理；
+    #    并发限流 _SCENE_GEN_CONCURRENCY 避免上游 RPM 限流）
+    semaphore = asyncio.Semaphore(_SCENE_GEN_CONCURRENCY)
+
+    async def _gen_one(plan: _ScenePlan) -> _ValidatedStoryboard:
+        scene_blocks_text = (
+            "\n\n".join(
+                f"[{block_by_ref[r].block_ref}] {block_by_ref[r].text}"
+                for r in plan.source_block_refs
+                if r in block_by_ref
+            )
+            or "（无本场景剧本段）"
+        )
+        async with semaphore:
+            sv = await _generate_scene_contract(
+                system_prompt,
+                episode,
+                plan,
+                scene_blocks_text,
+                subject_block,
+                "",
+                director_plan_section,
+                subject_catalog,
+                references,
+                description_template,
+                shot_template,
+            )
+        if sv.v2_contract is None or not sv.v2_contract.scenes:
+            raise ProviderContractError(
+                f"场景 {plan.scene_no} 生成未产出有效 v2 合约", diagnostic=None
+            )
+        if len(sv.v2_contract.scenes) != 1:
+            raise ProviderContractError(
+                f"场景 {plan.scene_no} 应只产出 1 个 scene，实际 "
+                f"{len(sv.v2_contract.scenes)}",
+                diagnostic=None,
+            )
+        logger.info(
+            "分镜场景 %d/%d 生成完成（组数=%d）",
+            plan.scene_no,
+            len(plans),
+            len(sv.v2_contract.scenes[0].shot_groups),
+        )
+        return sv
+
+    per_scene_validated: list[_ValidatedStoryboard] = list(
+        await asyncio.gather(*(_gen_one(p) for p in plans))
+    )
+
+    # 3) 合并 + renumber scene_no 全局连续 + 聚合所有 omitted（split + per-scene）
+    merged_scenes: list[dict] = []
+    merged_omitted: list[dict] = list(split_omitted)
+    for idx, sv in enumerate(per_scene_validated, start=1):
+        scene_dict = sv.v2_contract.scenes[0].model_dump()
+        scene_dict["scene_no"] = idx
+        merged_scenes.append(scene_dict)
+        for ob in sv.v2_contract.omitted_source_blocks:
+            merged_omitted.append(ob.model_dump())
+    merged_payload: dict = {
+        "schema_version": "storyboard.v2",
+        "scenes": merged_scenes,
+        "omitted_source_blocks": merged_omitted,
+    }
+
+    # 4) 整集契约校验 + 渲染（复用现有校验器，含 _normalize_provider_continuity）
+    merged_validated = _validate_provider_payload_result(
+        merged_payload,
+        subject_catalog=subject_catalog,
+        subject_reference_names=reference_names,
+        subject_reference_types=reference_types,
+        description_template=description_template,
+        shot_template=shot_template,
+    )
+    # 聚合 per-scene 的 salvage 标记到整集结果（任一场景被降级则整集标注）
+    if any(sv.salvaged for sv in per_scene_validated):
+        merged_validated = replace(
+            merged_validated,
+            salvaged=True,
+            dropped_shot_count=sum(sv.dropped_shot_count for sv in per_scene_validated),
+        )
+
+    # 5) 覆盖度 best-effort（拆分已逐场景尽力，不足只告警接受，不整集重做）
+    coverage = _check_coverage(merged_validated, script_text)
+    if not coverage.sufficient:
+        logger.warning(
+            "拆分生成覆盖度不足 shot=%d/%d group=%d/%d dur=%d/%d，best-effort 接受",
+            coverage.shot_count,
+            coverage.min_shots,
+            coverage.group_count,
+            coverage.min_groups,
+            coverage.total_duration,
+            coverage.min_duration,
+        )
+    return merged_validated
+
+
+# ---------------------------------------------------------------------------
 # 主入口: generate_storyboard
 # ---------------------------------------------------------------------------
 
@@ -3096,8 +3480,6 @@ async def generate_storyboard(
         subject_references=subject_references,
     )
     prompt_context = resolved_input.prompts
-    system_prompt = prompt_context.system_prompt
-    user_prompt = prompt_context.user_prompt
     script_blocks = resolved_input.script_blocks
     provenance = resolved_input.provenance
     provenance_sha256 = storyboard_provenance_sha256(provenance)
@@ -3105,51 +3487,16 @@ async def generate_storyboard(
 
     catalog = _subject_catalog(subjects, episode.episode_no)
 
-    # 4. 调用 LLM；首答失败时最多进行一次不含原剧本的定向修复。
-    validated = await _call_llm_with_contract_result(
-        system_prompt,
-        user_prompt,
+    # 4. 按场景拆分调用 LLM 生成（避免一次性整集超时）
+    validated = await _generate_storyboard_by_scenes(
+        episode,
+        subjects,
+        subject_references,
+        prompt_context,
+        script_blocks,
         catalog,
-        subject_references=subject_references,
-        description_template=prompt_context.templates[_STORYBOARD_DESCRIPTION_TEMPLATE_KEY],
-        shot_template=prompt_context.templates[_STORYBOARD_SHOT_TEMPLATE_KEY],
+        resolved_input.director_plan_block,
     )
-
-    # 4.5 覆盖度软校验：若镜头数远低于剧本规模，用原 prompt（含剧本）+ 覆盖强调
-    # 重生成一次。best-effort：重生成后仍不足则取镜头较多者接受，绝不因覆盖度硬失败。
-    coverage = _check_coverage(validated, episode.script_text or "")
-    if not coverage.sufficient:
-        logger.warning(
-            "分镜覆盖度不足 shot=%d/%d group=%d/%d dur=%d/%d，重新生成",
-            coverage.shot_count, coverage.min_shots,
-            coverage.group_count, coverage.min_groups,
-            coverage.total_duration, coverage.min_duration,
-        )
-        emphasis_user = user_prompt + _coverage_emphasis_suffix(coverage)
-        try:
-            retry_validated = await _call_llm_with_contract_result(
-                system_prompt,
-                emphasis_user,
-                catalog,
-                subject_references=subject_references,
-                description_template=prompt_context.templates[
-                    _STORYBOARD_DESCRIPTION_TEMPLATE_KEY
-                ],
-                shot_template=prompt_context.templates[_STORYBOARD_SHOT_TEMPLATE_KEY],
-            )
-        except ProviderContractError:
-            logger.warning("覆盖度重生成结构校验失败，回退首答 best-effort")
-            retry_validated = None
-        if retry_validated is not None:
-            retry_coverage = _check_coverage(retry_validated, episode.script_text or "")
-            if retry_coverage.sufficient or retry_coverage.shot_count > coverage.shot_count:
-                validated = retry_validated
-                coverage = retry_coverage
-            if not retry_coverage.sufficient:
-                logger.warning(
-                    "覆盖度重生成后仍不足 shot=%d/%d，best-effort 接受",
-                    retry_coverage.shot_count, retry_coverage.min_shots,
-                )
 
     quality_report = (
         evaluate_storyboard_quality(

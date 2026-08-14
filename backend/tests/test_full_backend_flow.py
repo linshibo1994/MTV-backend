@@ -299,45 +299,71 @@ def _twelve_section_prompt() -> str:
 
 def _storyboard_payload() -> dict[str, Any]:
     return {
+        "schema_version": "storyboard.v2",
         "scenes": [
             {
                 "scene_no": 1,
-                "background": "办公室",
+                "background_ref": "BG01",
                 "shot_groups": [
                     {
                         "group_no": "G1",
-                        "narrative_purpose": "交代冲突",
+                        "narrative_purpose": "建立空间并交代冲突",
                         "duration_seconds": 6,
                         "shots": [
                             {
                                 "display_no": 1,
-                                "content": "阿明推门进入办公室。",
-                                "description": "在【办公室】中采用【平视】拍摄视角，画面主体【阿明】的关键动作是【推门进入】，整体表现的画面是【阿明走进办公室】，表达了【紧张】，整体画面的光影效果是【冷色顶光】，整个镜头的叙事目的是【交代冲突】。",
-                                "shot_line": "【镜头1:0s～3s】场景是办公室，全景·平视，固定，冷色顶光，阿明推门进入，紧张，阿明:我们谈谈",
                                 "start_seconds": 0,
                                 "end_seconds": 3,
-                                "characters": ["阿明"],
-                                "dialogue_character": "阿明",
-                                "props": ["钥匙"],
-                                "sounds": ["门响"],
+                                "visual": {
+                                    "shot_size": "全景",
+                                    "composition": ["三分法", "纵深构图"],
+                                    "camera_angle": "平视",
+                                    "camera_movement": "推镜",
+                                    "action": "阿明推门进入",
+                                    "frame_description": "前景门框形成框景，阿明进入办公室",
+                                    "lighting": "冷色顶光",
+                                    "emotion": "紧张",
+                                },
+                                "narrative_purpose": "交代阿明进入并触发冲突",
+                                "source_block_refs": ["B01"],
+                                "character_refs": ["C01"],
+                                "prop_refs": ["P01"],
+                                "sound_refs": ["S01"],
+                                "sound_design": "门轴轻响，室内环境声短暂停顿",
+                                "dialogue": {
+                                    "speaker_ref": "C01",
+                                    "text": "我们谈谈",
+                                    "kind": "dialogue",
+                                },
                             },
                             {
                                 "display_no": 2,
-                                "content": "小林抬头看向阿明。",
-                                "description": "在【办公室】中采用【平视】拍摄视角，画面主体【小林】的关键动作是【抬头看向阿明】，整体表现的画面是【小林停下工作】，表达了【迟疑】，整体画面的光影效果是【冷色顶光】，整个镜头的叙事目的是【交代冲突】。",
-                                "shot_line": "【镜头2:3s～6s】场景是办公室，中景·平视，固定，冷色顶光，小林抬头，迟疑，小林:",
                                 "start_seconds": 3,
                                 "end_seconds": 6,
-                                "characters": ["小林"],
-                                "dialogue_character": "",
-                                "props": [],
-                                "sounds": [],
+                                "visual": {
+                                    "shot_size": "近景",
+                                    "composition": ["单人", "三分法"],
+                                    "camera_angle": "平视",
+                                    "camera_movement": "固定",
+                                    "action": "小林停下工作并抬头",
+                                    "frame_description": "小林越过前景文件看向门口",
+                                    "lighting": "冷色顶光勾勒面部",
+                                    "emotion": "迟疑",
+                                },
+                                "narrative_purpose": "用反应镜承接前一镜",
+                                "source_block_refs": ["B01"],
+                                "character_refs": ["C02"],
+                                "prop_refs": [],
+                                "sound_refs": [],
+                                "sound_design": "无",
+                                "dialogue": None,
                             },
                         ],
                     }
                 ],
             }
-        ]
+        ],
+        "omitted_source_blocks": [],
     }
 
 
@@ -614,6 +640,19 @@ async def test_full_backend_flow_reaches_succeeded_render_job(monkeypatch, tmp_p
     # 4. fake 分镜、fake 视频生成均走真实服务和积分/任务状态机。
     async def fake_storyboard_llm(system: str, user: str) -> dict[str, Any]:
         assert system and user
+        if "场景划分" in user:
+            return {
+                "scenes": [
+                    {
+                        "scene_no": 1,
+                        "background_ref": "BG01",
+                        "source_block_refs": ["B01"],
+                        "narrative_purpose": "建立空间并交代冲突",
+                        "estimated_groups": 1,
+                    }
+                ],
+                "omitted_source_blocks": [],
+            }
         return _storyboard_payload()
 
     monkeypatch.setattr(storyboard_service, "_call_llm", fake_storyboard_llm)
@@ -625,13 +664,11 @@ async def test_full_backend_flow_reaches_succeeded_render_job(monkeypatch, tmp_p
         expected_client_save_seq=1,
     )
     await db.commit()
-    assert storyboard_result == {
-        "script_id": script_id,
-        "episode_id": episode_id,
-        "scenes": 1,
-        "shot_groups": 1,
-        "shots": 2,
-    }
+    assert storyboard_result["script_id"] == script_id
+    assert storyboard_result["episode_id"] == episode_id
+    assert storyboard_result["scenes"] == 1
+    assert storyboard_result["shot_groups"] == 1
+    assert storyboard_result["shots"] == 2
     draft_group = (
         await db.execute(select(ShotGroup).where(ShotGroup.episode_id == episode_id))
     ).scalar_one()

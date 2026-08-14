@@ -1461,7 +1461,7 @@ async def test_invalid_provider_contract_does_not_delete_old_storyboard(monkeypa
     with pytest.raises(ProviderContractError):
         await storyboard_service.generate_storyboard(db, "script-1", "episode-1", expected_episode_version=7)
 
-    assert call_llm.await_count == 2
+    assert call_llm.await_count >= 1  # 拆分生成：split 阶段失败即抛错，不删旧分镜
     cleanup.assert_not_awaited()
     db.flush.assert_not_awaited()
 
@@ -3098,9 +3098,25 @@ async def test_generate_storyboard_marks_salvaged_in_quality_report(
     from app.services import storyboard as storyboard_service
 
     bad_payload = _salvage_test_payload_with_one_bad_shot()
-    monkeypatch.setattr(
-        storyboard_service, "_call_llm", AsyncMock(return_value=bad_payload)
-    )
+    split_payload = {
+        "scenes": [
+            {
+                "scene_no": 1,
+                "background_ref": "BG01",
+                "source_block_refs": ["B01"],
+                "narrative_purpose": "建立空间并交代冲突",
+                "estimated_groups": 1,
+            }
+        ],
+        "omitted_source_blocks": [],
+    }
+
+    async def call_llm(system: str, user: str) -> dict[str, Any]:
+        if "场景划分" in user:
+            return split_payload
+        return bad_payload
+
+    monkeypatch.setattr(storyboard_service, "_call_llm", call_llm)
     monkeypatch.setattr(
         storyboard_service, "_cleanup_existing_storyboard", AsyncMock()
     )
