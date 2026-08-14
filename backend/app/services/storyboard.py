@@ -2372,6 +2372,16 @@ def _normalize_provider_continuity(
     )
     if isinstance(payload, dict) and is_v2_payload:
         payload["schema_version"] = "storyboard.v2"
+        # scene 级 omitted_source_blocks 移到根级（contract 要求根级，LLM 常误放 scene 内）
+        root_omitted = payload.setdefault("omitted_source_blocks", [])
+        if not isinstance(root_omitted, list):
+            root_omitted = []
+            payload["omitted_source_blocks"] = root_omitted
+        for scene in scenes:
+            if isinstance(scene, dict) and isinstance(
+                scene.get("omitted_source_blocks"), list
+            ):
+                root_omitted.extend(scene.pop("omitted_source_blocks"))
         _normalize_omitted_source_blocks(payload)
     for scene_index, scene in enumerate(scenes, start=1):
         if not isinstance(scene, dict):
