@@ -3120,12 +3120,13 @@ def _build_scene_user_prompt(
 - 对白/旁白/内心独白逐字保留在 dialogue.text，无语言内容时 dialogue 为 null。
 - source_block_refs 指明本场景落实的 Bxx 段；character_refs/prop_refs/sound_refs 只能引用目录短引用。
 - 起止边界、角色九宫格位置/朝向按可见事实填写；与上一场景末镜保持人物位置/朝向连续。
+- audience_visibility 每项只含 fact(本镜揭示的事实文本)、status(只填 "show_now" 或 "withhold_now")、evidence(数组)、reveal_trigger(status=withhold_now 时必填)、protection_method、rationale；无可揭示事实则用空数组 []，不要写 character_ref/protection/展示 等其他字段或值。
 
 ## 输出 JSON
 {{
   "schema_version": "storyboard.v2",
   "scenes": [
-    {{"scene_no": 1, "background_ref": "{plan.background_ref}", "shot_groups": [{{"group_no": "G1", "narrative_purpose": "...", "duration_seconds": 6, "shots": [{{"display_no": 1, "start_seconds": 0, "end_seconds": 3, "visual": {{"shot_size": "...", "composition": ["..."], "camera_angle": "...", "camera_movement": "...", "action": "...", "frame_description": "...", "lighting": "...", "emotion": "..."}}, "narrative_purpose": "...", "source_block_refs": ["Bxx"], "character_refs": [], "prop_refs": [], "sound_refs": [], "sound_design": "...", "start_boundary": {{"positions": [], "visible_state": []}}, "end_boundary": {{"positions": [], "visible_state": []}}, "character_positions": [], "audience_visibility": [], "dialogue": null}}]}}]}}
+    {{"scene_no": 1, "background_ref": "{plan.background_ref}", "shot_groups": [{{"group_no": "G1", "narrative_purpose": "...", "duration_seconds": 6, "shots": [{{"display_no": 1, "start_seconds": 0, "end_seconds": 3, "visual": {{"shot_size": "...", "composition": ["..."], "camera_angle": "...", "camera_movement": "...", "action": "...", "frame_description": "...", "lighting": "...", "emotion": "..."}}, "narrative_purpose": "...", "source_block_refs": ["Bxx"], "character_refs": [], "prop_refs": [], "sound_refs": [], "sound_design": "...", "start_boundary": {{"positions": [], "visible_state": []}}, "end_boundary": {{"positions": [], "visible_state": []}}, "character_positions": [], "audience_visibility": [{{"fact": "本镜揭示的事实", "status": "show_now", "evidence": [], "reveal_trigger": null, "protection_method": null, "rationale": null}}], "dialogue": null}}]}}]}}
   ],
   "omitted_source_blocks": []
 }}
