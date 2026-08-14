@@ -6,8 +6,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from secrets import token_urlsafe
 
-TASK_HARD_TIME_LIMIT_SECONDS = 900
-TASK_SOFT_TIME_LIMIT_SECONDS = 810
+TASK_HARD_TIME_LIMIT_SECONDS = 1320
+TASK_SOFT_TIME_LIMIT_SECONDS = 1200
 MEDIA_STORAGE_JOB_LEASE_SECONDS = TASK_HARD_TIME_LIMIT_SECONDS + 60
 
 _SAFE_FAILURES: dict[str, tuple[str, bool]] = {
