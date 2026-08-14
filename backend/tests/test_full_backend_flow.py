@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import copy
 import shutil
 from datetime import UTC, datetime
 from pathlib import Path
@@ -28,6 +30,7 @@ from app.models.credit_reservation import CreditReservation
 from app.models.episode import Episode
 from app.models.pipeline_job import PipelineJob
 from app.models.pipeline_stage import PipelineStage
+from app.models.scene import Scene
 from app.models.script import Script
 from app.models.shot import Shot
 from app.models.shot_group import ShotGroup
@@ -365,6 +368,165 @@ def _storyboard_payload() -> dict[str, Any]:
         ],
         "omitted_source_blocks": [],
     }
+
+
+async def test_storyboard_scene_split_persists_plan_ordered_background_bindings(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """两场并行返回乱序时，落库仍必须按 split plan 绑定各自背景短引用。"""
+
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'scene-split-bindings.db'}")
+    Base.metadata.create_all(engine)
+    raw = Session(engine, expire_on_commit=False)
+    db = cast(AsyncSession, _AsyncSessionAdapter(raw))
+    script_id = "scene-split-script"
+    episode_id = "scene-split-episode"
+    raw.add_all(
+        [
+            Script(
+                id=script_id,
+                title="场景拆分绑定",
+                scope="personal",
+                owner_user_id="scene-split-owner",
+                created_by_user_id="scene-split-owner",
+            ),
+            Episode(
+                episode_id=episode_id,
+                script_id=script_id,
+                episode_no=1,
+                title="第一集",
+                script_text="第一场发生在办公室。\n\n第二场转到走廊。",
+                episode_version=1,
+                client_save_seq=0,
+            ),
+            Subject(
+                id="scene-split-bg-01",
+                script_id=script_id,
+                type="background",
+                name="A办公室",
+                pipeline_name="A办公室",
+                description="冷色办公室",
+                episode_nos=[1],
+                is_active=True,
+            ),
+            Subject(
+                id="scene-split-bg-02",
+                script_id=script_id,
+                type="background",
+                name="B走廊",
+                pipeline_name="B走廊",
+                description="安静走廊",
+                episode_nos=[1],
+                is_active=True,
+            ),
+        ]
+    )
+    raw.commit()
+
+    def scene_payload(background_ref: str, block_ref: str, action: str) -> dict[str, Any]:
+        payload = copy.deepcopy(_storyboard_payload())
+        scene = payload["scenes"][0]
+        scene["background_ref"] = background_ref
+        for shot in scene["shot_groups"][0]["shots"]:
+            shot["source_block_refs"] = [block_ref]
+            shot["character_refs"] = []
+            shot["prop_refs"] = []
+            shot["sound_refs"] = []
+            shot["dialogue"] = None
+        scene["shot_groups"][0]["shots"][0]["visual"]["action"] = action
+        return payload
+
+    completed_scene_calls: list[int] = []
+
+    async def fake_storyboard_llm(
+        system: str,
+        user: str,
+        **_kwargs: object,
+    ) -> dict[str, Any]:
+        assert system and user
+        if system == storyboard_service._SCENE_SPLIT_SYSTEM_PROMPT:
+            return {
+                "scenes": [
+                    {
+                        "scene_no": 1,
+                        "background_ref": "BG01",
+                        "source_block_refs": ["B01"],
+                        "narrative_purpose": "办公室定场",
+                        "estimated_groups": 1,
+                    },
+                    {
+                        "scene_no": 2,
+                        "background_ref": "BG02",
+                        "source_block_refs": ["B02"],
+                        "narrative_purpose": "走廊转场",
+                        "estimated_groups": 1,
+                    },
+                ],
+                "omitted_source_blocks": [],
+            }
+        if "当前场景：第 1 场" in user:
+            await asyncio.sleep(0.02)
+            completed_scene_calls.append(1)
+            return scene_payload("BG01", "B01", "镜头停留在办公室门口")
+        assert "当前场景：第 2 场" in user
+        completed_scene_calls.append(2)
+        return scene_payload("BG02", "B02", "镜头跟随进入走廊")
+
+    monkeypatch.setattr(storyboard_service, "_call_llm", fake_storyboard_llm)
+    result = await storyboard_service.generate_storyboard(
+        db,
+        script_id,
+        episode_id,
+        expected_episode_version=1,
+        expected_client_save_seq=0,
+    )
+    await db.commit()
+
+    assert completed_scene_calls == [2, 1]
+    assert result["scenes"] == 2
+    persisted_scenes = list(
+        (
+            await db.execute(
+                select(Scene)
+                .where(Scene.episode_id == episode_id)
+                .order_by(Scene.scene_no)
+            )
+        ).scalars()
+    )
+    persisted_groups = list(
+        (
+            await db.execute(
+                select(ShotGroup)
+                .where(ShotGroup.episode_id == episode_id)
+                .order_by(ShotGroup.scene_no, ShotGroup.group_index)
+            )
+        ).scalars()
+    )
+    persisted_shots = list(
+        (
+            await db.execute(
+                select(Shot)
+                .join(ShotGroup, Shot.shot_group_id == ShotGroup.shot_group_id)
+                .where(ShotGroup.episode_id == episode_id)
+                .order_by(Shot.scene_no, Shot.display_no)
+            )
+        ).scalars()
+    )
+
+    assert [(scene.scene_no, scene.background) for scene in persisted_scenes] == [
+        (1, "A办公室"),
+        (2, "B走廊"),
+    ]
+    assert [group.scene_no for group in persisted_groups] == [1, 2]
+    assert [group.materials["background"][0]["ref"] for group in persisted_groups] == [
+        "BG01",
+        "BG02",
+    ]
+    assert [
+        (shot.scene_no, shot.structured_data["background_ref"])
+        for shot in persisted_shots
+    ] == [(1, "BG01"), (1, "BG01"), (2, "BG02"), (2, "BG02")]
 
 
 async def test_full_backend_flow_reaches_succeeded_render_job(monkeypatch, tmp_path: Path) -> None:

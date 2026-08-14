@@ -8,6 +8,8 @@ from secrets import token_urlsafe
 
 TASK_HARD_TIME_LIMIT_SECONDS = 1320
 TASK_SOFT_TIME_LIMIT_SECONDS = 1200
+# 分镜 worker 在生成调用结束后还需要完成 lease CAS、积分结算和状态回写。
+STORYBOARD_GENERATION_TIMEOUT_SECONDS = TASK_SOFT_TIME_LIMIT_SECONDS - 90
 MEDIA_STORAGE_JOB_LEASE_SECONDS = TASK_HARD_TIME_LIMIT_SECONDS + 60
 
 _SAFE_FAILURES: dict[str, tuple[str, bool]] = {
@@ -31,6 +33,7 @@ _SAFE_DIAGNOSTIC_SCHEMAS = frozenset(
         "ParentsOutput",
         "StoryboardContract",
         "StoryboardV2Contract",
+        "StoryboardSceneSplitContract",
     }
 )
 _SAFE_DIAGNOSTIC_RESPONSE_KINDS = frozenset(
@@ -53,6 +56,37 @@ _SAFE_SEMANTIC_DIAGNOSTIC_CODES = frozenset(
         "reference_not_allowed",
         "reference_type_mismatch",
         "schema_version_unsupported",
+        "scene_split_no_source_blocks",
+        "scene_split_too_few_scenes",
+        "scene_split_scene_no_not_consecutive",
+        "scene_split_background_not_allowed",
+        "scene_split_duplicate_block_ref",
+        "scene_split_unknown_block_ref",
+        "scene_split_block_assigned_twice",
+        "scene_split_unknown_omitted_block_ref",
+        "scene_split_duplicate_omitted_block_ref",
+        "scene_split_covered_and_omitted",
+        "scene_generation_requires_v2",
+        "scene_generation_requires_one_scene",
+        "scene_generation_scene_no_must_be_one",
+        "scene_generation_background_mismatch",
+        "scene_generation_group_budget_mismatch",
+        "scene_generation_omitted_block_out_of_scope",
+        "scene_generation_duplicate_omitted_block",
+        "scene_generation_omitted_block_without_reason",
+        "scene_generation_covered_block_out_of_scope",
+        "scene_generation_covered_and_omitted",
+        "scene_generation_block_coverage_incomplete",
+        "merged_scene_missing_v2",
+        "merged_scene_shape_invalid",
+        "merged_omitted_item_invalid",
+        "merged_omitted_block_ref_invalid",
+        "merged_omitted_block_out_of_scope",
+        "merged_omitted_block_without_reason",
+        "merged_duplicate_omitted_block",
+        "merged_covered_block_out_of_scope",
+        "merged_covered_and_omitted",
+        "merged_block_coverage_incomplete",
     }
 )
 _SAFE_DIAGNOSTIC_PATH_FIELDS = frozenset(
@@ -85,6 +119,7 @@ _SAFE_DIAGNOSTIC_PATH_FIELDS = frozenset(
         "shot_groups",
         "group_no",
         "narrative_purpose",
+        "estimated_groups",
         "duration_seconds",
         "is_continuation",
         "shots",

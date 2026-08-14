@@ -362,6 +362,34 @@ class OmittedSourceBlock(StrictStoryboardModel):
     reason: ShortText | None = None
 
 
+class StoryboardSceneSplitOmittedContract(StrictStoryboardModel):
+    """场景划分阶段的显式省略项；该控制面必须给出省略理由。"""
+
+    block_ref: CoverageBlockRef
+    reason: ShortText
+
+
+class StoryboardScenePlanContract(StrictStoryboardModel):
+    """LLM 输出的单个场景生成计划，不包含任何镜头细节。"""
+
+    scene_no: int = Field(ge=1)
+    background_ref: SubjectRef
+    source_block_refs: list[CoverageBlockRef] = Field(min_length=1, max_length=200)
+    narrative_purpose: ShortText
+    # 单场调用的硬输出预算。上限将单次 LLM 响应控制在可预测范围内。
+    estimated_groups: int = Field(ge=1, le=5)
+
+
+class StoryboardSceneSplitContract(StrictStoryboardModel):
+    """按场景拆分的专用控制面合约，不能复用完整 storyboard.v2。"""
+
+    scenes: list[StoryboardScenePlanContract] = Field(min_length=1, max_length=30)
+    omitted_source_blocks: list[StoryboardSceneSplitOmittedContract] = Field(
+        default_factory=list,
+        max_length=200,
+    )
+
+
 class StoryboardV2ShotContract(StrictStoryboardModel):
     display_no: int = Field(ge=1)
     start_seconds: int = Field(ge=0)
@@ -536,6 +564,7 @@ _DIAGNOSTIC_FIELDS = frozenset(
         "lighting",
         "emotion",
         "source_block_refs",
+        "estimated_groups",
         "coverage",
         "status",
         "source_range",
@@ -790,7 +819,10 @@ __all__ = [
     "ShotBoundary",
     "StoryboardContract",
     "StoryboardContractValidationError",
+    "StoryboardScenePlanContract",
     "StoryboardSceneContract",
+    "StoryboardSceneSplitContract",
+    "StoryboardSceneSplitOmittedContract",
     "StoryboardShotContract",
     "StoryboardShotGroupContract",
     "StoryboardV2Contract",

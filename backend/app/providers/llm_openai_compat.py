@@ -99,7 +99,12 @@ class OpenAICompatLLMProvider:
         self._base_url = base_url or _DEFAULT_BASE_URL.get(vendor, "")
         if not self._base_url:
             raise ProviderConfigurationError(f"{vendor} LLM base_url 未配置")
-        self._client = AsyncOpenAI(api_key=api_key, base_url=self._base_url)
+        self._client = AsyncOpenAI(
+            api_key=api_key,
+            base_url=self._base_url,
+            timeout=300.0,
+            max_retries=0,
+        )
 
     async def complete_json(
         self,

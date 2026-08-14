@@ -30,7 +30,7 @@ from sqlalchemy.orm import noload
 
 from app.core.config import settings
 from app.core.database import async_session_factory
-from app.core.job_state import TASK_SOFT_TIME_LIMIT_SECONDS, PipelineFailure
+from app.core.job_state import STORYBOARD_GENERATION_TIMEOUT_SECONDS, PipelineFailure
 from app.crud.storyboard import (
     claim_job,
     complete_job,
@@ -56,8 +56,8 @@ logger = logging.getLogger(__name__)
 STORYBOARD_OUTBOX_TASK_TYPE = "storyboard.generate"
 _STORYBOARD_LEASE_SECONDS = 300
 _STORYBOARD_HEARTBEAT_SECONDS = 60.0
-# 为状态回写、积分释放和 Celery 软超时中断预留 90 秒。
-_STORYBOARD_GENERATION_TIMEOUT_SECONDS = TASK_SOFT_TIME_LIMIT_SECONDS - 90
+# 单次续租不能接近 lease 到期点；超时后立即取消生成，避免旧 worker 与重派任务并行写入。
+_STORYBOARD_HEARTBEAT_TRANSACTION_TIMEOUT_SECONDS = 30.0
 _STORYBOARD_INTERRUPT_GRACE_SECONDS = 30.0
 
 # 按 PLAN 路径 import (celery_app 为 Phase 1 产出)
@@ -173,17 +173,20 @@ async def _heartbeat_storyboard_job_loop(
             await asyncio.wait_for(stop.wait(), timeout=_STORYBOARD_HEARTBEAT_SECONDS)
             return
         except TimeoutError:
-            async with async_session_factory() as heartbeat_db:
-                renewed = await heartbeat_job(
-                    heartbeat_db,
-                    job_id,
-                    lease_token,
-                    lease_seconds=_STORYBOARD_LEASE_SECONDS,
-                )
-                if not renewed:
-                    await heartbeat_db.rollback()
-                    raise RuntimeError("storyboard lease heartbeat failed")
-                await heartbeat_db.commit()
+            # 独立连接也可能因数据库拥塞卡住。若让它无限等待，租约到期后恢复器
+            # 会重派同一任务，旧请求仍可能继续生成。短 deadline 让上层立即收敛。
+            async with asyncio.timeout(_STORYBOARD_HEARTBEAT_TRANSACTION_TIMEOUT_SECONDS):
+                async with async_session_factory() as heartbeat_db:
+                    renewed = await heartbeat_job(
+                        heartbeat_db,
+                        job_id,
+                        lease_token,
+                        lease_seconds=_STORYBOARD_LEASE_SECONDS,
+                    )
+                    if not renewed:
+                        await heartbeat_db.rollback()
+                        raise RuntimeError("storyboard lease heartbeat failed")
+                    await heartbeat_db.commit()
 
 
 async def _generate_storyboard_with_heartbeat(
@@ -202,13 +205,14 @@ async def _generate_storyboard_with_heartbeat(
             expected_episode_version=job.input_version,
             expected_client_save_seq=job.input_client_save_seq,
             source_storyboard_job_id=job.job_id,
+            release_db_connection_before_provider=True,
         )
     )
     heartbeat_task = asyncio.create_task(
         _heartbeat_storyboard_job_loop(job.job_id, lease_token, stop_heartbeat)
     )
     try:
-        async with asyncio.timeout(_STORYBOARD_GENERATION_TIMEOUT_SECONDS):
+        async with asyncio.timeout(STORYBOARD_GENERATION_TIMEOUT_SECONDS):
             done, _ = await asyncio.wait(
                 {generation_task, heartbeat_task},
                 return_when=asyncio.FIRST_COMPLETED,

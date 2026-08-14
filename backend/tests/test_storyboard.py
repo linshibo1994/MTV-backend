@@ -11,6 +11,7 @@ import logging
 import traceback
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -1466,6 +1467,78 @@ async def test_invalid_provider_contract_does_not_delete_old_storyboard(monkeypa
     db.flush.assert_not_awaited()
 
 
+async def test_worker_mode_releases_preflight_connection_before_provider(
+    monkeypatch,
+) -> None:
+    """worker 路径在 LLM 前提交预处理事务，避免长期占用数据库连接。"""
+
+    from app.schemas.pipeline_contracts import ProviderContractError
+    from app.services import storyboard as storyboard_service
+
+    episode = SimpleNamespace(
+        episode_id="episode-1",
+        script_id="script-1",
+        episode_no=1,
+        title="第一集",
+        script_text="阿明进入办公室。",
+        episode_version=7,
+    )
+    subjects = [
+        SimpleNamespace(
+            id="subject-bg",
+            name="办公室",
+            type="background",
+            episode_nos=[1],
+            description="",
+            image_entry_id="img-bg",
+            is_active=True,
+        ),
+    ]
+
+    class _Scalars:
+        def __init__(self, values):
+            self._values = values
+
+        def all(self):
+            return self._values
+
+    class _Result:
+        def __init__(self, scalar=None, scalars=None):
+            self._scalar = scalar
+            self._scalars = scalars or []
+
+        def scalar_one_or_none(self):
+            return self._scalar
+
+        def scalars(self):
+            return _Scalars(self._scalars)
+
+    db = SimpleNamespace(
+        execute=AsyncMock(side_effect=[_Result(episode), _Result(scalars=subjects)]),
+        flush=AsyncMock(),
+        commit=AsyncMock(),
+        add=lambda _: None,
+    )
+
+    async def invalid_split(*_args, **_kwargs):
+        assert db.commit.await_count == 1
+        return {"scenes": []}
+
+    monkeypatch.setattr(storyboard_service, "_call_llm", invalid_split)
+
+    with pytest.raises(ProviderContractError):
+        await storyboard_service.generate_storyboard(
+            db,
+            "script-1",
+            "episode-1",
+            expected_episode_version=7,
+            source_storyboard_job_id="job-1",
+            release_db_connection_before_provider=True,
+        )
+
+    db.commit.assert_awaited_once()
+
+
 async def test_generate_storyboard_provisions_fallback_scene_when_no_background(monkeypatch) -> None:
     """分集缺少场景主体时应自动补建默认场景主体，避免 background_ref 无合法引用卡死生成。"""
     from app.models.subject import Subject
@@ -2236,6 +2309,32 @@ def test_storyboard_failure_diagnostic_redacts_unknown_paths_and_response_kinds(
     )
     assert unsafe_semantic_code.diagnostic is None
 
+    scene_split_failure = PipelineFailure.from_exception(
+        ProviderContractError(
+            "private",
+            diagnostic={
+                "version": 1,
+                "category": "schema_validation",
+                "schema": "StoryboardSceneSplitContract",
+                "validation": {
+                    "error_count": 1,
+                    "codes": ["greater_than_equal"],
+                    "paths": ["scenes[].estimated_groups"],
+                },
+            },
+        )
+    )
+    assert scene_split_failure.diagnostic == {
+        "version": 1,
+        "category": "schema_validation",
+        "schema": "StoryboardSceneSplitContract",
+        "validation": {
+            "error_count": 1,
+            "codes": ["greater_than_equal"],
+            "paths": ["scenes[].estimated_groups"],
+        },
+    }
+
 
 def test_storyboard_failure_diagnostic_preserves_nested_storyboard_paths() -> None:
     from app.core.job_state import PipelineFailure
@@ -2523,6 +2622,72 @@ def test_storyboard_heartbeat_renews_in_independent_short_transactions(monkeypat
 
     assert renewals == 3
     assert [session.commit.await_count for session in sessions] == [1, 1, 1]
+
+
+async def test_heartbeat_transaction_timeout_cancels_generation(monkeypatch) -> None:
+    """续租数据库事务卡住时必须在 lease 到期前取消仍在运行的 LLM 请求。"""
+
+    from app.workers import storyboard as storyboard_worker
+
+    generation_started = asyncio.Event()
+    generation_cancelled = asyncio.Event()
+
+    class BlockedSessionContext:
+        async def __aenter__(self):
+            await generation_started.wait()
+            await asyncio.Event().wait()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    async def immediate_heartbeat_interval(awaitable, *, timeout):
+        awaitable.close()
+        await generation_started.wait()
+        raise TimeoutError
+
+    async def blocked_generation(*_args, **kwargs):
+        assert kwargs["release_db_connection_before_provider"] is True
+        generation_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            generation_cancelled.set()
+            raise
+
+    job = SimpleNamespace(
+        job_id="job-heartbeat-timeout",
+        script_id="script-1",
+        episode_id="episode-1",
+        input_version=1,
+        input_client_save_seq=0,
+    )
+    monkeypatch.setattr(storyboard_worker, "async_session_factory", BlockedSessionContext)
+    monkeypatch.setattr(storyboard_worker.asyncio, "wait_for", immediate_heartbeat_interval)
+    monkeypatch.setattr(
+        storyboard_worker,
+        "_STORYBOARD_HEARTBEAT_TRANSACTION_TIMEOUT_SECONDS",
+        0.01,
+    )
+    monkeypatch.setattr(storyboard_worker.storyboard_service, "generate_storyboard", blocked_generation)
+
+    with pytest.raises(TimeoutError):
+        await storyboard_worker._generate_storyboard_with_heartbeat(
+            SimpleNamespace(),
+            job,
+            "token-1",
+        )
+
+    assert generation_cancelled.is_set()
+
+
+def test_heartbeat_transaction_timeout_fits_lease_window() -> None:
+    from app.workers import storyboard as storyboard_worker
+
+    assert 0 < storyboard_worker._STORYBOARD_HEARTBEAT_TRANSACTION_TIMEOUT_SECONDS
+    assert (
+        storyboard_worker._STORYBOARD_HEARTBEAT_TRANSACTION_TIMEOUT_SECONDS
+        < storyboard_worker._STORYBOARD_LEASE_SECONDS - storyboard_worker._STORYBOARD_HEARTBEAT_SECONDS
+    )
 
 
 async def test_soft_timeout_cancellation_marks_current_job_failed(monkeypatch) -> None:
@@ -3098,6 +3263,8 @@ async def test_generate_storyboard_marks_salvaged_in_quality_report(
     from app.services import storyboard as storyboard_service
 
     bad_payload = _salvage_test_payload_with_one_bad_shot()
+    # 单场范围校验要求计划段落在 salvage 后仍有可用镜头落实。
+    bad_payload["scenes"][0]["shot_groups"][0]["shots"][1]["source_block_refs"] = ["B01"]
     split_payload = {
         "scenes": [
             {

@@ -16,12 +16,12 @@ from app.models.storyboard_job import StoryboardJob
 from app.models.subject import Subject
 
 ProvenanceStatus = Literal["current", "stale", "legacy"]
-_PROVENANCE_SCHEMA = "storyboard.provenance.v1"
+_PROVENANCE_SCHEMA = "storyboard.provenance.v2"
+_PROMPT_WORKFLOW_SCHEMA = "storyboard.prompt-workflow.v1"
 _HASH_FIELDS = (
     "episode_script_sha256",
     "subject_catalog_sha256",
-    "system_prompt_sha256",
-    "user_prompt_sha256",
+    "prompt_workflow_sha256",
     "prompt_templates_sha256",
 )
 
@@ -34,6 +34,33 @@ def _canonical_sha256(value: object) -> str:
         separators=(",", ":"),
     )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _is_sha256(value: object) -> bool:
+    """校验已持久化的摘要形状，避免损坏快照阻断新鲜度检查。"""
+
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(char in "0123456789abcdef" for char in value.lower())
+    )
+
+
+def _legacy_single_call_prompt_workflow(
+    *,
+    system_prompt: str,
+    user_prompt: str,
+) -> dict[str, object]:
+    """为旧调用方构造只用于计算摘要的单次调用工作流。"""
+
+    return {
+        "schema": _PROMPT_WORKFLOW_SCHEMA,
+        "strategy": "single_call",
+        "calls": [
+            {"role": "system", "prompt": system_prompt},
+            {"role": "user", "prompt": user_prompt},
+        ],
+    }
 
 
 def storyboard_provenance_sha256(provenance: Mapping[str, object]) -> str:
@@ -110,18 +137,30 @@ def build_storyboard_provenance(
     system_prompt: str,
     user_prompt: str,
     prompt_templates: Mapping[str, Mapping[str, object]],
+    prompt_workflow: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
-    """构造只含哈希、版本和最小重算元数据的持久化快照。"""
+    """构造只含哈希、版本和最小重算元数据的持久化快照。
+
+    ``system_prompt`` / ``user_prompt`` 保留给旧调用方；未传入工作流时，二者只参与
+    构造一次性调用的瞬态工作流摘要。无论哪种路径，提示词正文都不会进入快照。
+    """
     subjects = canonical_subject_catalog(subject_catalog)
     templates = _template_metadata(prompt_templates)
+    workflow = (
+        dict(prompt_workflow)
+        if prompt_workflow is not None
+        else _legacy_single_call_prompt_workflow(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+        )
+    )
     return {
         "schema": _PROVENANCE_SCHEMA,
         "episode_version": int(episode_version),
         "client_save_seq": int(client_save_seq),
         "episode_script_sha256": _canonical_sha256({"script_text": episode_script}),
         "subject_catalog_sha256": _canonical_sha256(subjects),
-        "system_prompt_sha256": _canonical_sha256({"prompt": system_prompt}),
-        "user_prompt_sha256": _canonical_sha256({"prompt": user_prompt}),
+        "prompt_workflow_sha256": _canonical_sha256(workflow),
         "prompt_templates_sha256": _canonical_sha256(templates),
         "subject_catalog": subjects,
         "prompt_templates": templates,
@@ -158,20 +197,26 @@ def compare_storyboard_provenance(
     stored: object,
     current: Mapping[str, object],
 ) -> ProvenanceReport:
-    """比较两个脱敏快照；历史任务标 legacy，差异仅称 stale。"""
+    """比较两个脱敏快照；v1 及更早任务标 legacy，差异仅称 stale。"""
     if not isinstance(stored, Mapping) or stored.get("schema") != _PROVENANCE_SCHEMA:
         return ProvenanceReport(job_id=job_id, status="legacy")
     stored_templates = stored.get("prompt_templates")
     stored_subjects = stored.get("subject_catalog")
     invalid_anchors: list[str] = []
-    if not isinstance(stored_templates, Mapping) or stored.get(
-        "prompt_templates_sha256"
-    ) != _canonical_sha256(stored_templates):
+    if (
+        not isinstance(stored_templates, Mapping)
+        or not _is_sha256(stored.get("prompt_templates_sha256"))
+        or stored.get("prompt_templates_sha256") != _canonical_sha256(stored_templates)
+    ):
         invalid_anchors.append("prompt_templates_sha256")
-    if not isinstance(stored_subjects, list) or stored.get(
-        "subject_catalog_sha256"
-    ) != _canonical_sha256(stored_subjects):
+    if (
+        not isinstance(stored_subjects, list)
+        or not _is_sha256(stored.get("subject_catalog_sha256"))
+        or stored.get("subject_catalog_sha256") != _canonical_sha256(stored_subjects)
+    ):
         invalid_anchors.append("subject_catalog_sha256")
+    if not _is_sha256(stored.get("prompt_workflow_sha256")):
+        invalid_anchors.append("prompt_workflow_sha256")
     mismatches = tuple(
         dict.fromkeys(
             [
