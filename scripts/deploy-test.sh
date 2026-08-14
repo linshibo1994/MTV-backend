@@ -481,12 +481,41 @@ verify_alembic_head() {
     )"
 
     [[ -n "$expected_heads" ]] || fail "未能从镜像读取 Alembic head revision。"
+    local head_count
+    head_count="$(printf '%s\n' "$expected_heads" | grep -c .)"
+    [[ "$head_count" -le 1 ]] || fail "检测到多个 Alembic head（$expected_heads），请先合并迁移链。"
+    if [[ -z "$current_heads" ]]; then
+        fail "数据库未处于任何 Alembic revision（可能未 stamp 或迁移未执行）。"
+    fi
     [[ "$current_heads" == "$expected_heads" ]] || {
         echo "期望 Alembic head：$expected_heads" >&2
-        echo "数据库当前版本：${current_heads:-未处于 head}" >&2
+        echo "数据库当前版本：$current_heads（落后于 head）" >&2
         fail "数据库迁移版本校验失败。"
     }
     info "Alembic 迁移已到达镜像中的 head revision：$current_heads"
+}
+
+# 检测是否需要执行 alembic upgrade（current 与 heads 不一致，或未 stamp）。
+# 已到 head 时返回 1（不需要升级），否则返回 0（需要升级）。
+needs_alembic_upgrade() {
+    local expected_heads current_heads
+    expected_heads="$(
+        compose run --rm --no-deps --entrypoint alembic migrate heads \
+            | awk '/\(head\)/ { print $1 }' \
+            | sort
+    )"
+    current_heads="$(
+        compose run --rm --no-deps --entrypoint alembic migrate current \
+            | awk '/\(head\)/ { print $1 }' \
+            | sort
+    )"
+    [[ -n "$expected_heads" && "$current_heads" != "$expected_heads" ]]
+}
+
+# 迁移后用 drift_repair --check-only 断言 schema 与模型一致，不一致则阻断上线。
+verify_schema_drift() {
+    info "校验 schema 一致性（drift_repair --check-only）…"
+    compose run --rm --no-deps --entrypoint python migrate -m app.db.drift_repair --check-only
 }
 
 require_migration_authorization() {
@@ -500,10 +529,18 @@ require_migration_authorization() {
 }
 
 run_database_migrations() {
-    require_migration_authorization
-    info "执行数据库迁移：alembic upgrade head"
-    compose run --rm --no-deps --entrypoint alembic migrate upgrade head
+    # 已到 head 时无需升级，跳过迁移授权（写操作确认）；幂等漂移修复默认执行。
+    if needs_alembic_upgrade; then
+        require_migration_authorization
+        info "数据库落后于 head，执行升级：alembic upgrade head + 幂等漂移修复"
+    else
+        info "数据库已在 head，无需升级；仅执行幂等漂移修复"
+    fi
+    # migrate 服务命令为 `alembic upgrade head && python -m app.db.drift_repair`，
+    # 升级在 head 上为 no-op，漂移修复幂等，二者均可安全每次执行。
+    compose run --rm --no-deps migrate
     verify_alembic_head
+    verify_schema_drift
 }
 
 assert_service_running() {

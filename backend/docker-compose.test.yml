@@ -59,7 +59,9 @@ services:
 
   migrate:
     <<: *app-common
-    command: alembic upgrade head
+    # 先执行标准 alembic 增量迁移，再幂等修复 stamp 漂移（缺表/缺列/缺约束与
+    # owner 成员数据回填）。两者均幂等，已是最新的数据库上为 no-op。
+    command: sh -c "alembic upgrade head && python -m app.db.drift_repair"
     restart: "no"
 
   api:

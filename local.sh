@@ -459,6 +459,23 @@ print("生产镜像配置与阿里云 OSS SDK 校验通过")
 '
 }
 
+# 在构建产物打包前校验 Alembic 迁移链自洽：head 唯一、down_revision 链无断裂。
+# alembic heads 在链断裂（引用不存在的 revision）时会非零退出，多 head 时输出多行。
+validate_alembic_chain() {
+    local image="$1"
+    local env_file="$2"
+    local heads_output head_count
+
+    echo "校验 Alembic 迁移链自洽性…"
+    heads_output="$(docker run --rm --platform "$TARGET_PLATFORM" --env-file "$env_file" \
+        --entrypoint alembic "$image" heads 2>&1)" \
+        || die "Alembic 迁移链自洽校验失败（可能存在断裂的 down_revision）：\n$heads_output"
+    head_count="$(printf '%s\n' "$heads_output" | grep -c '(head)')"
+    [[ "$head_count" -eq 1 ]] \
+        || die "Alembic head 不唯一（$head_count 个），迁移链存在分叉：\n$heads_output"
+    echo "Alembic 迁移链自洽：单 head $(printf '%s' "$heads_output" | tr -d '\n')"
+}
+
 write_manifest() {
     local release_root="$1"
     local manifest="$release_root/manifest.sha256"
@@ -535,6 +552,7 @@ build_bundle() {
         "$SCRIPT_DIR/backend"
     validate_image_platform "$backend_image"
     validate_backend_image_config "$backend_image" "$production_env"
+    validate_alembic_chain "$backend_image" "$production_env"
 
     echo "准备 PostgreSQL 与 Redis 离线镜像 ($TARGET_PLATFORM)"
     docker pull --platform "$TARGET_PLATFORM" "$POSTGRES_IMAGE"

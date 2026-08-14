@@ -704,6 +704,46 @@ assert_running() {
     }
 }
 
+# 迁移前记录 alembic current 与 heads，便于排查“已盖章到 head 但 schema 漂移”。
+log_migration_status() {
+    echo "Alembic heads：$(compose run --rm --no-deps --entrypoint alembic migrate heads 2>/dev/null | tr -d '\n')"
+    echo "Alembic current：$(compose run --rm --no-deps --entrypoint alembic migrate current 2>/dev/null | tr -d '\n')"
+}
+
+# 迁移前对数据库做 pg_dump 逻辑备份；MTV_SKIP_DB_BACKUP=true 可跳过。
+backup_database() {
+    if [[ "${MTV_SKIP_DB_BACKUP:-false}" == "true" ]]; then
+        echo "已跳过迁移前数据库备份（MTV_SKIP_DB_BACKUP=true）。"
+        return 0
+    fi
+    local pg_user pg_db pg_data_dir backup_dir backup_file
+    pg_user="$(read_env_value MTV_POSTGRES_USER)"
+    pg_db="$(read_env_value MTV_POSTGRES_DB)"
+    pg_data_dir="$(read_env_value MTV_POSTGRES_DATA_DIR)"
+    backup_dir="${MTV_DB_BACKUP_DIR:-$(dirname "$pg_data_dir")/backups}"
+    mkdir -p -m 0750 -- "$backup_dir"
+    backup_file="$backup_dir/pre-migrate-$(date +%Y%m%dT%H%M%S).sql.gz"
+    echo "迁移前备份数据库到：$backup_file"
+    # pipefail 已在脚本顶部启用：pg_dump 失败时 pipeline 非零退出，set -e 阻断部署；
+    # 不抑制 stderr，便于排查连接/权限错误。
+    if ! compose exec -T postgres pg_dump -U "$pg_user" "$pg_db" | gzip > "$backup_file"; then
+        echo "数据库备份失败。" >&2
+        exit 1
+    fi
+    # 校验解压后非空（gzip 头本身约 20 字节，不能只看文件大小）。
+    if [[ "$(gzip -cd "$backup_file" | wc -c | tr -d ' ')" -eq 0 ]]; then
+        echo "数据库备份内容为空。" >&2
+        exit 1
+    fi
+    echo "数据库备份完成（$(du -h "$backup_file" | cut -f1)）。"
+}
+
+# 迁移后用 drift_repair --check-only 断言 schema 与模型一致，不一致则阻断上线。
+verify_schema_drift() {
+    echo "校验 schema 一致性（drift_repair --check-only）…"
+    compose run --rm --no-deps --entrypoint python migrate -m app.db.drift_repair --check-only
+}
+
 validate() {
     require_docker
     prepare_compose
@@ -725,8 +765,14 @@ deploy() {
     echo "停止旧版 API、worker 与 beat，避免迁移期间并发写入…"
     compose stop api celery-worker celery-beat || true
 
-    echo "执行一次性数据库迁移…"
+    # 迁移前记录 alembic 版本并备份；迁移本身（alembic upgrade head + 幂等漂移修复）
+    # 由 migrate 服务命令执行；迁移失败因 set -e 直接退出，应用保持停止，避免在半迁移
+    # schema 上启动新代码。
+    log_migration_status
+    backup_database
+    echo "执行数据库迁移（alembic upgrade head + 幂等漂移修复）…"
     compose run --rm --no-deps migrate
+    verify_schema_drift
     bootstrap_default_admin
     run_local_storage_canary
     echo "启动新版 API、worker 与唯一 beat…"

@@ -1149,14 +1149,15 @@ if [[ "$RUN_MIGRATIONS" == true ]]; then
     wait_for_health redis
     info "停止旧 API、worker、beat 后执行 Alembic 迁移"
     compose stop api celery-worker celery-beat >/dev/null
-    migration_recovery_needed=true
-    trap 'if [[ "${migration_recovery_needed:-false}" == true ]]; then warn "迁移未完成，尝试恢复原有应用容器"; compose_up -d --no-build --remove-orphans api celery-worker celery-beat || true; fi' ERR
+    # 迁移失败时保持应用停止（set -e 直接退出），避免新代码在半迁移 schema 上写入；
+    # 由运维排查后再决定回滚或重试，对齐 deploy-test.sh “迁移失败保持停止”策略。
+    info "执行数据库迁移（alembic upgrade head + 幂等漂移修复）"
     compose_run --rm --no-deps migrate
+    info "校验 schema 一致性（drift_repair --check-only）"
+    compose_run --rm --no-deps --entrypoint python migrate -m app.db.drift_repair --check-only
     if [[ "$BOOTSTRAP_ADMIN_ENABLED" == true ]]; then
         bootstrap_admin_and_credits
     fi
-    migration_recovery_needed=false
-    trap - ERR
 else
     warn "已跳过数据库迁移（DEPLOY_RUN_MIGRATIONS=false）"
 fi
@@ -1256,7 +1257,7 @@ remote_compose_action() {
 
     case "$action" in
         start|restart)
-            remote_command="set -Eeuo pipefail; cd $path_q; test -r $env_q; export MTV_ENV_FILE=$env_q MTV_PRODUCTION_IMAGE=$image_q MTV_POSTGRES_IMAGE=$postgres_image_q MTV_REDIS_IMAGE=$redis_image_q; docker image inspect $image_q >/dev/null 2>&1 || { echo '远端缺少后端镜像，请先执行 deploy' >&2; exit 1; }; docker image inspect $postgres_image_q >/dev/null 2>&1 || { echo '远端缺少 PostgreSQL 镜像，请先执行 deploy 或设置正确的 MTV_POSTGRES_IMAGE' >&2; exit 1; }; docker image inspect $redis_image_q >/dev/null 2>&1 || { echo '远端缺少 Redis 镜像，请先执行 deploy 或设置正确的 MTV_REDIS_IMAGE' >&2; exit 1; }; $prefix config --quiet; $prefix up --pull never -d --no-build --remove-orphans postgres redis; $prefix up --pull never -d --no-build --force-recreate --remove-orphans api celery-worker celery-beat; $prefix ps postgres redis api celery-worker celery-beat"
+            remote_command="set -Eeuo pipefail; cd $path_q; test -r $env_q; export MTV_ENV_FILE=$env_q MTV_PRODUCTION_IMAGE=$image_q MTV_POSTGRES_IMAGE=$postgres_image_q MTV_REDIS_IMAGE=$redis_image_q; docker image inspect $image_q >/dev/null 2>&1 || { echo '远端缺少后端镜像，请先执行 deploy' >&2; exit 1; }; docker image inspect $postgres_image_q >/dev/null 2>&1 || { echo '远端缺少 PostgreSQL 镜像，请先执行 deploy 或设置正确的 MTV_POSTGRES_IMAGE' >&2; exit 1; }; docker image inspect $redis_image_q >/dev/null 2>&1 || { echo '远端缺少 Redis 镜像，请先执行 deploy 或设置正确的 MTV_REDIS_IMAGE' >&2; exit 1; }; $prefix config --quiet; $prefix up --pull never -d --no-build --remove-orphans postgres redis; $prefix run --pull never --rm --no-deps --entrypoint python migrate -m app.db.drift_repair --check-only || { echo '检测到 schema 漂移或迁移未完成，请先执行 deploy 或 migrate 子命令' >&2; exit 1; }; $prefix up --pull never -d --no-build --force-recreate --remove-orphans api celery-worker celery-beat; $prefix ps postgres redis api celery-worker celery-beat"
             ;;
         status)
             remote_command="set -Eeuo pipefail; cd $path_q; test -r $env_q; export MTV_ENV_FILE=$env_q MTV_PRODUCTION_IMAGE=$image_q MTV_POSTGRES_IMAGE=$postgres_image_q MTV_REDIS_IMAGE=$redis_image_q; $prefix config --quiet; $prefix ps postgres redis api celery-worker celery-beat"
@@ -1265,7 +1266,7 @@ remote_compose_action() {
             remote_command="set -Eeuo pipefail; cd $path_q; test -r $env_q; export MTV_ENV_FILE=$env_q MTV_PRODUCTION_IMAGE=$image_q MTV_POSTGRES_IMAGE=$postgres_image_q MTV_REDIS_IMAGE=$redis_image_q; $prefix config --quiet; $prefix stop api celery-worker celery-beat postgres redis"
             ;;
         migrate)
-            remote_command="set -Eeuo pipefail; cd $path_q; test -r $env_q; export MTV_ENV_FILE=$env_q MTV_PRODUCTION_IMAGE=$image_q MTV_POSTGRES_IMAGE=$postgres_image_q MTV_REDIS_IMAGE=$redis_image_q; test \"${ALLOW_DATABASE_MIGRATION}\" = true || { echo '请设置 DEPLOY_ALLOW_DATABASE_MIGRATION=true，并确认已完成数据库备份' >&2; exit 1; }; command -v flock >/dev/null 2>&1 || { echo '远端缺少 flock，无法阻止并发迁移' >&2; exit 1; }; exec 9>$path_q/.deploy.lock; flock -n 9 || { echo '已有部署或迁移正在执行' >&2; exit 1; }; docker image inspect $image_q >/dev/null 2>&1; docker image inspect $postgres_image_q >/dev/null 2>&1; docker image inspect $redis_image_q >/dev/null 2>&1; $prefix config --quiet; $prefix up --pull never -d --no-build postgres redis; for service in postgres redis; do started=\$SECONDS; while :; do container=\$($prefix ps -q \"\$service\"); health=\$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}missing-healthcheck{{end}}' \"\$container\" 2>/dev/null || true); test \"\$health\" = healthy && break; test \"\$health\" != unhealthy && test \$((SECONDS-started)) -lt 180 || { $prefix logs --tail 100 \"\$service\" >&2 || true; exit 1; }; sleep 2; done; done; $prefix stop api celery-worker celery-beat; migration_recovery_needed=true; trap '$prefix up --pull never -d --no-build --remove-orphans api celery-worker celery-beat >/dev/null 2>&1 || true' ERR; $prefix run --pull never --rm --no-deps migrate; migration_recovery_needed=false; trap - ERR; $prefix up --pull never -d --no-build --force-recreate --remove-orphans api celery-worker celery-beat; $prefix ps postgres redis api celery-worker celery-beat"
+            remote_command="set -Eeuo pipefail; cd $path_q; test -r $env_q; export MTV_ENV_FILE=$env_q MTV_PRODUCTION_IMAGE=$image_q MTV_POSTGRES_IMAGE=$postgres_image_q MTV_REDIS_IMAGE=$redis_image_q; test \"${ALLOW_DATABASE_MIGRATION}\" = true || { echo '请设置 DEPLOY_ALLOW_DATABASE_MIGRATION=true，并确认已完成数据库备份' >&2; exit 1; }; command -v flock >/dev/null 2>&1 || { echo '远端缺少 flock，无法阻止并发迁移' >&2; exit 1; }; exec 9>$path_q/.deploy.lock; flock -n 9 || { echo '已有部署或迁移正在执行' >&2; exit 1; }; docker image inspect $image_q >/dev/null 2>&1; docker image inspect $postgres_image_q >/dev/null 2>&1; docker image inspect $redis_image_q >/dev/null 2>&1; $prefix config --quiet; $prefix up --pull never -d --no-build postgres redis; for service in postgres redis; do started=\$SECONDS; while :; do container=\$($prefix ps -q \"\$service\"); health=\$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}missing-healthcheck{{end}}' \"\$container\" 2>/dev/null || true); test \"\$health\" = healthy && break; test \"\$health\" != unhealthy && test \$((SECONDS-started)) -lt 180 || { $prefix logs --tail 100 \"\$service\" >&2 || true; exit 1; }; sleep 2; done; done; $prefix stop api celery-worker celery-beat; $prefix run --pull never --rm --no-deps migrate; $prefix run --pull never --rm --no-deps --entrypoint python migrate -m app.db.drift_repair --check-only; $prefix up --pull never -d --no-build --force-recreate --remove-orphans api celery-worker celery-beat; $prefix ps postgres redis api celery-worker celery-beat"
             ;;
         logs)
             quote_arg "$LOG_TAIL"; local log_tail_q="$QUOTED_ARG"
