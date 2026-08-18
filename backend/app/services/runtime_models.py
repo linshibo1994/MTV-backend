@@ -36,7 +36,7 @@ class RuntimeVideoModel(RuntimeModel):
 
 
 def resolve_text_llm_model(configured_settings: Any | None = None) -> RuntimeModel:
-    configured_settings = configured_settings or settings
+    configured_settings = settings if configured_settings is None else configured_settings
     return RuntimeModel(
         provider=require_capability(configured_settings.text_llm_provider, "text"),
         model=configured_settings.text_llm_model,
@@ -44,7 +44,7 @@ def resolve_text_llm_model(configured_settings: Any | None = None) -> RuntimeMod
 
 
 def resolve_chat_llm_model(configured_settings: Any | None = None) -> RuntimeModel:
-    configured_settings = configured_settings or settings
+    configured_settings = settings if configured_settings is None else configured_settings
     return RuntimeModel(
         provider=require_capability(configured_settings.chat_llm_provider, "chat"),
         model=configured_settings.chat_llm_model,
@@ -52,7 +52,7 @@ def resolve_chat_llm_model(configured_settings: Any | None = None) -> RuntimeMod
 
 
 def resolve_image_gen_model(configured_settings: Any | None = None) -> RuntimeModel:
-    configured_settings = configured_settings or settings
+    configured_settings = settings if configured_settings is None else configured_settings
     return RuntimeModel(
         provider=require_capability(configured_settings.image_gen_provider, "image"),
         model=configured_settings.image_gen_model,
@@ -61,7 +61,7 @@ def resolve_image_gen_model(configured_settings: Any | None = None) -> RuntimeMo
 
 def resolve_env_video_model(configured_settings: Any | None = None) -> RuntimeVideoModel:
     """解析 ``env`` 模式创建视频任务会采用的配置。"""
-    configured_settings = configured_settings or settings
+    configured_settings = settings if configured_settings is None else configured_settings
     provider = require_capability(configured_settings.video_gen_provider, "video")
     fallback_models = {
         "volcengine": configured_settings.seedance_model,
@@ -96,7 +96,7 @@ async def resolve_video_model(
     database 模式严格复用 ``create_video_job`` 的 active-provider 查询及其无配置
     回退；因此前端展示和参考图审核门禁不会与实际任务漂移。
     """
-    configured_settings = configured_settings or settings
+    configured_settings = settings if configured_settings is None else configured_settings
     if configured_settings.video_provider_selection_mode == "env":
         return resolve_env_video_model(configured_settings)
 

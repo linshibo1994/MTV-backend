@@ -17,10 +17,11 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_serializer
 
-# 生图模型枚举：Google / OpenAI / 阿里百炼通义万相。
+# 生图模型枚举：Google / OpenAI / NeoLink / 阿里百炼通义万相。
 ImageModelName = Literal[
     "banana-2",
     "gpt-image-2",
+    "gp-im-2",
     "wan2.1-t2i-plus",
     "wan2.1-t2i-turbo",
     "wanx-v1",

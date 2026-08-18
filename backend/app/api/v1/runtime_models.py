@@ -5,6 +5,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth import get_current_user
 from app.core.database import get_db
+from app.core.reference_media_limits import (
+    reference_media_limits_for_provider,
+    supports_reference_videos,
+)
 from app.models.user import User
 from app.schemas.runtime_models import RuntimeModelOut, RuntimeModelsOut, RuntimeVideoModelOut
 from app.services.runtime_models import (
@@ -33,6 +37,10 @@ async def get_runtime_models(
     chat_llm = resolve_chat_llm_model()
     image_gen = resolve_image_gen_model()
     video_gen = await resolve_video_model(db)
+    reference_limits = reference_media_limits_for_provider(
+        video_gen.provider,
+        video_gen.model,
+    )
     return RuntimeModelsOut(
         text_llm=RuntimeModelOut(**text_llm.__dict__),
         chat_llm=RuntimeModelOut(**chat_llm.__dict__),
@@ -41,5 +49,10 @@ async def get_runtime_models(
             provider=video_gen.provider,
             model=video_gen.model,
             reference_image_audit_required=video_gen.reference_image_audit_required,
+            reference_video_supported=supports_reference_videos(
+                video_gen.provider,
+                video_gen.model,
+            ),
+            reference_video_limit=reference_limits.videos,
         ),
     )

@@ -3167,3 +3167,21 @@ def test_bailian_image_model_is_accepted_and_routes_to_provider() -> None:
             "http://127.0.0.1/private.png",
             "https://dashscope.aliyuncs.com",
         )
+
+
+def test_neolink_image_model_is_accepted_and_routes_to_provider() -> None:
+    from app.providers.image_gen import get_image_provider
+    from app.providers.image_gen_neolink import NeolinkImageGenProvider
+    from app.schemas.generation import CreateJobIn
+    from app.schemas.materials import SubjectImageNodeData
+
+    request = CreateJobIn(
+        material_id="material-1",
+        subject_id="subject-1",
+        model="gp-im-2",
+    )
+    node_data = SubjectImageNodeData(model="gp-im-2")
+
+    assert request.model == "gp-im-2"
+    assert node_data.model == "gp-im-2"
+    assert isinstance(get_image_provider(request.model), NeolinkImageGenProvider)

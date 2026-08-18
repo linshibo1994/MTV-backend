@@ -299,6 +299,7 @@ class SubjectImageNodeData(CanvasNodeData):
     model: Literal[
         "banana-2",
         "gpt-image-2",
+        "gp-im-2",
         "wan2.1-t2i-plus",
         "wan2.1-t2i-turbo",
         "wanx-v1",

@@ -11,6 +11,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import noload
 
 from app.core.errors import BadRequestError, ConflictError, ForbiddenError, NotFoundError
+from app.core.reference_media_limits import (
+    IMAGE_MATERIAL_KEYS,
+    ReferenceMediaLimitExceeded,
+    count_material_references,
+    reference_media_limits_for_provider,
+    supports_reference_videos,
+    validate_shot_group_reference_selection,
+)
 from app.models.asset_entry import AssetEntry
 from app.models.episode import Episode
 from app.models.script import Script
@@ -25,7 +33,7 @@ from app.services.shot_group_merge import _rewrite_shot_line
 
 _ACTIVE_VIDEO_STATUSES = ("waiting_dependency", "starting", "processing")
 _PROMPT_TIMELINE_PATTERN = re.compile(r"【镜头\s*(?P<display_no>\d+)\s*:\s*\d+\s*s\s*[～~\-—至]\s*\d+\s*s】")
-_MATERIAL_KEYS = ("character", "background", "prop", "other")
+_MATERIAL_KEYS = (*IMAGE_MATERIAL_KEYS, "video")
 
 
 @dataclass(frozen=True)
@@ -151,6 +159,7 @@ def _normalise_materials(
     *,
     subjects: list[Subject],
     approved_assets: list[AssetEntry],
+    successful_video_jobs: dict[str, VideoGenerationJob] | None = None,
 ) -> dict[str, list[dict[str, str]]]:
     subjects_by_id = {str(subject_model.id): subject_model for subject_model in subjects}
     subjects_by_name: dict[str, list[Subject]] = {}
@@ -160,6 +169,12 @@ def _normalise_materials(
 
     result: dict[str, list[dict[str, str]]] = {key: [] for key in _MATERIAL_KEYS}
     for category in _MATERIAL_KEYS:
+        if category == "video":
+            result[category] = _normalise_video_references(
+                raw.get(category, []),
+                successful_video_jobs=successful_video_jobs or {},
+            )
+            continue
         seen: set[tuple[str, str]] = set()
         for item in raw.get(category, []):
             resolved_subject, resolved_asset = _resolve_subject(
@@ -188,6 +203,45 @@ def _normalise_materials(
             if dedupe_key not in seen:
                 seen.add(dedupe_key)
                 result[category].append(normalised)
+    return result
+
+
+def _normalise_video_references(
+    raw: list[dict[str, Any]],
+    *,
+    successful_video_jobs: dict[str, VideoGenerationJob],
+) -> list[dict[str, str]]:
+    """校验并归一化已成功视频任务引用，禁止客户端提交任意 URL。"""
+
+    result: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in raw:
+        job_id = str(item.get("video_job_id") or "").strip()
+        if not job_id:
+            raise BadRequestError("参考视频缺少 video_job_id")
+        if job_id in seen:
+            continue
+        job = successful_video_jobs.get(job_id)
+        output = job.output_json if job is not None and isinstance(job.output_json, dict) else {}
+        storage_key = output.get("video_storage_key") if isinstance(output, dict) else None
+        if (
+            job is None
+            or job.status != "succeeded"
+            or not isinstance(storage_key, str)
+            or not storage_key.strip()
+        ):
+            raise BadRequestError("参考视频必须是当前剧本已成功生成的视频")
+        seen.add(job_id)
+        name = str(item.get("name") or "").strip() or "已生成视频"
+        # 同时持久化经过服务端验证的不可变产物键。源视频任务或镜头组后续
+        # 被删除时，StorageReferenceGuard 仍能识别该引用并保护对象。
+        result.append(
+            {
+                "name": name,
+                "video_job_id": job_id,
+                "storage_key": storage_key,
+            }
+        )
     return result
 
 
@@ -369,10 +423,32 @@ async def update_shot_group(
                 .all()
             )
         if "materials" in fields_set:
+            raw_video_refs = (materials or {}).get("video", [])
+            requested_video_job_ids = [
+                str(item.get("video_job_id") or "").strip()
+                for item in raw_video_refs
+                if isinstance(item, dict) and item.get("video_job_id")
+            ] if isinstance(raw_video_refs, list) else []
+            successful_video_jobs: dict[str, VideoGenerationJob] = {}
+            if requested_video_job_ids:
+                video_jobs = list(
+                    (
+                        await db.execute(
+                            select(VideoGenerationJob).where(
+                                VideoGenerationJob.script_id == script_id,
+                                VideoGenerationJob.job_id.in_(requested_video_job_ids),
+                            )
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                successful_video_jobs = {job.job_id: job for job in video_jobs}
             normalised_materials = _normalise_materials(
                 materials or {},
                 subjects=subjects,
                 approved_assets=approved_assets,
+                successful_video_jobs=successful_video_jobs,
             )
         if "audio_elements" in fields_set:
             normalised_audio = _normalise_audio_elements(
@@ -387,6 +463,65 @@ async def update_shot_group(
     audio_changed = (
         normalised_audio is not None and normalised_audio != group.audio_elements
     )
+    if {"materials", "audio_elements", "is_continuation"} & fields_set:
+        candidate_materials = (
+            normalised_materials if normalised_materials is not None else group.materials
+        )
+        candidate_audio = normalised_audio if normalised_audio is not None else group.audio_elements
+        candidate_is_continuation = (
+            bool(is_continuation)
+            if "is_continuation" in fields_set
+            else bool(getattr(group, "is_continuation", False))
+        )
+        from app.services.runtime_models import resolve_video_model
+
+        runtime_video_model = await resolve_video_model(db)
+        reference_limits = reference_media_limits_for_provider(
+            runtime_video_model.provider,
+            runtime_video_model.model,
+        )
+        # 普通组也会在前组完成后承接同场景前组的尾帧；因此只要存在更早
+        # 正式组且当前模型支持首帧输入时才预留。测试替身缺少 group_index 时
+        # 无需额外查询。
+        from app.services.video_generation import (
+            _reserves_first_frame,
+            _resolve_continuation_static_fallback,
+            _resolve_first_frame,
+        )
+
+        reserve_first_frame = await _reserves_first_frame(
+            db,
+            group,
+            is_continuation=candidate_is_continuation,
+            supports_first_frame=reference_limits.supports_first_frame,
+        )
+        available_first_frame = (
+            await _resolve_first_frame(
+                db,
+                group,
+                is_continuation=candidate_is_continuation,
+            )
+            if reference_limits.supports_first_frame
+            else None
+        )
+        if available_first_frame is None and candidate_is_continuation:
+            available_first_frame = await _resolve_continuation_static_fallback(db, group)
+        _, candidate_video_count = count_material_references(candidate_materials)
+        if candidate_video_count and not supports_reference_videos(
+            runtime_video_model.provider,
+            runtime_video_model.model,
+        ):
+            raise BadRequestError("当前视频模型不支持参考视频，请移除参考视频或切换至 Seedance/NeoLink")
+        try:
+            validate_shot_group_reference_selection(
+                candidate_materials,
+                candidate_audio,
+                reserve_continuation_first_frame=reserve_first_frame,
+                available_first_frames=1 if available_first_frame else 0,
+                limits=reference_limits,
+            )
+        except ReferenceMediaLimitExceeded as exc:
+            raise BadRequestError(exc.detail) from None
     if not (
         duration_changed
         or continuation_changed

@@ -28,6 +28,8 @@ from app.providers.image_gen import (
     ImageResult,
     ImageSafetyRejectedError,
     classify_image_safety_code,
+    image_gen_model_override_applies_to,
+    image_gen_provider_is_selected,
 )
 from app.providers.registry import ProviderConfigurationError
 from app.schemas.materials import (
@@ -274,23 +276,27 @@ class BailianImageGenProvider:
     ) -> list[ImageResult]:
         api_key = (
             settings.image_gen_api_key
-            if settings.is_explicitly_configured("image_gen_api_key") and settings.image_gen_api_key
-            else settings.dashscope_api_key or settings.image_gen_api_key
+            if image_gen_provider_is_selected("bailian", configuration=settings)
+            and settings.is_explicitly_configured("image_gen_api_key")
+            and settings.image_gen_api_key
+            else settings.dashscope_api_key
         )
         if not api_key:
             raise ProviderConfigurationError(
                 "未配置 IMAGE_GEN_API_KEY（或 DASHSCOPE_API_KEY），无法调用通义万相文生图"
             )
-        # IMAGE_GEN_PROVIDER 只决定厂商，不能把 Settings 的回退模型伪装成显式模型
-        # 配置并覆盖画布任务的模型。只有部署明确设置 IMAGE_GEN_MODEL 时才强制覆盖。
+        # 仅让当前生效厂商的显式模型覆盖画布任务模型，避免跨厂商串台。
         use_model = (
             settings.image_gen_model
-            if settings.is_explicitly_configured("image_gen_model") and settings.image_gen_model
+            if image_gen_model_override_applies_to("bailian", configuration=settings)
+            and settings.image_gen_model
             else model or "wan2.1-t2i-plus"
         )
         base_url = (
             settings.image_gen_base_url
-            if settings.is_explicitly_configured("image_gen_base_url") and settings.image_gen_base_url
+            if image_gen_provider_is_selected("bailian", configuration=settings)
+            and settings.is_explicitly_configured("image_gen_base_url")
+            and settings.image_gen_base_url
             else settings.dashscope_base_url
         ).rstrip("/")
         wanx_size = _map_size(use_model, size, aspect)

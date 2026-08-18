@@ -65,7 +65,7 @@ _CAPABILITIES: dict[ProviderCapability, frozenset[ProviderName]] = {
     "chat": frozenset(
         {"openai", "openai_compatible", "anthropic", "gemini", "bailian", "deepseek"}
     ),
-    "image": frozenset({"openai", "gemini", "bailian"}),
+    "image": frozenset({"openai", "gemini", "bailian", "neolink"}),
     "video": frozenset(
         {"openai", "gemini", "bailian", "volcengine", "neolink", "mgrouter"}
     ),

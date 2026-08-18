@@ -20,6 +20,13 @@ from typing import Any
 from urllib.parse import quote, urlsplit, urlunsplit
 
 from app.core.config import settings
+from app.core.reference_media_limits import (
+    ReferenceMediaCounts,
+    ReferenceMediaLimitExceeded,
+    effective_reference_media_limits_for_group,
+    reference_media_limits_for_provider,
+    validate_reference_media_counts,
+)
 from app.providers._url_safety import MAX_PROVIDER_VIDEO_BYTES
 from app.providers.registry import ProviderConfigurationError
 from app.providers.streaming_io import CancellationCallback
@@ -30,6 +37,7 @@ from app.providers.video_gen import (
     VideoGenerationRemoteTerminalError,
     VideoGenerationRequest,
     VideoGenerationResult,
+    VideoGenerationSubmitRejected,
     await_video_task_checkpoint,
     execute_video_submission,
     managed_video_client,
@@ -135,16 +143,44 @@ class OpenAIVideoGenProvider:
         on_progress=None,
     ) -> VideoGenerationResult:
         """文生/图生视频 → 返回视频 storage_key。"""
+        if request.reference_videos:
+            raise VideoGenerationSubmitRejected(
+                diagnostics={"code": "ReferenceVideoUnsupported"}
+            )
         logger.warning(
             "OpenAI Sora Videos API 已弃用并计划于 2026-09-24 关闭，请迁移视频供应商"
         )
         existing_video_id = str((request.metadata or {}).get("provider_task_id") or "")
+        use_model = request.model or settings.video_gen_model or "sora-2"
         if not existing_video_id:
             await raise_if_video_cancel_requested_before_submit(
                 request.cancel_requested
             )
+            # Sora 只会读取一张 input_reference。直调入口也必须拒绝多余图片、
+            # 声音或视频，不能悄悄截断后继续提交。
+            reference_images = [
+                reference
+                for reference in request.reference_images
+                if not request.first_frame
+                or not isinstance(reference, dict)
+                or reference.get("storage_key") != request.first_frame
+            ]
+            try:
+                validate_reference_media_counts(
+                    ReferenceMediaCounts(
+                        images=len(reference_images),
+                        audios=len(request.reference_audios),
+                        videos=len(request.reference_videos),
+                        first_frames=1 if request.first_frame else 0,
+                    ),
+                    limits=effective_reference_media_limits_for_group(
+                        reference_media_limits_for_provider("openai", use_model),
+                        reserve_first_frame=bool(request.first_frame),
+                    ),
+                )
+            except ReferenceMediaLimitExceeded as exc:
+                raise VideoGenerationSubmitRejected(diagnostics={"code": exc.code}) from None
         self._check_keys()
-        use_model = request.model or settings.video_gen_model or "sora-2"
 
         def _notify(stage: str, message: str, progress: int, task_id: str | None = None) -> None:
             if on_progress is not None:

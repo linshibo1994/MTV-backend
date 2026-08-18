@@ -159,6 +159,7 @@ async def test_neolink_submit_uses_documented_create_contract(monkeypatch) -> No
         ["https://storage.example/reference/voice.mp3?signature=audio"],
         "https://storage.example/reference/first-frame.png?signature=frame",
         lambda *_args: None,
+        video_urls=["https://storage.example/reference/motion.mp4?signature=video"],
         duration_seconds=8,
         on_task_created=on_task_created,
     )
@@ -189,6 +190,13 @@ async def test_neolink_submit_uses_documented_create_contract(monkeypatch) -> No
                     "url": "https://storage.example/reference/voice.mp3?signature=audio"
                 },
                 "role": "reference_audio",
+            },
+            {
+                "type": "video_url",
+                "video_url": {
+                    "url": "https://storage.example/reference/motion.mp4?signature=video"
+                },
+                "role": "reference_video",
             },
         ],
         generate_audio=True,

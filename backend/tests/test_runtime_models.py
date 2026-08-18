@@ -140,5 +140,45 @@ async def test_runtime_models_api_returns_only_public_model_metadata(client, mon
             "provider": "volcengine",
             "model": "doubao-seedance-test",
             "reference_image_audit_required": True,
+            "reference_video_supported": True,
+            "reference_video_limit": 3,
         },
+    }
+
+
+@pytest.mark.asyncio
+async def test_runtime_models_api_exposes_zero_video_reference_limit_for_bailian(
+    client,
+    monkeypatch,
+) -> None:
+    from app.api.v1 import runtime_models as api
+    from app.core.auth import get_current_user
+
+    async def override_user():
+        return SimpleNamespace(user_id="user-1", enabled=True, is_admin=False)
+
+    monkeypatch.setattr(api, "resolve_text_llm_model", lambda: RuntimeModel("bailian", "qwen-plus"))
+    monkeypatch.setattr(api, "resolve_chat_llm_model", lambda: RuntimeModel("anthropic", "claude-test"))
+    monkeypatch.setattr(api, "resolve_image_gen_model", lambda: RuntimeModel("bailian", "wan2.1-t2i"))
+    monkeypatch.setattr(
+        api,
+        "resolve_video_model",
+        AsyncMock(
+            return_value=RuntimeVideoModel(
+                "bailian", "wan2.6-i2v", False, "bailian"
+            )
+        ),
+    )
+    app = client._app  # type: ignore[attr-defined]
+    app.dependency_overrides[get_current_user] = override_user
+
+    response = await client.get("/v3api/runtime-models")
+
+    assert response.status_code == 200
+    assert response.json()["video_gen"] == {
+        "provider": "bailian",
+        "model": "wan2.6-i2v",
+        "reference_image_audit_required": False,
+        "reference_video_supported": False,
+        "reference_video_limit": 0,
     }

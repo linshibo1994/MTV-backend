@@ -149,6 +149,7 @@ class NeolinkVideoGenProvider(VolcengineVideoGenProvider):
         audio_urls: list[str],
         first_frame_url: str | None,
         duration_seconds: int | None,
+        video_urls: list[str] | None = None,
     ) -> dict:
         """按 NeoLink 已验证的内容生成契约构造创建参数。"""
         create_kwargs: dict = {
@@ -158,6 +159,7 @@ class NeolinkVideoGenProvider(VolcengineVideoGenProvider):
                 image_urls,
                 audio_urls,
                 first_frame_url,
+                video_urls,
             ),
             "generate_audio": True,
             "ratio": _DEFAULT_RATIO,

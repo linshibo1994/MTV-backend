@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.asset_entry import AssetEntry
 from app.models.shot_group import ShotGroup
 from app.models.subject import Subject
+from app.models.video_generation_job import VideoGenerationJob
 
 
 @dataclass
@@ -40,6 +41,11 @@ class AggregatedReferences:
     reference_audio_names: list[str] = field(default_factory=list)
     # 缺少已审核音频的角色名（供 [检查素材] 标红）
     missing_audio: list[str] = field(default_factory=list)
+    # 已成功视频任务作为动作/镜头运动参考，结构同参考图。
+    reference_videos: list[dict] = field(default_factory=list)
+    reference_video_names: list[str] = field(default_factory=list)
+    # 失效、跨剧本或尚未成功的视频任务。
+    missing_videos: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -57,6 +63,15 @@ class AudioReference:
     subject_id: str | None = None
     asset_entry_id: str | None = None
     item_type: str | None = None
+
+
+@dataclass(frozen=True)
+class VideoReference:
+    """镜头组中引用的已完成视频生成任务。"""
+
+    label: str
+    video_job_id: str | None = None
+    storage_key: str | None = None
 
 
 def _parse_material_names(materials: dict | None) -> list[str]:
@@ -218,6 +233,45 @@ def _parse_audio_references(audio_elements) -> list[AudioReference]:
                 subject_id=subject_id,
                 asset_entry_id=asset_entry_id,
                 item_type=item_type,
+            )
+        )
+    return refs
+
+
+def _parse_video_references(materials: dict | None) -> list[VideoReference]:
+    """解析 ``materials.video``，兼容历史 camelCase 键但只接受任务 ID 引用。"""
+
+    if not materials or not isinstance(materials, dict):
+        return []
+    raw_items = materials.get("video")
+    if not isinstance(raw_items, list):
+        return []
+
+    seen: set[str] = set()
+    refs: list[VideoReference] = []
+    for item in raw_items:
+        if isinstance(item, dict):
+            job_id = item.get("video_job_id") or item.get("videoJobId")
+            label = str(item.get("name") or job_id or "").strip()
+            storage_key = item.get("storage_key")
+        else:
+            job_id = None
+            label = str(item or "").strip()
+            storage_key = None
+        normalized_job_id = str(job_id).strip() if job_id else ""
+        normalized_storage_key = str(storage_key).strip() if storage_key else None
+        if not normalized_job_id:
+            if label:
+                refs.append(VideoReference(label=label, storage_key=normalized_storage_key))
+            continue
+        if normalized_job_id in seen:
+            continue
+        seen.add(normalized_job_id)
+        refs.append(
+            VideoReference(
+                label=label or normalized_job_id,
+                video_job_id=normalized_job_id,
+                storage_key=normalized_storage_key,
             )
         )
     return refs
@@ -394,6 +448,11 @@ async def aggregate_references(
     if audio_refs:
         await _aggregate_audio(db, script_id, audio_refs, result)
 
+    # ===== 参考视频：materials.video → 当前剧本已完成的视频任务 =====
+    video_refs = _parse_video_references(shot_group.materials)
+    if video_refs:
+        await _aggregate_videos(db, script_id, video_refs, result)
+
     return result
 
 
@@ -462,3 +521,60 @@ async def _aggregate_audio(
             "sha256": entry.sha256 or "",
         })
         result.reference_audio_names.append(ref.label)
+
+
+async def _aggregate_videos(
+    db: AsyncSession,
+    script_id: str,
+    video_refs: list[VideoReference],
+    result: AggregatedReferences,
+) -> None:
+    """汇聚已成功任务的视频产物，禁止跨剧本或未完成任务作为参考。"""
+
+    job_ids = [
+        ref.video_job_id
+        for ref in video_refs
+        if ref.video_job_id and not ref.storage_key
+    ]
+    jobs_by_id: dict[str, VideoGenerationJob] = {}
+    if job_ids:
+        job_result = await db.execute(
+            select(VideoGenerationJob).where(
+                VideoGenerationJob.script_id == script_id,
+                VideoGenerationJob.job_id.in_(job_ids),
+            )
+        )
+        jobs_by_id = {job.job_id: job for job in job_result.scalars().all()}
+
+    for ref in video_refs:
+        if ref.storage_key:
+            result.reference_videos.append(
+                {
+                    "kind": "storage",
+                    "storage_key": ref.storage_key,
+                    "mime_type": "video/mp4",
+                    "source_video_job_id": ref.video_job_id,
+                }
+            )
+            result.reference_video_names.append(ref.label)
+            continue
+        job = jobs_by_id.get(ref.video_job_id or "")
+        output = job.output_json if job is not None and isinstance(job.output_json, dict) else {}
+        storage_key = output.get("video_storage_key") if isinstance(output, dict) else None
+        if (
+            job is None
+            or job.status != "succeeded"
+            or not isinstance(storage_key, str)
+            or not storage_key.strip()
+        ):
+            result.missing_videos.append(ref.label)
+            continue
+        result.reference_videos.append(
+            {
+                "kind": "storage",
+                "storage_key": storage_key,
+                "mime_type": "video/mp4",
+                "source_video_job_id": job.job_id,
+            }
+        )
+        result.reference_video_names.append(ref.label)

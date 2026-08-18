@@ -8,6 +8,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.ids import new_id
+from app.core.reference_media_limits import CONTINUATION_FROM_PREDECESSOR_KEY
 from app.models.base import Base, TimestampMixin
 
 DRAFT_SHOT_GROUP_UNIT_PREFIX = "draft:"
@@ -35,6 +36,12 @@ def shot_group_content_hash(group: "ShotGroup") -> str:
     # 一致，避免部署后无条件让全部历史视频失效。getattr 同时兼容分步迁移。
     if bool(getattr(group, "is_continuation", False)):
         payload["is_continuation"] = True
+    reference_frames = getattr(group, "reference_frames", None)
+    if (
+        isinstance(reference_frames, dict)
+        and reference_frames.get(CONTINUATION_FROM_PREDECESSOR_KEY) is True
+    ):
+        payload[CONTINUATION_FROM_PREDECESSOR_KEY] = True
     canonical = json.dumps(
         payload,
         ensure_ascii=False,
@@ -135,7 +142,10 @@ class ShotGroup(TimestampMixin, Base):
         kwargs.setdefault("description_text", "")
         kwargs.setdefault("reference_frames", {})
         kwargs.setdefault("reference_image_audit", {})
-        kwargs.setdefault("materials", {"character": [], "background": [], "prop": [], "other": []})
+        kwargs.setdefault(
+            "materials",
+            {"character": [], "background": [], "prop": [], "other": [], "video": []},
+        )
         kwargs.setdefault("audio_elements", {"characters": [], "sounds": []})
         kwargs.setdefault("quality_summary", {})
         kwargs.setdefault("is_continuation", False)

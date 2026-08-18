@@ -15,6 +15,8 @@ from app.providers.image_gen import (
     ImageResult,
     ImageSafetyRejectedError,
     classify_image_safety_code,
+    image_gen_model_override_applies_to,
+    image_gen_provider_is_selected,
     prompt_with_negative_constraints,
 )
 from app.providers.registry import ProviderConfigurationError
@@ -108,7 +110,8 @@ class GoogleImageGenProvider:
             )
         api_key = (
             settings.image_gen_api_key
-            if settings.is_explicitly_configured("image_gen_api_key")
+            if image_gen_provider_is_selected("gemini", configuration=settings)
+            and settings.is_explicitly_configured("image_gen_api_key")
             and settings.image_gen_api_key
             else settings.gemini_api_key or settings.google_api_key
         )
@@ -119,10 +122,7 @@ class GoogleImageGenProvider:
             )
         use_model = (
             settings.image_gen_model
-            if (
-                settings.is_explicitly_configured("image_gen_provider")
-                or settings.is_explicitly_configured("image_gen_model")
-            )
+            if image_gen_model_override_applies_to("gemini", configuration=settings)
             and settings.image_gen_model
             else (
                 model
@@ -132,7 +132,8 @@ class GoogleImageGenProvider:
         )
         http_options = (
             gtypes.HttpOptions(base_url=settings.image_gen_base_url.rstrip("/"))
-            if settings.is_explicitly_configured("image_gen_base_url")
+            if image_gen_provider_is_selected("gemini", configuration=settings)
+            and settings.is_explicitly_configured("image_gen_base_url")
             and settings.image_gen_base_url
             else None
         )

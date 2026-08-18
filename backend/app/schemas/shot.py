@@ -12,6 +12,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from app.core.reference_media_limits import public_reference_media_limits
 from app.schemas.storyboard_contracts import ShotBoundary, StoryboardV2ShotContract
 
 # ---------------------------------------------------------------------------
@@ -182,6 +183,7 @@ class MaterialItemOut(BaseModel):
     ref: str | None = None
     subject_id: str | None = None
     asset_entry_id: str | None = None
+    video_job_id: str | None = None
 
 
 class MaterialsOut(BaseModel):
@@ -191,6 +193,8 @@ class MaterialsOut(BaseModel):
     background: list[MaterialItemOut] = Field(default_factory=list)
     prop: list[MaterialItemOut] = Field(default_factory=list)
     other: list[MaterialItemOut] = Field(default_factory=list)
+    # 已完成视频任务可作为下一次生成的动作/镜头运动参考。
+    video: list[MaterialItemOut] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -261,6 +265,17 @@ class ShotGroupWorkbenchOut(BaseModel):
     duration_seconds: int | None = None
     video_duration_seconds: int | None = None
     is_continuation: bool = False
+    # 该组本次生成会（或续帧任务完成后会）预留一张前序尾帧图片名额。
+    reserves_first_frame: bool = False
+    # 自动组合的图生后续组会等待同场景严格直接前驱的真实尾帧；它不等同于
+    # 用户手动勾选的 is_continuation。
+    awaits_predecessor_frame: bool = False
+    # 当前模型支持首帧且存在严格直接前驱；前端可据此允许用户手动开启续帧。
+    can_wait_for_predecessor_frame: bool = False
+    # 镜头组级有效额度。MGRouter 的首帧组使用独占输入槽，不能沿用工作台默认额度。
+    reference_limits: dict[str, int | bool] = Field(
+        default_factory=public_reference_media_limits
+    )
     materials: MaterialsOut | None = None
     audio_elements: list[dict[str, Any]] = Field(default_factory=list)
     shot_ids: list[str] = Field(default_factory=list)
@@ -296,6 +311,10 @@ class VideoWorkbenchOut(BaseModel):
 
     episode_id: str
     episode_version: int
+    # 固定供应商约束随工作台下发，避免前端维护另一套硬编码口径。
+    reference_limits: dict[str, int | bool] = Field(
+        default_factory=public_reference_media_limits
+    )
     scenes: list[SceneWorkbenchOut] = Field(default_factory=list)
 
 
@@ -337,6 +356,15 @@ class ShotGroupMaterialItemIn(BaseModel):
         return self
 
 
+class ShotGroupVideoReferenceIn(BaseModel):
+    """镜头组参考视频，必须引用当前剧本已成功的视频生成任务。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str | None = Field(default=None, min_length=1, max_length=255)
+    video_job_id: str = Field(min_length=1, max_length=36)
+
+
 class ShotGroupMaterialsIn(BaseModel):
     """镜头组视觉素材分组。"""
 
@@ -346,6 +374,7 @@ class ShotGroupMaterialsIn(BaseModel):
     background: list[ShotGroupMaterialItemIn] = Field(default_factory=list, max_length=100)
     prop: list[ShotGroupMaterialItemIn] = Field(default_factory=list, max_length=100)
     other: list[ShotGroupMaterialItemIn] = Field(default_factory=list, max_length=100)
+    video: list[ShotGroupVideoReferenceIn] = Field(default_factory=list, max_length=100)
 
 
 class ShotGroupAudioElementIn(BaseModel):
@@ -497,6 +526,7 @@ __all__ = [
     "VideoWorkbenchOut",
     "ShotGroupMergeIn",
     "ShotGroupMaterialItemIn",
+    "ShotGroupVideoReferenceIn",
     "ShotGroupMaterialsIn",
     "ShotGroupAudioElementIn",
     "ShotGroupUpdateIn",

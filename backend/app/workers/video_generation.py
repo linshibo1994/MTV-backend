@@ -1830,7 +1830,15 @@ async def run_video_generation_once(
     checkpoint_holder: _VideoTaskCheckpointHolder | None = None,
 ) -> None:
     """执行一次视频任务；测试可注入 fake provider / 抽帧函数。"""
+    from app.core.reference_media_limits import (
+        ReferenceMediaCounts,
+        ReferenceMediaLimitExceeded,
+        effective_reference_media_limits_for_group,
+        reference_media_limits_for_provider,
+        validate_reference_media_counts,
+    )
     from app.crud import video as video_crud
+    from app.providers.registry import require_capability
     from app.providers.video_gen import (
         VideoGenerationCancelled,
         VideoGenerationRequest,
@@ -1893,7 +1901,13 @@ async def run_video_generation_once(
                 retryable=False,
             )
             return
-        first_frame = await _resolve_execution_first_frame(db, job, input_json)
+        # 创建任务时已按实际模型冻结首帧能力。纯文生模型不能在执行阶段因为
+        # 同场景前组刚完成又重新解析出尾帧并把它作为未声明的图片输入提交。
+        first_frame = (
+            None
+            if input_json.get("first_frame_supported") is False
+            else await _resolve_execution_first_frame(db, job, input_json)
+        )
         provider_task_id = _provider_task_id_from_job(job)
         storage_attempt_id = _storage_attempt_id(claim.lease_token)
         provider = provider or get_video_provider(job_provider_key)
@@ -1945,6 +1959,8 @@ async def run_video_generation_once(
             reference_audio_names=input_json.get("reference_audio_names", []) or [],
             model=input_json.get("model") or settings.video_gen_model or settings.seedance_model,
             job_id=job_id,
+            reference_videos=input_json.get("reference_videos", []) or [],
+            reference_video_names=input_json.get("reference_video_names", []) or [],
             first_frame=first_frame,
             duration_seconds=input_json.get("duration_seconds"),
             metadata=request_metadata,
@@ -1953,6 +1969,36 @@ async def run_video_generation_once(
             before_submit=_before_submit,
             on_submission_uncertain=_on_submission_uncertain,
         )
+        # 历史任务的 input_json 可能在统一限额上线前创建。尚未持久化远端
+        # task id 时必须在 Worker 再做一次按实际首帧计算的校验，不能让
+        # MGRouter 静默丢弃普通图片或声音后继续提交。
+        if not provider_task_id:
+            provider_name = require_capability(job_provider_key, "video")
+            provider_reference_images = [
+                image
+                for image in request.reference_images
+                if not request.first_frame
+                or not isinstance(image, dict)
+                or image.get("storage_key") != request.first_frame
+            ]
+            try:
+                validate_reference_media_counts(
+                    ReferenceMediaCounts(
+                        images=len(provider_reference_images),
+                        audios=len(request.reference_audios),
+                        videos=len(request.reference_videos),
+                        first_frames=1 if request.first_frame else 0,
+                    ),
+                    limits=effective_reference_media_limits_for_group(
+                        reference_media_limits_for_provider(
+                            provider_name,
+                            request.model,
+                        ),
+                        reserve_first_frame=bool(request.first_frame),
+                    ),
+                )
+            except ReferenceMediaLimitExceeded as exc:
+                raise VideoGenerationSubmitRejected(diagnostics={"code": exc.code}) from None
         progress_queue: asyncio.Queue[Any] = asyncio.Queue()
         progress_stop = object()
         progress_errors: list[Exception] = []

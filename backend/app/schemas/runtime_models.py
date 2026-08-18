@@ -14,6 +14,9 @@ class RuntimeVideoModelOut(RuntimeModelOut):
     """视频模型配置及其参考图审核要求。"""
 
     reference_image_audit_required: bool
+    # 仅 Seedance/NeoLink 当前支持把参考视频真实传给上游模型。
+    reference_video_supported: bool
+    reference_video_limit: int
 
 
 class RuntimeModelsOut(BaseModel):

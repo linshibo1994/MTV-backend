@@ -15,6 +15,13 @@ import httpx
 from billiard.exceptions import SoftTimeLimitExceeded, TimeLimitExceeded
 
 from app.core.config import settings
+from app.core.reference_media_limits import (
+    ReferenceMediaCounts,
+    ReferenceMediaLimitExceeded,
+    effective_reference_media_limits_for_group,
+    reference_media_limits_for_provider,
+    validate_reference_media_counts,
+)
 from app.providers.registry import ProviderConfigurationError
 from app.providers.video_gen import (
     CancellationProbe,
@@ -50,8 +57,6 @@ _MAX_DURATION = 15
 _ALLOWED_RESOLUTIONS = frozenset({"480p", "720p", "1080p"})
 _ALLOWED_RATIOS = frozenset({"adaptive", "21:9", "16:9", "4:3", "1:1", "3:4", "9:16"})
 _ALLOWED_IMAGE_MIME_TYPES = frozenset({"image/jpeg", "image/png", "image/webp"})
-_MAX_REFERENCE_IMAGES = 9
-_MAX_REFERENCE_AUDIOS = 3
 _REFERENCE_URL_EXPIRY_SECONDS = 900
 
 
@@ -166,6 +171,10 @@ class MgrouterVideoGenProvider:
         on_progress=None,
     ) -> VideoGenerationResult:
         """提交或恢复远端任务，下载结果并返回对象存储键。"""
+        if request.reference_videos:
+            raise VideoGenerationSubmitRejected(
+                diagnostics={"code": "ReferenceVideoUnsupported"}
+            )
         existing_task_id = str((request.metadata or {}).get("provider_task_id") or "")
         if existing_task_id:
             await await_video_task_checkpoint(request.on_task_created, existing_task_id)
@@ -310,9 +319,29 @@ class MgrouterVideoGenProvider:
         prompt = request.prompt.strip()
         if not prompt:
             raise VideoGenerationSubmitRejected(diagnostics={"code": "PromptRequired"})
-        if len(request.reference_audios) > _MAX_REFERENCE_AUDIOS:
-            raise VideoGenerationSubmitRejected(diagnostics={"code": "TooManyReferenceAudios"})
-        if request.reference_audios and (request.first_frame or not request.reference_images):
+        reference_images = [
+            reference
+            for reference in request.reference_images
+            if not request.first_frame
+            or not isinstance(reference, Mapping)
+            or reference.get("storage_key") != request.first_frame
+        ]
+        try:
+            validate_reference_media_counts(
+                ReferenceMediaCounts(
+                    images=len(reference_images),
+                    audios=len(request.reference_audios),
+                    videos=len(request.reference_videos),
+                    first_frames=1 if request.first_frame else 0,
+                ),
+                limits=effective_reference_media_limits_for_group(
+                    reference_media_limits_for_provider("mgrouter", model),
+                    reserve_first_frame=bool(request.first_frame),
+                ),
+            )
+        except ReferenceMediaLimitExceeded as exc:
+            raise VideoGenerationSubmitRejected(diagnostics={"code": exc.code}) from None
+        if request.reference_audios and not (request.first_frame or reference_images):
             raise VideoGenerationSubmitRejected(diagnostics={"code": "ReferenceAudioRequiresReferenceImage"})
 
         content: list[dict] = [{"type": "text", "text": prompt}]
@@ -328,10 +357,10 @@ class MgrouterVideoGenProvider:
                 }
             )
             sensitive_values.append(encoded)
-        else:
-            if len(request.reference_images) > _MAX_REFERENCE_IMAGES:
-                raise VideoGenerationSubmitRejected(diagnostics={"code": "TooManyReferenceImages"})
-            for reference in request.reference_images:
+        # AICC 首帧是独占输入槽。统一限额已在上方拒绝混合素材；这里仍
+        # 按协议分支构造内容，避免历史任务或未来调用方静默改变提交语义。
+        if not request.first_frame:
+            for reference in reference_images:
                 storage_key, mime_type = self._storage_image_reference(reference)
                 encoded = await self._encode_storage_image(storage_key, mime_type)
                 content.append(

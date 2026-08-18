@@ -27,6 +27,13 @@ from urllib.parse import urlsplit
 import httpx
 
 from app.core.config import settings
+from app.core.reference_media_limits import (
+    ReferenceMediaCounts,
+    ReferenceMediaLimitExceeded,
+    effective_reference_media_limits_for_group,
+    reference_media_limits_for_provider,
+    validate_reference_media_counts,
+)
 from app.providers.registry import ProviderConfigurationError
 from app.providers.video_gen import (
     CancellationProbe,
@@ -127,6 +134,10 @@ class BailianVideoGenProvider:
         on_progress=None,
     ) -> VideoGenerationResult:
         """文生/图生视频 → 返回视频 storage_key。"""
+        if request.reference_videos:
+            raise VideoGenerationSubmitRejected(
+                diagnostics={"code": "ReferenceVideoUnsupported"}
+            )
         task_id = str((request.metadata or {}).get("provider_task_id") or "")
         if task_id:
             await await_video_task_checkpoint(
@@ -137,8 +148,33 @@ class BailianVideoGenProvider:
             await raise_if_video_cancel_requested_before_submit(
                 request.cancel_requested
             )
-        self._check_keys()
         use_model = request.model or settings.video_gen_model or "wanx2.1-t2v-turbo"
+        if not task_id:
+            # 历史任务可能在统一限额上线前创建；首帧会通过独立字段提交，
+            # 不能同时再按普通参考图重复计数。
+            reference_images = [
+                reference
+                for reference in request.reference_images
+                if not request.first_frame
+                or not isinstance(reference, dict)
+                or reference.get("storage_key") != request.first_frame
+            ]
+            try:
+                validate_reference_media_counts(
+                    ReferenceMediaCounts(
+                        images=len(reference_images),
+                        audios=len(request.reference_audios),
+                        videos=len(request.reference_videos),
+                        first_frames=1 if request.first_frame else 0,
+                    ),
+                    limits=effective_reference_media_limits_for_group(
+                        reference_media_limits_for_provider("bailian", use_model),
+                        reserve_first_frame=bool(request.first_frame),
+                    ),
+                )
+            except ReferenceMediaLimitExceeded as exc:
+                raise VideoGenerationSubmitRejected(diagnostics={"code": exc.code}) from None
+        self._check_keys()
 
         def _notify(stage: str, message: str, progress: int, task_id: str | None = None) -> None:
             if on_progress is not None:

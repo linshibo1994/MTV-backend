@@ -33,6 +33,11 @@ from urllib.parse import urlsplit
 from billiard.exceptions import SoftTimeLimitExceeded, TimeLimitExceeded
 
 from app.core.config import settings
+from app.core.reference_media_limits import (
+    ReferenceMediaCounts,
+    ReferenceMediaLimitExceeded,
+    validate_reference_media_counts,
+)
 from app.providers.video_gen import (
     CancellationProbe,
     SubmissionStateCallback,
@@ -43,6 +48,7 @@ from app.providers.video_gen import (
     VideoGenerationRemoteTerminalError,
     VideoGenerationRequest,
     VideoGenerationResult,
+    VideoGenerationSubmitRejected,
     await_video_task_checkpoint,
     execute_video_submission,
     managed_video_client,
@@ -64,6 +70,21 @@ _ARK_CONTENT_DOWNLOAD_HOST = re.compile(
     r"(?:ark-content-generation|ark-acg)-(?P<region>[a-z0-9]+(?:-[a-z0-9]+)*)\."
     r"tos-(?P=region)\.volces\.com"
 )
+
+
+def _without_duplicate_first_frame(
+    reference_images: list[dict],
+    first_frame: str | None,
+) -> list[dict]:
+    """首帧已通过独立 role 提交时，不再作为普通参考图重复发送。"""
+
+    if not first_frame:
+        return list(reference_images)
+    return [
+        reference
+        for reference in reference_images
+        if not isinstance(reference, dict) or reference.get("storage_key") != first_frame
+    ]
 
 
 class VolcengineVideoGenProvider:
@@ -321,22 +342,45 @@ class VolcengineVideoGenProvider:
             await raise_if_video_cancel_requested_before_submit(
                 request.cancel_requested
             )
-            await self._preflight_reference_sizes(
+            reference_images = _without_duplicate_first_frame(
                 request.reference_images,
+                request.first_frame,
+            )
+            try:
+                validate_reference_media_counts(
+                    ReferenceMediaCounts(
+                        images=len(reference_images),
+                        audios=len(request.reference_audios),
+                        videos=len(request.reference_videos),
+                        first_frames=1 if request.first_frame else 0,
+                    )
+                )
+            except ReferenceMediaLimitExceeded as exc:
+                raise VideoGenerationSubmitRejected(
+                    diagnostics={"code": exc.code}
+                ) from None
+            await self._preflight_reference_sizes(
+                reference_images,
                 request.reference_audios,
                 request.first_frame,
+                request.reference_videos,
             )
 
             # Ark 的 content 字段接收 URL；这里使用 data URL 承载私有存储中的媒体。
             reference_budget = [0]
             image_urls = await self._encode_storage_refs(
-                request.reference_images,
+                reference_images,
                 "image/png",
                 budget=reference_budget,
             )
             audio_urls = await self._encode_storage_refs(
                 request.reference_audios,
                 "audio/mpeg",
+                budget=reference_budget,
+            )
+            video_urls = await self._encode_storage_refs(
+                request.reference_videos,
+                "video/mp4",
                 budget=reference_budget,
             )
             first_frame_url: str | None = None
@@ -348,9 +392,13 @@ class VolcengineVideoGenProvider:
         else:
             image_urls = []
             audio_urls = []
+            video_urls = []
             first_frame_url = None
 
         # ===== volcengine SDK 调用 =====
+        submit_kwargs: dict[str, Any] = {}
+        if video_urls:
+            submit_kwargs["video_urls"] = video_urls
         video_url, task_meta = await self._submit_and_poll(
             use_model, request.prompt, image_urls, audio_urls, first_frame_url, _notify,
             duration_seconds=request.duration_seconds,
@@ -360,6 +408,7 @@ class VolcengineVideoGenProvider:
             on_task_created=(None if existing_task_id else request.on_task_created),
             before_submit=request.before_submit,
             on_submission_uncertain=request.on_submission_uncertain,
+            **submit_kwargs,
         )
 
         with TemporaryDirectory(prefix="mtv-volcengine-video-") as temp_dir:
@@ -415,11 +464,12 @@ class VolcengineVideoGenProvider:
         storage = get_storage()
         encoded: list[str] = []
         active_budget = budget if budget is not None else [0]
-        too_large_error = (
-            "reference_audio_too_large"
-            if default_mime.startswith("audio/")
-            else "reference_image_too_large"
-        )
+        if default_mime.startswith("audio/"):
+            too_large_error = "reference_audio_too_large"
+        elif default_mime.startswith("video/"):
+            too_large_error = "reference_video_too_large"
+        else:
+            too_large_error = "reference_image_too_large"
         for ref in refs:
             key = ref.get("storage_key") if isinstance(ref, dict) else None
             if not key:
@@ -459,6 +509,7 @@ class VolcengineVideoGenProvider:
         reference_images: list[dict],
         reference_audios: list[dict],
         first_frame: str | None,
+        reference_videos: list[dict] | None = None,
     ) -> None:
         """在读取任一多模态输入前校验单项与聚合体积。"""
         from app.providers.storage import get_storage
@@ -477,6 +528,11 @@ class VolcengineVideoGenProvider:
         media.extend(
             (str(ref["storage_key"]), "reference_audio_too_large")
             for ref in reference_audios
+            if isinstance(ref, dict) and ref.get("storage_key")
+        )
+        media.extend(
+            (str(ref["storage_key"]), "reference_video_too_large")
+            for ref in reference_videos or []
             if isinstance(ref, dict) and ref.get("storage_key")
         )
         if first_frame:
@@ -512,6 +568,7 @@ class VolcengineVideoGenProvider:
         image_urls: list[str],
         audio_urls: list[str],
         first_frame_url: str | None,
+        video_urls: list[str] | None = None,
     ) -> list[dict]:
         """构造 Ark 内容生成 API 的多模态 content。"""
         content: list[dict] = [{"type": "text", "text": prompt}]
@@ -539,6 +596,14 @@ class VolcengineVideoGenProvider:
             }
             for url in audio_urls
         )
+        content.extend(
+            {
+                "type": "video_url",
+                "video_url": {"url": url},
+                "role": "reference_video",
+            }
+            for url in video_urls or []
+        )
         return content
 
     def _build_create_kwargs(
@@ -549,6 +614,7 @@ class VolcengineVideoGenProvider:
         audio_urls: list[str],
         first_frame_url: str | None,
         duration_seconds: int | None,
+        video_urls: list[str] | None = None,
     ) -> dict:
         """构造 Ark 创建任务参数，兼容网关可覆盖供应商专属字段。"""
         create_kwargs: dict = {
@@ -558,6 +624,7 @@ class VolcengineVideoGenProvider:
                 image_urls,
                 audio_urls,
                 first_frame_url,
+                video_urls,
             ),
             # 参考音频是可选的声音约束，不应成为是否生成音轨的开关。
             # 没有参考音频时也让 Seedance 根据 Prompt 生成对白、环境音和音效。
@@ -577,6 +644,7 @@ class VolcengineVideoGenProvider:
         first_frame_url: str | None,
         _notify,
         *,
+        video_urls: list[str] | None = None,
         duration_seconds: int | None = None,
         job_id: str | None = None,
         provider_task_id: str | None = None,
@@ -607,6 +675,7 @@ class VolcengineVideoGenProvider:
                     audio_urls,
                     first_frame_url,
                     duration_seconds,
+                    video_urls,
                 )
                 async def _submit_video():
                     return await tasks.create(**create_kwargs)
@@ -623,6 +692,7 @@ class VolcengineVideoGenProvider:
                             first_frame_url,
                             *image_urls,
                             *audio_urls,
+                            *(video_urls or []),
                         ]
                         if isinstance(value, str) and value
                     ),

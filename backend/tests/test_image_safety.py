@@ -85,12 +85,13 @@ async def test_openai_provider_normalizes_explicit_content_filter(monkeypatch) -
     from app.providers.image_gen_openai import OpenAIImageGenProvider
 
     configured = SimpleNamespace(
+        image_gen_provider="openai",
         image_gen_api_key="image-key",
         openai_api_key="",
         image_gen_model="gpt-image-2",
         openai_image_model="gpt-image-2",
         image_gen_base_url="",
-        is_explicitly_configured=lambda name: name == "image_gen_api_key",
+        is_explicitly_configured=lambda name: name in {"image_gen_provider", "image_gen_api_key"},
     )
     monkeypatch.setattr(image_gen_openai, "settings", configured)
     response = Response(
@@ -129,12 +130,13 @@ async def test_openai_provider_normalizes_content_filter_finish_reason(monkeypat
     from app.providers.image_gen_openai import OpenAIImageGenProvider
 
     configured = SimpleNamespace(
+        image_gen_provider="openai",
         image_gen_api_key="image-key",
         openai_api_key="",
         image_gen_model="gpt-image-2",
         openai_image_model="gpt-image-2",
         image_gen_base_url="",
-        is_explicitly_configured=lambda name: name == "image_gen_api_key",
+        is_explicitly_configured=lambda name: name in {"image_gen_provider", "image_gen_api_key"},
     )
     monkeypatch.setattr(image_gen_openai, "settings", configured)
     monkeypatch.setattr(
@@ -161,12 +163,13 @@ async def test_openai_provider_keeps_auth_error_outside_safety_path(monkeypatch)
     from app.providers.image_gen_openai import OpenAIImageGenProvider
 
     configured = SimpleNamespace(
+        image_gen_provider="openai",
         image_gen_api_key="image-key",
         openai_api_key="",
         image_gen_model="gpt-image-2",
         openai_image_model="gpt-image-2",
         image_gen_base_url="",
-        is_explicitly_configured=lambda name: name == "image_gen_api_key",
+        is_explicitly_configured=lambda name: name in {"image_gen_provider", "image_gen_api_key"},
     )
     monkeypatch.setattr(image_gen_openai, "settings", configured)
     auth_error = AuthenticationError(

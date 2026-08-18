@@ -8,6 +8,7 @@ get_image_provider(model) 路由策略（模型别名优先 + .env 未知模型�
   2. model 为已知别名 -> 对应厂商：
      - banana-2     -> Google Nano Banana (image_gen_google)
      - gpt-image-2  -> OpenAI GPT Image (image_gen_openai)
+     - gp-im-2      -> NeoLink 图片生成 (image_gen_neolink)
      - wan2.1-* / wanx-* / qwen-image* -> 阿里百炼通义万相 (image_gen_bailian)
   3. model 为未知别名/真实 id -> 按 settings.image_gen_provider 选厂商，model 作为真实 id。
   4. 缺对应 API key 由具体实现抛 RuntimeError，worker 捕获后 release 积分。
@@ -20,7 +21,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Protocol, runtime_checkable
 
-from app.providers.registry import ProviderError
+from app.providers.registry import ProviderError, UnsupportedProviderError, normalize_provider
 
 
 class ImageSafetyCategory(StrEnum):
@@ -229,6 +230,53 @@ def prompt_with_negative_constraints(prompt: str, negative_prompt: str | None) -
     return f"{prompt.rstrip()}\n\nDo not include in the generated image: {normalized}"
 
 
+def _image_gen_configuration(configuration: object | None) -> object:
+    """返回调用方传入的配置；默认延迟读取全局 Settings。"""
+    if configuration is not None:
+        return configuration
+    from app.core.config import settings
+
+    return settings
+
+
+def image_gen_provider_is_selected(
+    vendor: str,
+    *,
+    configuration: object | None = None,
+) -> bool:
+    """判断厂商是否为 IMAGE_GEN_PROVIDER 规范化后选定的图片生成厂商。
+
+    空值、别名无法识别或非法厂商都视为不匹配，不能阻断实际图片生成调用。
+    ``configuration`` 仅供 Provider 传入当前绑定的 Settings，避免测试替身绕过归属校验。
+    """
+    configured = _image_gen_configuration(configuration)
+    try:
+        selected_vendor = getattr(configured, "image_gen_provider")
+        return normalize_provider(selected_vendor) == normalize_provider(vendor)
+    except (AttributeError, TypeError, UnsupportedProviderError):
+        return False
+
+
+def image_gen_model_override_applies_to(
+    vendor: str,
+    *,
+    configuration: object | None = None,
+) -> bool:
+    """仅在 IMAGE_GEN_MODEL 显式配置且厂商归属匹配时允许覆盖调用模型。
+
+    这样历史节点显式指定其他厂商模型时，不会被当前部署的图片厂商默认模型覆盖。
+    """
+    configured = _image_gen_configuration(configuration)
+    try:
+        is_explicitly_configured = getattr(configured, "is_explicitly_configured")
+        return bool(
+            is_explicitly_configured("image_gen_model")
+            and image_gen_provider_is_selected(vendor, configuration=configured)
+        )
+    except (AttributeError, TypeError):
+        return False
+
+
 def _provider_for_model(model: str) -> str | None:
     """按 model 别名识别厂商；无法识别返回 None（交由 .env provider 配置决定）。"""
     m = (model or "").strip().lower()
@@ -236,6 +284,8 @@ def _provider_for_model(model: str) -> str | None:
         return "google"
     if m.startswith("gpt-image"):
         return "openai"
+    if m == "gp-im-2":
+        return "neolink"
     if m.startswith(("wan2.", "wanx", "qwen-image")):
         return "bailian"
     return None
@@ -282,6 +332,10 @@ def _instantiate(vendor: str) -> ImageGenProvider:
         from app.providers.image_gen_bailian import BailianImageGenProvider
 
         return BailianImageGenProvider()  # type: ignore[return-value]
+    if normalized == "neolink":
+        from app.providers.image_gen_neolink import NeolinkImageGenProvider
+
+        return NeolinkImageGenProvider()  # type: ignore[return-value]
     if normalized == "openai":
         from app.providers.image_gen_openai import OpenAIImageGenProvider
 

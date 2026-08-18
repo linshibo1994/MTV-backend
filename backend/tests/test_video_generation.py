@@ -376,6 +376,173 @@ def test_create_video_job_blocks_when_reference_image_audit_is_pending() -> None
     asyncio.run(scenario())
 
 
+def test_create_video_job_counts_continuation_first_frame_before_submission(monkeypatch) -> None:
+    """首帧与九张素材图同时存在时，必须在冻结积分前拒绝。"""
+
+    async def scenario() -> None:
+        from app.services import video_generation
+        from app.services.reference_aggregator import AggregatedReferences
+
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        db = _AsyncSessionAdapter(raw)
+        monkeypatch.setattr(
+            video_generation,
+            "aggregate_references",
+            AsyncMock(
+                return_value=AggregatedReferences(
+                    reference_images=[
+                        {
+                            "kind": "storage",
+                            "storage_key": f"generate_images/reference-{index}.png",
+                            "mime_type": "image/png",
+                            "sha256": f"{index:064x}",
+                        }
+                        for index in range(9)
+                    ]
+                )
+            ),
+        )
+
+        with pytest.raises(BadRequestError, match="参考图最多支持 9 个"):
+            await video_generation.create_video_job(
+                db,
+                script_id=seeded.script.id,
+                episode_id=seeded.episode.episode_id,
+                shot_group_id=seeded.shot_group.shot_group_id,
+                user_id=seeded.user.user_id,
+                idempotency_key="first-frame-reference-limit",
+            )
+
+        assert raw.scalar(select(VideoGenerationJob)) is None
+
+    asyncio.run(scenario())
+
+
+def test_create_bailian_i2v_rejects_reserved_but_unavailable_first_frame() -> None:
+    """普通后续组的容量预约不能让图生模型在无实际输入图时创建任务。"""
+
+    async def scenario() -> None:
+        from app.services.video_generation import create_video_job
+
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        provider = raw.scalar(
+            select(VideoProviderConfig).where(VideoProviderConfig.is_active.is_(True))
+        )
+        provider.provider_key = "bailian"
+        provider.model = "wanx2.1-kf2v"
+        seeded.shot_group.materials = {
+            "character": [],
+            "background": [],
+            "prop": [],
+            "other": [],
+            "video": [],
+        }
+        seeded.shot_group.audio_elements = {"characters": [], "sounds": []}
+        raw.get(ShotGroup, "sg-2").reference_frames = {}
+        raw.commit()
+        db = _AsyncSessionAdapter(raw)
+
+        with pytest.raises(BadRequestError, match="至少需要 1 张参考图片或首帧"):
+            await create_video_job(
+                db,
+                script_id=seeded.script.id,
+                episode_id=seeded.episode.episode_id,
+                shot_group_id=seeded.shot_group.shot_group_id,
+                user_id=seeded.user.user_id,
+                idempotency_key="bailian-reserved-frame-unavailable",
+            )
+
+        assert raw.scalar(select(VideoGenerationJob)) is None
+
+    asyncio.run(scenario())
+
+
+def test_create_video_job_uses_mgrouter_exclusive_first_frame_quota() -> None:
+    """MGRouter 后续组的首帧不能和普通参考图或声音一同冻结并提交。"""
+
+    async def scenario() -> None:
+        from app.services.video_generation import create_video_job
+
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        provider = raw.scalar(
+            select(VideoProviderConfig).where(VideoProviderConfig.is_active.is_(True))
+        )
+        provider.provider_key = "mgrouter"
+        provider.model = "AICC-Doubao-Seedance-2.0"
+        raw.commit()
+        db = _AsyncSessionAdapter(raw)
+
+        with pytest.raises(BadRequestError, match="参考图最多支持 1 个"):
+            await create_video_job(
+                db,
+                script_id=seeded.script.id,
+                episode_id=seeded.episode.episode_id,
+                shot_group_id=seeded.shot_group.shot_group_id,
+                user_id=seeded.user.user_id,
+                idempotency_key="mgrouter-first-frame-exclusive",
+            )
+
+        assert raw.scalar(select(VideoGenerationJob)) is None
+
+    asyncio.run(scenario())
+
+
+def test_create_video_job_rejects_reference_video_for_unsupported_provider() -> None:
+    async def scenario() -> None:
+        from app.services.video_generation import create_video_job
+
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        provider = raw.scalar(
+            select(VideoProviderConfig).where(VideoProviderConfig.is_active.is_(True))
+        )
+        provider.provider_key = "bailian"
+        provider.model = "wan2.6-i2v"
+        reference_job = VideoGenerationJob(
+            job_id="reference-video-job",
+            script_id=seeded.script.id,
+            episode_id=seeded.episode.episode_id,
+            shot_group_id=seeded.shot_group.shot_group_id,
+            owner_user_id=seeded.user.user_id,
+            scene_no=1,
+            unit_id="group:reference-video-source",
+            unit_runtime_key="episode-1:1:reference-video-source",
+            provider_key="modelsai",
+            job_type="all_reference",
+            input_version=seeded.episode.episode_version,
+            attempt=1,
+            status="succeeded",
+            output_json={"video_storage_key": "generate_videos/source/video.mp4"},
+        )
+        seeded.shot_group.materials["video"] = [
+            {"name": "上一镜头视频", "video_job_id": reference_job.job_id}
+        ]
+        raw.add(reference_job)
+        raw.commit()
+        db = _AsyncSessionAdapter(raw)
+
+        with pytest.raises(BadRequestError, match="当前视频模型不支持参考视频"):
+            await create_video_job(
+                db,
+                script_id=seeded.script.id,
+                episode_id=seeded.episode.episode_id,
+                shot_group_id=seeded.shot_group.shot_group_id,
+                user_id=seeded.user.user_id,
+                idempotency_key="unsupported-reference-video",
+            )
+
+        assert raw.scalar(
+            select(VideoGenerationJob).where(
+                VideoGenerationJob.job_id != reference_job.job_id
+            )
+        ) is None
+
+    asyncio.run(scenario())
+
+
 def test_create_video_job_skips_reference_image_audit_for_database_bailian(monkeypatch) -> None:
     """实际激活供应商为百炼时，即使存在参考图也不能套用火山审核门禁。"""
     async def scenario() -> None:
@@ -387,6 +554,16 @@ def test_create_video_job_skips_reference_image_audit_for_database_bailian(monke
         provider = raw.scalar(select(VideoProviderConfig).where(VideoProviderConfig.is_active.is_(True)))
         provider.provider_key = "bailian"
         provider.model = "wan2.6-i2v"
+        # 百炼 I2V 仅消费一张首帧和一段驱动音频；此用例只验证审核能力，
+        # 因此移除夹具中的额外主体/声音引用，避免掩盖动态限额门禁。
+        seeded.shot_group.materials = {
+            "character": [],
+            "background": [],
+            "prop": [],
+            "other": [],
+            "video": [],
+        }
+        seeded.shot_group.audio_elements = {"characters": [], "sounds": []}
         seeded.shot_group.reference_image_audit = {}
         raw.commit()
         db = _AsyncSessionAdapter(raw)
@@ -418,6 +595,64 @@ def test_create_video_job_skips_reference_image_audit_for_database_bailian(monke
 
         assert job.provider_key == "bailian"
         assert job.input_json["reference_image_audit"]["status"] == "not_required"
+
+    asyncio.run(scenario())
+
+
+def test_create_text_to_video_job_does_not_freeze_or_pass_previous_tail_frame(monkeypatch) -> None:
+    """纯文生模型不能因为镜头组序号或续帧开关意外接收首帧。"""
+
+    async def scenario() -> None:
+        from app.core.config import Settings
+        from app.services import video_generation
+
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        provider = raw.scalar(select(VideoProviderConfig).where(VideoProviderConfig.is_active.is_(True)))
+        provider.provider_key = "bailian"
+        provider.model = "wan2.1-t2v"
+        seeded.shot_group.is_continuation = True
+        seeded.shot_group.materials = {
+            "character": [],
+            "background": [],
+            "prop": [],
+            "other": [],
+            "video": [],
+        }
+        seeded.shot_group.audio_elements = {"characters": [], "sounds": []}
+        seeded.shot_group.reference_image_audit = {}
+        raw.commit()
+        db = _AsyncSessionAdapter(raw)
+
+        async def fake_enqueue(db, **kwargs):
+            row = TaskDispatchOutbox(
+                id="dispatch-bailian-t2v",
+                task_type=kwargs["task_type"],
+                job_id=kwargs["job_id"],
+                attempt=kwargs["attempt"],
+                payload={**kwargs["payload"], "dispatch_id": "dispatch-bailian-t2v"},
+                status="pending",
+            )
+            db.add(row)
+            return row
+
+        monkeypatch.setattr(video_generation, "settings", Settings(_env_file=None))
+        monkeypatch.setattr(video_generation, "_credits_reserve", None)
+        monkeypatch.setattr(video_generation, "enqueue_task", fake_enqueue)
+
+        job = await video_generation.create_video_job(
+            db,
+            script_id=seeded.script.id,
+            episode_id=seeded.episode.episode_id,
+            shot_group_id=seeded.shot_group.shot_group_id,
+            user_id=seeded.user.user_id,
+            idempotency_key="bailian-t2v-no-tail-frame",
+        )
+
+        assert job.status == "starting"
+        assert job.input_json["first_frame_supported"] is False
+        assert job.input_json["first_frame"] is None
+        assert job.input_json["continuation_dependency"] is None
 
     asyncio.run(scenario())
 
@@ -1813,6 +2048,41 @@ def test_openai_video_provider_sends_first_frame_and_uses_safe_download(
     asyncio.run(scenario())
 
 
+def test_openai_video_provider_rejects_multiple_reference_images_before_submit(
+    monkeypatch,
+) -> None:
+    async def scenario() -> None:
+        from app.providers.video_gen import VideoGenerationRequest, VideoGenerationSubmitRejected
+        from app.providers.video_gen_openai import OpenAIVideoGenProvider
+
+        provider = OpenAIVideoGenProvider()
+        monkeypatch.setattr(provider, "_check_keys", lambda: None)
+        monkeypatch.setattr(
+            provider,
+            "_build_client",
+            lambda: (_ for _ in ()).throw(AssertionError("超限请求不得创建客户端")),
+        )
+        request = VideoGenerationRequest(
+            prompt="镜头提示词",
+            reference_images=[
+                {"storage_key": "frames/one.png", "mime_type": "image/png"},
+                {"storage_key": "frames/two.png", "mime_type": "image/png"},
+            ],
+            reference_image_names=[],
+            reference_audios=[],
+            reference_audio_names=[],
+            model="sora-2",
+            job_id="job-sora-over-limit",
+        )
+
+        with pytest.raises(VideoGenerationSubmitRejected) as exc_info:
+            await provider.generate(request)
+
+        assert exc_info.value.diagnostics == {"code": "reference_images_limit_exceeded"}
+
+    asyncio.run(scenario())
+
+
 def test_video_providers_resume_persisted_provider_tasks(monkeypatch) -> None:
     async def scenario() -> None:
         from app.core.config import settings
@@ -2335,14 +2605,24 @@ def test_check_materials_treats_missing_audio_as_optional_fallback(
             "_load_and_check_script",
             AsyncMock(return_value=seeded.script),
         )
+        from app.services.reference_aggregator import AggregatedReferences
+
         monkeypatch.setattr(
             "app.services.reference_aggregator.aggregate_references",
             AsyncMock(
-                return_value=SimpleNamespace(
+                return_value=AggregatedReferences(
                     missing_subjects=missing_subjects,
                     missing_audio=["阿明", "门响"],
                 )
             ),
+        )
+        monkeypatch.setattr(
+            "app.services.video_generation._resolve_first_frame",
+            AsyncMock(return_value=None),
+        )
+        monkeypatch.setattr(
+            "app.services.video_generation._reserves_first_frame",
+            AsyncMock(return_value=False),
         )
 
         result = await api.check_materials(
@@ -2355,8 +2635,214 @@ def test_check_materials_treats_missing_audio_as_optional_fallback(
         assert result == {
             "missing_subjects": missing_subjects,
             "missing_audio": ["阿明", "门响"],
+            "missing_videos": [],
+            "effective_reference_counts": {
+                "images": 0,
+                "audios": 0,
+                "videos": 0,
+                "total": 0,
+                "reserves_first_frame": False,
+            },
+            "reference_violations": [],
             "ready": expected_ready,
         }
+
+    asyncio.run(scenario())
+
+
+def test_check_materials_reports_all_reference_violations_as_objects(monkeypatch) -> None:
+    async def scenario() -> None:
+        from app.api.v1 import video_generation as api
+        from app.schemas.video import VideoMaterialCheckOut
+        from app.services.reference_aggregator import AggregatedReferences
+        from app.services.runtime_models import RuntimeVideoModel
+
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        db = _AsyncSessionAdapter(raw)
+        monkeypatch.setattr(
+            api,
+            "_load_and_check_script",
+            AsyncMock(return_value=seeded.script),
+        )
+        monkeypatch.setattr(
+            "app.services.reference_aggregator.aggregate_references",
+            AsyncMock(
+                return_value=AggregatedReferences(
+                    reference_images=[{"storage_key": f"image-{index}"} for index in range(10)],
+                    reference_audios=[{"storage_key": f"audio-{index}"} for index in range(4)],
+                    reference_videos=[{"storage_key": f"video-{index}"} for index in range(4)],
+                )
+            ),
+        )
+        monkeypatch.setattr(
+            "app.services.video_generation._resolve_first_frame",
+            AsyncMock(return_value=None),
+        )
+        monkeypatch.setattr(
+            "app.services.video_generation._reserves_first_frame",
+            AsyncMock(return_value=False),
+        )
+        monkeypatch.setattr(
+            api,
+            "resolve_video_model",
+            AsyncMock(
+                return_value=RuntimeVideoModel(
+                    provider="bailian",
+                    model="wan2.6-i2v",
+                    reference_image_audit_required=False,
+                    task_provider_key="bailian",
+                )
+            ),
+        )
+
+        result = await api.check_materials(
+            shot_group_id=seeded.shot_group.shot_group_id,
+            script_id=seeded.script.id,
+            db=db,
+            user=seeded.user,
+        )
+
+        assert result["effective_reference_counts"] == {
+            "images": 10,
+            "audios": 4,
+            "videos": 4,
+            "total": 18,
+            "reserves_first_frame": False,
+        }
+        assert [item["code"] for item in result["reference_violations"]] == [
+            "reference_images_limit_exceeded",
+            "reference_audios_limit_exceeded",
+            "reference_videos_limit_exceeded",
+            "reference_media_total_limit_exceeded",
+            "reference_video_unsupported",
+        ]
+        assert all(set(item) == {"code", "detail"} for item in result["reference_violations"])
+        assert VideoMaterialCheckOut.model_validate(result).model_dump() == result
+        assert result["ready"] is False
+
+    asyncio.run(scenario())
+
+
+def test_check_materials_rejects_bailian_i2v_reserved_but_unavailable_frame(monkeypatch) -> None:
+    async def scenario() -> None:
+        from app.api.v1 import video_generation as api
+        from app.services.reference_aggregator import AggregatedReferences
+        from app.services.runtime_models import RuntimeVideoModel
+
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        db = _AsyncSessionAdapter(raw)
+        monkeypatch.setattr(
+            api,
+            "_load_and_check_script",
+            AsyncMock(return_value=seeded.script),
+        )
+        monkeypatch.setattr(
+            "app.services.reference_aggregator.aggregate_references",
+            AsyncMock(return_value=AggregatedReferences()),
+        )
+        monkeypatch.setattr(
+            "app.services.video_generation._resolve_first_frame",
+            AsyncMock(return_value=None),
+        )
+        monkeypatch.setattr(
+            "app.services.video_generation._reserves_first_frame",
+            AsyncMock(return_value=True),
+        )
+        monkeypatch.setattr(
+            api,
+            "resolve_video_model",
+            AsyncMock(
+                return_value=RuntimeVideoModel(
+                    provider="bailian",
+                    model="wanx2.1-kf2v",
+                    reference_image_audit_required=False,
+                    task_provider_key="bailian",
+                )
+            ),
+        )
+
+        result = await api.check_materials(
+            shot_group_id=seeded.shot_group.shot_group_id,
+            script_id=seeded.script.id,
+            db=db,
+            user=seeded.user,
+        )
+
+        assert result["effective_reference_counts"]["images"] == 1
+        assert [item["code"] for item in result["reference_violations"]] == [
+            "reference_input_image_required"
+        ]
+        assert result["ready"] is False
+
+    asyncio.run(scenario())
+
+
+def test_check_materials_uses_mgrouter_exclusive_first_frame_quota(monkeypatch) -> None:
+    async def scenario() -> None:
+        from app.api.v1 import video_generation as api
+        from app.services.reference_aggregator import AggregatedReferences
+        from app.services.runtime_models import RuntimeVideoModel
+
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        db = _AsyncSessionAdapter(raw)
+        monkeypatch.setattr(
+            api,
+            "_load_and_check_script",
+            AsyncMock(return_value=seeded.script),
+        )
+        monkeypatch.setattr(
+            "app.services.reference_aggregator.aggregate_references",
+            AsyncMock(
+                return_value=AggregatedReferences(
+                    reference_images=[{"storage_key": "reference/character.png"}],
+                    reference_audios=[{"storage_key": "reference/voice.mp3"}],
+                )
+            ),
+        )
+        monkeypatch.setattr(
+            "app.services.video_generation._resolve_first_frame",
+            AsyncMock(return_value="frames/previous.png"),
+        )
+        monkeypatch.setattr(
+            "app.services.video_generation._reserves_first_frame",
+            AsyncMock(return_value=True),
+        )
+        monkeypatch.setattr(
+            api,
+            "resolve_video_model",
+            AsyncMock(
+                return_value=RuntimeVideoModel(
+                    provider="mgrouter",
+                    model="AICC-Doubao-Seedance-2.0",
+                    reference_image_audit_required=False,
+                    task_provider_key="mgrouter",
+                )
+            ),
+        )
+
+        result = await api.check_materials(
+            shot_group_id=seeded.shot_group.shot_group_id,
+            script_id=seeded.script.id,
+            db=db,
+            user=seeded.user,
+        )
+
+        assert result["effective_reference_counts"] == {
+            "images": 2,
+            "audios": 1,
+            "videos": 0,
+            "total": 3,
+            "reserves_first_frame": True,
+        }
+        assert [item["code"] for item in result["reference_violations"]] == [
+            "reference_images_limit_exceeded",
+            "reference_audios_limit_exceeded",
+            "reference_media_total_limit_exceeded",
+        ]
+        assert result["ready"] is False
 
     asyncio.run(scenario())
 
@@ -2780,6 +3266,103 @@ def test_worker_resolves_first_frame_at_execution_and_persists_progress_and_prov
         assert refreshed.output_json["provider_task_id"] == "provider-task-1"
         assert refreshed.metrics["provider_task_id"] == "provider-task-1"
         assert refreshed.progress == 100
+
+    asyncio.run(scenario())
+
+
+def test_worker_honors_frozen_no_first_frame_capability(monkeypatch) -> None:
+    """执行时不得为纯文生任务重新解析同场景上一组尾帧。"""
+
+    async def scenario() -> None:
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        raw.get(ShotGroup, "sg-2").reference_frames = {"last_frame": "/frames/latest.png"}
+        job = _add_worker_job(
+            raw,
+            seeded,
+            job_id="job-no-first-frame",
+            reservation_id="reservation-no-first-frame",
+        )
+        job.input_json = {**job.input_json, "first_frame_supported": False}
+        raw.commit()
+        db = _AsyncSessionAdapter(raw)
+        seen_requests = []
+
+        class Provider:
+            async def generate(self, request, on_progress=None):
+                seen_requests.append(request)
+                return SimpleNamespace(
+                    video_storage_key="generate_images/video/job-no-first-frame.mp4",
+                    provider_job_id="provider-no-first-frame",
+                    metrics={},
+                )
+
+        monkeypatch.setattr("app.workers.video_generation._credits_settle", AsyncMock())
+
+        from app.workers.video_generation import run_video_generation_once
+
+        await run_video_generation_once(
+            db,
+            job.job_id,
+            owner="worker",
+            provider=Provider(),
+            extract_last_frame=AsyncMock(),
+        )
+
+        assert seen_requests[0].first_frame is None
+
+    asyncio.run(scenario())
+
+
+def test_worker_rejects_legacy_mgrouter_mixed_first_frame_references() -> None:
+    """历史任务在远端提交前也不能把首帧与普通参考图混用。"""
+
+    async def scenario() -> None:
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        job = _add_worker_job(
+            raw,
+            seeded,
+            job_id="job-legacy-mgrouter-first-frame",
+            reservation_id="reservation-legacy-mgrouter-first-frame",
+        )
+        job.provider_key = "mgrouter"
+        job.input_json = {
+            **job.input_json,
+            "model": "AICC-Doubao-Seedance-2.0",
+            "reference_images": [
+                {
+                    "storage_key": "generate_images/reference/character.png",
+                    "mime_type": "image/png",
+                }
+            ],
+        }
+        raw.commit()
+        db = _AsyncSessionAdapter(raw)
+        provider_called = False
+
+        class Provider:
+            async def generate(self, request, on_progress=None):
+                nonlocal provider_called
+                provider_called = True
+                raise AssertionError("不应向 Provider 提交不兼容的历史任务")
+
+        from app.workers.video_generation import run_video_generation_once
+
+        await run_video_generation_once(
+            db,
+            job.job_id,
+            owner="worker",
+            provider=Provider(),
+        )
+
+        refreshed = raw.get(VideoGenerationJob, job.job_id)
+        reservation = raw.get(CreditReservation, job.reservation_id)
+        assert provider_called is False
+        assert refreshed.status == "failed"
+        assert refreshed.error_type == "provider_submit_rejected"
+        assert refreshed.error_message == "reference_images_limit_exceeded"
+        assert reservation.status == "released"
 
     asyncio.run(scenario())
 
@@ -4849,6 +5432,7 @@ def test_video_service_persists_gemini_aliases_as_canonical_provider(
 
         _, raw = _make_db()
         seeded = _seed(raw)
+        seeded.shot_group.audio_elements = {"characters": [], "sounds": []}
         db = _AsyncSessionAdapter(raw)
         configured = Settings(
             _env_file=None,
@@ -4888,6 +5472,7 @@ def test_video_service_uses_database_selected_gemini_provider(monkeypatch) -> No
 
         _, raw = _make_db()
         seeded = _seed(raw)
+        seeded.shot_group.audio_elements = {"characters": [], "sounds": []}
         raw.add(
             VideoProviderConfig(
                 id="provider-gemini",
@@ -4934,6 +5519,7 @@ def test_gemini_service_job_routes_through_google_worker_factory(monkeypatch) ->
 
         _, raw = _make_db()
         seeded = _seed(raw)
+        seeded.shot_group.audio_elements = {"characters": [], "sounds": []}
         db = _AsyncSessionAdapter(raw)
         configured = Settings(
             _env_file=None,

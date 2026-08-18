@@ -26,6 +26,7 @@ from app.providers.video_gen import (
     VideoGenerationRemoteTerminalError,
     VideoGenerationRequest,
     VideoGenerationResult,
+    VideoGenerationSubmitRejected,
     await_video_task_checkpoint,
     execute_video_submission,
     managed_video_client,
@@ -102,6 +103,11 @@ class GoogleVideoGenProvider:
 
     async def generate(self, request: VideoGenerationRequest, on_progress=None) -> VideoGenerationResult:
         """提交 Veo 长任务，轮询完成后保存 MP4。"""
+
+        if request.reference_videos:
+            raise VideoGenerationSubmitRejected(
+                diagnostics={"code": "ReferenceVideoUnsupported"}
+            )
 
         operation_name = str((request.metadata or {}).get("provider_task_id") or "")
         if not operation_name:

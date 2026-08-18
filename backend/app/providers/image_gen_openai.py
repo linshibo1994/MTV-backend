@@ -25,6 +25,8 @@ from app.providers.image_gen import (
     ImageSafetyCategory,
     ImageSafetyRejectedError,
     classify_image_safety_code,
+    image_gen_model_override_applies_to,
+    image_gen_provider_is_selected,
     prompt_with_negative_constraints,
 )
 from app.providers.registry import ProviderConfigurationError
@@ -73,9 +75,10 @@ class OpenAIImageGenProvider:
     ) -> list[ImageResult]:
         api_key = (
             settings.image_gen_api_key
-            if settings.is_explicitly_configured("image_gen_api_key")
+            if image_gen_provider_is_selected("openai", configuration=settings)
+            and settings.is_explicitly_configured("image_gen_api_key")
             and settings.image_gen_api_key
-            else settings.openai_api_key or settings.image_gen_api_key
+            else settings.openai_api_key
         )
         if not api_key:
             raise ProviderConfigurationError(
@@ -83,16 +86,15 @@ class OpenAIImageGenProvider:
             )
         use_model = (
             settings.image_gen_model
-            if (
-                settings.is_explicitly_configured("image_gen_provider")
-                or settings.is_explicitly_configured("image_gen_model")
-            )
+            if image_gen_model_override_applies_to("openai", configuration=settings)
             and settings.image_gen_model
             else model or settings.openai_image_model
         )
         base_url = (
             settings.image_gen_base_url
-            if settings.is_explicitly_configured("image_gen_base_url")
+            if image_gen_provider_is_selected("openai", configuration=settings)
+            and settings.is_explicitly_configured("image_gen_base_url")
+            and settings.image_gen_base_url
             else None
         )
 

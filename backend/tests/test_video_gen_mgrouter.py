@@ -202,30 +202,56 @@ def test_mgrouter_duration_maps_three_seconds_to_four_and_rejects_other_invalid_
 
 
 @pytest.mark.asyncio
-async def test_mgrouter_first_frame_excludes_reference_images(monkeypatch) -> None:
+async def test_mgrouter_first_frame_rejects_other_reference_images(monkeypatch) -> None:
     _patch_settings(monkeypatch)
     provider = MgrouterVideoGenProvider()
     provider._encode_storage_image = AsyncMock(return_value="data:image/png;base64,Zmlyc3Q=")
 
-    body, _sensitive_values = await provider._build_request_body(
-        _request(
-            first_frame="frames/first.png",
-            reference_images=[
-                {"storage_key": "frames/first.png", "mime_type": "image/png"},
-                {"storage_key": "references/ignored.webp", "mime_type": "image/webp"},
-            ],
-        ),
-        "AICC-Doubao-Seedance-2.0",
-    )
+    with pytest.raises(VideoGenerationSubmitRejected) as exc_info:
+        await provider._build_request_body(
+            _request(
+                first_frame="frames/first.png",
+                reference_images=[
+                    {"storage_key": "frames/first.png", "mime_type": "image/png"},
+                    {"storage_key": "references/other.webp", "mime_type": "image/webp"},
+                ],
+            ),
+            "AICC-Doubao-Seedance-2.0",
+        )
 
-    assert body["content"][1:] == [
-        {
-            "type": "image_url",
-            "image_url": {"url": "data:image/png;base64,Zmlyc3Q="},
-            "role": "first_frame",
-        }
-    ]
-    provider._encode_storage_image.assert_awaited_once_with("frames/first.png", "image/png")
+    assert exc_info.value.diagnostics == {"code": "reference_images_limit_exceeded"}
+    provider._encode_storage_image.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_mgrouter_first_frame_rejects_reference_audio(monkeypatch) -> None:
+    _patch_settings(monkeypatch)
+
+    with pytest.raises(VideoGenerationSubmitRejected) as exc_info:
+        await MgrouterVideoGenProvider()._build_request_body(
+            _request(
+                first_frame="frames/first.png",
+                reference_audios=[{"storage_key": "references/voice.mp3"}],
+            ),
+            "AICC-Doubao-Seedance-2.0",
+        )
+
+    assert exc_info.value.diagnostics == {"code": "reference_audios_limit_exceeded"}
+
+
+@pytest.mark.asyncio
+async def test_mgrouter_reference_audio_requires_normal_reference_image(monkeypatch) -> None:
+    _patch_settings(monkeypatch)
+
+    with pytest.raises(VideoGenerationSubmitRejected) as exc_info:
+        await MgrouterVideoGenProvider()._build_request_body(
+            _request(reference_audios=[{"storage_key": "references/voice.mp3"}]),
+            "AICC-Doubao-Seedance-2.0",
+        )
+
+    assert exc_info.value.diagnostics == {
+        "code": "reference_audio_requires_reference_image"
+    }
 
 
 @pytest.mark.asyncio

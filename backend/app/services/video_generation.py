@@ -32,6 +32,15 @@ from sqlalchemy.orm import noload
 
 from app.core.config import settings
 from app.core.errors import BadRequestError, ConflictError, ForbiddenError
+from app.core.reference_media_limits import (
+    ReferenceMediaCounts,
+    ReferenceMediaLimitExceeded,
+    effective_reference_media_limits_for_group,
+    reference_media_limits_for_provider,
+    should_follow_direct_predecessor,
+    supports_reference_videos,
+    validate_reference_media_counts,
+)
 from app.crud import video as video_crud
 from app.models.episode import Episode
 from app.models.script import Script
@@ -47,6 +56,7 @@ from app.providers.video_gen import (
     VideoCancellationResult,
     get_video_provider,
 )
+from app.services import runtime_models
 from app.services.prompt_template import (
     PromptTemplateSnapshot,
     render_prompt_template_with_fallback,
@@ -59,7 +69,6 @@ from app.services.reference_image_audit import (
     include_first_frame,
 )
 from app.services.reference_tokens import bind_reference_tokens_to_prompt
-from app.services.runtime_models import resolve_video_model
 from app.services.task_dispatch import cancel_outbox_task, enqueue_task
 from app.services.video_prompt import append_boundary_facts, compose_video_prompt
 from app.services.video_remote_cancellation import (
@@ -76,6 +85,16 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 _IDEMPOTENCY_CONFLICT_DETAIL = "幂等键已用于不同请求载荷"
+
+
+async def resolve_video_model(
+    db: AsyncSession,
+    configured_settings: Any | None = None,
+) -> runtime_models.RuntimeVideoModel:
+    """保留服务内可替换入口，同时在调用时解析运行时模型。"""
+
+    return await runtime_models.resolve_video_model(db, configured_settings)
+
 
 # 跨模块依赖（T2 积分服务可能未就绪，统一从 PLAN 路径 import）
 try:
@@ -244,13 +263,29 @@ async def create_video_job(
             job=active_job,
         )
 
+    # Provider/模型能力在创建时冻结。首帧是实际图片输入的一种，纯文生模型
+    # 不能建立前驱等待或在执行阶段继续传入上一组尾帧。
+    runtime_video_model = await resolve_video_model(db, settings)
+    reference_limits = reference_media_limits_for_provider(
+        runtime_video_model.provider,
+        runtime_video_model.model,
+    )
+    supports_first_frame = reference_limits.supports_first_frame
+    # 保留 is_continuation 作为用户明确选择；自动合并的 I2V 后续组通过
+    # reference_frames 内部标记进入同一严格前驱依赖链。
+    is_continuation = bool(getattr(shot_group, "is_continuation", False))
+    follows_direct_predecessor = should_follow_direct_predecessor(
+        shot_group,
+        limits=reference_limits,
+    )
+
     predecessor_job: VideoGenerationJob | None = None
     predecessor_group: ShotGroup | None = None
     predecessor_last_frame: str | None = None
     continuation_static_fallback: str | None = None
     waiting_for_dependency = False
     dependency_unavailable = False
-    if bool(getattr(shot_group, "is_continuation", False)):
+    if follows_direct_predecessor:
         predecessor_group = await _resolve_direct_predecessor(db, shot_group)
         # 静态回退在任务创建事务中冻结。它只来自当前组显式参考帧或同场景
         # 直接前驱的静态尾帧，不查询任何历史视频任务，避免把旧 attempt 的
@@ -285,22 +320,63 @@ async def create_video_job(
 
     # 3. 汇聚参考图 + 参考音频
     aggregated = await aggregate_references(db, shot_group_id)
+    if aggregated.missing_videos:
+        raise BadRequestError("参考视频必须是当前剧本已成功生成的视频，请重新选择")
 
     # 4. 首尾帧链式衔接：取上一组 last_frame 作为当前组首帧参考（doc 06 §10.3）
-    first_frame = (
-        predecessor_last_frame or continuation_static_fallback
-        if bool(getattr(shot_group, "is_continuation", False))
-        else await _resolve_first_frame(db, shot_group)
-    )
+    first_frame: str | None = None
+    if supports_first_frame:
+        first_frame = (
+            predecessor_last_frame or continuation_static_fallback
+            if follows_direct_predecessor
+            else await _resolve_first_frame(db, shot_group)
+        )
     if first_frame:
         # 持久化到当前组 reference_frames.first_frame
         await _persist_first_frame(db, shot_group, first_frame)
     # 任一实际传给视频模型的图片都必须绑定当前审核快照；首帧也在其中。
     include_first_frame(aggregated, first_frame)
+    if aggregated.reference_videos and not supports_reference_videos(
+        runtime_video_model.provider,
+        runtime_video_model.model,
+    ):
+        raise BadRequestError("当前视频模型不支持参考视频，请移除参考视频或切换至 Seedance/NeoLink")
+    reserves_first_frame = await _reserves_first_frame(
+        db,
+        shot_group,
+        is_continuation=follows_direct_predecessor,
+        supports_first_frame=supports_first_frame,
+    )
+    uses_first_frame = bool(first_frame) or reserves_first_frame
+    try:
+        # 首帧经独立 role 提交；审核清单中同键项不再作为普通参考图重复发送。
+        provider_reference_images = [
+            image
+            for image in aggregated.reference_images
+            if not first_frame or image.get("storage_key") != first_frame
+        ]
+        validate_reference_media_counts(
+            ReferenceMediaCounts(
+                images=len(provider_reference_images),
+                audios=len(aggregated.reference_audios),
+                videos=len(aggregated.reference_videos),
+                first_frames=1 if uses_first_frame else 0,
+                # 普通后续组的容量预约不能视为实际图片输入；只有已经解析到
+                # 首帧，或续帧任务已进入可靠等待链路时，图生模型才能通过下限校验。
+                available_first_frames=1
+                if first_frame or waiting_for_dependency
+                else 0,
+            ),
+            limits=effective_reference_media_limits_for_group(
+                reference_limits,
+                reserve_first_frame=uses_first_frame,
+            ),
+        )
+    except ReferenceMediaLimitExceeded as exc:
+        raise BadRequestError(exc.detail) from None
 
     # 5. 取实际激活供应商配置。审核要求由规范化后的实际供应商决定：只有
     # 火山 Seedance 才调用 veImageX；百炼等供应商不展示也不强制该审核流程。
-    runtime_video_model = await resolve_video_model(db, settings)
     if runtime_video_model.reference_image_audit_required:
         audit_state = ensure_references_approved(shot_group.reference_image_audit, aggregated)
     else:
@@ -379,16 +455,21 @@ async def create_video_job(
         "boundary_prompt_fragments": boundary_fragments,
         "reference_audios": aggregated.reference_audios,
         "reference_audio_names": aggregated.reference_audio_names,
-        "reference_videos": [],
-        "reference_video_names": [],
+        "reference_videos": aggregated.reference_videos,
+        "reference_video_names": aggregated.reference_video_names,
         # 首帧参考（上一组尾帧，链式衔接；传给 provider 作首帧约束）
         "first_frame": first_frame,
+        "first_frame_supported": supports_first_frame,
         "reference_image_audit": audit_state,
         # 未通过审核的主体名/角色（供 [检查素材] 接口标红）
         "missing_subjects": aggregated.missing_subjects,
         "missing_audio": aggregated.missing_audio,
+        "missing_videos": aggregated.missing_videos,
         "duration_seconds": shot_group.duration_seconds,
-        "is_continuation": bool(getattr(shot_group, "is_continuation", False)),
+        "is_continuation": is_continuation,
+        # 任务冻结的实际依赖语义。自动合并时该字段可为 true，而用户开关
+        # is_continuation 仍保持 false，供 Worker 避免重新解析到错误前驱。
+        "awaits_predecessor_frame": follows_direct_predecessor,
         "continuation_dependency": (
             {
                 "state": (
@@ -413,7 +494,7 @@ async def create_video_job(
                     else None
                 ),
             }
-            if bool(getattr(shot_group, "is_continuation", False))
+            if follows_direct_predecessor
             else None
         ),
         "shot_group_version": {
@@ -1157,14 +1238,19 @@ async def _bind_existing_job(
         raise ConflictError(_IDEMPOTENCY_CONFLICT_DETAIL) from exc
 
 
-async def _resolve_first_frame(db: AsyncSession, shot_group: ShotGroup) -> str | None:
+async def _resolve_first_frame(
+    db: AsyncSession,
+    shot_group: ShotGroup,
+    *,
+    is_continuation: bool | None = None,
+) -> str | None:
     """取上一镜头组的 reference_frames.last_frame 作为当前组首帧参考。
 
     普通镜头组兼容历史行为：使用同场景更早且已有尾帧的最近一组。
     ``is_continuation`` 镜头组必须使用同场景 group_index 的直接前驱；直接前驱
     缺少尾帧时返回 None，绝不跳过中间组寻找更早素材。
     """
-    if not shot_group.group_no:
+    if not getattr(shot_group, "group_no", None):
         return None
     stmt = select(ShotGroup).where(
         ShotGroup.script_id == shot_group.script_id,
@@ -1174,7 +1260,12 @@ async def _resolve_first_frame(db: AsyncSession, shot_group: ShotGroup) -> str |
     )
     result = await db.execute(stmt)
     candidates = list(result.scalars().all())
-    if bool(getattr(shot_group, "is_continuation", False)):
+    continuation = (
+        bool(getattr(shot_group, "is_continuation", False))
+        if is_continuation is None
+        else is_continuation
+    )
+    if continuation:
         predecessor = await _resolve_direct_predecessor(db, shot_group)
         if predecessor is None:
             return None
@@ -1193,6 +1284,42 @@ async def _resolve_first_frame(db: AsyncSession, shot_group: ShotGroup) -> str |
         if last_frame:
             return str(last_frame)
     return None
+
+
+async def _reserves_first_frame(
+    db: AsyncSession,
+    shot_group: ShotGroup,
+    *,
+    is_continuation: bool | None = None,
+    supports_first_frame: bool = True,
+) -> bool:
+    """判断是否应为同场景前组尾帧预留图片与总数配额。"""
+
+    if not supports_first_frame:
+        return False
+    continuation = (
+        bool(getattr(shot_group, "is_continuation", False))
+        if is_continuation is None
+        else is_continuation
+    )
+    if continuation:
+        return True
+    if not getattr(shot_group, "group_index", None):
+        return False
+    predecessor_id = (
+        await db.execute(
+            select(ShotGroup.shot_group_id)
+            .where(
+                ShotGroup.script_id == shot_group.script_id,
+                ShotGroup.episode_id == shot_group.episode_id,
+                ShotGroup.scene_no == shot_group.scene_no,
+                ShotGroup.group_index < shot_group.group_index,
+                ShotGroup.unit_id.like("group:%"),
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    return predecessor_id is not None
 
 
 def _safe_static_frame(reference_frames: object, key: str) -> str | None:

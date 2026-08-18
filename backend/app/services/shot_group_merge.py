@@ -11,6 +11,12 @@ from sqlalchemy.orm import noload
 
 from app.core.errors import BadRequestError, ConflictError, ForbiddenError, NotFoundError
 from app.core.ids import new_id
+from app.core.reference_media_limits import (
+    CONTINUATION_FROM_PREDECESSOR_KEY,
+    ReferenceMediaLimits,
+    reference_media_limits_for_provider,
+    trim_automatic_reference_selection,
+)
 from app.models.episode import Episode
 from app.models.scene import Scene
 from app.models.script import Script
@@ -319,6 +325,8 @@ async def _refresh_group(
     narrative_purpose: str,
     subjects: list[Subject],
     duration_by_shot: dict[str, int],
+    reserve_first_frame: bool = False,
+    reference_limits: ReferenceMediaLimits | None = None,
     prompt_context: dict[str, object] | None = None,
     source_storyboard_job_id: str | None = None,
 ) -> None:
@@ -362,7 +370,7 @@ async def _refresh_group(
         narrative_purpose=narrative_purpose,
         director_commands=director_commands,
     )
-    group.materials = _structured_materials(
+    materials = _structured_materials(
         shots,
         subjects,
         background=background,
@@ -370,14 +378,31 @@ async def _refresh_group(
         referenced_names,
         subjects,
     )
-    group.audio_elements = {
+    audio_elements_by_type = {
         "characters": [item for item in audio_elements if item.get("type") == "character"],
         "sounds": [item for item in audio_elements if item.get("type") == "sound"],
     }
+    # 自动组合来自多个小分镜，引用总数可能超出模型输入上限；按叙事顺序
+    # 收敛而非生成不可提交的正式组。人工编辑则由编辑接口显式拒绝超限。
+    group.materials, group.audio_elements = trim_automatic_reference_selection(
+        materials,
+        audio_elements_by_type,
+        reserve_continuation_first_frame=reserve_first_frame,
+        limits=reference_limits,
+    )
     group.description_text = narrative_purpose
     group.duration_seconds = cursor
     group.video_duration_seconds = cursor
     group.quality_summary = quality_summary
+    # 图生模型的同场景后续组没有普通图片额度时，必须等待严格直接前驱
+    # 的真实尾帧。该内部标记与用户的“承接上一组尾帧”开关分离。
+    if (
+        reserve_first_frame
+        and reference_limits is not None
+        and reference_limits.requires_input_image
+        and reference_limits.supports_first_frame
+    ):
+        reference_frames[CONTINUATION_FROM_PREDECESSOR_KEY] = True
     group.reference_frames = reference_frames
     group.is_continuation = is_continuation
     group.prompt_context = prompt_context
@@ -569,6 +594,13 @@ async def merge_shots_into_groups(
         ).scalars().all()
     )
     source_group_by_id = {group.shot_group_id: group for group in source_groups}
+    from app.services.runtime_models import resolve_video_model
+
+    runtime_video_model = await resolve_video_model(db)
+    reference_limits = reference_media_limits_for_provider(
+        runtime_video_model.provider,
+        runtime_video_model.model,
+    )
 
     # 先释放源组内唯一编号，避免批量搬迁时命中非延迟唯一约束。
     for index, shot in enumerate(all_shots, start=1):
@@ -577,6 +609,7 @@ async def merge_shots_into_groups(
     await db.flush()
 
     created_groups: list[ShotGroup] = []
+    created_scene_numbers: set[int] = set()
     temporary_base = max(group.group_index for group in source_groups) + 10_000
     for index, (scene, bucket) in enumerate(final_shot_buckets, start=1):
         shot_group_id = new_id()
@@ -625,10 +658,19 @@ async def merge_shots_into_groups(
             narrative_purpose="；".join(narrative_parts),
             subjects=subjects,
             duration_by_shot=duration_by_shot,
+            # 同场景第二个及后续组会从前组尾帧取得首帧约束，提前预留一张
+            # 图片和一个总引用名额；纯文生模型不消费首帧，不能制造虚假的
+            # 预留而让组合结果无法提交。
+            reserve_first_frame=(
+                reference_limits.supports_first_frame
+                and scene.scene_no in created_scene_numbers
+            ),
+            reference_limits=reference_limits,
             prompt_context=inherited_prompt_context,
             source_storyboard_job_id=inherited_source_job_id,
         )
         created_groups.append(group)
+        created_scene_numbers.add(scene.scene_no)
 
     await db.flush()
     await db.execute(

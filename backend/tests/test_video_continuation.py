@@ -762,7 +762,7 @@ def test_create_continuation_without_predecessor_job_waits_without_dispatch(monk
             AsyncMock(
                 return_value=RuntimeVideoModel(
                     provider="bailian",
-                    model="wan-video",
+                    model="wan2.6-i2v",
                     reference_image_audit_required=False,
                     task_provider_key="bailian",
                 )

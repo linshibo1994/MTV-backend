@@ -149,6 +149,18 @@ def test_neolink_video_capability_only_needs_dedicated_url_and_key() -> None:
     assert configured.video_gen_model == "doubao-seedance-2-0-260128"
 
 
+def test_neolink_image_capability_falls_back_to_dedicated_config() -> None:
+    configured = _settings(
+        image_gen_provider="neolink",
+        neolink_api_key="neolink-key",
+        neolink_base_url="https://neolink.com/api/",
+    )
+
+    assert configured.image_gen_api_key == "neolink-key"
+    assert configured.image_gen_base_url == "https://neolink.com/api"
+    assert configured.image_gen_model == "gp-im-2"
+
+
 @pytest.mark.parametrize(
     ("model", "expected_provider"),
     [
@@ -157,6 +169,7 @@ def test_neolink_video_capability_only_needs_dedicated_url_and_key() -> None:
         ("wan2.1-t2i-plus", "bailian"),
         ("qwen-image", "bailian"),
         ("qwen-image-2.0", "bailian"),
+        ("gp-im-2", "neolink"),
     ],
 )
 def test_image_factory_recognized_model_alias_wins_over_explicit_env_provider(
@@ -166,6 +179,7 @@ def test_image_factory_recognized_model_alias_wins_over_explicit_env_provider(
     from app.providers.image_gen import get_image_provider
     from app.providers.image_gen_bailian import BailianImageGenProvider
     from app.providers.image_gen_google import GoogleImageGenProvider
+    from app.providers.image_gen_neolink import NeolinkImageGenProvider
     from app.providers.image_gen_openai import OpenAIImageGenProvider
 
     configured = _settings(image_gen_provider="openai")
@@ -174,6 +188,7 @@ def test_image_factory_recognized_model_alias_wins_over_explicit_env_provider(
     expected_types = {
         "bailian": BailianImageGenProvider,
         "google": GoogleImageGenProvider,
+        "neolink": NeolinkImageGenProvider,
         "openai": OpenAIImageGenProvider,
     }
     assert isinstance(get_image_provider(model), expected_types[expected_provider])
@@ -198,6 +213,36 @@ def test_image_factory_keeps_legacy_model_alias_without_explicit_provider(monkey
     monkeypatch.setattr(config, "settings", configured)
 
     assert isinstance(get_image_provider("wan2.1-t2i-plus"), BailianImageGenProvider)
+
+
+@pytest.mark.parametrize(
+    ("selected_provider", "vendor"),
+    [
+        ("google", "gemini"),
+        ("gemini", "google"),
+        ("dashscope", "bailian"),
+        ("aliyun", "qwen"),
+        ("neo-link", "neolink"),
+    ],
+)
+def test_image_gen_provider_override_normalizes_vendor_aliases(
+    selected_provider: str,
+    vendor: str,
+) -> None:
+    from app.providers.image_gen import image_gen_provider_is_selected
+
+    configured = _settings(image_gen_provider=selected_provider)
+
+    assert image_gen_provider_is_selected(vendor, configuration=configured) is True
+
+
+@pytest.mark.parametrize("selected_provider", ["", "unsupported-image-vendor"])
+def test_image_gen_provider_override_ignores_empty_or_unknown_vendor(selected_provider: str) -> None:
+    from app.providers.image_gen import image_gen_provider_is_selected
+
+    configured = _settings(image_gen_provider=selected_provider)
+
+    assert image_gen_provider_is_selected("bailian", configuration=configured) is False
 
 
 def test_llm_factory_supports_anthropic_and_custom_openai_compatible(monkeypatch) -> None:
@@ -899,6 +944,95 @@ def test_openai_image_size_keeps_square_and_landscape_mappings(
     assert _map_size("2k", aspect) == expected
 
 
+@pytest.mark.parametrize(
+    ("size", "aspect", "expected"),
+    [
+        ("1k", "16:9", "1792x1008"),
+        ("1k", "9:16", "1008x1792"),
+        ("1k", "1:1", "1024x1024"),
+        ("1k", "4:3", "1344x1008"),
+        ("1k", "3:4", "1008x1344"),
+        ("1k", "3:2", "1536x1024"),
+        ("1k", "2:3", "1024x1536"),
+        ("2k", "16:9", "2816x1584"),
+        ("2k", "9:16", "1584x2816"),
+        ("2k", "1:1", "1536x1536"),
+        ("2k", "4:3", "2048x1536"),
+        ("2k", "3:4", "1536x2048"),
+        ("2k", "3:2", "2304x1536"),
+        ("2k", "2:3", "1536x2304"),
+        ("4k", "16:9", "3840x2160"),
+        ("4k", "9:16", "2160x3840"),
+        ("4k", "1:1", "2160x2160"),
+        ("4k", "4:3", "2880x2160"),
+        ("4k", "3:4", "2160x2880"),
+        ("4k", "3:2", "3216x2144"),
+        ("4k", "2:3", "2144x3216"),
+        ("1K", "AUTO", "1792x1008"),
+    ],
+)
+def test_neolink_image_size_mapping_uses_documented_16_multiple_sizes(
+    size: str,
+    aspect: str,
+    expected: str,
+) -> None:
+    from app.providers.image_gen_neolink import _map_size
+
+    actual = _map_size("gp-im-2", size, aspect)
+
+    assert actual == expected
+    width, height = (int(part) for part in actual.split("x", 1))
+    assert width % 16 == 0
+    assert height % 16 == 0
+    assert width <= height * 3
+    assert height <= width * 3
+    assert max(width, height) <= 3840
+    assert min(width, height) <= 2160
+
+
+def test_neolink_image_size_mapping_rejects_unsupported_gpt_image_tier() -> None:
+    from app.providers.image_gen_neolink import _map_size
+    from app.providers.registry import ProviderConfigurationError
+
+    with pytest.raises(ProviderConfigurationError):
+        _map_size("gpt-image-1", "2k", "16:9")
+
+
+def test_neolink_image_size_mapping_rejects_unsupported_aspect() -> None:
+    from app.providers.image_gen_neolink import _map_size
+    from app.providers.registry import ProviderConfigurationError
+
+    with pytest.raises(ProviderConfigurationError, match="支持"):
+        _map_size("gp-im-2", "1k", "5:4")
+
+
+def test_neolink_image_base_url_normalizes_openai_sdk_path() -> None:
+    from app.providers.image_gen_neolink import _normalize_neolink_image_base_url
+
+    assert (
+        _normalize_neolink_image_base_url("https://neolink.com/api")
+        == "https://neolink.com/api/v1"
+    )
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "http://neolink.com/api",
+        "https://neolink.com/api?api_key=leak",
+        "https://neolink.com:8443/api",
+        "https://user:password@neolink.com/api",
+        "https://neolink.com/api#fragment",
+    ],
+)
+def test_neolink_image_base_url_rejects_unsafe_values(base_url: str) -> None:
+    from app.providers.image_gen_neolink import _normalize_neolink_image_base_url
+    from app.providers.registry import ProviderConfigurationError
+
+    with pytest.raises(ProviderConfigurationError):
+        _normalize_neolink_image_base_url(base_url)
+
+
 @pytest.mark.asyncio
 async def test_google_image_provider_uses_capability_key_url_and_model(monkeypatch) -> None:
     from app.providers import image_gen_google
@@ -1064,6 +1198,195 @@ async def test_bailian_provider_config_keeps_requested_model_without_explicit_mo
 
     assert result[0].data == b"image"
     assert sync_generate.await_args.args[4:7] == ("qwen-image-2.0", "1728*2368", 1)
+
+
+@pytest.mark.asyncio
+async def test_bailian_image_provider_keeps_vendor_config_when_neolink_is_selected(
+    monkeypatch,
+) -> None:
+    """模型别名路由到百炼时，不得使用 NeoLink 的通用图片配置。"""
+    from app.providers import image_gen_bailian
+    from app.providers.image_gen import ImageResult
+    from app.providers.image_gen_bailian import BailianImageGenProvider
+
+    configured = _settings(
+        image_gen_provider="neolink",
+        image_gen_api_key="neolink-image-key",
+        image_gen_base_url="https://neolink.com/api",
+        image_gen_model="gp-im-2",
+        dashscope_api_key="dashscope-key",
+        dashscope_base_url="https://dashscope.example",
+    )
+    monkeypatch.setattr(image_gen_bailian, "settings", configured)
+    calls: dict = {}
+
+    class Response:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {
+                "output": {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": [{"image": "https://oss.aliyuncs.com/result.png"}]
+                            }
+                        }
+                    ]
+                }
+            }
+
+    class Client:
+        def __init__(self, **kwargs) -> None:
+            calls["client"] = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def post(self, url, *, headers, json):
+            calls["post"] = {"url": url, "headers": headers, "json": json}
+            return Response()
+
+    monkeypatch.setattr(image_gen_bailian.httpx, "AsyncClient", Client)
+    provider = BailianImageGenProvider()
+    download = AsyncMock(return_value=ImageResult(data=b"image", mime_type="image/png"))
+    monkeypatch.setattr(provider, "_download", download)
+
+    result = await provider.generate("角色设定图", "qwen-image-2.0", "2k", "1:1")
+
+    assert result[0].data == b"image"
+    assert calls["post"]["url"] == (
+        "https://dashscope.example/api/v1/services/aigc/multimodal-generation/generation"
+    )
+    assert calls["post"]["headers"]["Authorization"] == "Bearer dashscope-key"
+    assert "neolink-image-key" not in calls["post"]["headers"].values()
+    assert calls["post"]["json"]["model"] == "qwen-image-2.0"
+    download.assert_awaited_once_with(
+        "https://oss.aliyuncs.com/result.png",
+        base_url="https://dashscope.example",
+    )
+
+
+@pytest.mark.asyncio
+async def test_bailian_image_provider_applies_generic_override_when_bailian_is_selected(
+    monkeypatch,
+) -> None:
+    """百炼是生效厂商时，IMAGE_GEN_* 覆盖仍需正常生效。"""
+    from app.providers import image_gen_bailian
+    from app.providers.image_gen import ImageResult
+    from app.providers.image_gen_bailian import BailianImageGenProvider
+
+    configured = _settings(
+        image_gen_provider="bailian",
+        image_gen_api_key="bailian-image-key",
+        image_gen_base_url="https://bailian-gateway.example",
+        image_gen_model="qwen-image-2.0",
+        dashscope_api_key="dashscope-fallback-key",
+        dashscope_base_url="https://dashscope-fallback.example",
+    )
+    monkeypatch.setattr(image_gen_bailian, "settings", configured)
+    calls: dict = {}
+
+    class Response:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {
+                "output": {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": [{"image": "https://oss.aliyuncs.com/result.png"}]
+                            }
+                        }
+                    ]
+                }
+            }
+
+    class Client:
+        def __init__(self, **kwargs) -> None:
+            calls["client"] = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def post(self, url, *, headers, json):
+            calls["post"] = {"url": url, "headers": headers, "json": json}
+            return Response()
+
+    monkeypatch.setattr(image_gen_bailian.httpx, "AsyncClient", Client)
+    provider = BailianImageGenProvider()
+    download = AsyncMock(return_value=ImageResult(data=b"image", mime_type="image/png"))
+    monkeypatch.setattr(provider, "_download", download)
+
+    await provider.generate("角色设定图", "wan2.1-t2i-plus", "2k", "1:1")
+
+    assert calls["post"]["url"] == (
+        "https://bailian-gateway.example/api/v1/services/aigc/multimodal-generation/generation"
+    )
+    assert calls["post"]["headers"]["Authorization"] == "Bearer bailian-image-key"
+    assert calls["post"]["json"]["model"] == "qwen-image-2.0"
+    download.assert_awaited_once_with(
+        "https://oss.aliyuncs.com/result.png",
+        base_url="https://bailian-gateway.example",
+    )
+
+
+@pytest.mark.asyncio
+async def test_neolink_image_provider_applies_generic_override_when_neolink_is_selected(
+    monkeypatch,
+) -> None:
+    """NeoLink 是生效厂商时，IMAGE_GEN_* 覆盖仍需正常生效。"""
+    import base64
+
+    from app.providers import image_gen_neolink
+    from app.providers.image_gen_neolink import NeolinkImageGenProvider
+
+    configured = _settings(
+        image_gen_provider="neolink",
+        image_gen_api_key="neolink-image-key",
+        image_gen_base_url="https://neolink.com/api",
+        image_gen_model="gp-im-2",
+        neolink_api_key="neolink-fallback-key",
+        neolink_base_url="https://neolink-fallback.example/api",
+    )
+    monkeypatch.setattr(image_gen_neolink, "settings", configured)
+    calls: dict = {}
+
+    class Client:
+        def __init__(self, **kwargs) -> None:
+            calls["client"] = kwargs
+            self.images = SimpleNamespace(generate=AsyncMock(side_effect=self._generate))
+            self.close = AsyncMock()
+
+        async def _generate(self, **kwargs):
+            calls["generate"] = kwargs
+            encoded = base64.b64encode(b"neolink-image").decode("ascii")
+            return SimpleNamespace(data=[SimpleNamespace(b64_json=encoded, url=None)])
+
+    monkeypatch.setattr(image_gen_neolink, "AsyncOpenAI", Client)
+
+    result = await NeolinkImageGenProvider().generate(
+        prompt="prompt",
+        model="qwen-image-2.0",
+        size="1k",
+        aspect="1:1",
+    )
+
+    assert result[0].data == b"neolink-image"
+    assert calls["client"] == {
+        "api_key": "neolink-image-key",
+        "base_url": "https://neolink.com/api/v1",
+    }
+    assert calls["generate"]["model"] == "gp-im-2"
 
 
 @pytest.mark.asyncio
@@ -1380,11 +1703,258 @@ async def test_openai_image_provider_uses_capability_config_and_closes_client(mo
         "api_key": "image-key",
         "base_url": "https://openai-gateway.example/v1",
     }
-    assert calls["generate"]["model"] == "gpt-image-2"
+    assert calls["generate"]["model"] == "ignored"
     assert calls["generate"]["prompt"] == (
         "prompt\n\nDo not include in the generated image: photorealistic"
     )
     client_holder["client"].close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_neolink_image_provider_decodes_base64_and_closes_client(monkeypatch) -> None:
+    import base64
+
+    from app.providers import image_gen_neolink
+    from app.providers.image_gen import ImageResult
+    from app.providers.image_gen_neolink import NeolinkImageGenProvider
+
+    monkeypatch.setattr(
+        image_gen_neolink,
+        "settings",
+        _settings(
+            image_gen_provider="neolink",
+            image_gen_api_key="image-key",
+            image_gen_base_url="https://neolink.com/api",
+            image_gen_model="gp-im-2",
+        ),
+    )
+    calls: dict = {}
+
+    class Client:
+        def __init__(self, **kwargs):
+            calls["client"] = kwargs
+            self.images = SimpleNamespace(generate=AsyncMock(side_effect=self._generate))
+            self.close = AsyncMock()
+
+        async def _generate(self, **kwargs):
+            calls["generate"] = kwargs
+            encoded = base64.b64encode(b"neolink-image").decode("ascii")
+            return SimpleNamespace(data=[SimpleNamespace(b64_json=encoded, url=None)])
+
+    client_holder: dict = {}
+
+    def _client_factory(**kwargs):
+        client = Client(**kwargs)
+        client_holder["client"] = client
+        return client
+
+    monkeypatch.setattr(image_gen_neolink, "AsyncOpenAI", _client_factory)
+
+    result = await NeolinkImageGenProvider().generate(
+        prompt="prompt",
+        model="ignored",
+        size="1k",
+        aspect="16:9",
+        count=2,
+        negative_prompt="photorealistic",
+    )
+
+    assert isinstance(result[0], ImageResult)
+    assert result[0].data == b"neolink-image"
+    assert calls["client"] == {
+        "api_key": "image-key",
+        "base_url": "https://neolink.com/api/v1",
+    }
+    assert calls["generate"] == {
+        "model": "gp-im-2",
+        "prompt": "prompt\n\nDo not include in the generated image: photorealistic",
+        "size": "1792x1008",
+        "n": 2,
+    }
+    client_holder["client"].close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_neolink_image_provider_rejects_invalid_base64_data(monkeypatch) -> None:
+    from app.providers import image_gen_neolink
+    from app.providers.image_gen_neolink import NeolinkImageGenProvider
+
+    monkeypatch.setattr(
+        image_gen_neolink,
+        "settings",
+        _settings(
+            image_gen_provider="neolink",
+            image_gen_api_key="image-key",
+            image_gen_base_url="https://neolink.com/api",
+            image_gen_model="gp-im-2",
+        ),
+    )
+
+    class Client:
+        def __init__(self, **kwargs):
+            self.images = SimpleNamespace(
+                generate=AsyncMock(
+                    return_value=SimpleNamespace(
+                        data=[SimpleNamespace(b64_json="%%%", url=None)]
+                    )
+                )
+            )
+            self.close = AsyncMock()
+
+    monkeypatch.setattr(image_gen_neolink, "AsyncOpenAI", Client)
+
+    with pytest.raises(RuntimeError, match="NeoLink 返回的图片 Base64 数据无效"):
+        await NeolinkImageGenProvider().generate(
+            prompt="prompt",
+            model="ignored",
+            size="1k",
+            aspect="16:9",
+        )
+
+
+@pytest.mark.asyncio
+async def test_neolink_image_provider_treats_model_not_found_as_configuration_error(monkeypatch) -> None:
+    from httpx import Request, Response
+    from openai import NotFoundError
+
+    from app.providers import image_gen_neolink
+    from app.providers.image_gen_neolink import NeolinkImageGenProvider
+    from app.providers.registry import ProviderConfigurationError
+
+    monkeypatch.setattr(
+        image_gen_neolink,
+        "settings",
+        _settings(
+            image_gen_provider="neolink",
+            image_gen_api_key="image-key",
+            image_gen_base_url="https://neolink.com/api",
+            image_gen_model="gp-im-2",
+        ),
+    )
+    body = {"error": {"code": "model_not_found", "type": "neolink_error"}}
+    error = NotFoundError(
+        "model not found",
+        response=Response(
+            404,
+            request=Request("POST", "https://neolink.com/api/v1/images/generations"),
+            json=body,
+        ),
+        body=body,
+    )
+
+    class Client:
+        def __init__(self, **kwargs):
+            self.images = SimpleNamespace(generate=AsyncMock(side_effect=error))
+            self.close = AsyncMock()
+
+    monkeypatch.setattr(image_gen_neolink, "AsyncOpenAI", Client)
+
+    with pytest.raises(ProviderConfigurationError) as exc_info:
+        await NeolinkImageGenProvider().generate(
+            prompt="prompt",
+            model="ignored",
+            size="1k",
+            aspect="16:9",
+        )
+
+    assert "gp-im-2" in str(exc_info.value)
+    assert "当前 NeoLink API Key 分组未开通该图片模型渠道" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_neolink_image_provider_treats_model_not_found_type_as_configuration_error(
+    monkeypatch,
+) -> None:
+    from httpx import Request, Response
+    from openai import BadRequestError
+
+    from app.providers import image_gen_neolink
+    from app.providers.image_gen_neolink import NeolinkImageGenProvider
+    from app.providers.registry import ProviderConfigurationError
+
+    monkeypatch.setattr(
+        image_gen_neolink,
+        "settings",
+        _settings(
+            image_gen_provider="neolink",
+            image_gen_api_key="image-key",
+            image_gen_base_url="https://neolink.com/api",
+            image_gen_model="gp-im-2",
+        ),
+    )
+    body = {"error": {"type": "model_not_found"}}
+    error = BadRequestError(
+        "model not found",
+        response=Response(
+            400,
+            request=Request("POST", "https://neolink.com/api/v1/images/generations"),
+            json=body,
+        ),
+        body=body,
+    )
+
+    class Client:
+        def __init__(self, **kwargs):
+            self.images = SimpleNamespace(generate=AsyncMock(side_effect=error))
+            self.close = AsyncMock()
+
+    monkeypatch.setattr(image_gen_neolink, "AsyncOpenAI", Client)
+
+    with pytest.raises(ProviderConfigurationError, match="gp-im-2"):
+        await NeolinkImageGenProvider().generate(
+            prompt="prompt",
+            model="ignored",
+            size="1k",
+            aspect="16:9",
+        )
+
+
+@pytest.mark.asyncio
+async def test_neolink_image_provider_maps_content_filter_to_safety_rejection(monkeypatch) -> None:
+    from httpx import Request, Response
+    from openai import BadRequestError
+
+    from app.providers import image_gen_neolink
+    from app.providers.image_gen import ImageSafetyRejectedError
+    from app.providers.image_gen_neolink import NeolinkImageGenProvider
+
+    monkeypatch.setattr(
+        image_gen_neolink,
+        "settings",
+        _settings(
+            image_gen_provider="neolink",
+            image_gen_api_key="image-key",
+            image_gen_base_url="https://neolink.com/api",
+            image_gen_model="gp-im-2",
+        ),
+    )
+    body = {"error": {"code": "content_filter", "type": "neolink_error"}}
+    error = BadRequestError(
+        "content filtered",
+        response=Response(
+            400,
+            request=Request("POST", "https://neolink.com/api/v1/images/generations"),
+            json=body,
+        ),
+        body=body,
+    )
+
+    class Client:
+        def __init__(self, **kwargs):
+            self.images = SimpleNamespace(generate=AsyncMock(side_effect=error))
+            self.close = AsyncMock()
+
+    monkeypatch.setattr(image_gen_neolink, "AsyncOpenAI", Client)
+
+    with pytest.raises(ImageSafetyRejectedError) as exc_info:
+        await NeolinkImageGenProvider().generate(
+            prompt="prompt",
+            model="ignored",
+            size="1k",
+            aspect="16:9",
+        )
+
+    assert exc_info.value.provider == "neolink"
 
 
 @pytest.mark.asyncio

@@ -23,6 +23,13 @@ from app.core.auth import get_current_user
 from app.core.config import settings
 from app.core.database import get_db
 from app.core.errors import BadRequestError, ConflictError, ForbiddenError
+from app.core.reference_media_limits import (
+    ReferenceMediaCounts,
+    effective_reference_media_limits_for_group,
+    reference_media_limit_violations,
+    reference_media_limits_for_provider,
+    supports_reference_videos,
+)
 from app.crud import video as video_crud
 from app.models.script import Script
 from app.models.shot_group import ShotGroup
@@ -39,9 +46,11 @@ from app.schemas.video import (
     VideoJobFailedItem,
     VideoJobListOut,
     VideoJobOut,
+    VideoMaterialCheckOut,
 )
 from app.services.audit import best_effort_log as audit_log
 from app.services.reference_aggregator import AggregatedReferences
+from app.services.reference_image_audit import include_first_frame
 from app.services.runtime_models import resolve_env_video_model, resolve_video_model
 
 router = APIRouter()
@@ -425,6 +434,7 @@ async def cancel_video_generation_job(
 
 @router.get(
     "/video-generation/check-materials",
+    response_model=VideoMaterialCheckOut,
     summary="检查镜头组素材就绪情况",
 )
 async def check_materials(
@@ -435,7 +445,7 @@ async def check_materials(
 ) -> dict:
     """检查镜头组视频生成所需素材是否就绪（doc02 §5.9 工作台批量勾选前置）。
 
-    返回 {missing_subjects:[...], missing_audio:[...], ready:bool}。
+    返回缺失素材、最终有效引用数量和限额违规项；前端可在点击生成前直接提示。
     缺失主体/音频供前端标红提示；缺失参考音频可降级为模型原生声音，
     因此不影响 ready，缺失视觉主体仍判定素材未就绪。
     资源级授权：按 script_id 校验剧本读权限。
@@ -454,12 +464,83 @@ async def check_materials(
     await _load_and_check_script(db, user, script_id, require_write=False)
 
     from app.services.reference_aggregator import aggregate_references
+    from app.services.video_generation import (
+        _reserves_first_frame,
+        _resolve_continuation_static_fallback,
+        _resolve_first_frame,
+    )
 
+    runtime_video_model = await resolve_video_model(db, settings)
+    reference_limits = reference_media_limits_for_provider(
+        runtime_video_model.provider,
+        runtime_video_model.model,
+    )
     aggregated = await aggregate_references(db, shot_group_id)
+    first_frame = (
+        await _resolve_first_frame(db, shot_group)
+        if reference_limits.supports_first_frame
+        else None
+    )
+    if first_frame is None and bool(getattr(shot_group, "is_continuation", False)):
+        first_frame = await _resolve_continuation_static_fallback(db, shot_group)
+    include_first_frame(aggregated, first_frame)
+    provider_reference_images = [
+        image
+        for image in aggregated.reference_images
+        if not first_frame or image.get("storage_key") != first_frame
+    ]
+    reserves_first_frame = await _reserves_first_frame(
+        db,
+        shot_group,
+        supports_first_frame=reference_limits.supports_first_frame,
+    )
+    uses_first_frame = bool(first_frame) or reserves_first_frame
+    counts = ReferenceMediaCounts(
+        images=len(provider_reference_images),
+        audios=len(aggregated.reference_audios),
+        videos=len(aggregated.reference_videos),
+        first_frames=1 if uses_first_frame else 0,
+        # 预留后续组容量不等于当前已有可提交首帧。素材检查用于用户可见的
+        # 实际就绪状态，因此只把已解析到的帧计入图生模型的必需输入。
+        available_first_frames=1 if first_frame else 0,
+    )
+    reference_violations = [
+        {"code": violation.code, "detail": violation.detail}
+        for violation in reference_media_limit_violations(
+            counts,
+            limits=effective_reference_media_limits_for_group(
+                reference_limits,
+                reserve_first_frame=uses_first_frame,
+            ),
+        )
+    ]
+    if aggregated.reference_videos and not supports_reference_videos(
+        runtime_video_model.provider,
+        runtime_video_model.model,
+    ):
+        reference_violations.append(
+            {
+                "code": "reference_video_unsupported",
+                "detail": "当前视频模型不支持参考视频，请移除参考视频或切换至 Seedance/NeoLink",
+            }
+        )
     return {
         "missing_subjects": aggregated.missing_subjects,
         "missing_audio": aggregated.missing_audio,
-        "ready": not aggregated.missing_subjects,
+        "missing_videos": aggregated.missing_videos,
+        "effective_reference_counts": {
+            "images": counts.images + counts.first_frames,
+            "audios": counts.audios,
+            "videos": counts.videos,
+            "total": counts.total,
+            "reserves_first_frame": reserves_first_frame,
+        },
+        "reference_violations": reference_violations,
+        "ready": (
+            not aggregated.missing_subjects
+            and not aggregated.missing_videos
+            and not reference_violations
+        ),
     }
 
 

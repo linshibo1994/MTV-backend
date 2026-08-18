@@ -95,6 +95,36 @@ class ReferenceImageAuditOut(BaseModel):
     message: str | None = None
 
 
+class EffectiveReferenceMediaCountsOut(BaseModel):
+    """实际提交给视频模型的参考素材计数。"""
+
+    images: int = Field(ge=0)
+    audios: int = Field(ge=0)
+    videos: int = Field(ge=0)
+    total: int = Field(ge=0)
+    reserves_first_frame: bool
+
+
+class ReferenceMediaViolationOut(BaseModel):
+    """参考素材限额或模型能力不满足时的可展示原因。"""
+
+    code: str
+    detail: str
+
+
+class VideoMaterialCheckOut(BaseModel):
+    """镜头组视频生成前的素材与参考限额检查结果。"""
+
+    missing_subjects: list[str] = Field(default_factory=list)
+    missing_audio: list[str] = Field(default_factory=list)
+    missing_videos: list[str] = Field(default_factory=list)
+    effective_reference_counts: EffectiveReferenceMediaCountsOut
+    reference_violations: list[ReferenceMediaViolationOut] = Field(default_factory=list)
+    # 没有现成首帧时，是否可在创建任务后安全进入严格前驱的等待链。
+    can_wait_for_predecessor: bool = False
+    ready: bool
+
+
 class VideoJobBatchCreateIn(BaseModel):
     """批量创建视频生成任务入参 — 多个 shot_group_id（doc02 §5.9 工作台批量生成）。"""
 

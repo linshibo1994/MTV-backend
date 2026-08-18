@@ -15,20 +15,27 @@ def _request(
     model: str,
     duration_seconds: int | None = 10,
     reference_audios: list[dict] | None = None,
+    reference_images: list[dict] | None = None,
+    first_frame: str | None = None,
 ) -> VideoGenerationRequest:
     return VideoGenerationRequest(
         prompt="一名角色缓慢转身，看向镜头外。",
-        reference_images=[
-            {
-                "storage_key": "references/first.webp",
-                "mime_type": "image/webp",
-            }
-        ],
+        reference_images=(
+            [
+                {
+                    "storage_key": "references/first.webp",
+                    "mime_type": "image/webp",
+                }
+            ]
+            if reference_images is None
+            else reference_images
+        ),
         reference_image_names=["角色"],
         reference_audios=reference_audios or [],
         reference_audio_names=[],
         model=model,
         job_id="bailian-protocol-test",
+        first_frame=first_frame,
         duration_seconds=duration_seconds,
     )
 
@@ -130,6 +137,52 @@ async def test_wan26_i2v_flash_rejects_unsupported_duration_before_submit() -> N
             lambda *_args: None,
         )
     assert exc_info.value.diagnostics == {"code": "Wan26DurationMustBe5Or10"}
+
+
+@pytest.mark.asyncio
+async def test_i2v_rejects_missing_input_image_before_submit() -> None:
+    provider = BailianVideoGenProvider()
+    provider._check_keys = lambda: None
+
+    with pytest.raises(VideoGenerationSubmitRejected) as exc_info:
+        await provider.generate(
+            _request(model="wanx2.1-kf2v", reference_images=[]),
+        )
+
+    assert exc_info.value.diagnostics == {"code": "reference_input_image_required"}
+
+
+@pytest.mark.asyncio
+async def test_i2v_accepts_first_frame_as_required_input_image(monkeypatch) -> None:
+    provider = BailianVideoGenProvider()
+    provider._check_keys = lambda: None
+    provider._build_body = AsyncMock(return_value={"model": "wanx2.1-kf2v", "input": {}})
+    provider._poll = AsyncMock(return_value="https://result.example/video.mp4")
+    provider._download_to_file = AsyncMock(return_value=1)
+    provider._store_video_file = AsyncMock(return_value="video/output.mp4")
+
+    class HttpClient:
+        async def aclose(self) -> None:
+            return None
+
+        async def post(self, *_args, **_kwargs):
+            return SimpleNamespace(
+                status_code=200,
+                json=lambda: {"output": {"task_id": "bailian-task-1"}},
+            )
+
+    from app.providers import video_gen_bailian
+
+    monkeypatch.setattr(video_gen_bailian.httpx, "AsyncClient", lambda **_kwargs: HttpClient())
+    result = await provider.generate(
+        _request(
+            model="wanx2.1-kf2v",
+            reference_images=[],
+            first_frame="frames/previous-tail.png",
+        ),
+    )
+
+    assert result.video_storage_key == "video/output.mp4"
 
 
 @pytest.mark.asyncio

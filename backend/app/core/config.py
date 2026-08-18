@@ -119,7 +119,7 @@ class Settings(BaseSettings):
     chat_llm_api_key: str = ""
     chat_llm_model: str = ""
 
-    # 图片生成 —— openai | google | bailian
+    # 图片生成 —— openai | google | bailian | neolink
     image_gen_provider: str = "openai"
     image_gen_base_url: str = ""
     image_gen_api_key: str = ""
@@ -251,6 +251,13 @@ class Settings(BaseSettings):
                 self.image_gen_base_url = self.dashscope_base_url
             if not self.image_gen_model:
                 self.image_gen_model = "wan2.1-t2i-plus"
+        elif self.image_gen_provider == "neolink":
+            if not self.image_gen_api_key:
+                self.image_gen_api_key = self.neolink_api_key
+            if not self.image_gen_base_url:
+                self.image_gen_base_url = self.neolink_base_url
+            if not self.image_gen_model:
+                self.image_gen_model = "gp-im-2"
         video_defaults = {
             "volcengine": (
                 self.volcengine_api_key,

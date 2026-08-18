@@ -182,6 +182,9 @@ class VideoGenerationRequest:
     reference_audio_names: list[str]
     model: str
     job_id: str
+    # 仅 Seedance/NeoLink 支持；其他 Provider 会在创建任务前明确拒绝。
+    reference_videos: list[dict] = field(default_factory=list)
+    reference_video_names: list[str] = field(default_factory=list)
     first_frame: str | None = None
     duration_seconds: int | None = None
     metadata: dict = field(default_factory=dict)

@@ -165,7 +165,20 @@ def test_material_and_audio_references_resolve_approved_assets() -> None:
     ]
 
 
-async def test_update_shot_group_persists_fields_and_increments_version() -> None:
+async def test_update_shot_group_persists_fields_and_increments_version(monkeypatch) -> None:
+    from app.services.runtime_models import RuntimeVideoModel
+
+    monkeypatch.setattr(
+        "app.services.runtime_models.resolve_video_model",
+        AsyncMock(
+            return_value=RuntimeVideoModel(
+                provider="volcengine",
+                model="doubao-seedance-test",
+                reference_image_audit_required=True,
+                task_provider_key="modelsai",
+            )
+        ),
+    )
     episode = SimpleNamespace(episode_version=4)
     group = SimpleNamespace(
         shot_group_id="group-1",
