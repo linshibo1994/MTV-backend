@@ -470,6 +470,34 @@ def test_aliyun_oss_external_read_url_uses_configured_public_cdn_without_signing
         asyncio.run(scenario())
 
 
+def test_aliyun_oss_provider_uses_public_read_acl_for_writes_when_public_url_configured(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    client = _MemoryClient()
+    with _load_provider(monkeypatch, client) as module:
+        values = _settings_values()
+        values["aliyun_oss_public_url"] = "https://cdn-ai-public.commind.com"
+        monkeypatch.setattr(module, "settings", Settings(**values))
+        provider = _provider(module, client)
+        upload_path = tmp_path / "payload.bin"
+        upload_path.write_bytes(b"file-payload")
+
+        async def scenario() -> None:
+            source = "upload_images/_tmp/material-1/source.bin"
+            final = "upload_images/material-1/final.bin"
+
+            assert await provider.put("upload_images/material-1/data.bin", b"payload")
+            assert await provider.put_file("upload_images/material-1/file.bin", str(upload_path))
+            client.objects[source] = b"candidate"
+            assert await provider.promote(source, final) == final
+
+        asyncio.run(scenario())
+
+        assert [request.acl for request in client.put_requests] == ["public-read", "public-read"]
+        assert client.copy_requests[-1].acl == "public-read"
+
+
 def test_public_url_payload_adds_cdn_urls_without_changing_storage_keys(monkeypatch) -> None:
     from app.providers import storage as storage_module
 

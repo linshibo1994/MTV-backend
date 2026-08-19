@@ -24,6 +24,7 @@ from app.providers.storage import (
 MAX_SIGNED_URL_SECONDS = 7 * 24 * 60 * 60
 MAX_SIMPLE_OBJECT_BYTES = 5 * 1024 * 1024 * 1024
 PRIVATE_OBJECT_ACL = "private"
+PUBLIC_READ_OBJECT_ACL = "public-read"
 
 
 class AliyunOSSStorageProvider:
@@ -88,7 +89,7 @@ class AliyunOSSStorageProvider:
         request = oss.PutObjectRequest(
             bucket=self._bucket,
             key=rel,
-            acl=PRIVATE_OBJECT_ACL,
+            acl=self._write_acl(),
             body=data,
         )
         await asyncio.to_thread(self._client.put_object, request)
@@ -105,9 +106,16 @@ class AliyunOSSStorageProvider:
         request = oss.PutObjectRequest(
             bucket=self._bucket,
             key=key,
-            acl=PRIVATE_OBJECT_ACL,
+            acl=self._write_acl(),
         )
         self._client.put_object_from_file(request, path)
+
+    @staticmethod
+    def _write_acl() -> str:
+        """公共 CDN 启用时允许其匿名回源读取，否则保持私有对象。"""
+        if settings.aliyun_oss_public_url:
+            return PUBLIC_READ_OBJECT_ACL
+        return PRIVATE_OBJECT_ACL
 
     @staticmethod
     def _validate_simple_object_size(size_bytes: int) -> None:
@@ -164,7 +172,7 @@ class AliyunOSSStorageProvider:
             key=final,
             source_bucket=self._bucket,
             source_key=source,
-            acl=PRIVATE_OBJECT_ACL,
+            acl=self._write_acl(),
             forbid_overwrite="true" if forbid_overwrite else None,
         )
 
