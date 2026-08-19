@@ -12,7 +12,6 @@ from sqlalchemy.orm import noload
 from app.core.errors import BadRequestError, ConflictError, ForbiddenError, NotFoundError
 from app.core.ids import new_id
 from app.core.reference_media_limits import (
-    CONTINUATION_FROM_PREDECESSOR_KEY,
     ReferenceMediaLimits,
     reference_media_limits_for_provider,
     trim_automatic_reference_selection,
@@ -394,15 +393,6 @@ async def _refresh_group(
     group.duration_seconds = cursor
     group.video_duration_seconds = cursor
     group.quality_summary = quality_summary
-    # 图生模型的同场景后续组没有普通图片额度时，必须等待严格直接前驱
-    # 的真实尾帧。该内部标记与用户的“承接上一组尾帧”开关分离。
-    if (
-        reserve_first_frame
-        and reference_limits is not None
-        and reference_limits.requires_input_image
-        and reference_limits.supports_first_frame
-    ):
-        reference_frames[CONTINUATION_FROM_PREDECESSOR_KEY] = True
     group.reference_frames = reference_frames
     group.is_continuation = is_continuation
     group.prompt_context = prompt_context
@@ -609,7 +599,6 @@ async def merge_shots_into_groups(
     await db.flush()
 
     created_groups: list[ShotGroup] = []
-    created_scene_numbers: set[int] = set()
     temporary_base = max(group.group_index for group in source_groups) + 10_000
     for index, (scene, bucket) in enumerate(final_shot_buckets, start=1):
         shot_group_id = new_id()
@@ -658,19 +647,12 @@ async def merge_shots_into_groups(
             narrative_purpose="；".join(narrative_parts),
             subjects=subjects,
             duration_by_shot=duration_by_shot,
-            # 同场景第二个及后续组会从前组尾帧取得首帧约束，提前预留一张
-            # 图片和一个总引用名额；纯文生模型不消费首帧，不能制造虚假的
-            # 预留而让组合结果无法提交。
-            reserve_first_frame=(
-                reference_limits.supports_first_frame
-                and scene.scene_no in created_scene_numbers
-            ),
+            reserve_first_frame=False,
             reference_limits=reference_limits,
             prompt_context=inherited_prompt_context,
             source_storyboard_job_id=inherited_source_job_id,
         )
         created_groups.append(group)
-        created_scene_numbers.add(scene.scene_no)
 
     await db.flush()
     await db.execute(

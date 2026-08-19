@@ -120,7 +120,7 @@ class VideoMaterialCheckOut(BaseModel):
     missing_videos: list[str] = Field(default_factory=list)
     effective_reference_counts: EffectiveReferenceMediaCountsOut
     reference_violations: list[ReferenceMediaViolationOut] = Field(default_factory=list)
-    # 没有现成首帧时，是否可在创建任务后安全进入严格前驱的等待链。
+    # 自动前驱等待已停用，始终为 false；字段保留以兼容既有客户端。
     can_wait_for_predecessor: bool = False
     ready: bool
 

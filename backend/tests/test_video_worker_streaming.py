@@ -1046,14 +1046,10 @@ async def test_attempt_reconciliation_publish_failure_keeps_database_debt(
     )
 
 
-async def test_last_frame_unknown_authority_is_republished_with_job_debt_context(
-    monkeypatch,
-    tmp_path,
-) -> None:
+async def test_rollback_failure_does_not_create_tail_frame_cleanup(monkeypatch) -> None:
     from app.workers import video_generation as worker
 
     lease_token = "frame-unknown-authority"
-    attempt_id = hashlib.sha256(lease_token.encode("utf-8")).hexdigest()[:16]
     _install_video_run_fakes(
         monkeypatch,
         worker,
@@ -1073,12 +1069,6 @@ async def test_last_frame_unknown_authority_is_republished_with_job_debt_context
 
     storage = Storage()
     monkeypatch.setattr("app.providers.storage.get_storage", lambda: storage)
-    _install_fake_ffmpeg(monkeypatch, worker, tmp_path, b"video")
-    monkeypatch.setattr(
-        worker,
-        "_authoritative_last_frame_referenced",
-        AsyncMock(return_value=None),
-    )
     monkeypatch.setattr(
         worker,
         "_authoritative_video_attempt_succeeded",
@@ -1095,31 +1085,13 @@ async def test_last_frame_unknown_authority_is_republished_with_job_debt_context
         storage=storage,
     )
 
-    frame_key = (
-        "/generate_images/video/frames/"
-        f"attempt-group_{attempt_id}_last.png"
-    )
-    # 内层末帧、外层视频与外层末帧分别判权，避免任一对象借用另一对象的结论。
-    assert schedule_cleanup.await_count == 3
-    assert schedule_cleanup.await_args_list[-1].kwargs == {
-        "job_id": "job-attempt",
-        "script_id": None,
-        "shot_group_id": "attempt-group",
-        "storage_attempt_id": attempt_id,
-        "video_storage_key": None,
-        "last_frame_storage_key": frame_key,
-        "provider_task_id": "resume-provider-task",
-    }
+    schedule_cleanup.assert_not_awaited()
 
 
-async def test_outer_frame_failure_never_deletes_authoritative_frame(
-    monkeypatch,
-    tmp_path,
-) -> None:
+async def test_rollback_failure_does_not_check_or_delete_tail_frame(monkeypatch) -> None:
     from app.workers import video_generation as worker
 
     lease_token = "authoritative-frame"
-    attempt_id = hashlib.sha256(lease_token.encode("utf-8")).hexdigest()[:16]
     _install_video_run_fakes(
         monkeypatch,
         worker,
@@ -1140,7 +1112,6 @@ async def test_outer_frame_failure_never_deletes_authoritative_frame(
 
     storage = Storage()
     monkeypatch.setattr("app.providers.storage.get_storage", lambda: storage)
-    _install_fake_ffmpeg(monkeypatch, worker, tmp_path, b"video")
     frame_authority = AsyncMock(return_value=True)
     monkeypatch.setattr(
         worker,
@@ -1158,11 +1129,6 @@ async def test_outer_frame_failure_never_deletes_authoritative_frame(
         storage=storage,
     )
 
-    video_key = f"generate_images/video/job-attempt.{attempt_id}.mp4"
-    frame_key = (
-        "/generate_images/video/frames/"
-        f"attempt-group_{attempt_id}_last.png"
-    )
-    assert deleted == [video_key]
-    frame_authority.assert_awaited_once_with("attempt-group", frame_key)
+    assert deleted == []
+    frame_authority.assert_not_awaited()
     schedule_cleanup.assert_not_awaited()

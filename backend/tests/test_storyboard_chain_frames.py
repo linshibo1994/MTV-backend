@@ -41,7 +41,7 @@ def _group(
 
 
 @pytest.mark.asyncio
-async def test_update_chain_frames_backfills_direct_predecessor_without_mixing_boundaries() -> None:
+async def test_update_chain_frames_does_not_backfill_direct_predecessor() -> None:
     first_frames = {
         "first_frame": "storage/start-one.png",
         "last_frame": "storage/tail-one.png",
@@ -87,15 +87,15 @@ async def test_update_chain_frames_backfills_direct_predecessor_without_mixing_b
 
     assert isinstance(result, ChainFrameUpdateResult)
     assert isinstance(result, int)
-    assert result == result.updated == 1
-    assert result.model_dump() == {"updated": 1, "diagnostics": []}
-    assert second.reference_frames["first_frame"] == "storage/tail-one.png"
+    assert result == result.updated == 0
+    assert result.model_dump() == {"updated": 0, "diagnostics": []}
+    assert "first_frame" not in second.reference_frames
     assert second.reference_frames["boundary_projections"] == second_frames["boundary_projections"]
     assert first.reference_frames["boundary_projections"] == first_frames["boundary_projections"]
     assert first.reference_frames["future_extension"] == {"schema": 2}
     assert second.reference_frames["another_extension"] == ["must", "survive"]
     assert first.reference_frames["chain_diagnostics"] == first_frames["chain_diagnostics"]
-    db.flush.assert_awaited_once()
+    db.flush.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -238,10 +238,10 @@ async def test_update_chain_frames_replaces_owned_diagnostics_after_chain_recove
     first_result = await update_chain_frames(db, "episode-recovered")
     second_result = await update_chain_frames(db, "episode-recovered")
 
-    assert first_result.updated == 1
+    assert first_result.updated == 0
     assert second_result.updated == 0
     assert first_result.diagnostics == second_result.diagnostics == []
-    assert current.reference_frames["first_frame"] == "storage/recovered-tail.png"
+    assert "first_frame" not in current.reference_frames
     assert current.reference_frames["chain_diagnostics"] == [
         {"code": "future_chain_signal", "payload": {"preserved": True}}
     ]

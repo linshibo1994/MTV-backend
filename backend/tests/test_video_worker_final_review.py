@@ -1943,7 +1943,7 @@ async def test_settle_failure_requires_recoverable_attempt_cleanup_before_releas
 
 
 @pytest.mark.asyncio
-async def test_last_frame_reference_failure_propagates_uploaded_key_and_fails_closed(
+async def test_worker_does_not_trigger_last_frame_failure_path(
     monkeypatch,
 ) -> None:
     from app.providers import storage as storage_module
@@ -2033,68 +2033,22 @@ async def test_last_frame_reference_failure_propagates_uploaded_key_and_fails_cl
         publish_cleanup,
     )
 
-    with pytest.raises(RuntimeError, match="video_attempt_cleanup_unavailable"):
-        await worker.run_video_generation_once(
-            db,
-            job.job_id,
-            owner="last-frame-worker",
-            provider=Provider(),
-        )
-
-    expected_frame_key = (
-        f"/generate_images/video/frames/{job.shot_group_id}_"
-        f"{generated['attempt_id']}_last.png"
+    await worker.run_video_generation_once(
+        db,
+        job.job_id,
+        owner="last-frame-worker",
+        provider=Provider(),
     )
-    assert uploaded_frames == [expected_frame_key]
-    expected_video_cleanup = {
-        "job_id": job.job_id,
-        "shot_group_id": job.shot_group_id,
-        "storage_attempt_id": generated["attempt_id"],
-        "video_storage_key": generated["video_key"],
-        "last_frame_storage_key": None,
-        "provider_task_id": generated["provider_task_id"],
-    }
-    expected_frame_cleanup = {
-        "job_id": None,
-        "shot_group_id": job.shot_group_id,
-        "storage_attempt_id": generated["attempt_id"],
-        "video_storage_key": None,
-        "last_frame_storage_key": expected_frame_key,
-    }
-    expected_combined_cleanup = {
-        "job_id": job.job_id,
-        "shot_group_id": job.shot_group_id,
-        "storage_attempt_id": generated["attempt_id"],
-        "video_storage_key": generated["video_key"],
-        "last_frame_storage_key": expected_frame_key,
-        "provider_task_id": generated["provider_task_id"],
-    }
-    assert [call.kwargs for call in persist_cleanup.await_args_list] == [
-        {
-            **expected_video_cleanup,
-            "script_id": job.script_id,
-        },
-        {
-            **expected_combined_cleanup,
-            "script_id": job.script_id,
-        },
-    ]
-    assert [call.kwargs["kwargs"] for call in publish_cleanup.call_args_list] == [
-        expected_frame_cleanup,
-        expected_video_cleanup,
-        expected_combined_cleanup,
-    ]
-    assert [call.kwargs["countdown"] for call in publish_cleanup.call_args_list] == [
-        worker._ATTEMPT_CLEANUP_RETRY_SECONDS,
-        worker._ATTEMPT_CLEANUP_RETRY_SECONDS,
-        worker._ATTEMPT_CLEANUP_RETRY_SECONDS,
-    ]
+
+    assert uploaded_frames == []
+    persist_cleanup.assert_not_awaited()
+    publish_cleanup.assert_not_called()
     raw.expire_all()
     saved = raw.get(VideoGenerationJob, job.job_id)
     reservation = raw.get(CreditReservation, job.reservation_id)
     assert saved is not None
-    assert saved.status == "processing"
-    assert saved.lease_token is not None
+    assert saved.status == "succeeded"
+    assert saved.lease_token is None
     assert reservation is not None
     assert reservation.status == "reserved"
     release.assert_not_awaited()

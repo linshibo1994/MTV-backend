@@ -1360,6 +1360,150 @@ def test_normalize_provider_continuity_moves_quality_fields_out_of_visual() -> N
     assert normalized.character_positions[0].position == "左中"
 
 
+def test_normalize_provider_continuity_regroups_flattened_dialogue_fields() -> None:
+    """LLM 把 dialogue 子字段平铺到 Shot 层时必须回迁，而非以 extra_forbidden 整集失败。"""
+    from app.services import storyboard as storyboard_service
+
+    references = _subject_references()
+    reference_names = {ref: item.name for ref, item in references.items()}
+    reference_types = {ref: item.subject_type for ref, item in references.items()}
+
+    payload = _valid_storyboard_v2_payload()
+    shots = payload["scenes"][0]["shot_groups"][0]["shots"]
+    # 首镜：规范键全部平铺；次镜：中文别名平铺。两镜都不应被剔除或丢弃。
+    del shots[0]["dialogue"]
+    shots[0].update({"speaker_ref": "C01", "kind": "dialogue", "text": "我们谈谈"})
+    del shots[1]["dialogue"]
+    shots[1].update({"说话人": "小林", "台词": "现在不方便", "类型": "对白"})
+
+    validated = storyboard_service._validate_provider_payload_result(
+        payload,
+        subject_catalog=_subject_catalog(),
+        subject_reference_names=reference_names,
+        subject_reference_types=reference_types,
+    )
+
+    assert validated.v2_contract is not None
+    first, second = validated.v2_contract.scenes[0].shot_groups[0].shots
+    assert first.dialogue is not None
+    assert first.dialogue.text == "我们谈谈"
+    assert first.dialogue.speaker_ref == "C01"
+    assert first.dialogue.kind == "dialogue"
+    assert second.dialogue is not None
+    assert second.dialogue.text == "现在不方便"
+    assert second.dialogue.speaker_ref == "C02"
+    assert second.dialogue.kind == "dialogue"
+    # 平铺键必须从 Shot 层移除，否则严格契约仍会判 extra_forbidden
+    for shot in payload["scenes"][0]["shot_groups"][0]["shots"]:
+        assert not {"speaker_ref", "kind", "text", "说话人", "台词", "类型"} & set(shot)
+
+
+def test_normalize_provider_continuity_keeps_nested_dialogue_over_flattened() -> None:
+    """dialogue 内已有的语义是唯一事实源；平铺键只补缺失项并一律移除。"""
+    from app.services import storyboard as storyboard_service
+
+    references = _subject_references()
+    payload = _valid_storyboard_v2_payload()
+    shot = payload["scenes"][0]["shot_groups"][0]["shots"][0]
+    shot["dialogue"] = {"text": "嵌套优先", "kind": "dialogue"}
+    # speaker_ref 仅在 Shot 层出现 -> 补入；text 冲突时保留 dialogue 内的值
+    shot["speaker_ref"] = "C01"
+    shot["text"] = "平铺应被忽略"
+
+    validated = storyboard_service._validate_provider_payload_result(
+        payload,
+        subject_catalog=_subject_catalog(),
+        subject_reference_names={ref: item.name for ref, item in references.items()},
+        subject_reference_types={ref: item.subject_type for ref, item in references.items()},
+    )
+
+    assert validated.v2_contract is not None
+    dialogue = validated.v2_contract.scenes[0].shot_groups[0].shots[0].dialogue
+    assert dialogue is not None
+    assert dialogue.text == "嵌套优先"
+    assert dialogue.speaker_ref == "C01"
+    assert not {"speaker_ref", "text"} & set(shot)
+
+
+def test_normalize_provider_continuity_discards_unknown_v2_fields() -> None:
+    """Scene/Group/Shot 层的未知键必须确定性剔除，不让单点漂移阻断整集。"""
+    from app.services import storyboard as storyboard_service
+
+    references = _subject_references()
+    payload = _valid_storyboard_v2_payload()
+    scene = payload["scenes"][0]
+    group = scene["shot_groups"][0]
+    shot = group["shots"][0]
+    scene["scene_summary"] = "模型自创的场景摘要"
+    group["transition"] = "硬切"
+    shot["mood"] = "紧张"
+    shot["camera_note"] = "备注"
+
+    validated = storyboard_service._validate_provider_payload_result(
+        payload,
+        subject_catalog=_subject_catalog(),
+        subject_reference_names={ref: item.name for ref, item in references.items()},
+        subject_reference_types={ref: item.subject_type for ref, item in references.items()},
+    )
+
+    assert validated.v2_contract is not None
+    # 未知键被剔除后镜头本身完整保留，不走 salvage 丢镜
+    assert len(validated.v2_contract.scenes[0].shot_groups[0].shots) == 2
+    assert "scene_summary" not in scene
+    assert "transition" not in group
+    assert not {"mood", "camera_note"} & set(shot)
+
+
+def test_flattened_dialogue_across_all_shots_does_not_exhaust_salvage() -> None:
+    """整组镜头全部平铺时，归一化必须直接通过，避免 salvage 逐镜删空后彻底失败。"""
+    from app.services import storyboard as storyboard_service
+
+    references = _subject_references()
+    payload = _valid_storyboard_v2_payload()
+    for index, shot in enumerate(payload["scenes"][0]["shot_groups"][0]["shots"], start=1):
+        shot.pop("dialogue", None)
+        shot["speaker_ref"] = "C01"
+        shot["kind"] = "dialogue"
+        shot["text"] = f"第 {index} 句台词"
+        shot["character_refs"] = ["C01"]
+
+    validated = storyboard_service._validate_provider_payload_result(
+        payload,
+        subject_catalog=_subject_catalog(),
+        subject_reference_names={ref: item.name for ref, item in references.items()},
+        subject_reference_types={ref: item.subject_type for ref, item in references.items()},
+    )
+
+    assert validated.v2_contract is not None
+    assert validated.salvaged is False
+    assert validated.dropped_shot_count == 0
+    texts = [
+        shot.dialogue.text
+        for shot in validated.v2_contract.scenes[0].shot_groups[0].shots
+        if shot.dialogue is not None
+    ]
+    assert texts == ["第 1 句台词", "第 2 句台词"]
+
+
+def test_v1_shot_never_receives_flattened_dialogue_regrouping() -> None:
+    """v1 镜头没有 dialogue 字段，回迁逻辑不得向其注入 v2 字段。"""
+    from app.services import storyboard as storyboard_service
+
+    references = _subject_references()
+    payload = _valid_storyboard_payload()
+    shot = payload["scenes"][0]["shot_groups"][0]["shots"][0]
+    before = set(shot)
+
+    storyboard_service._normalize_provider_continuity(
+        payload,
+        subject_reference_names={ref: item.name for ref, item in references.items()},
+        subject_reference_types={ref: item.subject_type for ref, item in references.items()},
+    )
+
+    assert set(shot) == before
+    assert "dialogue" not in shot
+
+
 def test_v2_quality_state_persists_structured_shot_group_and_boundaries() -> None:
     from app.services import storyboard as storyboard_service
 

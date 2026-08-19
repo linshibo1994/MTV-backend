@@ -259,9 +259,9 @@ def _seed(raw: Session) -> SimpleNamespace:
         is_active=True,
     )
     # 该夹具的既有视频创建用例关注生成编排，不覆盖人工审核流程；显式构造一份
-    # 与最终输入（含上一组尾帧）绑定的已通过审核快照。
+    # 与最终普通参考图绑定的已通过审核快照。
     from app.services.reference_aggregator import AggregatedReferences
-    from app.services.reference_image_audit import include_first_frame, reference_image_hash
+    from app.services.reference_image_audit import reference_image_hash
 
     audit_references = AggregatedReferences(
         reference_images=[
@@ -274,7 +274,6 @@ def _seed(raw: Session) -> SimpleNamespace:
             }
         ]
     )
-    include_first_frame(audit_references, previous_g2.reference_frames["last_frame"])
     current.reference_image_audit = {
         "status": "approved",
         "reference_hash": reference_image_hash(audit_references),
@@ -376,8 +375,8 @@ def test_create_video_job_blocks_when_reference_image_audit_is_pending() -> None
     asyncio.run(scenario())
 
 
-def test_create_video_job_counts_continuation_first_frame_before_submission(monkeypatch) -> None:
-    """首帧与九张素材图同时存在时，必须在冻结积分前拒绝。"""
+def test_create_video_job_rejects_reference_images_over_normal_limit(monkeypatch) -> None:
+    """禁用自动首帧后，普通参考图仍必须遵守供应商限额。"""
 
     async def scenario() -> None:
         from app.services import video_generation
@@ -398,7 +397,7 @@ def test_create_video_job_counts_continuation_first_frame_before_submission(monk
                             "mime_type": "image/png",
                             "sha256": f"{index:064x}",
                         }
-                        for index in range(9)
+                        for index in range(10)
                     ]
                 )
             ),
@@ -459,8 +458,8 @@ def test_create_bailian_i2v_rejects_reserved_but_unavailable_first_frame() -> No
     asyncio.run(scenario())
 
 
-def test_create_video_job_uses_mgrouter_exclusive_first_frame_quota() -> None:
-    """MGRouter 后续组的首帧不能和普通参考图或声音一同冻结并提交。"""
+def test_create_video_job_does_not_use_mgrouter_first_frame_quota() -> None:
+    """MGRouter 任务不再为同场景前驱尾帧预留独占首帧槽。"""
 
     async def scenario() -> None:
         from app.services.video_generation import create_video_job
@@ -475,17 +474,18 @@ def test_create_video_job_uses_mgrouter_exclusive_first_frame_quota() -> None:
         raw.commit()
         db = _AsyncSessionAdapter(raw)
 
-        with pytest.raises(BadRequestError, match="参考图最多支持 1 个"):
-            await create_video_job(
-                db,
-                script_id=seeded.script.id,
-                episode_id=seeded.episode.episode_id,
-                shot_group_id=seeded.shot_group.shot_group_id,
-                user_id=seeded.user.user_id,
-                idempotency_key="mgrouter-first-frame-exclusive",
-            )
+        job = await create_video_job(
+            db,
+            script_id=seeded.script.id,
+            episode_id=seeded.episode.episode_id,
+            shot_group_id=seeded.shot_group.shot_group_id,
+            user_id=seeded.user.user_id,
+            idempotency_key="mgrouter-without-first-frame",
+        )
 
-        assert raw.scalar(select(VideoGenerationJob)) is None
+        assert job.status == "starting"
+        assert job.input_json["first_frame"] is None
+        assert job.input_json["awaits_predecessor_frame"] is False
 
     asyncio.run(scenario())
 
@@ -548,6 +548,7 @@ def test_create_video_job_skips_reference_image_audit_for_database_bailian(monke
     async def scenario() -> None:
         from app.core.config import Settings
         from app.services import video_generation
+        from app.services.reference_aggregator import AggregatedReferences
 
         _, raw = _make_db()
         seeded = _seed(raw)
@@ -583,6 +584,11 @@ def test_create_video_job_skips_reference_image_audit_for_database_bailian(monke
         monkeypatch.setattr(video_generation, "settings", Settings(_env_file=None))
         monkeypatch.setattr(video_generation, "_credits_reserve", None)
         monkeypatch.setattr(video_generation, "enqueue_task", fake_enqueue)
+        monkeypatch.setattr(
+            video_generation,
+            "aggregate_references",
+            AsyncMock(return_value=AggregatedReferences(reference_images=[{"storage_key": "input.png"}])),
+        )
 
         job = await video_generation.create_video_job(
             db,
@@ -938,8 +944,7 @@ def test_create_video_job_persists_explicit_prompt_with_exactly_one_full_constra
 
         expected = (
             "## 图片内容说明\n"
-            "图1: 首帧参考（短引用 无；类型 first_frame）\n"
-            "图2: 阿明（短引用 无；类型 character）\n"
+            "图1: 阿明（短引用 无；类型 character）\n"
             "## 图片内容说明结束\n"
             f"客户端自定义运镜\n{video_generation._CONSTRAINT_LOCK_TEXT}"
         )
@@ -956,14 +961,6 @@ def test_create_video_job_persists_explicit_prompt_with_exactly_one_full_constra
         assert job.input_json["constraint_prompt_template"]["source"] == "fallback"
         assert job.input_json["reference_token_map"] == {
             "图1": {
-                "ref": None,
-                "name": "首帧参考",
-                "category": "first_frame",
-                "subject_id": None,
-                "asset_entry_id": None,
-                "sha256": hashlib.sha256(b"/frames/g2-last.png").hexdigest(),
-            },
-            "图2": {
                 "ref": None,
                 "name": "阿明",
                 "category": "character",
@@ -2718,13 +2715,16 @@ def test_check_materials_reports_all_reference_violations_as_objects(monkeypatch
             "reference_video_unsupported",
         ]
         assert all(set(item) == {"code", "detail"} for item in result["reference_violations"])
-        assert VideoMaterialCheckOut.model_validate(result).model_dump() == result
+        assert VideoMaterialCheckOut.model_validate(result).model_dump() == {
+            **result,
+            "can_wait_for_predecessor": False,
+        }
         assert result["ready"] is False
 
     asyncio.run(scenario())
 
 
-def test_check_materials_rejects_bailian_i2v_reserved_but_unavailable_frame(monkeypatch) -> None:
+def test_check_materials_requires_explicit_bailian_i2v_reference_image(monkeypatch) -> None:
     async def scenario() -> None:
         from app.api.v1 import video_generation as api
         from app.services.reference_aggregator import AggregatedReferences
@@ -2741,14 +2741,6 @@ def test_check_materials_rejects_bailian_i2v_reserved_but_unavailable_frame(monk
         monkeypatch.setattr(
             "app.services.reference_aggregator.aggregate_references",
             AsyncMock(return_value=AggregatedReferences()),
-        )
-        monkeypatch.setattr(
-            "app.services.video_generation._resolve_first_frame",
-            AsyncMock(return_value=None),
-        )
-        monkeypatch.setattr(
-            "app.services.video_generation._reserves_first_frame",
-            AsyncMock(return_value=True),
         )
         monkeypatch.setattr(
             api,
@@ -2770,7 +2762,7 @@ def test_check_materials_rejects_bailian_i2v_reserved_but_unavailable_frame(monk
             user=seeded.user,
         )
 
-        assert result["effective_reference_counts"]["images"] == 1
+        assert result["effective_reference_counts"]["images"] == 0
         assert [item["code"] for item in result["reference_violations"]] == [
             "reference_input_image_required"
         ]
@@ -2779,7 +2771,7 @@ def test_check_materials_rejects_bailian_i2v_reserved_but_unavailable_frame(monk
     asyncio.run(scenario())
 
 
-def test_check_materials_uses_mgrouter_exclusive_first_frame_quota(monkeypatch) -> None:
+def test_check_materials_does_not_reserve_mgrouter_first_frame(monkeypatch) -> None:
     async def scenario() -> None:
         from app.api.v1 import video_generation as api
         from app.services.reference_aggregator import AggregatedReferences
@@ -2803,14 +2795,6 @@ def test_check_materials_uses_mgrouter_exclusive_first_frame_quota(monkeypatch) 
             ),
         )
         monkeypatch.setattr(
-            "app.services.video_generation._resolve_first_frame",
-            AsyncMock(return_value="frames/previous.png"),
-        )
-        monkeypatch.setattr(
-            "app.services.video_generation._reserves_first_frame",
-            AsyncMock(return_value=True),
-        )
-        monkeypatch.setattr(
             api,
             "resolve_video_model",
             AsyncMock(
@@ -2831,18 +2815,14 @@ def test_check_materials_uses_mgrouter_exclusive_first_frame_quota(monkeypatch) 
         )
 
         assert result["effective_reference_counts"] == {
-            "images": 2,
+            "images": 1,
             "audios": 1,
             "videos": 0,
-            "total": 3,
-            "reserves_first_frame": True,
+            "total": 2,
+            "reserves_first_frame": False,
         }
-        assert [item["code"] for item in result["reference_violations"]] == [
-            "reference_images_limit_exceeded",
-            "reference_audios_limit_exceeded",
-            "reference_media_total_limit_exceeded",
-        ]
-        assert result["ready"] is False
+        assert result["reference_violations"] == []
+        assert result["ready"] is True
 
     asyncio.run(scenario())
 
@@ -3183,7 +3163,7 @@ def test_cancel_release_failure_does_not_commit_canceled(monkeypatch) -> None:
     asyncio.run(scenario())
 
 
-def test_worker_resolves_first_frame_at_execution_and_persists_progress_and_provider_task(monkeypatch) -> None:
+def test_worker_ignores_legacy_first_frame_at_execution_and_persists_progress(monkeypatch) -> None:
     async def scenario() -> None:
         _, raw = _make_db()
         seeded = _seed(raw)
@@ -3262,7 +3242,7 @@ def test_worker_resolves_first_frame_at_execution_and_persists_progress_and_prov
         )
 
         refreshed = raw.get(VideoGenerationJob, "job-progress")
-        assert seen_requests[0].first_frame == "/frames/latest.png"
+        assert seen_requests[0].first_frame is None
         assert refreshed.output_json["provider_task_id"] == "provider-task-1"
         assert refreshed.metrics["provider_task_id"] == "provider-task-1"
         assert refreshed.progress == 100
@@ -3314,8 +3294,8 @@ def test_worker_honors_frozen_no_first_frame_capability(monkeypatch) -> None:
     asyncio.run(scenario())
 
 
-def test_worker_rejects_legacy_mgrouter_mixed_first_frame_references() -> None:
-    """历史任务在远端提交前也不能把首帧与普通参考图混用。"""
+def test_worker_ignores_legacy_mgrouter_first_frame_references() -> None:
+    """历史任务也不能再将首帧与普通参考图一同提交。"""
 
     async def scenario() -> None:
         _, raw = _make_db()
@@ -3345,7 +3325,12 @@ def test_worker_rejects_legacy_mgrouter_mixed_first_frame_references() -> None:
             async def generate(self, request, on_progress=None):
                 nonlocal provider_called
                 provider_called = True
-                raise AssertionError("不应向 Provider 提交不兼容的历史任务")
+                assert request.first_frame is None
+                return SimpleNamespace(
+                    video_storage_key="generate_images/video/legacy-mgrouter.mp4",
+                    provider_job_id="legacy-mgrouter-job",
+                    metrics={},
+                )
 
         from app.workers.video_generation import run_video_generation_once
 
@@ -3358,11 +3343,10 @@ def test_worker_rejects_legacy_mgrouter_mixed_first_frame_references() -> None:
 
         refreshed = raw.get(VideoGenerationJob, job.job_id)
         reservation = raw.get(CreditReservation, job.reservation_id)
-        assert provider_called is False
-        assert refreshed.status == "failed"
-        assert refreshed.error_type == "provider_submit_rejected"
-        assert refreshed.error_message == "reference_images_limit_exceeded"
-        assert reservation.status == "released"
+        assert provider_called is True
+        assert refreshed.status == "succeeded"
+        assert refreshed.error_type is None
+        assert reservation.status == "captured"
 
     asyncio.run(scenario())
 

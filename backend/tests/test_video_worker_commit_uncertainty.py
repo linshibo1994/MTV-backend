@@ -694,7 +694,7 @@ async def test_progress_commit_uncertainty_keeps_attempt_key_and_finishes_failur
         metrics={},
         reservation_id="progress-reservation",
         owner_user_id="progress-user",
-        provider_key="fake",
+        provider_key="modelsai",
         unit_id="group:progress-group",
     )
     state = {"status": "processing", "release_count": 0}
@@ -744,11 +744,6 @@ async def test_progress_commit_uncertainty_keeps_attempt_key_and_finishes_failur
     )
     monkeypatch.setattr(worker, "_get_video_job", AsyncMock(return_value=job))
     monkeypatch.setattr(worker, "_input_version_is_current", AsyncMock(return_value=True))
-    monkeypatch.setattr(
-        worker,
-        "_resolve_execution_first_frame",
-        AsyncMock(return_value=None),
-    )
     monkeypatch.setattr(worker, "_credits_settle", None)
     monkeypatch.setattr(
         worker,

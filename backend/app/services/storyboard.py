@@ -47,8 +47,8 @@ from app.schemas.storyboard_contracts import (
     FACING_DIRECTION_VALUES,
     POSITION9_GRID_VALUES,
     SHOT_SIZE_VALUES,
-    StoryboardContract,
     OmittedSourceBlock,
+    StoryboardContract,
     StoryboardContractValidationError,
     StoryboardSceneSplitContract,
     StoryboardV2Contract,
@@ -194,7 +194,7 @@ Episode -> Scene（连续时空段落）-> Shot Group（3~15 秒叙事单元）-
 3. 景别随叙事逐步聚焦或释放，避免连续三镜使用相同景别；运镜必须服务于发现、强调、跟随或情绪变化。
 4. 相邻镜头保持人物位置、朝向、视线与动作进度连续；用反应镜、动作桥或声音桥承接情绪和转场。
 5. frame_description 只写可见的主体、动作状态与前中后景空间，不写无法拍摄的心理判断。
-6. 剧本中的对白、旁白和内心独白必须逐字保留；不得增删或改写。无语言内容时 dialogue 必须为 null。
+6. 剧本中的对白、旁白和内心独白必须逐字保留；不得增删或改写。有语言内容时，speaker_ref、kind、text 必须全部嵌套在 dialogue 对象内，不得平铺在 Shot 层；无语言内容时 dialogue 必须为 null。
 7. 只可引用输入目录中的短引用；不得输出主体名称、subject_id、asset_entry_id，也不得创造新资产。
 8. 不要输出 content、description 或 shot_line；这些派生字段由服务端生成。
 9. 每镜用 source_block_refs 指明落实的 Bxx 原文段；无法落实的段只能在根级 omitted_source_blocks 声明并给出原因。
@@ -214,14 +214,14 @@ Episode -> Scene（连续时空段落）-> Shot Group（3~15 秒叙事单元）-
 - 每组 display_no 必须严格为 1, 2, ..., N；首镜 start_seconds=0，相邻区间首尾相接。
 - end_seconds 必须大于 start_seconds，末镜 end_seconds 必须等于 duration_seconds；所有时码只能是整数。
 - background_ref 只能引用场景；character_refs 只能引用角色；prop_refs 只能引用道具；sound_refs 只能引用声音。
-- kind=dialogue/inner_monologue 时 speaker_ref 必须是当前镜头可见角色；kind=voice_over 时 speaker_ref 可为角色、声音主体或 null。
+- dialogue.kind=dialogue/inner_monologue 时 dialogue.speaker_ref 必须是当前镜头可见角色；dialogue.kind=voice_over 时 dialogue.speaker_ref 可为角色、声音主体或 null。
 - narrative_purpose 要说明该镜头让观众获得什么信息、感受什么变化，不能只写“推进剧情”。
 - sound_design 写可执行的环境音/动作音/声音衔接，无声音时写“无”。
 
 ## 覆盖度（最高优先级，强制，优先于一切结构规则）
 1. 必须覆盖剧本从开头到结尾的全部叙事节拍：每一处场景切换、每一次台词交锋、每一个动作与情绪转折都要落到具体镜头，不得合并、跳过或用一句话带过。
 2. 不得把整场戏压缩进一个镜头组；除非该场戏本身只有一句定场旁白，否则每场戏至少拆为 2 个镜头组。
-3. 剧本中的全部对白、旁白、内心独白必须逐字保留在对应镜头的 dialogue.text 中；遗漏台词视为覆盖失败。
+3. 剧本中的全部对白、旁白、内心独白必须逐字保留在对应镜头的 dialogue.text 中；speaker_ref、kind、text 必须嵌套在 dialogue 对象内，不得位于 Shot 层；遗漏台词视为覆盖失败。
 4. 用户提示会给出由剧本字数推导的“本集覆盖度下限”（最少镜头数/组数/场数/总秒数），这是下限不是目标；实际产出应达到或超过该下限，低于下限会被判定为不合格并要求重做。
 5. 禁止用“一个全景镜 + 长 duration_seconds”敷衍整场戏；duration_seconds 上限 15 秒，长戏必须拆成多个 3~15 秒的镜头组。
 6. 不得为凑数量注水无叙事作用的装饰镜头；每镜只承载一个主要动作或信息变化。
@@ -604,7 +604,7 @@ def _build_user_prompt(
 - 覆盖度数量核对：镜头数 ≥ {min_shots}、镜头组数 ≥ {min_groups}、场数 ≥ {min_scenes}、总时长 ≥ {min_duration} 秒；任一不满足不要输出当前 JSON，请重新规划至全部达标后再输出；
 - 叙事覆盖核对：剧本每一处场景切换、每一次台词交锋、每一个动作/情绪转折是否都落到具体镜头；是否有台词被遗漏或合并；
 - 结构密度核对：叙事主体镜头组是否都含 2~5 镜；单镜头组是否仅用于定场/反应/转场且不超过组数 1/3；
-- 台词保真核对：对白/旁白/内心独白是否逐字保留在 dialogue.text，未增删改写；无语言内容时 dialogue 是否为 null；
+- 台词保真与结构核对：对白/旁白/内心独白是否逐字保留在 dialogue.text，未增删改写；有语言内容时 speaker_ref、kind、text 是否全部嵌套在 dialogue 对象内，未平铺在 Shot 层；无语言内容时 dialogue 是否为 null；
 - scene_no、group_no、display_no 是否连续；
 - 时码是否全部为整数、连续且与组时长一致；
 - 所有短引用是否存在且类型正确；
@@ -1995,6 +1995,23 @@ _DIALOGUE_SPEAKER_ALIASES = (
     "说话人",
     "角色",
 )
+_DIALOGUE_KIND_FIELD_ALIASES = (
+    "kind",
+    "type",
+    "dialogue_type",
+    "model_type",
+    "mode",
+    "category",
+    "台词类型",
+    "类型",
+)
+# ``dialogue`` 是容器键，``value`` 过于泛化，二者都不能从 Shot 顶层回迁。
+_DIALOGUE_STRAY_KEYS = frozenset(
+    _DIALOGUE_ALLOWED_FIELDS
+    | (set(_DIALOGUE_TEXT_ALIASES) - {"dialogue", "value"})
+    | set(_DIALOGUE_SPEAKER_ALIASES)
+    | set(_DIALOGUE_KIND_FIELD_ALIASES)
+)
 _DIALOGUE_KIND_ALIASES: dict[str, str] = {
     "dialogue": "dialogue",
     "dialog": "dialogue",
@@ -2114,7 +2131,7 @@ def _normalize_dialogue_value(
             if key in value:
                 raw_speaker = value.get(key)
                 break
-        for key in ("kind", "type", "dialogue_type", "model_type", "mode", "category", "台词类型", "类型"):
+        for key in _DIALOGUE_KIND_FIELD_ALIASES:
             if key in value:
                 raw_kind = value.get(key)
                 break
@@ -2161,6 +2178,71 @@ def _normalize_dialogue_value(
         for key in ("speaker_ref", "text", "kind")
         if key in _DIALOGUE_ALLOWED_FIELDS
     }
+
+
+def _merge_stray_dialogue_fields(shot: dict) -> None:
+    """回迁 v2 镜头顶层的台词字段，避免其被严格契约作为未知字段拒绝。"""
+
+    if not isinstance(shot.get("visual"), dict):
+        return
+    stray = {
+        key: shot.pop(key)
+        for key in list(shot)
+        if key in _DIALOGUE_STRAY_KEYS
+    }
+    if not stray:
+        return
+
+    dialogue = shot.get("dialogue")
+    if isinstance(dialogue, dict):
+        merged = dict(dialogue)
+        # dialogue 内已有任一规范键或别名时，保留它作为该语义的唯一来源。
+        for aliases in (
+            tuple(key for key in _DIALOGUE_TEXT_ALIASES if key in _DIALOGUE_STRAY_KEYS),
+            _DIALOGUE_SPEAKER_ALIASES,
+            _DIALOGUE_KIND_FIELD_ALIASES,
+        ):
+            if any(key in merged for key in aliases):
+                continue
+            for key in aliases:
+                if key in stray:
+                    merged[key] = stray[key]
+                    break
+        shot["dialogue"] = merged
+        return
+
+    has_text = any(
+        _dialogue_scalar(stray.get(key)) is not None
+        for key in _DIALOGUE_TEXT_ALIASES
+        if key in _DIALOGUE_STRAY_KEYS
+    )
+    if dialogue is None and has_text:
+        shot["dialogue"] = stray
+
+
+_V2_SCENE_ALLOWED_FIELDS = frozenset(StoryboardV2SceneContract.model_fields)
+_V2_SHOT_GROUP_ALLOWED_FIELDS = frozenset(StoryboardV2ShotGroupContract.model_fields)
+_V2_SHOT_ALLOWED_FIELDS = frozenset(StoryboardV2ShotContract.model_fields)
+
+
+def _discard_unknown_v2_fields(
+    value: dict,
+    *,
+    allowed_fields: frozenset[str],
+    level: str,
+) -> None:
+    """在字段回迁后清理 v2 外层漂移字段，保留严格契约作为最终边界。"""
+
+    unknown_fields = sorted(set(value).difference(allowed_fields))
+    if not unknown_fields:
+        return
+    for key in unknown_fields:
+        value.pop(key)
+    logger.warning(
+        "分镜 v2 Provider 响应存在未知%s字段，已剔除 keys=%s",
+        level,
+        ",".join(unknown_fields),
+    )
 
 
 def _normalize_shot_fields(
@@ -2309,6 +2391,8 @@ def _normalize_shot_fields(
             if isinstance(raw_positions, list)
             else []
         )
+    # 必须在处理 dialogue 前回迁；否则严格契约会把平铺字段判为 extra_forbidden。
+    _merge_stray_dialogue_fields(shot)
     if "dialogue" in shot:
         dialogue = _normalize_dialogue_value(
             shot.get("dialogue"),
@@ -2442,6 +2526,12 @@ def _normalize_provider_continuity(
             )
         groups = scene.get("shot_groups")
         if not isinstance(groups, list):
+            if is_v2_payload:
+                _discard_unknown_v2_fields(
+                    scene,
+                    allowed_fields=_V2_SCENE_ALLOWED_FIELDS,
+                    level="Scene",
+                )
             continue
         for group_index, group in enumerate(groups, start=1):
             if not isinstance(group, dict):
@@ -2453,6 +2543,12 @@ def _normalize_provider_continuity(
                 )
             shots = group.get("shots")
             if not isinstance(shots, list) or not shots:
+                if is_v2_payload:
+                    _discard_unknown_v2_fields(
+                        group,
+                        allowed_fields=_V2_SHOT_GROUP_ALLOWED_FIELDS,
+                        level="Shot Group",
+                    )
                 continue
             # 统一按数组顺序重编 display_no，并归一化镜头字段
             for shot_index, shot in enumerate(shots, start=1):
@@ -2464,7 +2560,25 @@ def _normalize_provider_continuity(
                         valid_refs=valid_refs,
                         subject_reference_types=subject_reference_types,
                     )
+                    if is_v2_payload:
+                        _discard_unknown_v2_fields(
+                            shot,
+                            allowed_fields=_V2_SHOT_ALLOWED_FIELDS,
+                            level="Shot",
+                        )
             _normalize_group_timecodes(group, shots)
+            if is_v2_payload:
+                _discard_unknown_v2_fields(
+                    group,
+                    allowed_fields=_V2_SHOT_GROUP_ALLOWED_FIELDS,
+                    level="Shot Group",
+                )
+        if is_v2_payload:
+            _discard_unknown_v2_fields(
+                scene,
+                allowed_fields=_V2_SCENE_ALLOWED_FIELDS,
+                level="Scene",
+            )
     return payload
 
 
@@ -2924,7 +3038,8 @@ def _build_contract_repair_prompt(
     return (
         "请只修复下面 JSON 的结构、枚举、引用、编号或连续整数时码错误。"
         "保持原剧情、动作和台词内容，不要新增情节，不要输出解释。\n"
-        f"修复规则：{repair_instruction}{scope_block}\n"
+        f"修复规则：{repair_instruction}。对白对象的 speaker_ref、kind、text 必须位于 dialogue 内，"
+        f"不能处于 Shot 顶层。{scope_block}\n"
         f"允许的主体短引用：{json.dumps(reference_lines, ensure_ascii=False)}\n"
         f"脱敏校验摘要：{json.dumps(diagnostic, ensure_ascii=False, sort_keys=True)}\n"
         f"待修复 JSON：{serialized}"
@@ -2933,7 +3048,8 @@ def _build_contract_repair_prompt(
 
 _REPAIR_SYSTEM_PROMPT = (
     "你是 storyboard.v2 JSON 修复器。只修复给定对象以符合 JSON Schema；"
-    "不得改写台词或创造资产，只输出修复后的 JSON 对象。"
+    "不得改写台词或创造资产。dialogue 的 speaker_ref、kind、text 必须嵌套在 dialogue 对象内，"
+    "不得平铺在 Shot 层；只输出修复后的 JSON 对象。"
 )
 
 
@@ -3337,7 +3453,7 @@ def _build_scene_user_prompt(
 - 只输出本场景一个 scene，schema_version 为 storyboard.v2。
 - 必须恰好输出 {plan.estimated_groups} 个 shot_groups，group_no 从 G1 连续；每组 1~5 镜；duration_seconds 为 3~15 整数秒。
 - 每组内 display_no 从 1 连续，start_seconds 从 0 累进，相邻区间首尾相接，末镜 end_seconds == duration_seconds。
-- 对白/旁白/内心独白逐字保留在 dialogue.text，无语言内容时 dialogue 为 null。
+- 对白/旁白/内心独白逐字保留在 dialogue.text；有语言内容时 speaker_ref、kind、text 必须全部嵌套在 dialogue 对象内，不得平铺在 Shot 层；无语言内容时 dialogue 为 null。
 - source_block_refs 或根级 omitted_source_blocks 只能使用本场景 Bxx：{", ".join(plan.source_block_refs)}；每段必须二选一落实或省略，省略必须说明 reason。character_refs/prop_refs/sound_refs 只能引用目录短引用。
 - 起止边界、角色九宫格位置/朝向按可见事实填写。
 - audience_visibility 每项只含 fact(本镜揭示的事实文本)、status(只填 "show_now" 或 "withhold_now")、evidence(数组)、reveal_trigger(status=withhold_now 时必填)、protection_method、rationale；无可揭示事实则用空数组 []，不要写 character_ref/protection/展示 等其他字段或值。
@@ -3346,7 +3462,7 @@ def _build_scene_user_prompt(
 {{
   "schema_version": "storyboard.v2",
   "scenes": [
-    {{"scene_no": 1, "background_ref": "{plan.background_ref}", "shot_groups": [{{"group_no": "G1", "narrative_purpose": "...", "duration_seconds": 6, "shots": [{{"display_no": 1, "start_seconds": 0, "end_seconds": 3, "visual": {{"shot_size": "...", "composition": ["..."], "camera_angle": "...", "camera_movement": "...", "action": "...", "frame_description": "...", "lighting": "...", "emotion": "..."}}, "narrative_purpose": "...", "source_block_refs": ["Bxx"], "character_refs": [], "prop_refs": [], "sound_refs": [], "sound_design": "...", "start_boundary": {{"positions": [], "visible_state": []}}, "end_boundary": {{"positions": [], "visible_state": []}}, "character_positions": [], "audience_visibility": [{{"fact": "本镜揭示的事实", "status": "show_now", "evidence": [], "reveal_trigger": null, "protection_method": null, "rationale": null}}], "dialogue": null}}]}}]}}
+    {{"scene_no": 1, "background_ref": "{plan.background_ref}", "shot_groups": [{{"group_no": "G1", "narrative_purpose": "...", "duration_seconds": 6, "shots": [{{"display_no": 1, "start_seconds": 0, "end_seconds": 3, "visual": {{"shot_size": "...", "composition": ["..."], "camera_angle": "...", "camera_movement": "...", "action": "...", "frame_description": "...", "lighting": "...", "emotion": "..."}}, "narrative_purpose": "...", "source_block_refs": ["Bxx"], "character_refs": ["Cxx"], "prop_refs": [], "sound_refs": [], "sound_design": "...", "start_boundary": {{"positions": [], "visible_state": []}}, "end_boundary": {{"positions": [], "visible_state": []}}, "character_positions": [], "audience_visibility": [{{"fact": "本镜揭示的事实", "status": "show_now", "evidence": [], "reveal_trigger": null, "protection_method": null, "rationale": null}}], "dialogue": {{"speaker_ref": "Cxx", "text": "逐字保留的原台词", "kind": "dialogue"}}}}]}}]}}
   ],
   "omitted_source_blocks": []
 }}
@@ -4358,11 +4474,7 @@ async def generate_storyboard(
                 group_index=total_groups + 1,
                 group_no=group_no,
                 prompt=group_prompt,
-                # 首尾帧链式衔接 (04§1.15 / 02§5.4.3 / T8.5):
-                # 分镜生成阶段尚无帧, 全部置 None; 由 T8 视频生成 worker
-                # 按组顺序回填 — 上一组 last_frame -> 下一组 first_frame,
-                # 保证相邻镜头组视觉连续。链式衔接逻辑归 T8 实现。
-                # 钩子: update_chain_frames(db, episode_id) 见本模块末尾。
+                # 分镜生成阶段不生成或继承首尾帧；视频任务仅使用用户选择的参考素材。
                 reference_frames=reference_frames,
                 duration_seconds=duration_seconds,
                 video_duration_seconds=duration_seconds,
@@ -4591,16 +4703,10 @@ def _is_direct_chain_predecessor(
 async def update_chain_frames(
     db: AsyncSession, episode_id: str
 ) -> ChainFrameUpdateResult:
-    """首尾帧链式衔接钩子 (跨模块, 供 T8 视频生成 worker 调用)。
+    """首尾帧链路诊断兼容钩子。
 
-    按 scene_no/group_no 顺序遍历该分集所有镜头组, 将上一组 reference_frames.last_frame
-    回填为下一组 reference_frames.first_frame, 实现相邻镜头组视觉连续 (04§1.15 / 02§5.4.3 / T8.5)。
-
-    本钩子仅做衔接回填, 实际帧内容由 T8 视频生成 worker 在每组生成完成后写入 last_frame。
-    返回值仍是 ``int`` 子类以兼容旧调用，并通过 ``diagnostics`` 暴露本次发现的
-    脱敏结构化问题；同一诊断也写入对应组的 ``reference_frames.chain_diagnostics``。
-
-    跨模块依赖标注: 链式衔接的具体调用时序由 T8 worker 在每组视频生成成功后触发。
+    已停用上一组尾帧到下一组首帧的自动回填。本函数保留诊断及返回类型，兼容
+    历史调用方，但绝不写入或覆盖 ``reference_frames.first_frame``。
     """
     groups_result = await db.execute(
         select(ShotGroup)
@@ -4663,9 +4769,7 @@ async def update_chain_frames(
                 )
             )
 
-        if predecessor_last_frame is not None and current_first_frame is None:
-            frames["first_frame"] = predecessor_last_frame
-            updated += 1
+        # 自动首尾帧衔接已停用，保留下方诊断更新以兼容历史调用方。
 
         preserved_diagnostics = _preserved_chain_diagnostics(frames)
         merged_diagnostics = [*preserved_diagnostics, *group_diagnostics]

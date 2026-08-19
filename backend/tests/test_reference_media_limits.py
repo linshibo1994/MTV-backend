@@ -179,7 +179,7 @@ async def test_video_workbench_disables_video_references_for_unsupported_provide
         "audios": 1,
         "videos": 0,
         "total": 2,
-        "continuation_first_frame_images": 1,
+        "continuation_first_frame_images": 0,
         "audio_requires_reference_image": False,
         "requires_input_image": True,
     }
@@ -235,7 +235,7 @@ def test_mgrouter_first_frame_group_uses_exclusive_effective_quota() -> None:
         "audios": 0,
         "videos": 0,
         "total": 1,
-        "continuation_first_frame_images": 1,
+        "continuation_first_frame_images": 0,
         "audio_requires_reference_image": True,
         "requires_input_image": False,
     }

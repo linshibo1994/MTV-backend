@@ -424,7 +424,7 @@ class StoryboardV2ShotGroupContract(StrictStoryboardModel):
     group_no: str
     narrative_purpose: ShortText
     duration_seconds: int = Field(ge=3, le=15)
-    # 显式续帧意图；服务端仍会用严格连续性规则收紧，默认关闭兼容历史响应。
+    # 保留历史分镜中的续帧意图；不再触发自动首尾帧衔接。
     is_continuation: bool = False
     # 单镜头组也是合法的 3～15 秒视频单元。保留上限以避免把整场戏塞入
     # 一个生成请求；建议性“多镜头”由 prompt 引导，而不应造成任务失败。

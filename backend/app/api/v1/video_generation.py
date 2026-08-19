@@ -25,7 +25,6 @@ from app.core.database import get_db
 from app.core.errors import BadRequestError, ConflictError, ForbiddenError
 from app.core.reference_media_limits import (
     ReferenceMediaCounts,
-    effective_reference_media_limits_for_group,
     reference_media_limit_violations,
     reference_media_limits_for_provider,
     supports_reference_videos,
@@ -50,7 +49,6 @@ from app.schemas.video import (
 )
 from app.services.audit import best_effort_log as audit_log
 from app.services.reference_aggregator import AggregatedReferences
-from app.services.reference_image_audit import include_first_frame
 from app.services.runtime_models import resolve_env_video_model, resolve_video_model
 
 router = APIRouter()
@@ -231,13 +229,11 @@ async def create_video_generation_job(
 async def _current_reference_image_audit_state(
     db: AsyncSession, group: ShotGroup
 ) -> tuple[AggregatedReferences, dict]:
-    """与视频创建共用最终参考图解析：主体图 + 当前链式首帧。"""
+    """与视频创建共用最终参考图解析。"""
     from app.services.reference_aggregator import aggregate_references
-    from app.services.reference_image_audit import current_audit_state, include_first_frame
-    from app.services.video_generation import _resolve_first_frame
+    from app.services.reference_image_audit import current_audit_state
 
     references = await aggregate_references(db, group.shot_group_id)
-    include_first_frame(references, await _resolve_first_frame(db, group))
     return references, current_audit_state(group.reference_image_audit, references)
 
 
@@ -464,11 +460,6 @@ async def check_materials(
     await _load_and_check_script(db, user, script_id, require_write=False)
 
     from app.services.reference_aggregator import aggregate_references
-    from app.services.video_generation import (
-        _reserves_first_frame,
-        _resolve_continuation_static_fallback,
-        _resolve_first_frame,
-    )
 
     runtime_video_model = await resolve_video_model(db, settings)
     reference_limits = reference_media_limits_for_provider(
@@ -476,42 +467,18 @@ async def check_materials(
         runtime_video_model.model,
     )
     aggregated = await aggregate_references(db, shot_group_id)
-    first_frame = (
-        await _resolve_first_frame(db, shot_group)
-        if reference_limits.supports_first_frame
-        else None
-    )
-    if first_frame is None and bool(getattr(shot_group, "is_continuation", False)):
-        first_frame = await _resolve_continuation_static_fallback(db, shot_group)
-    include_first_frame(aggregated, first_frame)
-    provider_reference_images = [
-        image
-        for image in aggregated.reference_images
-        if not first_frame or image.get("storage_key") != first_frame
-    ]
-    reserves_first_frame = await _reserves_first_frame(
-        db,
-        shot_group,
-        supports_first_frame=reference_limits.supports_first_frame,
-    )
-    uses_first_frame = bool(first_frame) or reserves_first_frame
     counts = ReferenceMediaCounts(
-        images=len(provider_reference_images),
+        images=len(aggregated.reference_images),
         audios=len(aggregated.reference_audios),
         videos=len(aggregated.reference_videos),
-        first_frames=1 if uses_first_frame else 0,
-        # 预留后续组容量不等于当前已有可提交首帧。素材检查用于用户可见的
-        # 实际就绪状态，因此只把已解析到的帧计入图生模型的必需输入。
-        available_first_frames=1 if first_frame else 0,
+        first_frames=0,
+        available_first_frames=0,
     )
     reference_violations = [
         {"code": violation.code, "detail": violation.detail}
         for violation in reference_media_limit_violations(
             counts,
-            limits=effective_reference_media_limits_for_group(
-                reference_limits,
-                reserve_first_frame=uses_first_frame,
-            ),
+            limits=reference_limits,
         )
     ]
     if aggregated.reference_videos and not supports_reference_videos(
@@ -533,7 +500,7 @@ async def check_materials(
             "audios": counts.audios,
             "videos": counts.videos,
             "total": counts.total,
-            "reserves_first_frame": reserves_first_frame,
+            "reserves_first_frame": False,
         },
         "reference_violations": reference_violations,
         "ready": (

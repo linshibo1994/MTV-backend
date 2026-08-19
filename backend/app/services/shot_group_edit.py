@@ -468,11 +468,6 @@ async def update_shot_group(
             normalised_materials if normalised_materials is not None else group.materials
         )
         candidate_audio = normalised_audio if normalised_audio is not None else group.audio_elements
-        candidate_is_continuation = (
-            bool(is_continuation)
-            if "is_continuation" in fields_set
-            else bool(getattr(group, "is_continuation", False))
-        )
         from app.services.runtime_models import resolve_video_model
 
         runtime_video_model = await resolve_video_model(db)
@@ -480,32 +475,6 @@ async def update_shot_group(
             runtime_video_model.provider,
             runtime_video_model.model,
         )
-        # 普通组也会在前组完成后承接同场景前组的尾帧；因此只要存在更早
-        # 正式组且当前模型支持首帧输入时才预留。测试替身缺少 group_index 时
-        # 无需额外查询。
-        from app.services.video_generation import (
-            _reserves_first_frame,
-            _resolve_continuation_static_fallback,
-            _resolve_first_frame,
-        )
-
-        reserve_first_frame = await _reserves_first_frame(
-            db,
-            group,
-            is_continuation=candidate_is_continuation,
-            supports_first_frame=reference_limits.supports_first_frame,
-        )
-        available_first_frame = (
-            await _resolve_first_frame(
-                db,
-                group,
-                is_continuation=candidate_is_continuation,
-            )
-            if reference_limits.supports_first_frame
-            else None
-        )
-        if available_first_frame is None and candidate_is_continuation:
-            available_first_frame = await _resolve_continuation_static_fallback(db, group)
         _, candidate_video_count = count_material_references(candidate_materials)
         if candidate_video_count and not supports_reference_videos(
             runtime_video_model.provider,
@@ -516,8 +485,8 @@ async def update_shot_group(
             validate_shot_group_reference_selection(
                 candidate_materials,
                 candidate_audio,
-                reserve_continuation_first_frame=reserve_first_frame,
-                available_first_frames=1 if available_first_frame else 0,
+                reserve_continuation_first_frame=False,
+                available_first_frames=0,
                 limits=reference_limits,
             )
         except ReferenceMediaLimitExceeded as exc:

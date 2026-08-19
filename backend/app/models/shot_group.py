@@ -101,7 +101,7 @@ class ShotGroup(TimestampMixin, Base):
     )
     # 生成时使用的结构化引用、模板与 token 绑定上下文；历史镜头组允许为空。
     prompt_context: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
-    # True 表示视频应优先承接同场景直接前驱的真实尾帧；默认关闭以兼容历史组。
+    # 保留历史分镜的续帧意图；视频生成不再据此自动传递前驱尾帧。
     is_continuation: Mapped[bool] = mapped_column(
         Boolean,
         nullable=False,

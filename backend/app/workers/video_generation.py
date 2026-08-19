@@ -1901,13 +1901,9 @@ async def run_video_generation_once(
                 retryable=False,
             )
             return
-        # 创建任务时已按实际模型冻结首帧能力。纯文生模型不能在执行阶段因为
-        # 同场景前组刚完成又重新解析出尾帧并把它作为未声明的图片输入提交。
-        first_frame = (
-            None
-            if input_json.get("first_frame_supported") is False
-            else await _resolve_execution_first_frame(db, job, input_json)
-        )
+        # 禁用自动首尾帧衔接。即使历史任务中已冻结首帧或前驱刚刚生成尾帧，
+        # 本次提交也不能将其混入参考媒体请求。
+        first_frame = None
         provider_task_id = _provider_task_id_from_job(job)
         storage_attempt_id = _storage_attempt_id(claim.lease_token)
         provider = provider or get_video_provider(job_provider_key)
@@ -2110,14 +2106,9 @@ async def run_video_generation_once(
                 )
                 return
         try:
-            if extract_last_frame is None:
-                last_frame_storage_key = await _update_last_frame(
-                    db,
-                    unit_id,
-                    result.video_storage_key,
-                    storage_attempt_id,
-                )
-            else:
+            # 生产路径不再自动抽取视频尾帧。保留注入钩子仅供测试覆盖失败后的
+            # 清理闭环，不会由 Celery 任务传入。
+            if extract_last_frame is not None:
                 maybe = extract_last_frame(db, unit_id, result.video_storage_key, claim.lease_token)
                 if hasattr(maybe, "__await__"):
                     maybe = await maybe

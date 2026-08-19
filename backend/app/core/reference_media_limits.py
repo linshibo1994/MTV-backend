@@ -219,9 +219,8 @@ def public_reference_media_limits(
         "audios": effective_limits.audios,
         "videos": videos,
         "total": effective_limits.total,
-        "continuation_first_frame_images": (
-            CONTINUATION_FIRST_FRAME_IMAGES if effective_limits.supports_first_frame else 0
-        ),
+        # 自动首尾帧衔接已停用，工作台不再为它保留可选素材名额。
+        "continuation_first_frame_images": 0,
         "audio_requires_reference_image": effective_limits.audio_requires_reference_image,
         "requires_input_image": effective_limits.requires_input_image,
     }

@@ -13,11 +13,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.core.reference_media_limits import (
-    effective_reference_media_limits_for_group,
-    has_automatic_predecessor_frame_dependency,
     public_reference_media_limits,
     reference_media_limits_for_provider,
-    should_follow_direct_predecessor,
 )
 from app.core.storyboard_fields import storyboard_fields_from_shot
 from app.models.episode import Episode
@@ -47,7 +44,6 @@ from app.schemas.shot import (
 from app.services.reference_aggregator import aggregate_references
 from app.services.reference_image_audit import (
     current_audit_state,
-    include_first_frame,
     public_audit_state,
 )
 from app.services.runtime_models import resolve_video_model
@@ -322,10 +318,6 @@ async def get_shot_hierarchy(
         group_ids.add(g.shot_group_id)
     for grouped_shot_groups in groups_by_scene.values():
         grouped_shot_groups.sort(key=_group_sort_key)
-    groups_by_scene_and_index = {
-        (group.scene_no, group.group_index): group
-        for group in groups
-    }
 
     # 按 scene_no 分组未分组镜头
     ungrouped_by_scene: dict[int, list[Shot]] = {}
@@ -447,40 +439,6 @@ async def get_video_workbench(
         group_ids.add(g.shot_group_id)
     for grouped_shot_groups in groups_by_scene.values():
         grouped_shot_groups.sort(key=_group_sort_key)
-    # 同场景第二个及后续正式组会在前组完成后承接尾帧，即使当前还没有
-    # 可读的静态帧，也必须提前为其预留一个图片和总引用名额。
-    first_frame_reserved_by_group_id = {
-        group.shot_group_id: (
-            effective_reference_limits.supports_first_frame
-            and (index > 0 or bool(getattr(group, "is_continuation", False)))
-        )
-        for grouped_shot_groups in groups_by_scene.values()
-        for index, group in enumerate(grouped_shot_groups)
-    }
-    group_reference_limits_by_id = {
-        group.shot_group_id: public_reference_media_limits(
-            effective_reference_media_limits_for_group(
-                effective_reference_limits,
-                reserve_first_frame=first_frame_reserved_by_group_id.get(
-                    group.shot_group_id,
-                    False,
-                ),
-            )
-        )
-        for group in groups
-    }
-    # 仅自动合并的 I2V 后续组使用该公开状态；用户手工勾选的续帧仍由
-    # is_continuation 表达。严格按 group_index 取前驱，不能用同场景任意旧组代替。
-    awaits_predecessor_by_group_id = {
-        group.shot_group_id: (
-            effective_reference_limits.supports_first_frame
-            and effective_reference_limits.requires_input_image
-            and has_automatic_predecessor_frame_dependency(group)
-            and (group.scene_no, group.group_index - 1) in groups_by_scene_and_index
-        )
-        for group in groups
-    }
-
     ungrouped_by_scene: dict[int, list[Shot]] = {}
     for shot in all_shots:
         if _is_ungrouped(shot, group_ids):
@@ -530,22 +488,6 @@ async def get_video_workbench(
         for g in groups_by_scene.get(scene.scene_no, []):
             sorted_shots = sorted(g.shots, key=lambda s: s.display_no)
             references = await aggregate_references(db, g.shot_group_id)
-            from app.services.video_generation import _resolve_first_frame
-
-            follows_direct_predecessor = should_follow_direct_predecessor(
-                g,
-                limits=effective_reference_limits,
-            )
-            first_frame = (
-                await _resolve_first_frame(
-                    db,
-                    g,
-                    is_continuation=follows_direct_predecessor,
-                )
-                if effective_reference_limits.supports_first_frame
-                else None
-            )
-            include_first_frame(references, first_frame)
             audit_state = current_audit_state(g.reference_image_audit, references)
             workbench_groups.append(
                 ShotGroupWorkbenchOut(
@@ -560,18 +502,9 @@ async def get_video_workbench(
                     duration_seconds=g.duration_seconds,
                     video_duration_seconds=g.video_duration_seconds,
                     is_continuation=bool(getattr(g, "is_continuation", False)),
-                    reserves_first_frame=first_frame_reserved_by_group_id.get(
-                        g.shot_group_id,
-                        bool(getattr(g, "is_continuation", False)),
-                    ),
-                    awaits_predecessor_frame=awaits_predecessor_by_group_id.get(
-                        g.shot_group_id,
-                        False,
-                    ),
-                    reference_limits=group_reference_limits_by_id.get(
-                        g.shot_group_id,
-                        reference_limits,
-                    ),
+                    reserves_first_frame=False,
+                    awaits_predecessor_frame=False,
+                    reference_limits=reference_limits,
                     materials=_to_materials(g.materials),
                     audio_elements=_normalise_audio_elements(g.audio_elements),
                     shot_ids=[s.shot_id for s in sorted_shots],

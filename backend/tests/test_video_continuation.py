@@ -737,25 +737,30 @@ def test_predecessor_failure_cascades_and_releases_each_reservation_once(monkeyp
     asyncio.run(scenario())
 
 
-def test_create_continuation_without_predecessor_job_waits_without_dispatch(monkeypatch) -> None:
+def test_create_continuation_does_not_wait_or_pass_predecessor_tail(monkeypatch) -> None:
     async def scenario() -> None:
         from app.services import video_generation as service
 
         _, raw = _make_db()
         seeded = _seed(raw)
-        _add_group(
+        predecessor = _add_group(
             raw,
             seeded,
             shot_group_id="sg-9",
             group_index=9,
             is_continuation=False,
         )
+        predecessor.reference_frames = {"last_frame": "frames/predecessor-tail.png"}
         seeded.shot_group.is_continuation = True
         seeded.shot_group.reference_image_audit = {}
         raw.commit()
         db = _AsyncSessionAdapter(raw)
         monkeypatch.setattr(service, "_credits_reserve", None)
-        monkeypatch.setattr(service, "aggregate_references", AsyncMock(return_value=AggregatedReferences()))
+        monkeypatch.setattr(
+            service,
+            "aggregate_references",
+            AsyncMock(return_value=AggregatedReferences(reference_images=[{"storage_key": "input.png"}])),
+        )
         monkeypatch.setattr(
             service,
             "resolve_video_model",
@@ -768,7 +773,7 @@ def test_create_continuation_without_predecessor_job_waits_without_dispatch(monk
                 )
             ),
         )
-        enqueue = AsyncMock(side_effect=AssertionError("等待依赖时不得创建 Outbox"))
+        enqueue = AsyncMock(return_value=SimpleNamespace(id="dispatch-without-tail"))
         monkeypatch.setattr(service, "enqueue_task", enqueue)
 
         job = await service.create_video_job(
@@ -780,11 +785,55 @@ def test_create_continuation_without_predecessor_job_waits_without_dispatch(monk
             idempotency_key="continuation-waiting-create",
         )
 
-        assert job.status == "waiting_dependency"
+        assert job.status == "starting"
         assert job.predecessor_job_id is None
         assert job.lease_token is None
-        assert job.input_json["continuation_dependency"]["state"] == "waiting"
-        enqueue.assert_not_awaited()
+        assert job.input_json["first_frame"] is None
+        assert job.input_json["awaits_predecessor_frame"] is False
+        assert job.input_json["continuation_dependency"] is None
+        enqueue.assert_awaited_once()
+
+    asyncio.run(scenario())
+
+
+def test_worker_does_not_extract_tail_frame_without_test_hook(monkeypatch) -> None:
+    async def scenario() -> None:
+        from app.providers.video_gen import VideoGenerationResult
+        from app.workers import video_generation as worker
+        from tests.test_video_generation import _add_worker_job
+
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        job = _add_worker_job(
+            raw,
+            seeded,
+            job_id="job-no-auto-tail-frame",
+            reservation_id="reservation-no-auto-tail-frame",
+        )
+        db = _AsyncSessionAdapter(raw)
+        extract_tail = AsyncMock(side_effect=AssertionError("不得自动抽取尾帧"))
+        monkeypatch.setattr(worker, "_update_last_frame", extract_tail)
+        monkeypatch.setattr(worker, "_credits_settle", AsyncMock())
+        provider = SimpleNamespace(
+            generate=AsyncMock(
+                return_value=VideoGenerationResult(
+                    video_storage_key="generate_images/video/no-auto-tail.mp4",
+                    provider_job_id="provider-no-auto-tail",
+                )
+            )
+        )
+
+        await worker.run_video_generation_once(
+            db,
+            job.job_id,
+            owner="worker",
+            provider=provider,
+        )
+
+        saved = raw.get(VideoGenerationJob, job.job_id)
+        assert saved.status == "succeeded"
+        assert "last_frame_storage_key" not in (saved.output_json or {})
+        extract_tail.assert_not_awaited()
 
     asyncio.run(scenario())
 

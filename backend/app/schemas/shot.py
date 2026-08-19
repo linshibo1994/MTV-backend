@@ -265,14 +265,13 @@ class ShotGroupWorkbenchOut(BaseModel):
     duration_seconds: int | None = None
     video_duration_seconds: int | None = None
     is_continuation: bool = False
-    # 该组本次生成会（或续帧任务完成后会）预留一张前序尾帧图片名额。
+    # 自动首帧衔接已停用，始终为 false；字段保留以兼容既有客户端。
     reserves_first_frame: bool = False
-    # 自动组合的图生后续组会等待同场景严格直接前驱的真实尾帧；它不等同于
-    # 用户手动勾选的 is_continuation。
+    # 自动前驱依赖已停用，始终为 false；字段保留以兼容既有客户端。
     awaits_predecessor_frame: bool = False
-    # 当前模型支持首帧且存在严格直接前驱；前端可据此允许用户手动开启续帧。
+    # 自动前驱等待已停用，始终为 false；字段保留以兼容既有客户端。
     can_wait_for_predecessor_frame: bool = False
-    # 镜头组级有效额度。MGRouter 的首帧组使用独占输入槽，不能沿用工作台默认额度。
+    # 镜头组级有效参考素材额度。
     reference_limits: dict[str, int | bool] = Field(
         default_factory=public_reference_media_limits
     )

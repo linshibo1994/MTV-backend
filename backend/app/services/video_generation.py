@@ -4,7 +4,7 @@
 1. 幂等去重（Idempotency-Key 或同 shot_group 活动任务复用，doc 08 §4.2）
 2. 取 shot_group，校验存在与归属
 3. aggregate_references 汇聚参考图 + 参考音频（audio_elements，doc 06 §9.6）
-4. 首尾帧链式衔接：取上一组 last_frame → 当前组 first_frame（doc 06 §10.3）
+4. 不自动生成或继承首尾帧
 5. 取激活供应商配置 (provider_key + model)，缺失则兜底默认
 6. 落库 VideoGenerationJob（status=pending, input_json 含 model/参考图/prompt/first_frame）
 7. credits.reserve (source_type='generation_job', source_id=job_id,
@@ -35,9 +35,7 @@ from app.core.errors import BadRequestError, ConflictError, ForbiddenError
 from app.core.reference_media_limits import (
     ReferenceMediaCounts,
     ReferenceMediaLimitExceeded,
-    effective_reference_media_limits_for_group,
     reference_media_limits_for_provider,
-    should_follow_direct_predecessor,
     supports_reference_videos,
     validate_reference_media_counts,
 )
@@ -66,7 +64,6 @@ from app.services.reference_aggregator import aggregate_references
 from app.services.reference_image_audit import (
     audit_not_required_state,
     ensure_references_approved,
-    include_first_frame,
 )
 from app.services.reference_tokens import bind_reference_tokens_to_prompt
 from app.services.task_dispatch import cancel_outbox_task, enqueue_task
@@ -118,7 +115,7 @@ async def create_video_job(
     prompt: str | None = None,
     style_id: str | None = None,
 ) -> "VideoGenerationJob":
-    """创建视频生成任务 — 幂等去重 → 汇聚参考图/音频 → 首帧衔接 → 落库 → reserve 积分 → 投递 worker。
+    """创建视频生成任务 — 幂等去重 → 汇聚参考图/音频 → 落库 → reserve 积分 → 投递 worker。
 
     Args:
         db: 异步会话。
@@ -263,114 +260,38 @@ async def create_video_job(
             job=active_job,
         )
 
-    # Provider/模型能力在创建时冻结。首帧是实际图片输入的一种，纯文生模型
-    # 不能建立前驱等待或在执行阶段继续传入上一组尾帧。
+    # Provider/模型能力在创建时冻结。视频生成不再自动承接同场景前驱视频的
+    # 尾帧，首帧仅保留为历史任务兼容字段，新的任务始终不传入该输入。
     runtime_video_model = await resolve_video_model(db, settings)
     reference_limits = reference_media_limits_for_provider(
         runtime_video_model.provider,
         runtime_video_model.model,
     )
     supports_first_frame = reference_limits.supports_first_frame
-    # 保留 is_continuation 作为用户明确选择；自动合并的 I2V 后续组通过
-    # reference_frames 内部标记进入同一严格前驱依赖链。
     is_continuation = bool(getattr(shot_group, "is_continuation", False))
-    follows_direct_predecessor = should_follow_direct_predecessor(
-        shot_group,
-        limits=reference_limits,
-    )
-
-    predecessor_job: VideoGenerationJob | None = None
-    predecessor_group: ShotGroup | None = None
-    predecessor_last_frame: str | None = None
-    continuation_static_fallback: str | None = None
-    waiting_for_dependency = False
-    dependency_unavailable = False
-    if follows_direct_predecessor:
-        predecessor_group = await _resolve_direct_predecessor(db, shot_group)
-        # 静态回退在任务创建事务中冻结。它只来自当前组显式参考帧或同场景
-        # 直接前驱的静态尾帧，不查询任何历史视频任务，避免把旧 attempt 的
-        # 抽帧误认成当前直接前驱的权威真实尾帧。
-        continuation_static_fallback = await _resolve_continuation_static_fallback(
-            db,
-            shot_group,
-            predecessor=predecessor_group,
-        )
-        if predecessor_group is None:
-            dependency_unavailable = continuation_static_fallback is None
-        else:
-            predecessor_job = await _latest_predecessor_video_job(db, predecessor_group)
-            frozen_last_frame = (
-                (predecessor_job.output_json or {}).get("last_frame_storage_key")
-                if predecessor_job is not None
-                else None
-            )
-            predecessor_last_frame = (
-                frozen_last_frame if isinstance(frozen_last_frame, str) else None
-            )
-            if predecessor_job is None:
-                # 批量接口可能按任意顺序提交。先创建 child 时保持无租约等待，
-                # 待直接前驱任务创建后再在同事务绑定 predecessor_job_id。
-                waiting_for_dependency = True
-            elif predecessor_job.status in {"failed", "canceled"}:
-                dependency_unavailable = continuation_static_fallback is None
-            elif predecessor_job.status == "succeeded" and not predecessor_last_frame:
-                dependency_unavailable = continuation_static_fallback is None
-            elif predecessor_job.status != "succeeded":
-                waiting_for_dependency = True
 
     # 3. 汇聚参考图 + 参考音频
     aggregated = await aggregate_references(db, shot_group_id)
     if aggregated.missing_videos:
         raise BadRequestError("参考视频必须是当前剧本已成功生成的视频，请重新选择")
 
-    # 4. 首尾帧链式衔接：取上一组 last_frame 作为当前组首帧参考（doc 06 §10.3）
+    # 4. 不再自动从其他视频生成或继承首帧。
     first_frame: str | None = None
-    if supports_first_frame:
-        first_frame = (
-            predecessor_last_frame or continuation_static_fallback
-            if follows_direct_predecessor
-            else await _resolve_first_frame(db, shot_group)
-        )
-    if first_frame:
-        # 持久化到当前组 reference_frames.first_frame
-        await _persist_first_frame(db, shot_group, first_frame)
-    # 任一实际传给视频模型的图片都必须绑定当前审核快照；首帧也在其中。
-    include_first_frame(aggregated, first_frame)
     if aggregated.reference_videos and not supports_reference_videos(
         runtime_video_model.provider,
         runtime_video_model.model,
     ):
         raise BadRequestError("当前视频模型不支持参考视频，请移除参考视频或切换至 Seedance/NeoLink")
-    reserves_first_frame = await _reserves_first_frame(
-        db,
-        shot_group,
-        is_continuation=follows_direct_predecessor,
-        supports_first_frame=supports_first_frame,
-    )
-    uses_first_frame = bool(first_frame) or reserves_first_frame
     try:
-        # 首帧经独立 role 提交；审核清单中同键项不再作为普通参考图重复发送。
-        provider_reference_images = [
-            image
-            for image in aggregated.reference_images
-            if not first_frame or image.get("storage_key") != first_frame
-        ]
         validate_reference_media_counts(
             ReferenceMediaCounts(
-                images=len(provider_reference_images),
+                images=len(aggregated.reference_images),
                 audios=len(aggregated.reference_audios),
                 videos=len(aggregated.reference_videos),
-                first_frames=1 if uses_first_frame else 0,
-                # 普通后续组的容量预约不能视为实际图片输入；只有已经解析到
-                # 首帧，或续帧任务已进入可靠等待链路时，图生模型才能通过下限校验。
-                available_first_frames=1
-                if first_frame or waiting_for_dependency
-                else 0,
+                first_frames=0,
+                available_first_frames=0,
             ),
-            limits=effective_reference_media_limits_for_group(
-                reference_limits,
-                reserve_first_frame=uses_first_frame,
-            ),
+            limits=reference_limits,
         )
     except ReferenceMediaLimitExceeded as exc:
         raise BadRequestError(exc.detail) from None
@@ -381,8 +302,6 @@ async def create_video_job(
         audit_state = ensure_references_approved(shot_group.reference_image_audit, aggregated)
     else:
         audit_state = audit_not_required_state(aggregated)
-    # 创建任务的组级版本快照必须来自所有镜头组变更落库之后；否则自动补首帧
-    # 会更新 updated_at，导致刚创建的任务立即被工作台判定为历史结果。
     await db.flush()
     await db.refresh(shot_group, attribute_names=["updated_at"])
 
@@ -457,7 +376,7 @@ async def create_video_job(
         "reference_audio_names": aggregated.reference_audio_names,
         "reference_videos": aggregated.reference_videos,
         "reference_video_names": aggregated.reference_video_names,
-        # 首帧参考（上一组尾帧，链式衔接；传给 provider 作首帧约束）
+        # 新任务不自动传递首帧，避免与参考媒体混用。
         "first_frame": first_frame,
         "first_frame_supported": supports_first_frame,
         "reference_image_audit": audit_state,
@@ -467,36 +386,8 @@ async def create_video_job(
         "missing_videos": aggregated.missing_videos,
         "duration_seconds": shot_group.duration_seconds,
         "is_continuation": is_continuation,
-        # 任务冻结的实际依赖语义。自动合并时该字段可为 true，而用户开关
-        # is_continuation 仍保持 false，供 Worker 避免重新解析到错误前驱。
-        "awaits_predecessor_frame": follows_direct_predecessor,
-        "continuation_dependency": (
-            {
-                "state": (
-                    "unavailable"
-                    if dependency_unavailable
-                    else "waiting"
-                    if waiting_for_dependency
-                    else "ready"
-                ),
-                "predecessor_shot_group_id": (
-                    predecessor_group.shot_group_id if predecessor_group is not None else None
-                ),
-                "predecessor_job_id": (
-                    predecessor_job.job_id if predecessor_job is not None else None
-                ),
-                "static_fallback_frame": continuation_static_fallback,
-                "frame_source": (
-                    "real_tail"
-                    if predecessor_last_frame
-                    else "static_fallback"
-                    if continuation_static_fallback and not waiting_for_dependency
-                    else None
-                ),
-            }
-            if follows_direct_predecessor
-            else None
-        ),
+        "awaits_predecessor_frame": False,
+        "continuation_dependency": None,
         "shot_group_version": {
             "episode_version": int(episode.episode_version or 1),
             "shot_group_updated_at": shot_group.updated_at.isoformat()
@@ -528,10 +419,8 @@ async def create_video_job(
             attempt=attempt,
             reservation_id=None,
             input_json=input_json,
-            initial_status=("waiting_dependency" if waiting_for_dependency else "starting"),
-            predecessor_job_id=(
-                predecessor_job.job_id if predecessor_job is not None else None
-            ),
+            initial_status="starting",
+            predecessor_job_id=None,
         )
         await video_crud.bind_idempotency_request(
             db,
@@ -540,11 +429,6 @@ async def create_video_job(
             request_hash=request_hash,
             job_id=job.job_id,
         )
-        bound_waiting_children = await video_crud.bind_waiting_dependents_to_predecessor_job(
-            db,
-            job,
-        )
-
         # 7. 积分 reserve（source_id=job_id 幂等；冻结量=price_video_gen_frozen）
         reservation_id: str | None = None
         if _credits_reserve is not None:
@@ -561,52 +445,20 @@ async def create_video_job(
             job.reservation_id = reservation_id
             input_json["reservation_id"] = reservation_id
 
-        if dependency_unavailable:
-            if reservation_id:
-                from app.services.credits import release as _credits_release
-
-                await _credits_release(
-                    db,
-                    reservation_id=reservation_id,
-                    reason="dependency_unavailable",
-                    actor_user_id=user_id,
-                    commit=False,
-                )
-            job.status = "failed"
-            job.progress_stage = "dependency_unavailable"
-            job.progress_message = "同场景直接前驱未提供可用真实尾帧"
-            job.error_type = "dependency_unavailable"
-            job.error_message = "dependency_unavailable"
-            job.finished_at = datetime.now(UTC)
-            job.retryable = False
-
-        if bound_waiting_children and job.status in {"failed", "canceled"}:
-            # 正常批量中首个非续帧前驱不会走到这里；该分支覆盖依赖链中间节点
-            # 在创建时已确定不可用的场景，并保证后继 reservation 不会永久冻结。
-            from app.workers.video_generation import _resolve_continuation_dependents
-
-            await _resolve_continuation_dependents(
-                db,
-                job.job_id,
-                last_frame_storage_key=None,
-                succeeded=False,
-            )
-
-        if not waiting_for_dependency and not dependency_unavailable:
-            dispatch = await enqueue_task(
-                db,
-                task_type="video.generate",
-                job_id=job.job_id,
-                attempt=job.attempt,
-                payload={
-                    "job_id": job.job_id,
-                    "script_id": script_id,
-                    "episode_id": episode_id,
-                    "shot_group_id": shot_group_id,
-                    "input_version": job.input_version,
-                },
-            )
-            job.dispatch_id = dispatch.id
+        dispatch = await enqueue_task(
+            db,
+            task_type="video.generate",
+            job_id=job.job_id,
+            attempt=job.attempt,
+            payload={
+                "job_id": job.job_id,
+                "script_id": script_id,
+                "episode_id": episode_id,
+                "shot_group_id": shot_group_id,
+                "input_version": job.input_version,
+            },
+        )
+        job.dispatch_id = dispatch.id
         # updated_at 由数据库侧 onupdate 生成；flush 后会被 SQLAlchemy 标记为过期。
         # 提交前定向刷新，避免响应序列化在同步属性访问中触发异步隐式查询。
         await db.flush()
