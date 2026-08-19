@@ -3,7 +3,9 @@
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from app.providers.storage import public_url_for_output_key
 
 
 class ArtStyleOut(BaseModel):
@@ -19,6 +21,7 @@ class ArtStyleOut(BaseModel):
     source_asset_ids: list[str]
     source_hashes: list[str]
     thumbnail_storage_key: str | None = None
+    thumbnail_public_url: str | None = None
     extraction_provider: str | None = None
     extraction_model: str | None = None
     extraction_version: int
@@ -27,6 +30,11 @@ class ArtStyleOut(BaseModel):
     updated_by_user_id: str
     created_at: datetime
     updated_at: datetime
+
+    @model_validator(mode="after")
+    def populate_thumbnail_public_url(self) -> "ArtStyleOut":
+        self.thumbnail_public_url = public_url_for_output_key(self.thumbnail_storage_key)
+        return self
 
 
 class ArtStyleListOut(BaseModel):

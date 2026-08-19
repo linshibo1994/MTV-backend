@@ -57,7 +57,7 @@ from app.providers.image_gen import (
     soften_prompt,
 )
 from app.providers.registry import ProviderError
-from app.providers.storage import get_storage
+from app.providers.storage import get_storage, storage_key_for_write
 from app.schemas.materials import CHARACTER_SHEET_MARKER, LEGACY_CHARACTER_SHEET_MARKERS
 from app.services.credits import release as credits_release
 from app.services.credits import settle as credits_settle
@@ -425,8 +425,10 @@ async def _persist_validated_image(
     material_id: str, job_id: str, lease_token: str, image: ValidatedImage, storage: Any
 ) -> PersistedImage:
     file_id = new_id()
-    final_key = f"generate_images/{material_id}/{file_id}.{image.extension}"
-    temp_key = f"generate_images/{material_id}/tmp/{job_id}/{lease_token}/{file_id}.{image.extension}"
+    final_key = storage_key_for_write(f"generate_images/{material_id}/{file_id}.{image.extension}")
+    temp_key = storage_key_for_write(
+        f"generate_images/{material_id}/tmp/{job_id}/{lease_token}/{file_id}.{image.extension}"
+    )
     await storage.put(temp_key, image.data)
     return PersistedImage(
         temp_key=temp_key,
@@ -1284,7 +1286,7 @@ async def _persist_image(material_id: str, data: bytes) -> tuple[str, str]:
     local 写本地磁盘，oss 写对象存储；media 代理经同一 provider 读取不会 404。
     """
     file_id = new_id()
-    storage_key = f"/generate_images/{material_id}/{file_id}.png"
+    storage_key = f"/{storage_key_for_write(f'generate_images/{material_id}/{file_id}.png')}"
     storage = get_storage()
     await storage.put(storage_key, data)
     sha256 = hashlib.sha256(data).hexdigest()

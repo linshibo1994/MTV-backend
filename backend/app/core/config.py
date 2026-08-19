@@ -59,6 +59,8 @@ class Settings(BaseSettings):
     aliyun_oss_access_key_secret: SecretStr = SecretStr("")
     aliyun_oss_bucket: str = "flowapp"
     aliyun_oss_region: str = ""
+    # 对外公开资源域名。配置后，外部供应商读取媒体时使用该 CDN URL，而非 OSS 签名 URL。
+    aliyun_oss_public_url: str = ""
 
     # OpenAI (旧字段，保留作新能力配置为空时的回退)
     openai_api_key: str = ""
@@ -356,6 +358,13 @@ class Settings(BaseSettings):
                 ) from exc
             self.volc_image_audit_public_base_url = normalized_audit_origin
 
+        oss_public_url = self.aliyun_oss_public_url.strip()
+        if oss_public_url:
+            try:
+                self.aliyun_oss_public_url = _normalize_public_cdn_url(oss_public_url)
+            except ValueError as exc:
+                raise ValueError(f"ALIYUN_OSS_PUBLIC_URL 配置不安全：{exc}") from exc
+
         for field_name in (
             "text_llm_base_url",
             "chat_llm_base_url",
@@ -484,6 +493,26 @@ def _normalize_cors_origin(origin: str, *, allow_wildcard: bool) -> str:
         raise ValueError("必须是无用户信息、查询、片段和非根路径的 http/https origin")
 
     return parsed._replace(scheme=parsed.scheme.lower(), path="").geturl()
+
+
+def _normalize_public_cdn_url(value: str) -> str:
+    """规范化可匿名访问媒体的 CDN Origin，禁止其指向内网或携带路径。"""
+    normalized = _normalize_cors_origin(value, allow_wildcard=False)
+    try:
+        parsed = urlsplit(normalized)
+        hostname = (parsed.hostname or "").rstrip(".").lower()
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("URL 格式无效") from exc
+
+    if parsed.scheme != "https":
+        raise ValueError("必须使用 HTTPS")
+    if port not in {None, 443}:
+        raise ValueError("仅允许 HTTPS 默认端口")
+    if _is_non_public_origin_host(hostname):
+        raise ValueError("必须使用公网主机")
+    netloc = hostname if ":" not in hostname else f"[{hostname}]"
+    return parsed._replace(scheme="https", netloc=netloc, path="", query="", fragment="").geturl()
 
 
 def _normalize_provider_base_url(value: str, *, allow_local_http: bool) -> str:

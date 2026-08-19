@@ -3,7 +3,9 @@
 from datetime import datetime
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
+
+from app.providers.storage import public_urls_for_payload
 
 MAX_VIDEO_PROMPT_LENGTH = 32_000
 VideoPrompt = Annotated[
@@ -51,6 +53,11 @@ class VideoJobOut(BaseModel):
     metrics: dict[str, Any] | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
+
+    @model_validator(mode="after")
+    def populate_output_public_urls(self) -> "VideoJobOut":
+        self.output_json = public_urls_for_payload(self.output_json)
+        return self
 
 
 class ActiveProviderOut(BaseModel):

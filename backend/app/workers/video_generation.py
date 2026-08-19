@@ -36,6 +36,7 @@ from billiard.exceptions import SoftTimeLimitExceeded, TimeLimitExceeded
 from celery.exceptions import Reject, WorkerTerminate
 
 from app.core.config import settings
+from app.providers.storage import storage_key_for_write
 from app.providers.video_gen import (
     VideoCancellationOutcome,
     VideoCancellationResult,
@@ -3227,6 +3228,16 @@ def _storage_attempt_id(lease_token: str) -> str:
     return hashlib.sha256(lease_token.encode("utf-8")).hexdigest()[:16]
 
 
+def _video_output_storage_key(job_id: str, storage_attempt_id: str) -> str:
+    return storage_key_for_write(
+        f"generate_images/video/{job_id}-{storage_attempt_id}.mp4"
+    )
+
+
+def _video_last_frame_storage_key(shot_group_id: str, storage_attempt_id: str) -> str:
+    return f"/{storage_key_for_write(f'generate_images/video/frames/{shot_group_id}_{storage_attempt_id}_last.png')}"
+
+
 def _is_attempt_storage_key(storage_key: str | None, attempt_id: str) -> bool:
     return bool(storage_key and attempt_id in storage_key)
 
@@ -3321,10 +3332,9 @@ def _record_stale_video_attempt_cleanup_debt(job: Any) -> bool:
             job_id,
         )
         return False
-    video_storage_key = f"generate_images/video/{job_id}-{storage_attempt_id}.mp4"
+    video_storage_key = _video_output_storage_key(job_id, storage_attempt_id)
     last_frame_storage_key = (
-        "/generate_images/video/frames/"
-        f"{shot_group_id}_{storage_attempt_id}_last.png"
+        _video_last_frame_storage_key(shot_group_id, storage_attempt_id)
         if shot_group_id is not None
         else None
     )
@@ -4007,10 +4017,7 @@ async def _update_last_frame(
             frame_bytes = f.read(_MAX_LAST_FRAME_BYTES + 1)
         if not frame_bytes or len(frame_bytes) > _MAX_LAST_FRAME_BYTES:
             raise RuntimeError("frame_extraction_failed")
-        frame_storage_key = (
-            "/generate_images/video/frames/"
-            f"{shot_group_id}_{storage_attempt_id}_last.png"
-        )
+        frame_storage_key = _video_last_frame_storage_key(shot_group_id, storage_attempt_id)
         await storage.put(frame_storage_key, frame_bytes)
     except Exception as exc:  # noqa: BLE001
         if frame_storage_key is not None:

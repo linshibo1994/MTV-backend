@@ -17,6 +17,7 @@ from app.models.credit import CreditAccount
 from app.models.timeline_render_job import TimelineRenderJob
 from app.models.user import User
 from app.models.video_generation_job import VideoGenerationJob
+from app.providers.storage import storage_key_for_write
 from app.services.credits import release as credits_release
 from app.services.credits import reserve as credits_reserve
 from app.services.task_dispatch import cancel_outbox_task, enqueue_task
@@ -46,7 +47,9 @@ def _extract_video_storage_key(job: VideoGenerationJob) -> str | None:
 
 
 def _output_storage_key(render_job_id: str, script_id: str, episode_id: str) -> str:
-    return f"generate_outputs/{script_id}/{episode_id}/{render_job_id}.mp4"
+    return storage_key_for_write(
+        f"generate_outputs/{script_id}/{episode_id}/{render_job_id}.mp4"
+    )
 
 
 async def _resolve_user_account_id(db: AsyncSession, user_id: str) -> str:

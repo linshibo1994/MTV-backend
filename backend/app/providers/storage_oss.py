@@ -15,7 +15,11 @@ from urllib.parse import urlsplit
 import alibabacloud_oss_v2 as oss
 
 from app.core.config import settings
-from app.providers.storage import StorageObjectNotFoundError, validate_key_prefix
+from app.providers.storage import (
+    StorageObjectNotFoundError,
+    public_url_for_key,
+    validate_key_prefix,
+)
 
 MAX_SIGNED_URL_SECONDS = 7 * 24 * 60 * 60
 MAX_SIMPLE_OBJECT_BYTES = 5 * 1024 * 1024 * 1024
@@ -69,7 +73,14 @@ class AliyunOSSStorageProvider:
         *,
         expires_seconds: int = 300,
     ) -> str:
-        return await self.signed_url(key, expires_seconds=expires_seconds)
+        del expires_seconds
+        public_url = public_url_for_key(
+            key,
+            public_base=settings.aliyun_oss_public_url,
+        )
+        if public_url is not None:
+            return public_url
+        raise RuntimeError("OSS 对外读取需要配置 ALIYUN_OSS_PUBLIC_URL")
 
     async def put(self, key: str, data: bytes) -> str:
         rel = validate_key_prefix(key)

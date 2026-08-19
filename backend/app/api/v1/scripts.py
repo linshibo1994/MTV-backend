@@ -38,7 +38,7 @@ from app.crud import script as script_crud
 from app.models.episode import Episode
 from app.models.script import Script
 from app.models.user import User
-from app.providers.storage import get_storage
+from app.providers.storage import get_storage, storage_key_for_write
 from app.schemas.script import (
     BreakdownOut,
     BreakdownShot,
@@ -211,7 +211,7 @@ async def upload_and_split_script(
         await check_script_access(db, user, script, action=Action.RUN_AI)
 
     document = await stage_script_document(file, max_bytes=settings.max_upload_bytes)
-    storage_key = f"upload_scripts/{script_id}/{new_id()}{document.suffix}"
+    storage_key = storage_key_for_write(f"upload_scripts/{script_id}/{new_id()}{document.suffix}")
     storage = get_storage()
     source_episode: Episode | None = None
     source_episode_id: str | None = None

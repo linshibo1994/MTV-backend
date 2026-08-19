@@ -13,6 +13,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.core.reference_media_limits import public_reference_media_limits
+from app.providers.storage import public_url_for_output_key, public_urls_for_payload
 from app.schemas.storyboard_contracts import ShotBoundary, StoryboardV2ShotContract
 
 # ---------------------------------------------------------------------------
@@ -157,13 +158,23 @@ class ReferenceFramesOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     first_frame: str | None = None
+    first_frame_public_url: str | None = None
     last_frame: str | None = None
+    last_frame_public_url: str | None = None
     reference_frame: str | None = None
+    reference_frame_public_url: str | None = None
     boundary_projections: BoundaryProjectionsOut | None = None
     chain_diagnostics: list[ChainFrameDiagnosticOut] = Field(
         default_factory=list,
         max_length=64,
     )
+
+    @model_validator(mode="after")
+    def populate_public_urls(self) -> ReferenceFramesOut:
+        self.first_frame_public_url = public_url_for_output_key(self.first_frame)
+        self.last_frame_public_url = public_url_for_output_key(self.last_frame)
+        self.reference_frame_public_url = public_url_for_output_key(self.reference_frame)
+        return self
 
 
 class ReferenceImageAuditOut(BaseModel):
@@ -219,6 +230,11 @@ class ShotGroupHierarchyOut(BaseModel):
     reference_frames: ReferenceFramesOut | None = None
     quality_summary: ShotGroupQualitySummaryOut | None = None
     shots: list[ShotOut] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def populate_audio_public_urls(self) -> ShotGroupHierarchyOut:
+        self.audio_elements = public_urls_for_payload(self.audio_elements)
+        return self
 
 
 class SceneHierarchyOut(BaseModel):
@@ -286,6 +302,11 @@ class ShotGroupWorkbenchOut(BaseModel):
     reference_image_audit: ReferenceImageAuditOut
     content_hash: str = Field(min_length=64, max_length=64)
     updated_at: datetime
+
+    @model_validator(mode="after")
+    def populate_audio_public_urls(self) -> ShotGroupWorkbenchOut:
+        self.audio_elements = public_urls_for_payload(self.audio_elements)
+        return self
 
 
 class SceneWorkbenchOut(BaseModel):
@@ -454,7 +475,13 @@ class CoverOut(BaseModel):
 
     script_id: str
     cover: str | None = None
+    public_url: str | None = None
     mime_type: str | None = None
+
+    @model_validator(mode="after")
+    def populate_public_url(self) -> CoverOut:
+        self.public_url = public_url_for_output_key(self.cover)
+        return self
 
 
 # ---------------------------------------------------------------------------

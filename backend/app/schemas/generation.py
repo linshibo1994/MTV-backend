@@ -15,7 +15,9 @@ import json
 from datetime import datetime
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_serializer
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_serializer, model_validator
+
+from app.providers.storage import public_urls_for_payload
 
 # 生图模型枚举：Google / OpenAI / NeoLink / 阿里百炼通义万相。
 ImageModelName = Literal[
@@ -114,6 +116,11 @@ class GenerationJobOut(BaseModel):
     metrics: dict[str, Any] | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
+
+    @model_validator(mode="after")
+    def populate_output_public_urls(self) -> GenerationJobOut:
+        self.output_json = public_urls_for_payload(self.output_json)
+        return self
 
     @field_serializer("input_json", "output_json")
     def _serialize_json_field(self, v: dict[str, Any] | None) -> str | None:

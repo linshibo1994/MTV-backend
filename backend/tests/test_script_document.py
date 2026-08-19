@@ -100,6 +100,16 @@ class _Rows:
 
 
 async def test_upload_endpoint_creates_source_episode_stores_file_and_triggers_pipeline(monkeypatch) -> None:
+    from app.providers import storage as storage_module
+
+    monkeypatch.setattr(
+        storage_module,
+        "settings",
+        SimpleNamespace(
+            storage_driver="oss",
+            aliyun_oss_public_url="https://cdn-ai-public.commind.com",
+        ),
+    )
     document = StagedScriptDocument(
         original_filename="完整剧本.txt",
         suffix=".txt",
@@ -140,7 +150,10 @@ async def test_upload_endpoint_creates_source_episode_stores_file_and_triggers_p
     assert isinstance(result, ScriptUploadOut)
     assert result.analysis_job_id == "run-1"
     assert result.status == "queued"
-    assert result.script_file_storage_key.startswith("upload_scripts/script-1/")
+    assert result.script_file_storage_key.startswith("MTV/upload_scripts/script-1/")
+    assert result.script_file_public_url == (
+        f"https://cdn-ai-public.commind.com/{result.script_file_storage_key}"
+    )
     storage.put_file.assert_awaited_once()
     trigger.assert_awaited_once_with(db, "script-1", result.source_episode_id)
     assert db.rollback.await_count == 0

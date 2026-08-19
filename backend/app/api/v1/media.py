@@ -48,7 +48,10 @@ from app.models.user import User
 from app.models.video_generation_job import VideoGenerationJob
 from app.providers.storage import (
     get_storage,
+    logical_storage_key,
     parse_mid_from_key,
+    public_url_for_output_key,
+    storage_key_for_write,
     validate_key_prefix,
 )
 from app.services import media_storage_jobs
@@ -290,13 +293,13 @@ def _detect_mime(path: str, filename: str) -> str:
 def _storage_key_for_upload(mid: str, filename: str, mime_type: str | None = None) -> str:
     """构造上传 storage_key: ``upload_images/<mid>/<id>.<ext>``。"""
     ext = _MIME_EXTENSION.get(mime_type or "") or os.path.splitext(filename)[1].lower()
-    return f"upload_images/{mid}/{new_id()}{ext}"
+    return storage_key_for_write(f"upload_images/{mid}/{new_id()}{ext}")
 
 
 def _temp_storage_key_for_upload(mid: str, filename: str, mime_type: str | None = None) -> str:
     """构造上传临时 key，仍位于允许的 upload_images 前缀下。"""
     ext = _MIME_EXTENSION.get(mime_type or "") or os.path.splitext(filename)[1].lower()
-    return f"upload_images/_tmp/{mid}/{new_id()}{ext}"
+    return storage_key_for_write(f"upload_images/_tmp/{mid}/{new_id()}{ext}")
 
 
 async def _record_delete_job(db: AsyncSession, storage_key: str, asset_id: str | None = None) -> None:
@@ -647,7 +650,7 @@ async def _authorize_by_storage_key(
         rel = validate_key_prefix(storage_key)
     except ValueError:
         raise ForbiddenError("非法媒体路径")
-    parts = rel.split("/")
+    parts = logical_storage_key(rel).split("/")
     if parts[:2] == ["generate_images", "video"]:
         await _authorize_video_media_key(db, rel, user, require_write)
         return
@@ -939,6 +942,7 @@ async def upload_image(
 
     return {
         "storage_key": f"/{final_storage_key}",
+        "public_url": public_url_for_output_key(final_storage_key),
         "mime_type": mime,
         "size_bytes": size_bytes,
         "sha256": sha,

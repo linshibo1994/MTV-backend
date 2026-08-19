@@ -197,6 +197,7 @@ def test_upload_persists_staging_before_io_and_all_media_become_authorizable(
 ) -> None:
     async def scenario() -> None:
         from app.api.v1 import media
+        from app.providers import storage as storage_module
 
         async def _allow(*_args, **_kwargs) -> None:
             return None
@@ -207,6 +208,14 @@ def test_upload_persists_staging_before_io_and_all_media_become_authorizable(
             _seed(raw)
             storage = _Storage(raw)
             db = _AsyncSessionAdapter(raw)
+            monkeypatch.setattr(
+                storage_module,
+                "settings",
+                SimpleNamespace(
+                    storage_driver="oss",
+                    aliyun_oss_public_url="https://cdn-ai-public.commind.com",
+                ),
+            )
             monkeypatch.setattr(media, "get_storage", lambda: storage)
             monkeypatch.setattr(media, "check_script_access", _allow)
             monkeypatch.setattr(media, "_detect_mime", lambda *_args: mime)
@@ -223,6 +232,9 @@ def test_upload_persists_staging_before_io_and_all_media_become_authorizable(
             upload = raw.scalar(select(MediaUpload))
             assert upload is not None and upload.status == "ready"
             assert upload.final_storage_key == result["storage_key"].lstrip("/")
+            assert result["public_url"] == (
+                f"https://cdn-ai-public.commind.com/{upload.final_storage_key}"
+            )
             assert storage.events[:1] == ["durable_staging_before_put"]
             await media._authorize_upload_media_key(
                 db,

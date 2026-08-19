@@ -19,6 +19,45 @@ class _Result:
         return self.value
 
 
+async def test_authorize_rooted_video_storage_key_uses_video_authorizer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = SimpleNamespace()
+    user = SimpleNamespace()
+    authorize_video = AsyncMock()
+    monkeypatch.setattr(media, "_authorize_video_media_key", authorize_video)
+
+    await media._authorize_by_storage_key(
+        db,
+        "MTV/generate_images/video/video-job-1.mp4",
+        user,
+    )
+
+    authorize_video.assert_awaited_once_with(
+        db,
+        "MTV/generate_images/video/video-job-1.mp4",
+        user,
+        False,
+    )
+
+
+async def test_authorize_rooted_script_storage_key_uses_script_authorizer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = SimpleNamespace()
+    user = SimpleNamespace()
+    authorize_script = AsyncMock()
+    monkeypatch.setattr(media, "_authorize_script", authorize_script)
+
+    await media._authorize_by_storage_key(
+        db,
+        "MTV/upload_scripts/script-1/source.txt",
+        user,
+    )
+
+    authorize_script.assert_awaited_once_with(db, "script-1", user, False)
+
+
 async def test_video_media_authorizes_video_job_by_exact_json_field(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

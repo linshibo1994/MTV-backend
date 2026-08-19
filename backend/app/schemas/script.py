@@ -9,6 +9,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from app.providers.storage import public_url_for_output_key
 from app.schemas.shot import StoryboardFieldsOut
 
 
@@ -111,8 +112,14 @@ class ScriptUploadOut(BaseModel):
     source_episode_id: str
     filename: str
     script_file_storage_key: str
+    script_file_public_url: str | None = None
     auto: bool
     status: str
+
+    @model_validator(mode="after")
+    def populate_script_file_public_url(self) -> "ScriptUploadOut":
+        self.script_file_public_url = public_url_for_output_key(self.script_file_storage_key)
+        return self
 
 
 class AnalysisJobStageOut(BaseModel):
@@ -174,11 +181,17 @@ class EpisodeOut(BaseModel):
     title: str
     script_text: str | None = None
     script_file_storage_key: str | None = None
+    script_file_public_url: str | None = None
     schema_version: int
     episode_version: int
     client_save_seq: int
     created_at: datetime
     updated_at: datetime
+
+    @model_validator(mode="after")
+    def populate_script_file_public_url(self) -> "EpisodeOut":
+        self.script_file_public_url = public_url_for_output_key(self.script_file_storage_key)
+        return self
 
 
 class EpisodeSaveIn(BaseModel):

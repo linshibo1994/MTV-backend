@@ -18,6 +18,7 @@ import copy
 import inspect
 import json
 import logging
+import math
 import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
@@ -1389,6 +1390,30 @@ def _is_int(value: object) -> TypeGuard[int]:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
+def _coerce_int(value: object) -> object:
+    """将供应商可确定的整数字段收敛为 int，保留无法判断的原始值。
+
+    时码以整秒为存储与契约单位。浮点值不能无损保留时，用四舍五入取最近整秒，
+    比向零截断更能保留原始时间点；后续仍会按镜头时长连续平铺。bool 明确排除，
+    与 _is_int 的语义保持一致，避免把 True/False 伪装成 1/0。
+    """
+    if _is_int(value) or isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.isdigit():
+            return int(stripped)
+        return value
+    if isinstance(value, float) and math.isfinite(value):
+        # Python round 的银行家舍入不符合时码的通常“四舍五入”预期，显式 half-up。
+        return (
+            math.floor(value + 0.5)
+            if value >= 0
+            else math.ceil(value - 0.5)
+        )
+    return value
+
+
 def _try_scale_durations(durations: list[int], target: int) -> list[int] | None:
     """把单镜时长等比例缩放到 target，每镜至少 1 秒。
 
@@ -1427,7 +1452,7 @@ def _normalize_group_timecodes(group: dict, shots: list[dict]) -> None:
     - 目标组时长优先取模型声明值，其次平铺总时长，越界则夹到 3 或 15；
     - 目标不得少于镜头数（每镜至少 1 秒），多于 15 秒时夹到 15；
     - 把单镜时长等比例缩放到目标，确保末镜 end_seconds == duration_seconds。
-    仅当所有 start/end 均为整数时才介入；非整数类型错误留给严格校验处理。
+    调用方会先将可确定的字符串/浮点时码收敛为整数；其余类型错误留给严格校验处理。
     """
     if not all(
         isinstance(shot, dict)
@@ -1490,6 +1515,12 @@ _DEFAULT_SHOT_SIZE = "中景"
 _DEFAULT_CAMERA_ANGLE = "平视"
 _DEFAULT_CAMERA_MOVEMENT = "固定"
 _DEFAULT_COMPOSITION = "三分法"
+_DEFAULT_NARRATIVE_PURPOSE = "未提供叙事目的"
+_DEFAULT_SOUND_DESIGN = "无"
+_DEFAULT_VISUAL_ACTION = "未提供动作"
+_DEFAULT_VISUAL_FRAME_DESCRIPTION = "未提供画面描述"
+_DEFAULT_VISUAL_LIGHTING = "未提供光线信息"
+_DEFAULT_VISUAL_EMOTION = "未提供情绪信息"
 _SHOT_SIZE_SET = frozenset(SHOT_SIZE_VALUES)
 _COMPOSITION_SET = frozenset(COMPOSITION_VALUES)
 _CAMERA_ANGLE_SET = frozenset(CAMERA_ANGLE_VALUES)
@@ -2254,9 +2285,10 @@ def _normalize_shot_fields(
 ) -> None:
     """归位错放字段、去重构图、截断超长文本、收敛主体引用与对白可见性。
 
-    只对已存在的字段操作（v2 形态）；v1 形态镜头没有 visual / character_refs
-    等字段，全部跳过，避免向 v1 字典注入 v2 字段触发 extra="forbid"。
+    v2 形态（visual 为 dict）会补齐契约必填字段；v1 形态镜头没有 visual /
+    character_refs 等字段，全部跳过，避免向 v1 字典注入 v2 字段触发 extra="forbid"。
     """
+    filled_required_fields: list[str] = []
     visual = shot.get("visual")
     if not isinstance(visual, dict):
         # visual 整体缺失但视觉字段散落在 shot 层 -> 重建 visual
@@ -2294,6 +2326,16 @@ def _normalize_shot_fields(
         visual["camera_movement"] = _coerce_enum(
             visual["camera_movement"], _CAMERA_MOVEMENT_SET, _DEFAULT_CAMERA_MOVEMENT
         )
+        # 文本默认值明确标记为供应商未提供，既满足严格契约，也不伪造剧情细节。
+        for key, default in (
+            ("action", _DEFAULT_VISUAL_ACTION),
+            ("frame_description", _DEFAULT_VISUAL_FRAME_DESCRIPTION),
+            ("lighting", _DEFAULT_VISUAL_LIGHTING),
+            ("emotion", _DEFAULT_VISUAL_EMOTION),
+        ):
+            if key not in visual:
+                visual[key] = default
+                filled_required_fields.append(f"visual.{key}")
         # 构图：过滤非法枚举、去重、截断到 3；全部非法时补默认
         composition = visual.get("composition")
         if isinstance(composition, list):
@@ -2320,7 +2362,14 @@ def _normalize_shot_fields(
         ):
             if key in visual:
                 visual[key] = _truncate_text(visual[key], limit)
-    # 镜头级文本与引用（仅 v2 形态存在这些字段）
+    is_v2_shot = isinstance(visual, dict)
+    # 镜头级文本与引用仅在 v2 形态补默认；v1 绝不能注入 v2 专属字段。
+    if is_v2_shot and "narrative_purpose" not in shot:
+        shot["narrative_purpose"] = _DEFAULT_NARRATIVE_PURPOSE
+        filled_required_fields.append("narrative_purpose")
+    if is_v2_shot and "sound_design" not in shot:
+        shot["sound_design"] = _DEFAULT_SOUND_DESIGN
+        filled_required_fields.append("sound_design")
     if "narrative_purpose" in shot:
         shot["narrative_purpose"] = _truncate_text(
             shot["narrative_purpose"], _SHORT_TEXT_MAX
@@ -2329,6 +2378,9 @@ def _normalize_shot_fields(
         shot["sound_design"] = _truncate_text(
             shot["sound_design"], _SHORT_TEXT_MAX
         )
+    if is_v2_shot and "character_refs" not in shot:
+        shot["character_refs"] = []
+        filled_required_fields.append("character_refs")
     if "character_refs" in shot:
         shot["character_refs"] = _normalize_ref_list(
             shot.get("character_refs"),
@@ -2337,6 +2389,9 @@ def _normalize_shot_fields(
             subject_reference_types=subject_reference_types,
             expected_type="character",
         )
+    if is_v2_shot and "prop_refs" not in shot:
+        shot["prop_refs"] = []
+        filled_required_fields.append("prop_refs")
     if "prop_refs" in shot:
         shot["prop_refs"] = _normalize_ref_list(
             shot.get("prop_refs"),
@@ -2345,6 +2400,9 @@ def _normalize_shot_fields(
             subject_reference_types=subject_reference_types,
             expected_type="prop",
         )
+    if is_v2_shot and "sound_refs" not in shot:
+        shot["sound_refs"] = []
+        filled_required_fields.append("sound_refs")
     if "sound_refs" in shot:
         shot["sound_refs"] = _normalize_ref_list(
             shot.get("sound_refs"),
@@ -2460,6 +2518,11 @@ def _normalize_shot_fields(
                 )
                 if sp_type not in {"character", "sound"}:
                     dialogue["speaker_ref"] = None
+    if filled_required_fields:
+        logger.warning(
+            "分镜 v2 Provider 响应必填字段缺失，已补齐 keys=%s",
+            ",".join(filled_required_fields),
+        )
 
 
 def _normalize_provider_continuity(
@@ -2479,8 +2542,8 @@ def _normalize_provider_continuity(
     - 编号/时码/组时长：按数组顺序重编、从 0 平铺、组时长夹到 3~15；
     - 引用：名称->短引用（仅无歧义名）、去重、丢弃仍非法的可选引用；
     - 构图：去重截断到 3；文本：截断到上限；字段：错放回迁。
-    非整数时码、非法枚举（shot_size 等）、必填 background_ref 无法解析等仍交给
-    严格校验与修复流程。
+    无法转换的整数类型、非法枚举（shot_size 等）、必填 background_ref 无法解析等
+    仍交给严格校验与修复流程。
     """
     scenes = payload.get("scenes") if isinstance(payload, dict) else None
     if not isinstance(scenes, list):
@@ -2512,9 +2575,16 @@ def _normalize_provider_continuity(
             ):
                 root_omitted.extend(scene.pop("omitted_source_blocks"))
         _normalize_omitted_source_blocks(payload)
+    coerced_int_fields: set[str] = set()
     for scene_index, scene in enumerate(scenes, start=1):
         if not isinstance(scene, dict):
             continue
+        if is_v2_payload:
+            original_scene_no = scene.get("scene_no")
+            coerced_scene_no = _coerce_int(original_scene_no)
+            if not _is_int(original_scene_no) and _is_int(coerced_scene_no):
+                scene["scene_no"] = coerced_scene_no
+                coerced_int_fields.add("scene_no")
         scene["scene_no"] = scene_index
         # background_ref 必填且必须是 background 类型；模型常输出 null/名称/非法引用，
         # 这里强解析：合法则保留、名称则映射、否则兜底为目录首个背景引用，绝不留给校验卡死。
@@ -2536,6 +2606,12 @@ def _normalize_provider_continuity(
         for group_index, group in enumerate(groups, start=1):
             if not isinstance(group, dict):
                 continue
+            if is_v2_payload:
+                original_duration = group.get("duration_seconds")
+                coerced_duration = _coerce_int(original_duration)
+                if not _is_int(original_duration) and _is_int(coerced_duration):
+                    group["duration_seconds"] = coerced_duration
+                    coerced_int_fields.add("duration_seconds")
             group["group_no"] = f"G{group_index}"
             if "narrative_purpose" in group:
                 group["narrative_purpose"] = _truncate_text(
@@ -2553,6 +2629,13 @@ def _normalize_provider_continuity(
             # 统一按数组顺序重编 display_no，并归一化镜头字段
             for shot_index, shot in enumerate(shots, start=1):
                 if isinstance(shot, dict):
+                    if is_v2_payload:
+                        for field in ("display_no", "start_seconds", "end_seconds"):
+                            original_value = shot.get(field)
+                            coerced_value = _coerce_int(original_value)
+                            if not _is_int(original_value) and _is_int(coerced_value):
+                                shot[field] = coerced_value
+                                coerced_int_fields.add(field)
                     shot["display_no"] = shot_index
                     _normalize_shot_fields(
                         shot,
@@ -2579,6 +2662,11 @@ def _normalize_provider_continuity(
                 allowed_fields=_V2_SCENE_ALLOWED_FIELDS,
                 level="Scene",
             )
+    if coerced_int_fields:
+        logger.warning(
+            "分镜 v2 Provider 响应整数元数据字段已归一化 fields=%s",
+            ",".join(sorted(coerced_int_fields)),
+        )
     return payload
 
 

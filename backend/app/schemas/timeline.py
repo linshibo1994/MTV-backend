@@ -7,7 +7,9 @@
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+
+from app.providers.storage import public_url_for_output_key
 
 
 class TimelineItemOut(BaseModel):
@@ -93,7 +95,15 @@ class RenderStatusOut(BaseModel):
     storage_key: str | None = Field(
         default=None, description="合成产物 storage_key（succeeded 时返回）"
     )
+    public_url: str | None = None
     output_storage_key: str | None = None
+    output_public_url: str | None = None
+
+    @model_validator(mode="after")
+    def populate_public_urls(self) -> "RenderStatusOut":
+        self.public_url = public_url_for_output_key(self.storage_key)
+        self.output_public_url = public_url_for_output_key(self.output_storage_key)
+        return self
 
 
 class RenderJobOut(BaseModel):
@@ -102,3 +112,9 @@ class RenderJobOut(BaseModel):
     job_id: str
     status: Literal["starting", "processing", "succeeded", "failed", "canceled"] = "starting"
     output_storage_key: str | None = None
+    output_public_url: str | None = None
+
+    @model_validator(mode="after")
+    def populate_output_public_url(self) -> "RenderJobOut":
+        self.output_public_url = public_url_for_output_key(self.output_storage_key)
+        return self

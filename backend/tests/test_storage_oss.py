@@ -9,12 +9,18 @@ import sys
 from contextlib import contextmanager
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from pydantic import ValidationError
 
 from app.core.config import Settings
-from app.providers.storage import StorageObjectNotFoundError
+from app.providers.storage import (
+    StorageObjectNotFoundError,
+    parse_mid_from_key,
+    storage_key_for_write,
+    validate_key_prefix,
+)
 
 
 class _ServiceError(Exception):
@@ -225,6 +231,105 @@ def test_aliyun_oss_settings_normalize_public_endpoint_and_hide_secrets() -> Non
     assert str(configured.aliyun_oss_access_key_secret) == "**********"
 
 
+def test_aliyun_oss_settings_normalize_public_cdn_url() -> None:
+    values = _settings_values()
+    values["aliyun_oss_public_url"] = "https://CDN-AI-PUBLIC.COMMIND.COM/"
+
+    configured = Settings(**values)
+
+    assert configured.aliyun_oss_public_url == "https://cdn-ai-public.commind.com"
+
+
+@pytest.mark.parametrize(
+    "public_url",
+    [
+        "http://cdn-ai-public.commind.com",
+        "https://localhost",
+        "https://127.0.0.1",
+        "https://user:password@cdn-ai-public.commind.com",
+        "https://cdn-ai-public.commind.com/path",
+        "https://cdn-ai-public.commind.com?token=test",
+        "https://cdn-ai-public.commind.com#fragment",
+    ],
+)
+def test_aliyun_oss_settings_reject_unsafe_public_cdn_url(public_url: str) -> None:
+    values = _settings_values()
+    values["aliyun_oss_public_url"] = public_url
+
+    with pytest.raises(ValidationError, match="ALIYUN_OSS_PUBLIC_URL"):
+        Settings(**values)
+
+
+def test_storage_keys_accept_mtv_root_and_new_oss_writes_use_it(monkeypatch) -> None:
+    from app.providers import storage as storage_module
+
+    configured = Settings(**_settings_values())
+    monkeypatch.setattr(storage_module, "settings", configured)
+
+    legacy_key = "upload_images/material-1/portrait.png"
+    rooted_key = "MTV/upload_images/material-1/portrait.png"
+
+    assert validate_key_prefix(rooted_key) == rooted_key
+    assert parse_mid_from_key(rooted_key) == "material-1"
+    assert storage_key_for_write(legacy_key) == f"MTV/{legacy_key}"
+    assert storage_key_for_write(rooted_key) == rooted_key
+
+
+def test_new_upload_and_render_keys_use_mtv_root_in_oss(monkeypatch) -> None:
+    from app.api.v1 import media
+    from app.providers import storage as storage_module
+    from app.services import timeline_render
+
+    monkeypatch.setattr(storage_module, "settings", SimpleNamespace(storage_driver="oss"))
+
+    upload_key = media._storage_key_for_upload("material-1", "portrait.png", "image/png")
+    temporary_upload_key = media._temp_storage_key_for_upload(
+        "material-1", "portrait.png", "image/png"
+    )
+    render_key = timeline_render._output_storage_key("render-1", "script-1", "episode-1")
+
+    assert upload_key.startswith("MTV/upload_images/material-1/")
+    assert temporary_upload_key.startswith("MTV/upload_images/_tmp/material-1/")
+    assert render_key == "MTV/generate_outputs/script-1/episode-1/render-1.mp4"
+
+
+def test_new_generated_image_keys_use_mtv_root_in_oss(monkeypatch) -> None:
+    from app.providers import storage as storage_module
+    from app.workers import generation
+
+    monkeypatch.setattr(storage_module, "settings", SimpleNamespace(storage_driver="oss"))
+    storage = SimpleNamespace(put=AsyncMock())
+    image = generation.ValidatedImage(
+        data=b"image",
+        mime_type="image/png",
+        extension="png",
+        width=1,
+        height=1,
+    )
+
+    persisted = asyncio.run(
+        generation._persist_validated_image("material-1", "job-1", "lease-1", image, storage)
+    )
+
+    assert persisted.final_key.startswith("MTV/generate_images/material-1/")
+    assert persisted.temp_key.startswith("MTV/generate_images/material-1/tmp/job-1/")
+    storage.put.assert_awaited_once_with(persisted.temp_key, b"image")
+
+
+def test_video_worker_recovery_keys_use_mtv_root_in_oss(monkeypatch) -> None:
+    from app.providers import storage as storage_module
+    from app.workers import video_generation
+
+    monkeypatch.setattr(storage_module, "settings", SimpleNamespace(storage_driver="oss"))
+
+    assert video_generation._video_output_storage_key("job-1", "attempt-1") == (
+        "MTV/generate_images/video/job-1-attempt-1.mp4"
+    )
+    assert video_generation._video_last_frame_storage_key("group-1", "attempt-1") == (
+        "/MTV/generate_images/video/frames/group-1_attempt-1_last.png"
+    )
+
+
 @pytest.mark.parametrize(
     ("field_name", "env_name"),
     [
@@ -326,15 +431,78 @@ def test_aliyun_oss_provider_read_write_range_sign_and_delete_contract(
             assert client.get_requests[-1].range_behavior == "standard"
             assert client.last_body is not None and client.last_body.closed is True
 
-            signed = await provider.external_read_url(key, expires_seconds=600)
+            signed = await provider.signed_url(key, expires_seconds=600)
             assert signed.startswith("https://flowapp.oss-cn-hangzhou.aliyuncs.com/")
             assert client.presign_expires_seconds == 600
+
+            with pytest.raises(RuntimeError, match="ALIYUN_OSS_PUBLIC_URL"):
+                await provider.external_read_url(key, expires_seconds=600)
 
             await provider.delete(key)
             assert await provider.exists(key) is False
             assert await provider.get(file_key) == b"file-payload"
 
         asyncio.run(scenario())
+
+
+def test_aliyun_oss_external_read_url_uses_configured_public_cdn_without_signing(
+    monkeypatch,
+) -> None:
+    client = _MemoryClient()
+    with _load_provider(monkeypatch, client) as module:
+        values = _settings_values()
+        values["aliyun_oss_public_url"] = "https://cdn-ai-public.commind.com"
+        monkeypatch.setattr(module, "settings", Settings(**values))
+        provider = module.AliyunOSSStorageProvider()
+
+        async def scenario() -> None:
+            url = await provider.external_read_url(
+                "/MTV/upload_images/material-1/portrait #1.png",
+                expires_seconds=600,
+            )
+
+            assert (
+                url
+                == "https://cdn-ai-public.commind.com/MTV/upload_images/material-1/portrait%20%231.png"
+            )
+            assert client.presign_expires_seconds is None
+
+        asyncio.run(scenario())
+
+
+def test_public_url_payload_adds_cdn_urls_without_changing_storage_keys(monkeypatch) -> None:
+    from app.providers import storage as storage_module
+
+    values = _settings_values()
+    values["aliyun_oss_public_url"] = "https://cdn-ai-public.commind.com"
+    monkeypatch.setattr(storage_module, "settings", Settings(**values))
+    payload = {
+        "storage_key": "MTV/upload_images/material-1/portrait #1.png",
+        "nested": {
+            "video_storage_key": "MTV/generate_images/video/job-1.mp4",
+        },
+        "items": [
+            {"storageKey": "MTV/generate_images/material-1/portrait.png"},
+        ],
+    }
+
+    result = storage_module.public_urls_for_payload(payload)
+
+    assert result == {
+        "storage_key": "MTV/upload_images/material-1/portrait #1.png",
+        "public_url": "https://cdn-ai-public.commind.com/MTV/upload_images/material-1/portrait%20%231.png",
+        "nested": {
+            "video_storage_key": "MTV/generate_images/video/job-1.mp4",
+            "video_public_url": "https://cdn-ai-public.commind.com/MTV/generate_images/video/job-1.mp4",
+        },
+        "items": [
+            {
+                "storageKey": "MTV/generate_images/material-1/portrait.png",
+                "publicUrl": "https://cdn-ai-public.commind.com/MTV/generate_images/material-1/portrait.png",
+            },
+        ],
+    }
+    assert payload["nested"].get("video_public_url") is None
 
 
 def test_aliyun_oss_put_file_rejects_copy_object_limit_before_upload(

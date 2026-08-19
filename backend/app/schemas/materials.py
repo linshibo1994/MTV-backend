@@ -11,6 +11,8 @@ from typing import Annotated, Any, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
+from app.providers.storage import public_url_for_output_key, public_urls_for_payload
+
 # ---------------------------------------------------------------------------
 # 主体类型 → 中文映射 (06 文档固定模板使用中文主体类型)
 # ---------------------------------------------------------------------------
@@ -214,7 +216,7 @@ class CanvasNodeOut(BaseModel):
     @model_validator(mode="after")
     def validate_data_for_type(self) -> CanvasNodeOut:
         if self.data is not None:
-            self.data = normalize_node_data(self.type, self.data)
+            self.data = public_urls_for_payload(normalize_node_data(self.type, self.data))
         return self
 
 
@@ -240,14 +242,20 @@ class CanvasStateOut(BaseModel):
 class ImageAssetOut(BaseModel):
     """图片资产元数据 —— GET /materials/<mid>/image/<image_id>。
 
-    实际图片 URL 由前端拼接 ``settings.media_proxy_prefix + storage_key``。
+    ``storage_key`` 用于站内鉴权代理，``public_url`` 用于外部可读取资源。
     """
 
     image_id: str
     storage_key: str
+    public_url: str | None = None
     mime_type: str
     size_bytes: int
     source: str  # generate_images | upload_images
+
+    @model_validator(mode="after")
+    def populate_public_url(self) -> ImageAssetOut:
+        self.public_url = public_url_for_output_key(self.storage_key)
+        return self
 
 
 # ---------------------------------------------------------------------------
@@ -287,6 +295,7 @@ class ImageOutputData(BaseModel):
     status: str
     asset_id: str | None = Field(default=None, alias="assetId")
     storage_key: str | None = Field(default=None, alias="storageKey")
+    public_url: str | None = Field(default=None, alias="publicUrl")
     width: int | None = Field(default=None, ge=1)
     height: int | None = Field(default=None, ge=1)
 

@@ -11,7 +11,7 @@ from collections.abc import AsyncIterable, Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import BinaryIO
 
-from app.providers.storage import StorageProvider
+from app.providers.storage import StorageProvider, storage_key_for_write
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +91,7 @@ async def atomic_put_file(
     preserve_existing_final: bool = False,
 ) -> str:
     """先上传唯一临时对象，再提升为本次尝试的正式对象。"""
+    final_key = storage_key_for_write(final_key)
     safe_attempt = _SAFE_ATTEMPT_PART.sub("-", attempt_id).strip("-")[:32] or "unknown"
     temp_key = f"{final_key}.upload-{safe_attempt}-{uuid.uuid4().hex}.tmp"
     final_existed = (

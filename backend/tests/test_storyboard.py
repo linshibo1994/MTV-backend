@@ -744,19 +744,14 @@ async def test_storyboard_llm_call_passes_v2_schema_to_capable_provider(monkeypa
     assert await storyboard_service._call_llm("system", "user") == {"scenes": []}
 
 
-async def test_storyboard_repairs_invalid_contract_once_without_resending_script(monkeypatch) -> None:
-    """非整数时码属类型错误、不可确定性归一化，应交给一次 LLM 定向修复，且不重发剧本。"""
+async def test_storyboard_normalizes_string_timecodes_without_llm_repair(monkeypatch) -> None:
+    """字符串时码可确定转为整秒，必须本地归一化，不能消耗唯一一次 LLM 修复机会。"""
     from app.services import storyboard as storyboard_service
 
     invalid_timing = _valid_storyboard_v2_payload()
-    # start_seconds 给非整数字符串：归一化只处理整数时码，类型错误会穿透到严格校验
+    # start_seconds 是纯数字字符串，可确定转为 int 后参与时码连续平铺。
     invalid_timing["scenes"][0]["shot_groups"][0]["shots"][1]["start_seconds"] = "3"
-    call_llm = AsyncMock(
-        side_effect=[
-            invalid_timing,
-            _valid_storyboard_v2_payload(),
-        ]
-    )
+    call_llm = AsyncMock(return_value=invalid_timing)
     monkeypatch.setattr(storyboard_service, "_call_llm", call_llm)
 
     contract = await storyboard_service._call_llm_with_contract(
@@ -767,11 +762,7 @@ async def test_storyboard_repairs_invalid_contract_once_without_resending_script
     )
 
     assert contract.scenes[0].shot_groups[0].shots[1].display_no == 2
-    assert call_llm.await_count == 2
-    repair_call = call_llm.await_args_list[1]
-    assert repair_call.args[0] == storyboard_service._REPAIR_SYSTEM_PROMPT
-    assert "SCRIPT_PRIVATE_SENTINEL" not in repair_call.args[1]
-    assert "scenes[].shot_groups[].shots[].start_seconds" in repair_call.args[1]
+    assert call_llm.await_count == 1
 
 
 
@@ -3353,6 +3344,148 @@ def test_normalize_shot_fields_fills_missing_enum_with_default() -> None:
     assert contract.scenes[0].shot_groups[0].shots[0].visual.shot_size == (
         storyboard_service._DEFAULT_SHOT_SIZE
     )
+
+
+@pytest.mark.parametrize(
+    "drift_case",
+    [
+        "string_timecodes",
+        "float_timecodes",
+        "missing_sound_design",
+        "missing_subject_refs",
+        "missing_narrative_purpose",
+        "missing_visual_text",
+        "mixed",
+    ],
+)
+def test_normalize_provider_continuity_repairs_systemic_v2_required_field_drift(
+    drift_case: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """整组镜头同类必填字段漂移时，归一化必须直接保留所有镜头通过严格契约。"""
+    from app.services import storyboard as storyboard_service
+
+    payload = _valid_storyboard_v2_payload()
+    scene = payload["scenes"][0]
+    group = scene["shot_groups"][0]
+    shots = group["shots"]
+    original_actions = [shot["visual"]["action"] for shot in shots]
+    original_dialogues = [shot["dialogue"] for shot in shots]
+
+    if drift_case in {"string_timecodes", "mixed"}:
+        scene["scene_no"] = " 1 "
+        group["duration_seconds"] = "6"
+        for index, shot in enumerate(shots, start=1):
+            shot["display_no"] = str(index)
+            shot["start_seconds"] = str((index - 1) * 3)
+            shot["end_seconds"] = str(index * 3)
+    if drift_case == "float_timecodes":
+        for index, shot in enumerate(shots, start=1):
+            shot["start_seconds"] = float((index - 1) * 3)
+            shot["end_seconds"] = float(index * 3)
+    if drift_case in {"missing_sound_design", "mixed"}:
+        for shot in shots:
+            del shot["sound_design"]
+    if drift_case in {"missing_subject_refs", "mixed"}:
+        for shot in shots:
+            del shot["character_refs"]
+            del shot["prop_refs"]
+            del shot["sound_refs"]
+    if drift_case in {"missing_narrative_purpose", "mixed"}:
+        for shot in shots:
+            del shot["narrative_purpose"]
+    if drift_case in {"missing_visual_text", "mixed"}:
+        for shot in shots:
+            for field in ("action", "frame_description", "lighting", "emotion"):
+                del shot["visual"][field]
+
+    caplog.set_level(logging.WARNING, logger=storyboard_service.__name__)
+    storyboard_service._normalize_provider_continuity(
+        payload,
+        subject_reference_names={
+            ref: item.name for ref, item in _subject_references().items()
+        },
+        subject_reference_types={
+            ref: item.subject_type for ref, item in _subject_references().items()
+        },
+    )
+
+    # 直接严格校验，证明无需 salvage 逐镜删除；既有创作事实也不能被默认值覆盖。
+    contract = storyboard_service.StoryboardV2Contract.model_validate(payload)
+    normalized_shots = contract.scenes[0].shot_groups[0].shots
+    assert len(normalized_shots) == len(shots) == 2
+    assert [
+        shot.dialogue.model_dump() if shot.dialogue is not None else None
+        for shot in normalized_shots
+    ] == original_dialogues
+    if drift_case not in {"missing_visual_text", "mixed"}:
+        assert [shot.visual.action for shot in normalized_shots] == original_actions
+    else:
+        assert all(
+            shot.visual.action == storyboard_service._DEFAULT_VISUAL_ACTION
+            for shot in normalized_shots
+        )
+
+    if drift_case in {"missing_sound_design", "mixed"}:
+        assert [shot.sound_design for shot in normalized_shots] == ["无", "无"]
+    if drift_case in {"missing_narrative_purpose", "mixed"}:
+        assert all(
+            shot.narrative_purpose == storyboard_service._DEFAULT_NARRATIVE_PURPOSE
+            for shot in normalized_shots
+        )
+    if drift_case in {"missing_visual_text", "mixed"}:
+        assert all(
+            shot.visual.frame_description == storyboard_service._DEFAULT_VISUAL_FRAME_DESCRIPTION
+            for shot in normalized_shots
+        )
+    if drift_case in {"string_timecodes", "float_timecodes", "mixed"}:
+        assert [shot.start_seconds for shot in normalized_shots] == [0, 3]
+        assert [shot.end_seconds for shot in normalized_shots] == [3, 6]
+        assert sum("整数元数据字段已归一化" in record.message for record in caplog.records) == 1
+    if drift_case not in {"string_timecodes", "float_timecodes"}:
+        assert any("必填字段缺失，已补齐" in record.message for record in caplog.records)
+
+
+def test_coerce_int_rounds_fractional_float_and_preserves_unconvertible_values() -> None:
+    """秒级时码对非整值浮点取最近整秒，且不把 bool 或垃圾值伪造成整数。"""
+    from app.services import storyboard as storyboard_service
+
+    assert storyboard_service._coerce_int(" 3 ") == 3
+    assert storyboard_service._coerce_int(3.0) == 3
+    assert storyboard_service._coerce_int(3.7) == 4
+    assert storyboard_service._coerce_int(True) is True
+    assert storyboard_service._coerce_int("abc") == "abc"
+    assert storyboard_service._coerce_int(None) is None
+
+
+def test_normalize_provider_continuity_never_injects_v2_required_fields_into_v1() -> None:
+    """v1 无 visual 镜头不应获得任何 v2 必填字段，避免 strict extra_forbidden。"""
+    from app.services import storyboard as storyboard_service
+
+    payload = _valid_storyboard_payload()
+    shot = payload["scenes"][0]["shot_groups"][0]["shots"][0]
+    before = dict(shot)
+
+    storyboard_service._normalize_provider_continuity(
+        payload,
+        subject_reference_names={
+            ref: item.name for ref, item in _subject_references().items()
+        },
+        subject_reference_types={
+            ref: item.subject_type for ref, item in _subject_references().items()
+        },
+    )
+
+    assert set(shot) == set(before)
+    assert not {
+        "visual",
+        "narrative_purpose",
+        "character_refs",
+        "prop_refs",
+        "sound_refs",
+        "sound_design",
+        "dialogue",
+    } & set(shot)
 
 
 async def test_call_llm_with_contract_result_salvages_instead_of_raising(

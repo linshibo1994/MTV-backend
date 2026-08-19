@@ -8,6 +8,8 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from app.providers.storage import public_url_for_output_key
+
 # ---- 枚举常量 ----
 
 # 主体类型：character=角色, background/scene=场景, prop=道具, sound=声音
@@ -57,6 +59,7 @@ class AssetEntryOut(BaseModel):
 
     asset_id: str
     storage_key: str
+    public_url: str | None = None
     mime_type: str
     size_bytes: int
     source: str
@@ -70,6 +73,11 @@ class AssetEntryOut(BaseModel):
     created_at: datetime | None = None
     updated_at: datetime | None = None
 
+    @model_validator(mode="after")
+    def populate_public_url(self) -> "AssetEntryOut":
+        self.public_url = public_url_for_output_key(self.storage_key)
+        return self
+
 
 class CandidateOut(BaseModel):
     """审核候选出参 — 未通过审核的图片/声音候选。"""
@@ -78,12 +86,18 @@ class CandidateOut(BaseModel):
 
     candidate_id: str
     storage_key: str
+    public_url: str | None = None
     mime_type: str
     size_bytes: int
     source: str
     sha256: str | None = None
     kind: str  # image | audio
     status: str = "pending"
+
+    @model_validator(mode="after")
+    def populate_public_url(self) -> "CandidateOut":
+        self.public_url = public_url_for_output_key(self.storage_key)
+        return self
 
 
 # ---- 主体 ----

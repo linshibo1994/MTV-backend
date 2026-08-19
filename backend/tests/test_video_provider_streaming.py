@@ -813,6 +813,27 @@ async def test_atomic_put_file_cleans_partial_source_and_final_objects(tmp_path:
 
 
 @pytest.mark.asyncio
+async def test_atomic_put_file_uses_mtv_root_for_new_oss_video(tmp_path: Path, monkeypatch) -> None:
+    from app.providers import storage as storage_module
+    from app.providers.streaming_io import atomic_put_file
+
+    monkeypatch.setattr(storage_module, "settings", SimpleNamespace(storage_driver="oss"))
+    source = tmp_path / "video.mp4"
+    source.write_bytes(b"video")
+    storage = _AtomicFakeStorage()
+
+    stored_key = await atomic_put_file(
+        storage,
+        "generate_images/video/job-attempt.mp4",
+        source,
+        attempt_id="attempt",
+    )
+
+    assert stored_key == "MTV/generate_images/video/job-attempt.mp4"
+    assert storage.objects == {stored_key: b"video"}
+
+
+@pytest.mark.asyncio
 async def test_atomic_put_file_cleans_objects_when_upload_fails(tmp_path: Path) -> None:
     from app.providers.streaming_io import atomic_put_file
 
