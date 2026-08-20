@@ -356,7 +356,7 @@ async def list_video_generation_jobs(
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> VideoJobListOut:
-    """按剧本/分集过滤视频生成任务，按创建时间倒序（前端轮询）。
+    """按剧本/分集过滤视频生成任务，按镜头组叙事顺序返回（前端轮询）。
 
     资源级授权：按 script_id 加载剧本并 check_script_access，未通过则 403。
     total 为匹配全集总数（非当前页条数），供前端分页计数。
@@ -369,7 +369,15 @@ async def list_video_generation_jobs(
     total = await video_crud.count_video_jobs(
         db, script_id=script_id, episode_id=episode_id
     )
-    items = [VideoJobOut.model_validate(j) for j in jobs]
+    items = [
+        VideoJobOut.model_validate(item.job).model_copy(
+            update={
+                "group_index": item.group_index,
+                "group_no": item.group_no,
+            }
+        )
+        for item in jobs
+    ]
     return VideoJobListOut(items=items, total=total)
 
 

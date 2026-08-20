@@ -10,6 +10,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import noload
 
 from app.core.ids import new_id
+from app.models.episode import Episode
+from app.models.shot_group import ShotGroup
 from app.models.video_generation_job import (
     VIDEO_SUBMISSION_MANUAL_REVIEW_ERROR_TYPE,
     VideoGenerationIdempotencyRequest,
@@ -43,6 +45,15 @@ class VideoJobClaim:
 class VideoIdempotencyBinding:
     request_hash: str
     job: VideoGenerationJob
+
+
+@dataclass(frozen=True)
+class VideoJobListItem:
+    """视频列表项及其镜头组展示序号。"""
+
+    job: VideoGenerationJob
+    group_index: int | None
+    group_no: str | None
 
 
 def _merge_latest_video_json(
@@ -193,20 +204,38 @@ async def list_video_jobs(
     script_id: str | None = None,
     episode_id: str | None = None,
     limit: int = 30,
-) -> list[VideoGenerationJob]:
-    """按剧本/分集过滤视频生成任务，按创建时间倒序。
+) -> list[VideoJobListItem]:
+    """按剧本/分集过滤视频生成任务，按镜头组叙事顺序返回。
 
-    limit 上限由调用方约束（API 层 500）。
+    同一镜头组内按创建时间和任务 ID 倒序，保证多次生成结果稳定。镜头组被
+    删除的历史任务仍可返回，但其组级展示字段为空并排在当前镜头组之后。
     """
-    stmt = select(VideoGenerationJob).order_by(
-        VideoGenerationJob.created_at.desc()
-    ).limit(limit)
+    stmt = (
+        select(
+            VideoGenerationJob,
+            ShotGroup.group_index,
+            ShotGroup.group_no,
+        )
+        .outerjoin(ShotGroup, VideoGenerationJob.shot_group_id == ShotGroup.shot_group_id)
+        .outerjoin(Episode, VideoGenerationJob.episode_id == Episode.episode_id)
+    )
     if script_id is not None:
         stmt = stmt.where(VideoGenerationJob.script_id == script_id)
     if episode_id is not None:
         stmt = stmt.where(VideoGenerationJob.episode_id == episode_id)
+    stmt = stmt.order_by(
+        Episode.episode_no.asc().nulls_last(),
+        VideoGenerationJob.episode_id.asc(),
+        ShotGroup.group_index.asc().nulls_last(),
+        ShotGroup.group_no.asc().nulls_last(),
+        VideoGenerationJob.created_at.desc(),
+        VideoGenerationJob.job_id.desc(),
+    ).limit(limit)
     result = await db.execute(stmt)
-    return list(result.scalars().all())
+    return [
+        VideoJobListItem(job=job, group_index=group_index, group_no=group_no)
+        for job, group_index, group_no in result.all()
+    ]
 
 
 async def count_video_jobs(

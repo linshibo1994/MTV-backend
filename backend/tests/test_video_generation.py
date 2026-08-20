@@ -5667,6 +5667,112 @@ async def test_video_generation_http_denies_cross_user_create_list_get_cancel(cl
     assert cancel_response.status_code == 403
 
 
+async def test_video_generation_jobs_list_orders_by_group_index_and_exposes_group_identity(
+    client,
+) -> None:
+    from app.core.auth import get_current_user
+    from app.core.database import get_db
+
+    engine, raw = _make_db()
+    seeded = _seed(raw)
+    group_01 = ShotGroup(
+        shot_group_id="sg-01",
+        script_id=seeded.script.id,
+        episode_id=seeded.episode.episode_id,
+        scene_no=1,
+        group_index=1,
+        group_no="G1",
+        prompt="镜头组 01",
+    )
+    group_04 = ShotGroup(
+        shot_group_id="sg-04",
+        script_id=seeded.script.id,
+        episode_id=seeded.episode.episode_id,
+        scene_no=1,
+        group_index=4,
+        group_no="G4",
+        prompt="镜头组 04",
+    )
+    created_at = datetime(2026, 8, 20, 12, 0, tzinfo=UTC)
+
+    def make_job(
+        job_id: str,
+        shot_group_id: str,
+        group_no: str,
+        attempt: int,
+        created: datetime,
+    ) -> VideoGenerationJob:
+        return VideoGenerationJob(
+            job_id=job_id,
+            script_id=seeded.script.id,
+            episode_id=seeded.episode.episode_id,
+            shot_group_id=shot_group_id,
+            owner_user_id=seeded.user.user_id,
+            scene_no=1,
+            unit_id=f"group:{shot_group_id}",
+            unit_runtime_key=f"episode-1:1:{group_no}:{attempt}",
+            provider_key="modelsai",
+            job_type="all_reference",
+            idempotency_key=f"order-{job_id}",
+            request_hash="h",
+            input_version=1,
+            attempt=attempt,
+            status="succeeded",
+            input_json={},
+            created_at=created,
+        )
+
+    # 创建顺序是 01、02、04；旧接口按创建时间倒序时会返回 04、02、01。
+    # 同一镜头组的相同创建时间必须继续按 job_id 倒序，避免数据库返回不稳定。
+    raw.add_all([
+        group_01,
+        group_04,
+        make_job("job-01", "sg-01", "G1", 1, created_at + timedelta(seconds=1)),
+        make_job("job-02", "sg-2", "G2", 1, created_at + timedelta(seconds=2)),
+        make_job("job-04-a", "sg-04", "G4", 1, created_at + timedelta(seconds=3)),
+        make_job("job-04-z", "sg-04", "G4", 2, created_at + timedelta(seconds=3)),
+    ])
+    raw.commit()
+    db = _AsyncSessionAdapter(raw)
+
+    async def override_db():
+        yield db
+
+    async def override_user():
+        return seeded.user
+
+    app = client._app  # type: ignore[attr-defined]
+    app.dependency_overrides[get_db] = override_db
+    app.dependency_overrides[get_current_user] = override_user
+    try:
+        response = await client.get(
+            "/v3api/video-generation-jobs",
+            params={
+                "script_id": seeded.script.id,
+                "episode_id": seeded.episode.episode_id,
+                "limit": 500,
+            },
+        )
+    finally:
+        app.dependency_overrides.clear()
+        engine.dispose()
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total"] == 4
+    assert "group_index" in body["items"][0]
+    assert "group_no" in body["items"][0]
+    assert [
+        (item["group_index"], item["group_no"], item["shot_group_id"], item["job_id"])
+        for item in body["items"]
+    ] == [
+        (1, "G1", "sg-01", "job-01"),
+        (2, "G2", "sg-2", "job-02"),
+        (4, "G4", "sg-04", "job-04-z"),
+        (4, "G4", "sg-04", "job-04-a"),
+    ]
+
+
 def test_volcengine_cancel_calls_tasks_delete_and_closes_client(monkeypatch) -> None:
     async def scenario() -> None:
         from app.providers.video_gen import VideoCancellationOutcome

@@ -36,6 +36,9 @@ class VideoJobOut(BaseModel):
     dispatch_id: str | None = None
     predecessor_job_id: str | None = None
     scene_no: int
+    # 列表查询关联镜头组后填充；单任务及创建响应兼容历史契约时可为空。
+    group_index: int | None = None
+    group_no: str | None = None
     unit_id: str
     unit_runtime_key: str
     provider_key: str
