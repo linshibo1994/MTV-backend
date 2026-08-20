@@ -10,7 +10,7 @@ from app.api.v1.generation_jobs import _sanitize_input_json
 from app.core.errors import BadRequestError, ConflictError
 from app.schemas.generation import BatchCreateJobIn, CreateJobIn
 from app.schemas.materials import build_subject_prompt
-from app.schemas.prompt_style import PromptOptimizeIn
+from app.schemas.prompt_style import PromptOptimizeBatchIn, PromptOptimizeIn
 from app.schemas.video import VideoJobBatchCreateIn, VideoJobCreateIn
 from app.services import prompt_style
 from app.services.prompt_style import apply_style, optimize_prompt, strip_image_style
@@ -1062,9 +1062,183 @@ def test_prompt_optimize_in_accepts_max_length_prompt() -> None:
     assert len(payload.prompt) == 2000
 
 
+def test_prompt_optimize_batch_schema_requires_one_to_fifty_items() -> None:
+    """批量请求必须至少包含一项，且不能超过服务端上限。"""
+    with pytest.raises(ValidationError):
+        PromptOptimizeBatchIn(items=[])
+    with pytest.raises(ValidationError):
+        PromptOptimizeBatchIn(
+            items=[{"prompt": "a", "target": "image"}] * 51,
+        )
+
+
+def test_prompt_optimize_batch_schema_reuses_single_item_contract() -> None:
+    """批量项沿用单条字段校验，并拒绝未知字段。"""
+    payload = PromptOptimizeBatchIn(
+        items=[
+            {"prompt": "a", "target": "image"},
+            {"prompt": "b", "style_id": "cinematic", "target": "video"},
+        ]
+    )
+    assert [item.target for item in payload.items] == ["image", "video"]
+    with pytest.raises(ValidationError):
+        PromptOptimizeBatchIn(
+            items=[{"prompt": "a", "target": "image", "unexpected": True}],
+        )
+
+
+@pytest.mark.asyncio
+async def test_prompt_optimize_batch_api_returns_ordered_items(client, monkeypatch) -> None:
+    """批量 API 应一次接收多项并按输入顺序返回结果。"""
+    from app.api.v1 import prompt_styles as api
+    from app.core.auth import get_current_user
+
+    async def override_user():
+        return SimpleNamespace(user_id="batch-api-user", enabled=True, is_admin=False)
+
+    async def fake_optimize_prompts(items, **kwargs):
+        return [
+            {
+                "optimized_prompt": f"optimized-{prompt}",
+                "negative_prompt": "",
+                "style_id": style_id,
+                "style_name": None,
+                "original_prompt": prompt,
+            }
+            for prompt, style_id, _target in items
+        ]
+
+    app = client._app  # type: ignore[attr-defined]
+    app.dependency_overrides[get_current_user] = override_user
+    original = api.optimize_prompts
+    api.optimize_prompts = fake_optimize_prompts
+    api._OPTIMIZE_CALLS.clear()
+    try:
+        response = await client.post(
+            "/v3api/prompt-optimize/batch",
+            json={
+                "items": [
+                    {"prompt": "first", "target": "image"},
+                    {"prompt": "second", "style_id": "anime", "target": "video"},
+                ]
+            },
+        )
+        assert response.status_code == 200, response.text
+        assert [item["original_prompt"] for item in response.json()["items"]] == [
+            "first",
+            "second",
+        ]
+        assert response.json()["items"][1]["style_id"] == "anime"
+        assert len(api._OPTIMIZE_CALLS["batch-api-user"]) == 1
+    finally:
+        api.optimize_prompts = original
+        api._OPTIMIZE_CALLS.clear()
+        app.dependency_overrides.pop(get_current_user, None)
+
+
+@pytest.mark.asyncio
+async def test_optimize_prompts_caps_concurrency_and_preserves_order(monkeypatch) -> None:
+    """服务层批量优化最多并发 4 项，结果仍按输入顺序排列。"""
+    import asyncio
+
+    from app.services import prompt_style as service
+
+    active = 0
+    max_active = 0
+
+    async def fake_optimize_prompt(raw_prompt, style_id, target, **kwargs):
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        await asyncio.sleep(0.01)
+        active -= 1
+        return {
+            "optimized_prompt": f"optimized-{raw_prompt}",
+            "negative_prompt": "",
+            "style_id": style_id,
+            "style_name": None,
+            "original_prompt": raw_prompt,
+        }
+
+    monkeypatch.setattr(service, "optimize_prompt", fake_optimize_prompt)
+    results = await service.optimize_prompts(
+        [(f"prompt-{index}", None, "image") for index in range(10)]
+    )
+
+    assert max_active == 4
+    assert [result["original_prompt"] for result in results] == [
+        f"prompt-{index}" for index in range(10)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_prompt_optimize_batch_api_validation_error(client) -> None:
+    """批量 API 对空列表和超上限列表返回统一 422 校验错误。"""
+    from app.core.auth import get_current_user
+
+    async def override_user():
+        return SimpleNamespace(user_id="batch-validation-user", enabled=True, is_admin=False)
+
+    app = client._app  # type: ignore[attr-defined]
+    app.dependency_overrides[get_current_user] = override_user
+    try:
+        empty = await client.post("/v3api/prompt-optimize/batch", json={"items": []})
+        oversized = await client.post(
+            "/v3api/prompt-optimize/batch",
+            json={"items": [{"prompt": "a", "target": "image"}] * 51},
+        )
+        assert empty.status_code == 422
+        assert oversized.status_code == 422
+        assert empty.json() == {"detail": "字段校验失败"}
+    finally:
+        app.dependency_overrides.pop(get_current_user, None)
+
+
+@pytest.mark.asyncio
+async def test_prompt_optimize_batch_rate_limit_returns_429(client) -> None:
+    """批量请求按请求计数，第 21 次应返回标准 429 限流响应。"""
+    from app.api.v1 import prompt_styles as api
+    from app.core.auth import get_current_user
+
+    api._OPTIMIZE_CALLS.clear()
+
+    async def override_user():
+        return SimpleNamespace(user_id="batch-rate-user", enabled=True, is_admin=False)
+
+    async def fake_optimize_prompts(items, **kwargs):
+        return [
+            {
+                "optimized_prompt": prompt,
+                "negative_prompt": "",
+                "style_id": style_id,
+                "style_name": None,
+                "original_prompt": prompt,
+            }
+            for prompt, style_id, _target in items
+        ]
+
+    app = client._app  # type: ignore[attr-defined]
+    app.dependency_overrides[get_current_user] = override_user
+    original = api.optimize_prompts
+    api.optimize_prompts = fake_optimize_prompts
+    try:
+        payload = {"items": [{"prompt": "a quiet street", "target": "image"}]}
+        for _ in range(20):
+            response = await client.post("/v3api/prompt-optimize/batch", json=payload)
+            assert response.status_code == 200, response.text
+
+        limited = await client.post("/v3api/prompt-optimize/batch", json=payload)
+        assert limited.status_code == 429
+        assert "频繁" in limited.json()["detail"]
+    finally:
+        api.optimize_prompts = original
+        api._OPTIMIZE_CALLS.clear()
+        app.dependency_overrides.pop(get_current_user, None)
+
+
 @pytest.mark.asyncio
 async def test_optimize_rate_limit(client) -> None:
-    """每用户每分钟 20 次限流：第 21 次必须被 BadRequestError(400) 拒绝。"""
+    """每用户每分钟 20 次限流：第 21 次必须被 429 拒绝。"""
     from app.api.v1 import prompt_styles as api
     from app.core.auth import get_current_user
 
@@ -1096,7 +1270,7 @@ async def test_optimize_rate_limit(client) -> None:
             assert resp.status_code == 200, resp.text
 
         limited = await client.post("/v3api/prompt-optimize", json=payload)
-        assert limited.status_code == 400
+        assert limited.status_code == 429
         assert "频繁" in limited.json()["detail"]
     finally:
         _api_module.optimize_prompt = original

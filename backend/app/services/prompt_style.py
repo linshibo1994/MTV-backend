@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from collections import Counter
+from collections.abc import Sequence
 from typing import TypedDict
 
 from app.providers import LLMProvider, get_chat_llm_provider
@@ -19,6 +21,10 @@ class PromptOptimizeResult(TypedDict):
     style_id: str | None
     style_name: str | None
     original_prompt: str
+
+
+PromptOptimizeBatchItem = tuple[str, str | None, str]
+PROMPT_OPTIMIZE_BATCH_CONCURRENCY = 4
 
 
 STYLE_CATALOG: list[dict] = [
@@ -503,3 +509,35 @@ async def optimize_prompt(
         "style_name": style_name,
         "original_prompt": raw_prompt,
     }
+
+
+async def optimize_prompts(
+    items: Sequence[PromptOptimizeBatchItem],
+    *,
+    provider: LLMProvider | None = None,
+    concurrency: int = PROMPT_OPTIMIZE_BATCH_CONCURRENCY,
+) -> list[PromptOptimizeResult]:
+    """批量优化提示词，限制供应商并发并保持输入顺序。
+
+    单项优化继续复用 ``optimize_prompt`` 的供应商降级和风格处理逻辑；
+    ``asyncio.gather`` 的结果顺序与输入一致，信号量避免一次批量请求
+    对外部 LLM 造成无界并发。
+    """
+    if not items:
+        return []
+    if concurrency < 1:
+        raise ValueError("concurrency 必须大于 0")
+
+    semaphore = asyncio.Semaphore(concurrency)
+
+    async def _optimize_one(item: PromptOptimizeBatchItem) -> PromptOptimizeResult:
+        raw_prompt, style_id, target = item
+        async with semaphore:
+            return await optimize_prompt(
+                raw_prompt,
+                style_id,
+                target,
+                provider=provider,
+            )
+
+    return list(await asyncio.gather(*(_optimize_one(item) for item in items)))
