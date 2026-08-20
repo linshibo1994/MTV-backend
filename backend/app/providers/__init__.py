@@ -33,10 +33,10 @@ def _build_llm(
 ) -> LLMProvider:
     """按 provider 标识构造 LLM 实例。
 
-    openai/deepseek/bailian/gemini 走 OpenAI 兼容实现；claude 走 Anthropic 原生实现。
+    openai/deepseek/bailian/gemini/neolink 走 OpenAI 兼容实现；claude 走 Anthropic 原生实现。
     """
     key = require_capability(provider, capability)
-    if key in ("openai", "openai_compatible", "deepseek", "bailian", "gemini"):
+    if key in ("openai", "openai_compatible", "deepseek", "bailian", "gemini", "neolink"):
         from app.providers.llm_openai_compat import OpenAICompatLLMProvider
 
         return OpenAICompatLLMProvider(  # type: ignore[return-value]

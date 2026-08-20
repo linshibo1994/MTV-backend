@@ -11,6 +11,8 @@ from urllib.parse import urlsplit
 from pydantic import Field, PrivateAttr, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+_DEFAULT_NEOLINK_BASE_URL = "https://neolink.com/api"
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
@@ -91,7 +93,7 @@ class Settings(BaseSettings):
     seedance_model: str = "doubao-seedance-2-0-260128"
     # NeoLink Seedance（火山内容生成兼容协议；模型复用 SEEDANCE_MODEL）
     neolink_api_key: str = ""
-    neolink_base_url: str = "https://neolink.com/api"
+    neolink_base_url: str = _DEFAULT_NEOLINK_BASE_URL
     # mgrouter AICC Seedance（火山内容生成兼容协议）
     mgrouter_api_key: str = ""
     mgrouter_base_url: str = "https://mgrouter.com/api/v3"
@@ -106,7 +108,7 @@ class Settings(BaseSettings):
 
     # ===== 统一能力×厂商适配层（每个能力独立配置厂商 URL+Key） =====
     # 厂商切换：在 .env 设 *_PROVIDER 即可，无需改代码。
-    # 对应厂商：openai | deepseek | bailian | claude | gemini
+    # 对应厂商：openai | deepseek | bailian | claude | gemini | neolink
     # base_url 留空则使用 provider 内置默认值（见各 adapter 的 _DEFAULT_BASE_URL）。
 
     # 文本 LLM —— 结构化单轮补全，用于 pipeline split/extract/merge/enrich/parents
@@ -197,6 +199,30 @@ class Settings(BaseSettings):
         self.image_gen_provider = self.image_gen_provider.strip().lower()
         self.video_gen_provider = self.video_gen_provider.strip().lower()
 
+        image_uses_neolink = (
+            self.is_explicitly_configured("image_gen_provider")
+            and self.image_gen_provider in {"neolink", "neo-link", "neo_link"}
+        )
+        image_api_key_fallback = (
+            self.image_gen_api_key
+            if image_uses_neolink
+            and self.is_explicitly_configured("image_gen_api_key")
+            and self.image_gen_api_key.strip()
+            else ""
+        )
+        image_base_url_fallback = (
+            self.image_gen_base_url
+            if image_uses_neolink
+            and self.is_explicitly_configured("image_gen_base_url")
+            and self.image_gen_base_url.strip()
+            else ""
+        )
+        default_neolink_base_url = self.neolink_base_url or _DEFAULT_NEOLINK_BASE_URL
+        neolink_llm_defaults = (
+            image_api_key_fallback or (self.neolink_api_key if self.neolink_api_key.strip() else ""),
+            "qwen-turbo",
+            image_base_url_fallback or default_neolink_base_url,
+        )
         llm_defaults = {
             "openai": (self.openai_api_key, self.openai_llm_model, ""),
             "deepseek": (self.deepseek_api_key, self.deepseek_model, ""),
@@ -217,6 +243,9 @@ class Settings(BaseSettings):
             ),
             "gemini": (self.gemini_api_key, self.gemini_llm_model, ""),
             "google": (self.gemini_api_key or self.google_api_key, self.gemini_llm_model, ""),
+            "neolink": neolink_llm_defaults,
+            "neo-link": neolink_llm_defaults,
+            "neo_link": neolink_llm_defaults,
         }
         for capability in ("text_llm", "chat_llm"):
             provider = getattr(self, f"{capability}_provider")
@@ -253,7 +282,7 @@ class Settings(BaseSettings):
                 self.image_gen_base_url = self.dashscope_base_url
             if not self.image_gen_model:
                 self.image_gen_model = "wan2.1-t2i-plus"
-        elif self.image_gen_provider == "neolink":
+        elif self.image_gen_provider in {"neolink", "neo-link", "neo_link"}:
             if not self.image_gen_api_key:
                 self.image_gen_api_key = self.neolink_api_key
             if not self.image_gen_base_url:
@@ -282,6 +311,11 @@ class Settings(BaseSettings):
                 self.neolink_base_url,
             ),
             "neo-link": (
+                self.neolink_api_key,
+                self.seedance_model,
+                self.neolink_base_url,
+            ),
+            "neo_link": (
                 self.neolink_api_key,
                 self.seedance_model,
                 self.neolink_base_url,

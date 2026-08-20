@@ -124,31 +124,65 @@ def test_reference_image_audit_public_base_url_normalizes_https_origin() -> None
 
 
 @pytest.mark.parametrize(
-    ("provider", "provider_settings", "expected_model", "expected_base_url"),
+    ("provider", "provider_settings", "expected_key", "expected_model", "expected_base_url"),
     [
         (
             "deepseek",
             {"deepseek_api_key": "deepseek-key"},
+            "deepseek-key",
             "deepseek-v4-flash",
             "",
         ),
         (
             "claude",
             {"anthropic_api_key": "anthropic-key"},
+            "anthropic-key",
             "claude-sonnet-5",
             "https://api.anthropic.com",
         ),
         (
             "gemini",
             {"gemini_api_key": "gemini-key"},
+            "gemini-key",
             "gemini-2.5-flash",
             "",
         ),
         (
             "bailian",
             {"dashscope_api_key": "dashscope-key"},
+            "dashscope-key",
             "qwen-plus",
             "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        ),
+        (
+            "neolink",
+            {
+                "neolink_api_key": "neolink-key",
+                "neolink_base_url": "https://neolink.example/api/",
+            },
+            "neolink-key",
+            "qwen-turbo",
+            "https://neolink.example/api",
+        ),
+        (
+            "neo-link",
+            {
+                "neolink_api_key": "neolink-key",
+                "neolink_base_url": "https://neolink.example/api/",
+            },
+            "neolink-key",
+            "qwen-turbo",
+            "https://neolink.example/api",
+        ),
+        (
+            "neo_link",
+            {
+                "neolink_api_key": "neolink-key",
+                "neolink_base_url": "https://neolink.example/api/",
+            },
+            "neolink-key",
+            "qwen-turbo",
+            "https://neolink.example/api",
         ),
     ],
 )
@@ -156,6 +190,7 @@ def test_llm_capabilities_use_provider_specific_defaults(
     monkeypatch,
     provider: str,
     provider_settings: dict[str, str],
+    expected_key: str,
     expected_model: str,
     expected_base_url: str,
 ) -> None:
@@ -165,9 +200,11 @@ def test_llm_capabilities_use_provider_specific_defaults(
         "DEEPSEEK_API_KEY", "DEEPSEEK_MODEL",
         "GEMINI_API_KEY", "GEMINI_LLM_MODEL",
         "DASHSCOPE_API_KEY", "DASHSCOPE_BASE_URL", "DASHSCOPE_VIDEO_MODEL",
+        "NEOLINK_API_KEY", "NEOLINK_BASE_URL",
         "OPENAI_API_KEY", "OPENAI_LLM_MODEL", "OPENAI_IMAGE_MODEL", "OPENAI_VIDEO_MODEL",
         "TEXT_LLM_PROVIDER", "TEXT_LLM_API_KEY", "TEXT_LLM_MODEL", "TEXT_LLM_BASE_URL",
         "CHAT_LLM_PROVIDER", "CHAT_LLM_API_KEY", "CHAT_LLM_MODEL", "CHAT_LLM_BASE_URL",
+        "IMAGE_GEN_PROVIDER", "IMAGE_GEN_API_KEY", "IMAGE_GEN_MODEL", "IMAGE_GEN_BASE_URL",
     ):
         monkeypatch.delenv(env_name, raising=False)
     configured = Settings(
@@ -177,13 +214,131 @@ def test_llm_capabilities_use_provider_specific_defaults(
         **provider_settings,
     )
 
-    expected_key = next(iter(provider_settings.values()))
     assert configured.text_llm_api_key == expected_key
     assert configured.chat_llm_api_key == expected_key
     assert configured.text_llm_model == expected_model
     assert configured.chat_llm_model == expected_model
     assert configured.text_llm_base_url == expected_base_url
     assert configured.chat_llm_base_url == expected_base_url
+
+
+def test_neolink_llm_generic_settings_take_precedence_over_fallbacks() -> None:
+    configured = Settings(
+        text_llm_provider="neolink",
+        text_llm_api_key="text-key",
+        text_llm_model="text-model",
+        text_llm_base_url="https://text.example/api/",
+        chat_llm_provider="neolink",
+        chat_llm_api_key="chat-key",
+        chat_llm_model="chat-model",
+        chat_llm_base_url="https://chat.example/api/",
+        neolink_api_key="dedicated-key",
+        neolink_base_url="https://dedicated.example/api/",
+        image_gen_provider="neolink",
+        image_gen_api_key="image-key",
+        image_gen_base_url="https://image.example/api/",
+        _env_file=None,
+    )
+
+    assert (
+        configured.text_llm_api_key,
+        configured.text_llm_model,
+        configured.text_llm_base_url,
+    ) == ("text-key", "text-model", "https://text.example/api")
+    assert (
+        configured.chat_llm_api_key,
+        configured.chat_llm_model,
+        configured.chat_llm_base_url,
+    ) == ("chat-key", "chat-model", "https://chat.example/api")
+
+
+@pytest.mark.parametrize("image_gen_provider", ["neolink", "neo_link"])
+def test_neolink_llm_falls_back_to_explicit_neolink_image_settings(
+    monkeypatch,
+    image_gen_provider: str,
+) -> None:
+    for env_name in (
+        "NEOLINK_API_KEY",
+        "NEOLINK_BASE_URL",
+        "TEXT_LLM_API_KEY",
+        "TEXT_LLM_BASE_URL",
+        "TEXT_LLM_MODEL",
+        "CHAT_LLM_API_KEY",
+        "CHAT_LLM_BASE_URL",
+        "CHAT_LLM_MODEL",
+    ):
+        monkeypatch.delenv(env_name, raising=False)
+
+    configured = Settings(
+        text_llm_provider="neolink",
+        chat_llm_provider="neolink",
+        image_gen_provider=image_gen_provider,
+        image_gen_api_key="image-key",
+        image_gen_base_url="https://image.example/api/",
+        _env_file=None,
+    )
+
+    assert configured.text_llm_api_key == "image-key"
+    assert configured.chat_llm_api_key == "image-key"
+    assert configured.text_llm_base_url == "https://image.example/api"
+    assert configured.chat_llm_base_url == "https://image.example/api"
+    assert configured.text_llm_model == "qwen-turbo"
+    assert configured.chat_llm_model == "qwen-turbo"
+
+
+def test_neolink_llm_explicit_image_settings_take_precedence_over_dedicated_fallbacks(
+    monkeypatch,
+) -> None:
+    for env_name in (
+        "TEXT_LLM_API_KEY",
+        "TEXT_LLM_BASE_URL",
+        "CHAT_LLM_API_KEY",
+        "CHAT_LLM_BASE_URL",
+        "NEOLINK_API_KEY",
+        "NEOLINK_BASE_URL",
+        "IMAGE_GEN_PROVIDER",
+        "IMAGE_GEN_API_KEY",
+        "IMAGE_GEN_BASE_URL",
+    ):
+        monkeypatch.delenv(env_name, raising=False)
+
+    configured = Settings(
+        text_llm_provider="neolink",
+        chat_llm_provider="neolink",
+        neolink_api_key="dedicated-key",
+        neolink_base_url="https://neolink.com/api/",
+        image_gen_provider="neolink",
+        image_gen_api_key="image-key",
+        image_gen_base_url="https://image.example/api/",
+        _env_file=None,
+    )
+
+    assert configured.text_llm_api_key == "image-key"
+    assert configured.chat_llm_api_key == "image-key"
+    assert configured.text_llm_base_url == "https://image.example/api"
+    assert configured.chat_llm_base_url == "https://image.example/api"
+
+
+def test_neolink_llm_blank_dedicated_key_does_not_bypass_local_configuration_error(
+    monkeypatch,
+) -> None:
+    for env_name in (
+        "TEXT_LLM_API_KEY",
+        "CHAT_LLM_API_KEY",
+        "IMAGE_GEN_PROVIDER",
+        "IMAGE_GEN_API_KEY",
+    ):
+        monkeypatch.delenv(env_name, raising=False)
+
+    configured = Settings(
+        text_llm_provider="neolink",
+        chat_llm_provider="neolink",
+        neolink_api_key=" \t",
+        _env_file=None,
+    )
+
+    assert configured.text_llm_api_key == ""
+    assert configured.chat_llm_api_key == ""
 
 
 def test_production_alias_enables_secure_session_cookie(monkeypatch) -> None:

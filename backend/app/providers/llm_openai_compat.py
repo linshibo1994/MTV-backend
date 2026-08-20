@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import sys
 from typing import Literal
+from urllib.parse import urlsplit, urlunsplit
 
 from openai import (
     APIConnectionError,
@@ -27,10 +28,10 @@ from openai import (
     RateLimitError,
 )
 
-from app.providers.llm import parse_json_object, require_non_empty_chat_content
+from app.providers.llm import LLMResponseContractError, parse_json_object, require_non_empty_chat_content
 from app.providers.registry import ProviderConfigurationError
 
-LLMVendor = Literal["openai", "openai_compatible", "deepseek", "bailian", "gemini"]
+LLMVendor = Literal["openai", "openai_compatible", "deepseek", "bailian", "gemini", "neolink"]
 
 # 各厂商 OpenAI 兼容端点默认 base_url（.env 未显式配置时使用）
 _DEFAULT_BASE_URL: dict[str, str] = {
@@ -38,6 +39,7 @@ _DEFAULT_BASE_URL: dict[str, str] = {
     "deepseek": "https://api.deepseek.com",
     "bailian": "https://dashscope.aliyuncs.com/compatible-mode/v1",
     "gemini": "https://generativelanguage.googleapis.com/v1beta/openai/",
+    "neolink": "https://neolink.com/api/v1",
 }
 
 # 强制注入的 JSON 约束前缀（仅当 system 不含 "json" 关键词时追加）
@@ -75,6 +77,56 @@ def _is_transient_provider_error(exc: BaseException) -> bool:
     return bool(runtime_types) and isinstance(exc, runtime_types)
 
 
+def _normalize_neolink_base_url(value: str) -> str:
+    """将 NeoLink OpenAI 兼容基址限制为文档声明的 HTTPS API 路径。"""
+    if not isinstance(value, str):
+        raise ProviderConfigurationError("NEOLINK_BASE_URL 格式无效")
+    try:
+        parsed = urlsplit(value.strip())
+        port = parsed.port
+    except ValueError as exc:
+        raise ProviderConfigurationError("NEOLINK_BASE_URL 格式无效") from exc
+
+    if (
+        parsed.scheme.lower() != "https"
+        or not parsed.netloc
+        or not parsed.hostname
+        or port not in {None, 443}
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or any(char.isspace() or char == "\\" for char in parsed.netloc)
+        or parsed.netloc.endswith(":")
+    ):
+        raise ProviderConfigurationError(
+            "NEOLINK_BASE_URL 必须是不含用户信息、查询或片段的 HTTPS 443 地址"
+        )
+
+    if parsed.path in {"/api", "/api/"}:
+        path = "/api/v1"
+    elif parsed.path in {"/api/v1", "/api/v1/"}:
+        path = "/api/v1"
+    else:
+        raise ProviderConfigurationError("NEOLINK_BASE_URL 必须以 /api 或 /api/v1 结尾")
+    return urlunsplit(("https", parsed.netloc, path, "", ""))
+
+
+def _require_json_assistant_content(response: object) -> str:
+    """读取 JSON 补全正文，不在错误中暴露上游响应内容。"""
+    choices = getattr(response, "choices", None)
+    if not choices:
+        raise LLMResponseContractError
+    try:
+        message = getattr(choices[0], "message", None)
+    except (IndexError, KeyError, TypeError):
+        raise LLMResponseContractError from None
+    content = getattr(message, "content", None)
+    if content is None or not isinstance(content, str):
+        raise LLMResponseContractError
+    return content
+
+
 class OpenAICompatLLMProvider:
     """OpenAI 兼容端点的统一 LLM 实现。
 
@@ -97,6 +149,8 @@ class OpenAICompatLLMProvider:
         self._vendor = vendor
         self._model = model
         self._base_url = base_url or _DEFAULT_BASE_URL.get(vendor, "")
+        if vendor == "neolink":
+            self._base_url = _normalize_neolink_base_url(self._base_url)
         if not self._base_url:
             raise ProviderConfigurationError(f"{vendor} LLM base_url 未配置")
         self._client = AsyncOpenAI(
@@ -183,7 +237,7 @@ class OpenAICompatLLMProvider:
                     ) from None
             else:
                 raise RuntimeError(f"LLM 供应商调用失败 status={status_code}") from None
-        content = response.choices[0].message.content or ""
+        content = _require_json_assistant_content(response)
         return parse_json_object(content, kind="text")
 
     async def chat(
@@ -216,6 +270,9 @@ class OpenAICompatLLMProvider:
         except Exception as exc:
             if _is_transient_provider_error(exc):
                 raise ConnectionError("LLM 供应商暂不可用") from None
+            status_code = _http_status_code(exc)
+            if status_code is not None:
+                raise RuntimeError(f"LLM 供应商调用失败 status={status_code}") from None
             raise
         choices = getattr(response, "choices", None)
         if not choices:

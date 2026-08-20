@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Literal
 from unittest.mock import AsyncMock
 
 import pytest
@@ -63,6 +63,17 @@ def test_registry_normalizes_vendor_aliases_and_rejects_wrong_capability() -> No
         require_capability("deepseek", "image")
     with pytest.raises(UnsupportedProviderError, match="unknown-vendor"):
         normalize_provider("unknown-vendor")
+
+
+@pytest.mark.parametrize("provider", ["neolink", "neo-link", "neo_link"])
+@pytest.mark.parametrize("capability", ["text", "chat"])
+def test_neolink_registry_supports_both_aliases_for_text_and_chat(
+    provider: str,
+    capability: Literal["text", "chat"],
+) -> None:
+    from app.providers.registry import require_capability
+
+    assert require_capability(provider, capability) == "neolink"
 
 
 def test_video_capability_uses_generic_config_before_vendor_fallbacks() -> None:
@@ -268,6 +279,168 @@ def test_llm_factory_supports_anthropic_and_custom_openai_compatible(monkeypatch
     assert isinstance(anthropic, AnthropicLLMProvider)
     assert isinstance(custom, OpenAICompatLLMProvider)
     assert custom._base_url == "https://vendor.example/v1"
+
+
+def test_llm_factory_supports_neolink_alias_for_text_and_chat(monkeypatch) -> None:
+    from app.providers import _build_llm, llm_openai_compat
+    from app.providers.llm_openai_compat import OpenAICompatLLMProvider
+
+    monkeypatch.setattr(
+        llm_openai_compat,
+        "AsyncOpenAI",
+        lambda **kwargs: SimpleNamespace(config=kwargs),
+    )
+
+    providers = [
+        _build_llm(
+            provider_name,
+            "neolink-key",
+            "qwen-plus",
+            "https://neolink.example/api",
+            capability,
+        )
+        for provider_name in ("neolink", "neo-link", "neo_link")
+        for capability in ("text", "chat")
+    ]
+
+    assert all(isinstance(provider, OpenAICompatLLMProvider) for provider in providers)
+    assert [provider._vendor for provider in providers] == ["neolink"] * 6
+    assert [provider._base_url for provider in providers] == [
+        "https://neolink.example/api/v1",
+        "https://neolink.example/api/v1",
+        "https://neolink.example/api/v1",
+        "https://neolink.example/api/v1",
+        "https://neolink.example/api/v1",
+        "https://neolink.example/api/v1",
+    ]
+
+
+def test_neolink_settings_and_factory_use_default_openai_compatible_base_url(monkeypatch) -> None:
+    from app.providers import _build_llm, llm_openai_compat
+    from app.providers.llm_openai_compat import OpenAICompatLLMProvider
+
+    monkeypatch.setattr(
+        llm_openai_compat,
+        "AsyncOpenAI",
+        lambda **kwargs: SimpleNamespace(config=kwargs),
+    )
+    configured = _settings(
+        text_llm_provider="neolink",
+        chat_llm_provider="neolink",
+        neolink_api_key="neolink-key",
+    )
+
+    assert (configured.text_llm_api_key, configured.chat_llm_api_key) == (
+        "neolink-key",
+        "neolink-key",
+    )
+    assert (configured.text_llm_base_url, configured.chat_llm_base_url) == (
+        "https://neolink.com/api",
+        "https://neolink.com/api",
+    )
+
+    providers = [
+        _build_llm(
+            configured.text_llm_provider,
+            configured.text_llm_api_key,
+            configured.text_llm_model,
+            configured.text_llm_base_url,
+            "text",
+        ),
+        _build_llm(
+            configured.chat_llm_provider,
+            configured.chat_llm_api_key,
+            configured.chat_llm_model,
+            configured.chat_llm_base_url,
+            "chat",
+        ),
+    ]
+
+    assert all(isinstance(provider, OpenAICompatLLMProvider) for provider in providers)
+    assert [provider._base_url for provider in providers] == [
+        "https://neolink.com/api/v1",
+        "https://neolink.com/api/v1",
+    ]
+    assert [provider._client.config["base_url"] for provider in providers] == [
+        "https://neolink.com/api/v1",
+        "https://neolink.com/api/v1",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("base_url", "expected_base_url"),
+    [
+        ("https://neolink.example/api", "https://neolink.example/api/v1"),
+        ("https://neolink.example/api/v1/", "https://neolink.example/api/v1"),
+    ],
+)
+def test_neolink_llm_normalizes_openai_compatible_base_url(
+    monkeypatch,
+    base_url: str,
+    expected_base_url: str,
+) -> None:
+    from app.providers import llm_openai_compat
+    from app.providers.llm_openai_compat import OpenAICompatLLMProvider
+
+    monkeypatch.setattr(
+        llm_openai_compat,
+        "AsyncOpenAI",
+        lambda **kwargs: SimpleNamespace(config=kwargs),
+    )
+
+    provider = OpenAICompatLLMProvider(
+        vendor="neolink",
+        api_key="neolink-key",
+        model="qwen-plus",
+        base_url=base_url,
+    )
+
+    assert provider._base_url == expected_base_url
+    assert provider._client.config["base_url"] == expected_base_url
+
+
+def test_neolink_llm_uses_documented_default_openai_compatible_base_url(monkeypatch) -> None:
+    from app.providers import llm_openai_compat
+    from app.providers.llm_openai_compat import OpenAICompatLLMProvider
+
+    monkeypatch.setattr(
+        llm_openai_compat,
+        "AsyncOpenAI",
+        lambda **kwargs: SimpleNamespace(config=kwargs),
+    )
+
+    provider = OpenAICompatLLMProvider(
+        vendor="neolink",
+        api_key="neolink-key",
+        model="qwen-plus",
+        base_url="",
+    )
+
+    assert provider._base_url == "https://neolink.com/api/v1"
+    assert provider._client.config["base_url"] == "https://neolink.com/api/v1"
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "http://neolink.example/api",
+        "https://user:password@neolink.example/api",
+        "https://neolink.example/api?token=private",
+        "https://neolink.example/api#fragment",
+    ],
+    ids=["http", "userinfo", "query", "fragment"],
+)
+def test_neolink_llm_rejects_unsafe_openai_compatible_base_url(base_url: str) -> None:
+    from app.providers.llm_openai_compat import OpenAICompatLLMProvider
+    from app.providers.registry import ProviderConfigurationError
+
+    with pytest.raises(ProviderConfigurationError, match="NEOLINK_BASE_URL"):
+        OpenAICompatLLMProvider(
+            vendor="neolink",
+            api_key="neolink-key",
+            model="qwen-plus",
+            base_url=base_url,
+        )
 
 
 @pytest.mark.asyncio
@@ -502,6 +675,216 @@ async def test_openai_compatible_complete_json_keeps_json_object_for_compatible_
         ],
         response_format={"type": "json_object"},
     )
+
+
+@pytest.mark.asyncio
+async def test_neolink_complete_json_uses_documented_json_object_response_format() -> None:
+    from app.providers.llm_openai_compat import OpenAICompatLLMProvider
+
+    create = AsyncMock(
+        return_value=SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content='{"title": "NeoLink"}'))]
+        )
+    )
+    provider = OpenAICompatLLMProvider.__new__(OpenAICompatLLMProvider)
+    provider._model = "qwen-plus"
+    provider._vendor = "neolink"
+    provider._client = SimpleNamespace(  # type: ignore[assignment]
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+    )
+
+    result = await provider.complete_json(
+        "请输出 JSON",
+        "生成标题",
+        response_schema={"type": "object"},
+    )
+
+    assert result == {"title": "NeoLink"}
+    create.assert_awaited_once_with(
+        model="qwen-plus",
+        messages=[
+            {"role": "system", "content": "请输出 JSON"},
+            {"role": "user", "content": "生成标题"},
+        ],
+        response_format={"type": "json_object"},
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "response",
+    [
+        SimpleNamespace(choices=[]),
+        SimpleNamespace(choices=[SimpleNamespace(reasoning_content="NEOLINK_PRIVATE_REASONING")]),
+        SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=None,
+                        reasoning_content="NEOLINK_PRIVATE_REASONING",
+                    )
+                )
+            ]
+        ),
+    ],
+    ids=["empty-choices", "missing-message", "none-content"],
+)
+async def test_neolink_complete_json_rejects_invalid_assistant_content(response) -> None:
+    from app.providers.llm import LLMResponseContractError
+    from app.providers.llm_openai_compat import OpenAICompatLLMProvider
+
+    create = AsyncMock(return_value=response)
+    provider = OpenAICompatLLMProvider.__new__(OpenAICompatLLMProvider)
+    provider._model = "qwen-plus"
+    provider._vendor = "neolink"
+    provider._client = SimpleNamespace(  # type: ignore[assignment]
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+    )
+
+    with pytest.raises(LLMResponseContractError) as exc_info:
+        await provider.complete_json("请输出 JSON", "生成标题")
+
+    assert str(exc_info.value) == "LLM 供应商返回了无效的 assistant 正文"
+    assert "NEOLINK_PRIVATE_REASONING" not in str(exc_info.value)
+    create.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("content", ["", " \n"], ids=["empty-string", "blank-content"])
+async def test_neolink_complete_json_reports_invalid_json_for_empty_or_blank_content(
+    content: str,
+) -> None:
+    from app.providers.llm import LLMJSONResponseError
+    from app.providers.llm_openai_compat import OpenAICompatLLMProvider
+
+    create = AsyncMock(
+        return_value=SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=content,
+                        reasoning_content="NEOLINK_PRIVATE_REASONING",
+                    )
+                )
+            ]
+        )
+    )
+    provider = OpenAICompatLLMProvider.__new__(OpenAICompatLLMProvider)
+    provider._model = "qwen-plus"
+    provider._vendor = "neolink"
+    provider._client = SimpleNamespace(  # type: ignore[assignment]
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+    )
+
+    with pytest.raises(LLMJSONResponseError) as exc_info:
+        await provider.complete_json("请输出 JSON", "生成标题")
+
+    assert "NEOLINK_PRIVATE_REASONING" not in str(exc_info.value)
+    create.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_name", ["rate-limit", "timeout"])
+async def test_neolink_complete_json_maps_transient_openai_errors_to_connection_error(
+    error_name: str,
+) -> None:
+    from httpx import Request, Response
+    from openai import APITimeoutError, RateLimitError
+
+    from app.providers.llm_openai_compat import OpenAICompatLLMProvider
+
+    request = Request("POST", "https://neolink.example/api/v1/chat/completions")
+    error = (
+        RateLimitError(
+            "NEOLINK_PRIVATE_RATE_LIMIT_BODY",
+            response=Response(429, request=request),
+            body={"error": "NEOLINK_PRIVATE_RATE_LIMIT_BODY"},
+        )
+        if error_name == "rate-limit"
+        else APITimeoutError(request)
+    )
+    create = AsyncMock(side_effect=error)
+    provider = OpenAICompatLLMProvider.__new__(OpenAICompatLLMProvider)
+    provider._model = "qwen-plus"
+    provider._vendor = "neolink"
+    provider._client = SimpleNamespace(  # type: ignore[assignment]
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+    )
+
+    with pytest.raises(ConnectionError, match="LLM 供应商暂不可用") as exc_info:
+        await provider.complete_json("请输出 JSON", "生成标题")
+
+    assert "NEOLINK_PRIVATE_RATE_LIMIT_BODY" not in str(exc_info.value)
+    assert exc_info.value.__cause__ is None
+    create.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_neolink_complete_json_hides_auth_response_body() -> None:
+    from httpx import Request, Response
+    from openai import AuthenticationError
+
+    from app.providers.llm_openai_compat import OpenAICompatLLMProvider
+
+    response_body = "NEOLINK_PRIVATE_AUTH_RESPONSE_BODY"
+    create = AsyncMock(
+        side_effect=AuthenticationError(
+            response_body,
+            response=Response(
+                401,
+                request=Request("POST", "https://neolink.example/api/v1/chat/completions"),
+                json={"error": {"message": response_body}},
+            ),
+            body={"error": {"message": response_body}},
+        )
+    )
+    provider = OpenAICompatLLMProvider.__new__(OpenAICompatLLMProvider)
+    provider._model = "qwen-plus"
+    provider._vendor = "neolink"
+    provider._client = SimpleNamespace(  # type: ignore[assignment]
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+    )
+
+    with pytest.raises(RuntimeError, match="status=401") as exc_info:
+        await provider.complete_json("请输出 JSON", "生成标题")
+
+    assert response_body not in str(exc_info.value)
+    assert exc_info.value.__cause__ is None
+    create.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_neolink_chat_hides_auth_response_body() -> None:
+    from httpx import Request, Response
+    from openai import AuthenticationError
+
+    from app.providers.llm_openai_compat import OpenAICompatLLMProvider
+
+    response_body = "NEOLINK_PRIVATE_CHAT_AUTH_RESPONSE_BODY"
+    create = AsyncMock(
+        side_effect=AuthenticationError(
+            response_body,
+            response=Response(
+                401,
+                request=Request("POST", "https://neolink.example/api/v1/chat/completions"),
+                json={"error": {"message": response_body}},
+            ),
+            body={"error": {"message": response_body}},
+        )
+    )
+    provider = OpenAICompatLLMProvider.__new__(OpenAICompatLLMProvider)
+    provider._model = "qwen-plus"
+    provider._vendor = "neolink"
+    provider._client = SimpleNamespace(  # type: ignore[assignment]
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+    )
+
+    with pytest.raises(RuntimeError, match="status=401") as exc_info:
+        await provider.chat([{"role": "user", "content": "生成标题"}])
+
+    assert response_body not in str(exc_info.value)
+    assert exc_info.value.__cause__ is None
+    create.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -749,6 +1132,43 @@ async def test_openai_compatible_chat_preserves_multi_turn_messages() -> None:
             {"role": "user", "content": "追问"},
         ],
         temperature=0.2,
+        max_tokens=512,
+    )
+
+
+@pytest.mark.asyncio
+async def test_neolink_chat_preserves_multi_turn_messages_and_max_tokens() -> None:
+    from app.providers.llm_openai_compat import OpenAICompatLLMProvider
+
+    create = AsyncMock(
+        return_value=SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="最终回答"))])
+    )
+    provider = OpenAICompatLLMProvider.__new__(OpenAICompatLLMProvider)
+    provider._model = "qwen-plus"
+    provider._vendor = "neolink"
+    provider._client = SimpleNamespace(  # type: ignore[assignment]
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+    )
+
+    result = await provider.chat(
+        [
+            {"role": "user", "content": "问题"},
+            {"role": "assistant", "content": "中间回答"},
+            {"role": "user", "content": "追问"},
+        ],
+        system="系统指令",
+        max_tokens=512,
+    )
+
+    assert result == "最终回答"
+    create.assert_awaited_once_with(
+        model="qwen-plus",
+        messages=[
+            {"role": "system", "content": "系统指令"},
+            {"role": "user", "content": "问题"},
+            {"role": "assistant", "content": "中间回答"},
+            {"role": "user", "content": "追问"},
+        ],
         max_tokens=512,
     )
 

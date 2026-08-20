@@ -60,10 +60,26 @@ _ALIASES: dict[str, ProviderName] = {
 
 _CAPABILITIES: dict[ProviderCapability, frozenset[ProviderName]] = {
     "text": frozenset(
-        {"openai", "openai_compatible", "anthropic", "gemini", "bailian", "deepseek"}
+        {
+            "openai",
+            "openai_compatible",
+            "anthropic",
+            "gemini",
+            "bailian",
+            "deepseek",
+            "neolink",
+        }
     ),
     "chat": frozenset(
-        {"openai", "openai_compatible", "anthropic", "gemini", "bailian", "deepseek"}
+        {
+            "openai",
+            "openai_compatible",
+            "anthropic",
+            "gemini",
+            "bailian",
+            "deepseek",
+            "neolink",
+        }
     ),
     "image": frozenset({"openai", "gemini", "bailian", "neolink"}),
     "video": frozenset(
