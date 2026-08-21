@@ -43,7 +43,6 @@ from app.models.task_dispatch_outbox import TaskDispatchOutbox
 from app.models.timeline_render_job import TimelineRenderJob
 from app.models.user import User
 from app.models.video_generation_job import VideoGenerationJob
-from app.schemas.materials import build_subject_prompt
 from app.services import reference_aggregator
 from app.services import review as review_service
 
@@ -886,10 +885,8 @@ def test_storyboard_materials_persist_stable_subject_ids_for_rename_safe_impact(
     ) == (True, "character")
 
 
-def test_prompt_helper_is_available_through_review_service():
-    expected = build_subject_prompt("小明", "character", "蓝色外套")
-
-    assert review_service.build_subject_prompt("小明", "character", "蓝色外套") == expected
+def test_review_service_does_not_expose_server_prompt_template_builder():
+    assert not hasattr(review_service, "build_subject_prompt")
 
 
 @pytest.mark.parametrize("status", ["approved", "superseded", "deleted"])

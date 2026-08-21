@@ -5,7 +5,6 @@
 线上数据库曾被 ``alembic stamp`` 盖章到基线 ``d4b7e1c9a362``，但 stamp 不会
 真正执行迁移的 DDL，因此线上实际 schema 与基线声明不一致（schema 漂移）：
 
-- ``art_style_extraction_jobs`` 表未创建；
 - ``scene_auditions`` 缺 ``attempt_count`` / ``error_code`` / ``error_message``
   / ``started_at`` / ``finished_at`` 五列；
 - ``subject_candidates`` 缺 ``resolution_action`` / ``resolution_request_hash``
@@ -44,7 +43,6 @@ from sqlalchemy.engine import Connection
 
 from app.core.config import settings
 from app.models import Base  # noqa: F401  触发各模型注册到 Base.metadata
-
 
 # ---------------------------------------------------------------------------
 # 已知漂移列：基线 create_table 已含这些列，但线上旧表（stamp 前已存在）
@@ -131,7 +129,11 @@ def _existing_columns(conn: Connection, table: str) -> set[str]:
 
 
 def _existing_constraints(conn: Connection, table: str) -> set[str]:
-    return {c["name"] for c in inspect(conn).get_check_constraints(table) if c.get("name")}
+    return {
+        name
+        for constraint in inspect(conn).get_check_constraints(table)
+        if isinstance(name := constraint.get("name"), str)
+    }
 
 
 def _detect_missing_tables(conn: Connection, existing: set[str]) -> list[str]:

@@ -30,10 +30,6 @@ from app.schemas.asset import (
     review_status_label,
     subject_type_label,
 )
-from app.schemas.materials import (
-    SUBJECT_DESIGN_PROMPT_TEMPLATE_VERSION,
-    build_subject_prompt,
-)
 from app.services.cover import generate_svg_cover
 from app.services.storage_references import (
     StorageReferenceExclusions,
@@ -218,7 +214,6 @@ async def create_subject(
     name: str,
     description: str,
     episode_nos: list[int],
-    visual_style: str | None = None,
 ) -> Subject:
     """手动新增主体，并保证同一剧本内的同名同类唯一。
 
@@ -249,9 +244,7 @@ async def create_subject(
         name=name,
         pipeline_name=name,
         description=description,
-        visual_style=visual_style,
         subject_version=1,
-        enrich_version=1,
         name_locked=True,
         description_locked=True,
         is_child=True,
@@ -275,7 +268,6 @@ async def update_subject(
 ) -> Subject:
     """部分更新主体；人工修改名称/描述时默认锁定并递增版本。"""
     current_version = int(subject.subject_version or 1)
-    current_enrich_version = int(subject.enrich_version or 1)
     if (
         expected_subject_version is not None
         and current_version != expected_subject_version
@@ -323,7 +315,6 @@ async def update_subject(
         "episode_nos",
         "name_locked",
         "description_locked",
-        "visual_style",
     }
     should_bump_version = any(
         key in versioned_fields
@@ -331,19 +322,11 @@ async def update_subject(
         and getattr(subject, key) != value
         for key, value in data.items()
     )
-    should_bump_enrich_version = any(
-        key in {"name", "description", "type", "visual_style"}
-        and hasattr(subject, key)
-        and getattr(subject, key) != value
-        for key, value in data.items()
-    )
     for key, value in data.items():
-        if hasattr(subject, key) and (value is not None or key == "visual_style"):
+        if hasattr(subject, key) and value is not None:
             setattr(subject, key, value)
     if should_bump_version:
         subject.subject_version = current_version + 1
-    if should_bump_enrich_version:
-        subject.enrich_version = current_enrich_version + 1
     await db.flush()
     return subject
 
@@ -488,7 +471,6 @@ async def resolve_subject_suggestion(
         else:
             raise ConflictError("差异建议字段无效")
         subject.subject_version = current_version + 1
-        subject.enrich_version = int(subject.enrich_version or 1) + 1
         suggestion.status = "accepted"
     elif action == "ignore":
         suggestion.status = "ignored"
@@ -851,28 +833,17 @@ async def get_episode_context_maps(
     db: AsyncSession,
     script_id: str,
 ) -> tuple[dict[int, str], dict[int, dict[str, object]]]:
-    """一次查询返回主体序列化映射与 enrich 版本快照，避免重复加载分集 ORM。"""
+    """返回主体序列化所需的分集映射，保留空上下文映射以兼容既有调用方。"""
     rows = (
         await db.execute(
             select(
                 Episode.episode_no,
                 Episode.episode_id,
-                Episode.episode_version,
-                Episode.client_save_seq,
             ).where(Episode.script_id == script_id)
         )
     ).all()
-    episode_map: dict[int, str] = {}
-    snapshot_by_no: dict[int, dict[str, object]] = {}
-    for episode_no, episode_id, episode_version, client_save_seq in rows:
-        normalized_no = int(episode_no)
-        episode_map[normalized_no] = episode_id
-        snapshot_by_no[normalized_no] = {
-            "episode_id": episode_id,
-            "episode_version": int(episode_version or 1),
-            "client_save_seq": int(client_save_seq or 0),
-        }
-    return episode_map, snapshot_by_no
+    episode_map = {int(episode_no): episode_id for episode_no, episode_id in rows}
+    return episode_map, {}
 
 
 # =====================================================================
@@ -960,9 +931,7 @@ def serialize_subject(
         e for e in all_entries if e.kind == "audio" and _entry_status(e) == "approved"
     ]
 
-    raw_type = subject.type
-    norm_type = normalize_subject_type(raw_type)
-    is_visual_subject = raw_type != "sound"
+    norm_type = normalize_subject_type(subject.type)
 
     parent_name: str | None = None
     if subject.parent_subject is not None:
@@ -982,21 +951,6 @@ def serialize_subject(
         subject_type=norm_type,
         subject_type_label=subject_type_label(norm_type),
         subject_description=subject.description,
-        visual_style=getattr(subject, "visual_style", None),
-        design_prompt=(
-            build_subject_prompt(subject.name, raw_type, subject.description or "")
-            if is_visual_subject
-            else None
-        ),
-        design_prompt_source="template_fallback" if is_visual_subject else None,
-        design_prompt_version=(
-            int(getattr(subject, "enrich_version", 1) or 1)
-            if is_visual_subject
-            else None
-        ),
-        design_prompt_template_version=(
-            SUBJECT_DESIGN_PROMPT_TEMPLATE_VERSION if is_visual_subject else None
-        ),
         name_locked=bool(getattr(subject, "name_locked", False)),
         description_locked=bool(getattr(subject, "description_locked", False)),
         subject_version=int(getattr(subject, "subject_version", 1) or 1),

@@ -41,21 +41,14 @@ from app.models.subject import Subject
 from app.models.task_dispatch_outbox import TaskDispatchOutbox
 from app.models.user import User
 from app.schemas import pipeline_contracts
-from app.schemas.materials import (
-    CHARACTER_SHEET_CONSTRAINT,
-    SUBJECT_DESIGN_PROMPT_MARKER,
-)
 from app.schemas.pipeline_contracts import (
-    EnrichOutput,
     ExtractOutput,
     MergeOutput,
     ParentsOutput,
     SplitOutput,
-    should_enrich_subject,
 )
 from app.schemas.pipeline_runs import PipelineRunCreateIn, PipelineRunMode
 from app.schemas.script import EpisodeCreateIn
-from app.services import generation as generation_service
 from app.services import pipeline_runs as pipeline_runs_service
 from app.services.pipeline import (
     STAGE_ORDER,
@@ -219,33 +212,6 @@ def _retrying_provider(valid_payload: dict) -> tuple[FakeProvider, list[dict]]:
     return FakeProvider(payloads), payloads
 
 
-def _twelve_sections() -> str:
-    labels = [
-        "形制描述",
-        "材质钉死",
-        "使用痕迹",
-        "摆放姿态",
-        "反悬浮锁",
-        "时代锚定",
-        "画面构图",
-        "画风统一锁",
-        "三点柔光箱白底布光",
-        "反水印锁",
-        "文字渲染降级方案",
-        "写实质感锚定",
-    ]
-    return "\n".join(
-        f"【{label}】有效内容，包含稳定特征、材质、物理关系、构图与布光约束。"
-        for label in labels
-    )
-
-
-def _numbered_twelve_sections() -> str:
-    return "\n".join(
-        f"{index}. {line}" for index, line in enumerate(_twelve_sections().splitlines(), 1)
-    )
-
-
 def _strict_contract_payloads() -> dict[type, dict]:
     return {
         SplitOutput: {
@@ -277,10 +243,6 @@ def _strict_contract_payloads() -> dict[type, dict]:
             ],
             "total_count": 1,
         },
-        EnrichOutput: {
-            "schema_version": "pipeline.v1",
-            "resolved_prompts": {"final": _twelve_sections()},
-        },
         ParentsOutput: {
             "schema_version": "pipeline.v1",
             "parent_subjects": [
@@ -311,7 +273,6 @@ def test_pipeline_contracts_require_pipeline_v1_and_forbid_root_extra(schema) ->
         (SplitOutput, "episodes", None),
         (ExtractOutput, "subjects", None),
         (MergeOutput, "merged_subjects", None),
-        (EnrichOutput, "resolved_prompts", "unexpected"),
         (ParentsOutput, "parent_subjects", None),
     ],
 )
@@ -331,10 +292,6 @@ def test_pipeline_contracts_forbid_nested_extra(schema, container, field) -> Non
         (SplitOutput, lambda p: p["episodes"][0].update(episode_no="1")),
         (ExtractOutput, lambda p: p["subjects"][0].update(is_child="true")),
         (MergeOutput, lambda p: p.update(total_count="1")),
-        (
-            EnrichOutput,
-            lambda p: p["resolved_prompts"].update(final=_twelve_sections().encode()),
-        ),
         (ParentsOutput, lambda p: p["parent_subjects"][0].update(child_count="1")),
     ],
 )
@@ -659,7 +616,7 @@ def test_provider_budget_combines_schema_and_transport_across_durable_attempts(
     asyncio.run(scenario())
 
 
-def test_fake_provider_payloads_validate_all_five_pipeline_contracts() -> None:
+def test_fake_provider_payloads_validate_pipeline_llm_contracts() -> None:
     provider = FakeProvider(
         [
             {"episodes": [{"episode_no": 1, "title": "第一集", "script_text": "正文"}]},
@@ -686,7 +643,6 @@ def test_fake_provider_payloads_validate_all_five_pipeline_contracts() -> None:
                 ],
                 "total_count": 1,
             },
-            {"resolved_prompts": {"final": _twelve_sections()}},
             {
                 "parent_subjects": [
                     {
@@ -705,90 +661,9 @@ def test_fake_provider_payloads_validate_all_five_pipeline_contracts() -> None:
         assert SplitOutput.model_validate(await provider.complete_json("", "")).episodes[0].episode_no == 1
         assert ExtractOutput.model_validate(await provider.complete_json("", "")).subjects[0].name == "主角"
         assert MergeOutput.model_validate(await provider.complete_json("", "")).total_count == 1
-        assert EnrichOutput.model_validate(await provider.complete_json("", "")).resolved_prompts.final
         assert ParentsOutput.model_validate(await provider.complete_json("", "")).parent_subjects[0].child_count == 1
 
     asyncio.run(validate_payloads())
-
-
-def test_free_form_prompt_and_sound_subject_are_not_visual_enrichment() -> None:
-    contract = EnrichOutput.model_validate(
-        {
-            "schema_version": "pipeline.v1",
-            "resolved_prompts": {"final": "【形制描述】只有一段"},
-        }
-    )
-    assert contract.resolved_prompts.final == "【形制描述】只有一段"
-    with pytest.raises(ValidationError):
-        EnrichOutput.model_validate(
-            {
-                "schema_version": "pipeline.v1",
-                "resolved_prompts": {"final": " "},
-            }
-        )
-    assert not should_enrich_subject("sound")
-    assert should_enrich_subject("character")
-
-
-def test_enrich_contract_normalizes_legacy_numbering_and_accepts_free_sections() -> None:
-    contract = EnrichOutput.model_validate(
-        {
-            "schema_version": "pipeline.v1",
-            "resolved_prompts": {"final": _numbered_twelve_sections()},
-        }
-    )
-    assert contract.resolved_prompts.final == _twelve_sections()
-
-    free_prompts = [
-        "\n".join(reversed(_twelve_sections().splitlines())),
-        "\n".join(_twelve_sections().splitlines()[:-1]),
-        _twelve_sections().replace("【材质钉死】有效内容", "【材质钉死】"),
-    ]
-    for prompt in free_prompts:
-        contract = EnrichOutput.model_validate(
-            {
-                "schema_version": "pipeline.v1",
-                "resolved_prompts": {"final": prompt},
-            }
-        )
-        assert contract.resolved_prompts.final
-
-
-def test_enrich_stage_persists_canonical_prompt_from_numbered_provider_output(monkeypatch) -> None:
-    subject = Subject(
-        id="subject-1",
-        script_id="script-1",
-        name="主角",
-        type="character",
-        description="红衣角色",
-        episode_nos=[1],
-        is_child=True,
-        is_parent=False,
-    )
-    set_stage = AsyncMock()
-    monkeypatch.setattr(enrich, "set_stage", set_stage)
-
-    result = asyncio.run(
-        enrich.run_enrich(
-            _ServiceSession(_episode(), [subject]),
-            "script-1",
-            episode_id="episode-1",
-            input_version=3,
-            provider=FakeProvider(
-                [{"resolved_prompts": {"final": _numbered_twelve_sections()}}]
-            ),
-            commit=False,
-        )
-    )
-
-    assert result == 1
-    assert (
-        set_stage.await_args.kwargs["detail"]["prompts"]["subject-1"]["resolved_prompts"]["final"]
-        == (
-            f"{SUBJECT_DESIGN_PROMPT_MARKER}\n"
-            f"{_twelve_sections()}\n{CHARACTER_SHEET_CONSTRAINT}"
-        )
-    )
 
 
 def test_pipeline_metadata_parent_fk_attempt_uniqueness_reset_and_failure_shape() -> None:
@@ -1576,7 +1451,7 @@ def test_episode_create_rejects_zero_and_negative_episode_numbers() -> None:
             EpisodeCreateIn(title="测试", episode_no=episode_no)
 
 
-def test_all_five_services_retry_invalid_provider_contracts_before_writing(monkeypatch) -> None:
+def test_pipeline_services_keep_enrich_as_noop_leaf(monkeypatch) -> None:
     async def scenario() -> None:
         stage_writes: list[str] = []
 
@@ -1672,17 +1547,14 @@ def test_all_five_services_retry_invalid_provider_contracts_before_writing(monke
             is_child=True,
             is_parent=False,
         )
-        enrich_provider, _ = _retrying_provider(
-            {"resolved_prompts": {"final": _twelve_sections()}}
-        )
         monkeypatch.setattr(enrich, "set_stage", record_stage)
         assert await enrich.run_enrich(
             _ServiceSession(episode, [subject]),
             "script-1",
             episode_id="episode-1",
             input_version=3,
-            provider=enrich_provider,
-        ) == 1
+            provider=FakeProvider([]),
+        ) == 0
 
         parents_provider, _ = _retrying_provider(
             {
@@ -2374,14 +2246,14 @@ def test_extract_and_enrich_leave_commit_to_worker_and_persist_stage_totals(monk
             "script-1",
             episode_id="episode-1",
             input_version=3,
-            provider=FakeProvider([{"resolved_prompts": {"final": _twelve_sections()}}]),
+            provider=FakeProvider([]),
             commit=False,
         )
 
         assert extract_db.commits == extract_db.rollbacks == 0
         assert enrich_db.commits == enrich_db.rollbacks == 0
         assert extract_stage.await_args.kwargs["total"] == 1
-        assert enrich_stage.await_args.kwargs["total"] == 1
+        assert enrich_stage.await_args.kwargs["total"] == 0
         assert enrich_stage.await_args.kwargs["status"] == "running"
 
     asyncio.run(scenario())
@@ -2766,84 +2638,6 @@ def test_parents_filters_cross_type_children_without_blocking_pipeline(monkeypat
         assert result == 0
         published = parents.replace_parent_subjects.await_args.args[2]
         assert published == []
-
-    asyncio.run(scenario())
-
-
-def test_generation_rejects_enrich_prompt_when_any_related_episode_seq_changed() -> None:
-    async def scenario() -> None:
-        from app.models.pipeline_stage import PipelineStage
-
-        engine = create_engine("sqlite+pysqlite:///:memory:")
-        Episode.__table__.create(engine)
-        PipelineStage.__table__.create(engine)
-        with Session(engine, expire_on_commit=False) as raw_session:
-            raw_session.add_all(
-                [
-                    Episode(
-                        episode_id="episode-1",
-                        script_id="script-1",
-                        episode_no=1,
-                        title="第一集",
-                        episode_version=7,
-                        client_save_seq=3,
-                    ),
-                    Episode(
-                        episode_id="episode-2",
-                        script_id="script-1",
-                        episode_no=2,
-                        title="第二集",
-                        episode_version=5,
-                        client_save_seq=8,
-                    ),
-                    PipelineStage(
-                        id="stage-enrich",
-                        script_id="script-1",
-                        stage="enrich",
-                        status="done",
-                        detail={
-                            "prompts": {
-                                "subject-1": {
-                                    "resolved_prompts": {"final": _twelve_sections()},
-                                    "episode_snapshot": {
-                                        "1": {
-                                            "episode_id": "episode-1",
-                                            "episode_version": 7,
-                                            "client_save_seq": 3,
-                                        },
-                                        "2": {
-                                            "episode_id": "episode-2",
-                                            "episode_version": 5,
-                                            "client_save_seq": 7,
-                                        },
-                                    },
-                                }
-                            }
-                        },
-                    ),
-                ]
-            )
-            raw_session.commit()
-            with pytest.raises(ConflictError, match="enrich 快照不是当前输入版本"):
-                await generation_service._load_server_resolved_prompt(
-                    _AsyncSessionAdapter(raw_session),
-                    "script-1",
-                    "subject-1",
-                    input_version=7,
-                    input_client_save_seq=3,
-                    episode_snapshot={
-                        1: {
-                            "episode_id": "episode-1",
-                            "episode_version": 7,
-                            "client_save_seq": 3,
-                        },
-                        2: {
-                            "episode_id": "episode-2",
-                            "episode_version": 5,
-                            "client_save_seq": 8,
-                        },
-                    },
-                )
 
     asyncio.run(scenario())
 
@@ -3813,9 +3607,7 @@ def test_run_scoped_merge_publishes_subjects_before_leaf_stages(monkeypatch) -> 
                 "episode_nos": [1],
                 "is_child": True,
                 "base_subject_version": None,
-                "base_enrich_version": None,
                 "subject_version": 1,
-                "enrich_version": 1,
             }
         ]
         publish = AsyncMock()
@@ -3875,29 +3667,13 @@ def test_run_scoped_merge_publishes_subjects_before_leaf_stages(monkeypatch) -> 
     asyncio.run(scenario())
 
 
-def test_run_scoped_enrich_keeps_prompts_private_until_finalizer(monkeypatch) -> None:
+def test_run_scoped_enrich_returns_noop_detail_for_finalizer(monkeypatch) -> None:
     async def scenario() -> None:
         episode = SimpleNamespace(
             **vars(_episode()),
             client_save_seq=0,
         )
-        merge_output = {
-            "subjects": [
-                {
-                    "id": "subject-1",
-                    "name": "主角",
-                    "type": "character",
-                    "description": "红衣角色",
-                    "episode_nos": [1],
-                    "subject_version": 4,
-                    "enrich_version": 7,
-                }
-            ]
-        }
         stage = AsyncMock()
-        monkeypatch.setattr(
-            enrich, "get_run_stage_output", AsyncMock(return_value=merge_output)
-        )
         monkeypatch.setattr(enrich, "set_stage", stage)
 
         result = await enrich.run_enrich(
@@ -3907,16 +3683,15 @@ def test_run_scoped_enrich_keeps_prompts_private_until_finalizer(monkeypatch) ->
             input_version=3,
             input_client_save_seq=0,
             run_id="run-1",
-            provider=FakeProvider(
-                [{"resolved_prompts": {"final": _twelve_sections()}}]
-            ),
+            provider=FakeProvider([]),
         )
 
-        assert isinstance(result, dict)
-        assert "prompts" not in stage.await_args.kwargs["detail"]
-        prompt = result["prompts"]["subject-1"]
-        assert prompt["subject_version"] == 4
-        assert prompt["enrich_version"] == 7
+        assert result == {
+            "count": 0,
+            "input_version": 3,
+            "input_client_save_seq": 0,
+        }
+        assert stage.await_args.kwargs["detail"] == result
 
     asyncio.run(scenario())
 
@@ -4054,7 +3829,7 @@ def test_finalizer_settles_once_before_marking_both_leaf_jobs_done(monkeypatch) 
                         input_version=3,
                         attempt=1,
                         output_json=(
-                            {"prompts": {}}
+                            {"count": 0}
                             if stage == "enrich"
                             else {"parent_subjects": []}
                         ),
@@ -4155,7 +3930,7 @@ def test_finalizer_settlement_failure_never_marks_leaf_jobs_done(monkeypatch) ->
                         input_version=3,
                         attempt=1,
                         output_json=(
-                            {"prompts": {}}
+                            {"count": 0}
                             if stage == "enrich"
                             else {"parent_subjects": []}
                         ),
@@ -4250,7 +4025,7 @@ def test_finalizer_uses_latest_immutable_leaf_attempt(monkeypatch) -> None:
                         input_version=3,
                         attempt=2,
                         output_json=(
-                            {"prompts": {}}
+                            {"count": 0}
                             if stage == "enrich"
                             else {"parent_subjects": []}
                         ),
@@ -4411,6 +4186,68 @@ def test_replace_subjects_preserves_old_subject_referenced_by_asset_entry() -> N
     assert archived.is_active is False
 
 
+def test_replace_subjects_staged_subject_uses_only_subject_version_fence() -> None:
+    subject = SimpleNamespace(
+        id="subject-1",
+        script_id="script-1",
+        type="character",
+        name="主角",
+        pipeline_name="主角",
+        description="旧描述",
+        subject_version=4,
+        is_child=True,
+        is_parent=False,
+        parent_id=None,
+        episode_nos=[1],
+        review_status="not_designed",
+        is_active=True,
+    )
+
+    class _ReplaceSession:
+        def __init__(self) -> None:
+            self.results = iter(
+                [
+                    _RowsResult([subject]),
+                    _RowsResult([]),
+                ]
+            )
+
+        async def execute(self, statement):
+            return next(self.results)
+
+        async def delete(self, row) -> None:
+            raise AssertionError(f"不应删除主体: {row}")
+
+        def add(self, row) -> None:
+            raise AssertionError(f"不应新增主体: {row}")
+
+        async def flush(self) -> None:
+            return None
+
+    asyncio.run(
+        replace_subjects(
+            _ReplaceSession(),
+            "script-1",
+            [
+                {
+                    "id": "subject-1",
+                    "name": "主角",
+                    "type": "character",
+                    "description": "新描述",
+                    "is_child": True,
+                    "episode_nos": [1],
+                    "base_subject_version": 4,
+                    "subject_version": 5,
+                }
+            ],
+        )
+    )
+
+    assert subject.description == "新描述"
+    assert subject.subject_version == 5
+    assert not hasattr(subject, "enrich_version")
+
+
 def test_save_episode_does_not_swallow_durable_trigger_failure(monkeypatch) -> None:
     db = _ServiceSession(_episode())
     script = SimpleNamespace(id="script-1")
@@ -4446,43 +4283,28 @@ def test_save_episode_does_not_swallow_durable_trigger_failure(monkeypatch) -> N
     assert db.rollbacks == 1
 
 
-def test_real_enrich_skips_sound_and_persists_only_visual_prompt(monkeypatch) -> None:
+def test_enrich_compat_stage_persists_zero_total(monkeypatch) -> None:
     episode = _episode()
-    visual = Subject(
-        id="subject-visual",
-        script_id="script-1",
-        name="主角",
-        type="character",
-        description="红衣角色",
-        is_child=True,
-        is_parent=False,
-    )
-    sound = Subject(
-        id="subject-sound",
-        script_id="script-1",
-        name="旁白",
-        type="sound",
-        description="低沉男声",
-        is_child=True,
-        is_parent=False,
-    )
-    provider = FakeProvider([{"resolved_prompts": {"final": _twelve_sections()}}])
     set_stage = AsyncMock()
     monkeypatch.setattr(enrich, "set_stage", set_stage)
 
     assert asyncio.run(
         enrich.run_enrich(
-            _ServiceSession(episode, [visual, sound]),
+            _ServiceSession(episode),
             "script-1",
             episode_id="episode-1",
             input_version=3,
-            provider=provider,
+            provider=FakeProvider([]),
             commit=False,
         )
-    ) == 1
+    ) == 0
     detail = set_stage.await_args.kwargs["detail"]
-    assert set(detail["prompts"]) == {"subject-visual"}
-    assert set_stage.await_args.kwargs["total"] == 1
+    assert detail == {
+        "count": 0,
+        "input_version": 3,
+        "input_client_save_seq": None,
+    }
+    assert set_stage.await_args.kwargs["total"] == 0
 
 
 def test_breakdown_returns_real_episode_subject_scene_group_and_shot_rows() -> None:
@@ -4605,7 +4427,7 @@ def test_breakdown_returns_real_episode_subject_scene_group_and_shot_rows() -> N
     asyncio.run(scenario())
 
 
-def test_archived_subjects_are_excluded_from_enrich_and_parents(monkeypatch) -> None:
+def test_archived_subjects_are_excluded_from_parents(monkeypatch) -> None:
     async def scenario() -> None:
         engine = create_engine("sqlite+pysqlite:///:memory:")
         Base.metadata.create_all(engine)
@@ -4648,17 +4470,6 @@ def test_archived_subjects_are_excluded_from_enrich_and_parents(monkeypatch) -> 
             )
             raw_session.commit()
             db = _AsyncSessionAdapter(raw_session)
-
-            enrich_provider = FakeProvider(
-                [{"resolved_prompts": {"final": _twelve_sections()}}]
-            )
-            assert await enrich.run_enrich(
-                db,
-                "script-active-subjects",
-                episode_id="episode-active-subjects",
-                input_version=1,
-                provider=enrich_provider,
-            ) == 1
 
             parent_payload = {
                 "parent_subjects": [

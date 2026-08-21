@@ -28,7 +28,6 @@ app = Celery(
         "app.workers.video_generation",
         "app.workers.media_storage",
         "app.workers.scene_audition",
-        "app.workers.art_style_extraction",
     ],
 )
 
@@ -94,10 +93,6 @@ app.conf.update(
         },
         "recover-media-storage-jobs": {
             "task": "app.workers.media_storage.recover_media_storage_jobs",
-            "schedule": 60.0,
-        },
-        "recover-art-style-extractions": {
-            "task": "art_style.recover-expired",
             "schedule": 60.0,
         },
         "recover-scene-auditions": {

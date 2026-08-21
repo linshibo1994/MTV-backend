@@ -22,7 +22,6 @@ from app.models.credit_reservation import CreditReservation
 from app.models.episode import Episode
 from app.models.pipeline_job import PipelineJob
 from app.models.script import Script
-from app.models.subject import Subject
 from app.services.credits import release as credits_release
 from app.services.credits import reserve
 from app.services.pipeline import (
@@ -190,7 +189,6 @@ async def _estimate_cost(db: AsyncSession, script_id: str) -> int:
 
     extract: 当前集数 × price_extract_per_episode
     merge:   price_merge（固定）
-    enrich:  当前主体数 × price_enrich_per_subject（首次运行主体为 0，由 settle 按实际结算补足）
     +1 保底，确保 estimated > 0（reserve 拒绝 0）。
     """
     ep_count = (
@@ -198,20 +196,11 @@ async def _estimate_cost(db: AsyncSession, script_id: str) -> int:
             select(func.count(Episode.episode_id)).where(Episode.script_id == script_id)
         )
     ).scalar() or 0
-    subj_count = (
-        await db.execute(
-            select(func.count(Subject.id)).where(
-                Subject.script_id == script_id,
-                Subject.is_active.is_(True),
-            )
-        )
-    ).scalar() or 0
     from app.core.config import settings
 
     estimated = (
         int(ep_count) * settings.price_extract_per_episode
         + settings.price_merge
-        + int(subj_count) * settings.price_enrich_per_subject
         + 1
     )
     return max(estimated, 1)

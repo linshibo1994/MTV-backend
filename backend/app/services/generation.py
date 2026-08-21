@@ -44,29 +44,11 @@ from app.models.episode import Episode
 from app.models.generation_batch_request import GenerationBatchRequest
 from app.models.generation_job import GenerationJob
 from app.models.materials import Materials
-from app.models.pipeline_stage import PipelineStage
 from app.models.script import Script
 from app.models.subject import Subject
 from app.models.user import User
 from app.schemas.generation import BatchCreateJobIn, CreateJobIn
-from app.schemas.materials import (
-    CHARACTER_SHEET_MARKER,
-    SUBJECT_DESIGN_PROMPT_MARKER,
-    ensure_character_sheet_constraint,
-    strip_legacy_character_sheet_constraints,
-)
-from app.schemas.pipeline_contracts import normalize_enrich_prompt
-from app.services.art_styles import get_art_style_definition
 from app.services.credits import reserve
-from app.services.pipeline.enrich import build_base_prompt
-from app.services.prompt_style import (
-    apply_style,
-    apply_style_definition,
-    apply_visual_style_dimension,
-    find_style,
-    get_styles,
-    strip_image_style,
-)
 from app.services.task_dispatch import enqueue_task
 
 _SINGLE_IDEMPOTENCY_NAMESPACE = "single:"
@@ -74,15 +56,6 @@ _BATCH_JOB_IDEMPOTENCY_NAMESPACE = "batch-job:"
 _MAX_CLIENT_IDEMPOTENCY_KEY_LENGTH = 128
 _BATCH_GENERATION_GROUP_SIZE = 2
 _BATCH_GENERATION_GROUP_INTERVAL_SECONDS = 5
-
-_CHARACTER_SHEET_MARKER = CHARACTER_SHEET_MARKER
-_CHARACTER_SHEET_NEGATIVE_PROMPT = (
-    "额外人物，多余视图，缺少左侧极近面部特写，缺少正面 0° 视图，缺少标准侧面 90° 视图，"
-    "缺少背面 180° 视图，头部裁切，脚部裁切，肩部进入左侧特写，身体遮挡，视图重叠，"
-    "透视变形，身份不一致，脸部不一致，发型不一致，服装不一致，体型不一致，文字，标签，"
-    "尺寸线，水印，边框，分栏线，额外剧情动作"
-)
-
 
 def _batch_dispatch_available_at(batch_started_at: datetime, created_count: int) -> datetime:
     """按供应商实测容量错峰发布批量生图任务。"""
@@ -99,126 +72,6 @@ def _normalize_idempotency_key(value: str | None) -> str:
     if len(normalized) > _MAX_CLIENT_IDEMPOTENCY_KEY_LENGTH:
         raise BadRequestError("Idempotency-Key 过长")
     return normalized
-
-
-def _validate_image_style(style_id: str | None) -> dict | None:
-    """校验显式风格，并返回可用于图片生成的风格定义。"""
-    if style_id is None:
-        return None
-    style = find_style(style_id)
-    if style is None:
-        raise BadRequestError(f"未知风格: {style_id}")
-    if "image" not in style["target"]:
-        raise BadRequestError(f"风格不支持图片生成: {style_id}")
-    return style
-
-
-def _unwrap_style_template(prompt: str, style: dict) -> str | None:
-    """精确解包已应用的目录模板；不使用模糊关键词猜测。"""
-    template = str(style["prompt_template"])
-    if "{prompt}" not in template:
-        suffix = f", {template}"
-        if not prompt.endswith(suffix):
-            return None
-        inner = prompt[: -len(suffix)].strip()
-        return inner or None
-
-    prefix, suffix = template.split("{prompt}", 1)
-    if not prefix and not suffix:
-        return None
-    if not prompt.startswith(prefix) or not prompt.endswith(suffix):
-        return None
-    end = len(prompt) - len(suffix) if suffix else len(prompt)
-    inner = prompt[len(prefix) : end].strip()
-    return inner or None
-
-
-def _is_style_template_applied(prompt: str, style: dict) -> bool:
-    """仅按模板固定边界识别已包裹 prompt，避免用模糊关键词误判。"""
-    return _unwrap_style_template(prompt, style) is not None
-
-
-def _unwrap_unique_image_style_template(prompt: str, preferred_style: dict) -> str:
-    """结构化资产兼容旧风格包装；优先解包当前风格，否则要求目录唯一匹配。"""
-    if inner := _unwrap_style_template(prompt, preferred_style):
-        return inner
-    matches = [
-        inner
-        for candidate in get_styles("image")
-        if (inner := _unwrap_style_template(prompt, candidate)) is not None
-    ]
-    return matches[0] if len(matches) == 1 else prompt
-
-
-def _resolve_image_prompt(
-    prompt: str,
-    explicit_style: dict | None,
-    *,
-    subject_type: str | None = None,
-    infer_embedded_style: bool = True,
-) -> tuple[str, str, str | None]:
-    """解析并应用一次图片风格；兼容前端只提交完整风格 prompt 的情况。"""
-    style = explicit_style
-    if style is not None:
-        prompt = strip_image_style(prompt)
-    elif not infer_embedded_style:
-        return strip_image_style(prompt), "", None
-    if style is None and infer_embedded_style:
-        matches = [
-            candidate
-            for candidate in get_styles("image")
-            if _is_style_template_applied(prompt, candidate)
-        ]
-        style = matches[0] if len(matches) == 1 else None
-    if style is None:
-        return prompt, "", None
-
-    style_id = str(style["id"])
-    if SUBJECT_DESIGN_PROMPT_MARKER in prompt:
-        base_prompt = _unwrap_unique_image_style_template(prompt, style)
-        positive_prompt, negative_prompt = apply_style(
-            style_id,
-            base_prompt,
-            "image",
-            subject_type=subject_type,
-        )
-        return positive_prompt, negative_prompt, style_id
-    if _is_style_template_applied(prompt, style):
-        return prompt, str(style["negative_prompt"]), style_id
-    positive_prompt, negative_prompt = apply_style(
-        style_id,
-        prompt,
-        "image",
-        subject_type=subject_type,
-    )
-    return positive_prompt, negative_prompt, style_id
-
-
-def _remove_legacy_character_sheet_constraints(prompt: str) -> str:
-    """清理历史角色三视图约束，避免与 v2 版式重复注入。"""
-    return strip_legacy_character_sheet_constraints(prompt)
-
-
-def _apply_character_sheet_constraints(
-    prompt: str,
-    negative_prompt: str,
-    subject_type: str,
-    aspect: str,
-) -> tuple[str, str]:
-    """为人物生成追加一次固定设定图构图约束，并合并固定负面提示。"""
-    if subject_type != "character":
-        return prompt, negative_prompt
-
-    resolved_prompt = ensure_character_sheet_constraint(
-        _remove_legacy_character_sheet_constraints(prompt)
-    )
-
-    resolved_negative = negative_prompt.strip()
-    if _CHARACTER_SHEET_NEGATIVE_PROMPT not in resolved_negative:
-        resolved_negative = ", ".join(
-            part for part in (resolved_negative, _CHARACTER_SHEET_NEGATIVE_PROMPT) if part
-        )
-    return resolved_prompt, resolved_negative
 
 
 def _resolve_subject_image_aspect(aspect: str, subject_type: str) -> str:
@@ -284,11 +137,7 @@ async def _create_one_job(
     account: CreditAccount,
     idempotency_key: str,
     prompt: str,
-    resolved_prompt: str,
     negative_prompt: str,
-    style_id: str | None,
-    art_style_id: str | None,
-    visual_style: str | None,
     input_version: int,
     input_client_save_seq: int | None,
     episode_id: str | None,
@@ -308,11 +157,8 @@ async def _create_one_job(
     job_id = new_id()
     input_json: dict = {
         "prompt": prompt,
-        "resolved_prompts": {"final": resolved_prompt or prompt},
         "negative_prompt": negative_prompt,
-        "style_id": style_id,
-        "art_style_id": art_style_id,
-        "visual_style": visual_style,
+        "prompt_source": "client",
         "model": model,
         "size": size,
         "aspect": aspect,
@@ -320,7 +166,6 @@ async def _create_one_job(
         "subject_id": subject.id,
         "subject_name": subject.name,
         "subject_version": int(subject.subject_version or 1),
-        "enrich_version": int(subject.enrich_version or 1),
         "input_version": input_version,
         "input_client_save_seq": input_client_save_seq,
         "episode_snapshot": episode_snapshot or {},
@@ -417,86 +262,6 @@ async def _subject_episode_snapshot(
         int(primary.client_save_seq or 0),
         snapshot,
     )
-
-
-def _validate_twelve_section_prompt(prompt: str) -> str:
-    try:
-        return normalize_enrich_prompt(prompt)
-    except ValueError as exc:
-        raise ConflictError(f"enrich resolved prompt 无效：{exc}") from exc
-
-
-async def _load_server_resolved_prompt(
-    db: AsyncSession,
-    script_id: str,
-    subject_id: str,
-    input_version: int,
-    input_client_save_seq: int | None = None,
-    episode_snapshot: dict[int, dict] | None = None,
-    subject_version: int | None = None,
-    enrich_version: int | None = None,
-) -> str:
-    stage = (
-        await db.execute(
-            select(PipelineStage).where(
-                PipelineStage.script_id == script_id,
-                PipelineStage.stage == "enrich",
-                PipelineStage.status == "done",
-            ).options(noload(PipelineStage.script))
-        )
-    ).scalar_one_or_none()
-    detail = stage.detail if stage else None
-    if not detail:
-        raise ConflictError("enrich 快照不是当前输入版本")
-    prompt_entry = (detail.get("prompts") or {}).get(subject_id, {})
-    if subject_version is not None and prompt_entry.get("subject_version") != subject_version:
-        raise ConflictError("enrich 快照不是当前输入版本")
-    if enrich_version is not None and prompt_entry.get("enrich_version") != enrich_version:
-        raise ConflictError("enrich 快照不是当前输入版本")
-    stored_snapshot = prompt_entry.get("episode_snapshot") or {}
-    expected_snapshot = episode_snapshot or {}
-    if stored_snapshot:
-        normalized_stored = {int(key): value for key, value in stored_snapshot.items()}
-        if normalized_stored != expected_snapshot:
-            raise ConflictError("enrich 快照不是当前输入版本")
-        episode_ids = [str(item["episode_id"]) for item in normalized_stored.values()]
-        current_rows = list(
-            (
-                await db.execute(
-                    select(Episode)
-                    .where(
-                        Episode.script_id == script_id,
-                        Episode.episode_id.in_(episode_ids),
-                    )
-                    .options(noload(Episode.script), noload(Episode.scenes))
-                )
-            )
-            .scalars()
-            .all()
-        )
-        current_snapshot = {
-            int(episode.episode_no): {
-                "episode_id": episode.episode_id,
-                "episode_version": int(episode.episode_version or 1),
-                "client_save_seq": int(episode.client_save_seq or 0),
-            }
-            for episode in current_rows
-        }
-        if current_snapshot != normalized_stored:
-            raise ConflictError("enrich 快照不是当前输入版本")
-    elif (
-        detail.get("input_version") != input_version
-        or (
-            input_client_save_seq is not None
-            and "input_client_save_seq" in detail
-            and detail.get("input_client_save_seq") != input_client_save_seq
-        )
-    ):
-        raise ConflictError("enrich 快照不是当前输入版本")
-    prompt = (prompt_entry.get("resolved_prompts") or {}).get("final")
-    if not isinstance(prompt, str) or not prompt.strip():
-        raise ConflictError("缺少服务端 enrich resolved prompt")
-    return _validate_twelve_section_prompt(prompt)
 
 
 def _request_hash(payload: dict) -> str:
@@ -620,24 +385,9 @@ async def create_generation_job(
     episode_id, input_version, input_client_save_seq, episode_snapshot = (
         await _subject_episode_snapshot(db, script.id, subject)
     )
-    prompt = payload.prompt or build_base_prompt(subject)
-    if not prompt.strip():
-        raise BadRequestError("主体缺少描述，无法生图")
-    if payload.prompt is not None:
-        # 客户端显式 prompt 是用户本次确认的最终输入，不再套用 enrich 十二段格式校验。
-        resolved_prompt = prompt
-    else:
-        # 兼容尚未升级的客户端：缺省时继续使用服务端 enrich 快照。
-        resolved_prompt = await _load_server_resolved_prompt(
-            db,
-            script.id,
-            subject.id,
-            input_version,
-            input_client_save_seq,
-            episode_snapshot,
-            int(subject.subject_version or 1),
-            int(subject.enrich_version or 1),
-        )
+    # 提示词由客户端确认后直接冻结；服务端不再读取 enrich、风格目录或项目画风。
+    prompt = payload.prompt
+    negative_prompt = payload.negative_prompt
     request_payload = {
         "material_id": payload.material_id,
         "script_id": script.id,
@@ -647,68 +397,18 @@ async def create_generation_job(
         "aspect": aspect,
         "count": payload.count,
         "prompt": prompt,
-        "resolved_prompt": resolved_prompt,
+        "negative_prompt": negative_prompt,
         "input_version": input_version,
         "input_client_save_seq": input_client_save_seq,
         "episode_snapshot": episode_snapshot,
         "subject_version": int(subject.subject_version or 1),
-        "enrich_version": int(subject.enrich_version or 1),
     }
-    if payload.style_id is not None:
-        request_payload["style_id"] = payload.style_id
-    if payload.art_style_id is not None:
-        request_payload["art_style_id"] = payload.art_style_id
-    if payload.visual_style is not None:
-        request_payload["visual_style"] = payload.visual_style
     req_hash = _request_hash(request_payload)
     existing = await _find_idempotent_job(db, user.user_id, idempotency_key)
     if existing is not None:
         if existing.request_hash != req_hash:
             raise ConflictError("Idempotency-Key 已用于不同请求")
         return existing
-
-    effective_visual_style = payload.visual_style or subject.visual_style or (
-        getattr(script, "visual_style", None)
-        if bool(getattr(script, "unify_style", True))
-        else None
-    )
-    dynamic_style = None
-    if payload.art_style_id is not None:
-        dynamic_style = await get_art_style_definition(
-            db,
-            script_id=script.id,
-            art_style_id=payload.art_style_id,
-        )
-        if dynamic_style is None:
-            raise BadRequestError("项目画风不存在或已停用")
-    resolved_style_id: str | None
-    if dynamic_style is not None:
-        resolved_prompt, negative_prompt = apply_style_definition(
-            dynamic_style,
-            strip_image_style(resolved_prompt),
-            "image",
-            subject_type=subject.type,
-            visual_style=effective_visual_style,
-        )
-        resolved_style_id = str(dynamic_style["id"])
-    else:
-        explicit_style = _validate_image_style(payload.style_id)
-        resolved_prompt, negative_prompt, builtin_style_id = _resolve_image_prompt(
-            resolved_prompt,
-            explicit_style,
-            subject_type=subject.type,
-        )
-        resolved_style_id = builtin_style_id
-        resolved_prompt = apply_visual_style_dimension(
-            resolved_prompt,
-            effective_visual_style,
-        )
-    resolved_prompt, negative_prompt = _apply_character_sheet_constraints(
-        resolved_prompt,
-        negative_prompt,
-        subject.type,
-        aspect,
-    )
 
     # 3. 查用户积分账户
     account = await _load_credit_account(db, user)
@@ -724,11 +424,7 @@ async def create_generation_job(
             account=account,
             idempotency_key=idempotency_key,
             prompt=prompt,
-            resolved_prompt=resolved_prompt,
             negative_prompt=negative_prompt,
-            style_id=resolved_style_id,
-            art_style_id=payload.art_style_id,
-            visual_style=effective_visual_style,
             input_version=input_version,
             input_client_save_seq=input_client_save_seq,
             episode_id=episode_id,
@@ -771,37 +467,18 @@ async def create_batch_generation_jobs(
         "script_id": script.id,
         "subject_ids": list(payload.subject_ids) if payload.subject_ids else None,
         "prompts": payload.prompts,
+        "negative_prompts": payload.negative_prompts,
         "model": payload.model,
         "size": payload.size,
         "aspect": payload.aspect,
         "count": payload.count,
     }
-    if payload.style_id is not None:
-        batch_payload["style_id"] = payload.style_id
-    if payload.style_ids is not None:
-        batch_payload["style_ids"] = payload.style_ids
-    if payload.art_style_id is not None:
-        batch_payload["art_style_id"] = payload.art_style_id
-    if payload.visual_style is not None:
-        batch_payload["visual_style"] = payload.visual_style
     batch_hash = _request_hash(batch_payload)
     existing_batch = await _find_batch_request(db, user.user_id, idempotency_key)
     if existing_batch is not None:
         if existing_batch.request_hash != batch_hash:
             raise ConflictError("Idempotency-Key 已用于不同请求")
         return await _load_batch_manifest(db, existing_batch)
-    explicit_style = _validate_image_style(payload.style_id)
-    dynamic_style = None
-    if payload.art_style_id is not None:
-        dynamic_style = await get_art_style_definition(
-            db,
-            script_id=script.id,
-            art_style_id=payload.art_style_id,
-        )
-        if dynamic_style is None:
-            raise BadRequestError("项目画风不存在或已停用")
-    account = await _load_credit_account(db, user)
-
     # 确定目标主体集合
     if payload.subject_ids:
         requested_subject_ids = list(dict.fromkeys(payload.subject_ids))
@@ -834,24 +511,26 @@ async def create_batch_generation_jobs(
             ).scalars().all()
         )
 
-    target_subject_ids = {subject.id for subject in subjects}
-    unknown_prompt_ids = set(payload.prompts or {}) - target_subject_ids
+    target_subject_ids = {subject.id for subject in subjects if subject.type != "sound"}
+    unknown_prompt_ids = set(payload.prompts) - target_subject_ids
     if unknown_prompt_ids:
         raise BadRequestError("prompts 包含非目标主体")
-    unknown_style_ids = set(payload.style_ids or {}) - target_subject_ids
-    if unknown_style_ids:
-        raise BadRequestError("style_ids 包含非目标主体")
-    explicit_styles_by_subject = {
-        subject_id: _validate_image_style(style_id)
-        for subject_id, style_id in (payload.style_ids or {}).items()
-    }
+    missing_prompt_ids = target_subject_ids - set(payload.prompts)
+    if missing_prompt_ids:
+        raise BadRequestError("prompts 缺少目标主体")
+    negative_prompts = payload.negative_prompts or {}
+    unknown_negative_prompt_ids = set(negative_prompts) - target_subject_ids
+    if unknown_negative_prompt_ids:
+        raise BadRequestError("negative_prompts 包含非目标主体")
+
+    account = await _load_credit_account(db, user)
 
     batch = await _create_batch_request(
         db,
         owner_user_id=user.user_id,
         idempotency_key=idempotency_key,
         request_hash=batch_hash,
-        target_subject_ids=[subject.id for subject in subjects],
+        target_subject_ids=[subject.id for subject in subjects if subject.type != "sound"],
     )
     if batch.request_hash != batch_hash:
         raise ConflictError("Idempotency-Key 已用于不同请求")
@@ -867,73 +546,13 @@ async def create_batch_generation_jobs(
         if subject.type == "sound":
             skipped.append(subject.id)
             continue
-        client_prompt = (payload.prompts or {}).get(subject.id)
-        # 旧客户端未提供 prompt 时，仍按主体描述构造基础 prompt。
-        prompt = client_prompt or build_base_prompt(subject)
-        if not prompt.strip():
-            skipped.append(subject.id)
-            continue
+        prompt = payload.prompts[subject.id]
+        negative_prompt = negative_prompts.get(subject.id, "")
         try:
             episode_id, input_version, input_client_save_seq, episode_snapshot = (
                 await _subject_episode_snapshot(db, script.id, subject)
             )
-            if client_prompt is not None:
-                resolved_prompt = prompt
-            else:
-                resolved_prompt = await _load_server_resolved_prompt(
-                    db,
-                    script.id,
-                    subject.id,
-                    input_version,
-                    input_client_save_seq,
-                    episode_snapshot,
-                    int(subject.subject_version or 1),
-                    int(subject.enrich_version or 1),
-                )
-            effective_visual_style = (
-                payload.visual_style
-                or getattr(subject, "visual_style", None)
-                or (
-                    getattr(script, "visual_style", None)
-                    if bool(getattr(script, "unify_style", True))
-                    else None
-                )
-            )
-            has_subject_style_override = subject.id in explicit_styles_by_subject
-            resolved_style_id: str | None
-            if dynamic_style is not None:
-                resolved_prompt, negative_prompt = apply_style_definition(
-                    dynamic_style,
-                    strip_image_style(resolved_prompt),
-                    "image",
-                    subject_type=subject.type,
-                    visual_style=effective_visual_style,
-                )
-                resolved_style_id = str(dynamic_style["id"])
-            else:
-                subject_style = (
-                    explicit_styles_by_subject[subject.id]
-                    if has_subject_style_override
-                    else explicit_style
-                )
-                resolved_prompt, negative_prompt, builtin_style_id = _resolve_image_prompt(
-                    resolved_prompt,
-                    subject_style,
-                    subject_type=subject.type,
-                    infer_embedded_style=not has_subject_style_override,
-                )
-                resolved_style_id = builtin_style_id
-                resolved_prompt = apply_visual_style_dimension(
-                    resolved_prompt,
-                    effective_visual_style,
-                )
             aspect = _resolve_subject_image_aspect(payload.aspect, subject.type)
-            resolved_prompt, negative_prompt = _apply_character_sheet_constraints(
-                resolved_prompt,
-                negative_prompt,
-                subject.type,
-                aspect,
-            )
             job = await _create_one_job(
                 db,
                 user=user,
@@ -943,11 +562,7 @@ async def create_batch_generation_jobs(
                 account=account,
                 idempotency_key=f"{_BATCH_JOB_IDEMPOTENCY_NAMESPACE}{batch.id}:{subject.id}",
                 prompt=prompt,
-                resolved_prompt=resolved_prompt,
                 negative_prompt=negative_prompt,
-                style_id=resolved_style_id,
-                art_style_id=payload.art_style_id,
-                visual_style=effective_visual_style,
                 input_version=input_version,
                 input_client_save_seq=input_client_save_seq,
                 episode_id=episode_id,

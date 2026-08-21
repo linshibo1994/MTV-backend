@@ -156,8 +156,8 @@ async def _reset_owned_running_stage(
     if row.status != "running" or detail.get("input_version") != input_version:
         return False
     row.status = "pending"
-    # extract/enrich 的明细是可恢复检查点；同一输入版本重试时保留，避免重复外呼。
-    if stage not in {"extract", "enrich"}:
+    # extract 的明细是可恢复检查点；同一输入版本重试时保留，避免重复外呼。
+    if stage != "extract":
         row.detail = None
         row.current = None
         row.total = None
@@ -485,23 +485,17 @@ async def _compute_actual(db, script_id: str) -> int:
 
     - extract: 集数 × price_extract_per_episode
     - merge:   price_merge（固定）
-    - enrich:  主体数 × price_enrich_per_subject
-    - split / parents: 文档未定义定价，按 0 计
+    - split / enrich / parents: 不计费
     """
     from app.services.pipeline import get_stage
 
     extract_stage = await get_stage(db, script_id, "extract")
-    enrich_stage = await get_stage(db, script_id, "enrich")
-    # extract/enrich 的计数由 run_extract/run_enrich 通过 set_stage(..., total=...)
-    # 写入 PipelineStage.total 整数列；detail 结构为 {"episodes":[...]} /
-    # {"count":..., "prompts":{...}}，并不含 total 键，故必须读 total 列，
-    # 否则 extract 成本会漏算为 0。
+    # extract 的计数由 run_extract 通过 set_stage(..., total=...) 写入
+    # PipelineStage.total 整数列，不能从 detail 推导。
     ep_total = int((extract_stage.total or 0) if extract_stage else 0)
-    subj_count = int((enrich_stage.total or 0) if enrich_stage else 0)
     actual = (
         ep_total * settings.price_extract_per_episode
         + settings.price_merge  # merge 按固定价计（未写 total 列）
-        + subj_count * settings.price_enrich_per_subject
     )
     return max(actual, 0)
 
@@ -621,7 +615,7 @@ async def finalize_pipeline_jobs(
     parents_output = latest["parents"].output_json or {}
     if merge_job is None or not isinstance(merge_output, dict):
         raise RuntimeError("pipeline merge staging output is missing")
-    if "prompts" not in enrich_output or "parent_subjects" not in parents_output:
+    if not isinstance(enrich_output, dict) or not isinstance(parents_output, dict) or "parent_subjects" not in parents_output:
         raise RuntimeError("pipeline leaf staging output is missing")
 
     if reservation_id:
@@ -646,11 +640,16 @@ async def finalize_pipeline_jobs(
     for stage in ("enrich", "parents"):
         row = latest[stage]
         stage_output = enrich_output if stage == "enrich" else parents_output
-        public_detail = {
-            key: value
-            for key, value in stage_output.items()
-            if key != "parent_subjects"
-        }
+        if stage == "enrich":
+            public_detail = {
+                key: value
+                for key, value in stage_output.items()
+                if key in {"count", "input_version", "input_client_save_seq"}
+            }
+        else:
+            public_detail = {
+                key: value for key, value in stage_output.items() if key != "parent_subjects"
+            }
         if not await _call_mark_stage(
             db,
             script_id,
@@ -1121,7 +1120,7 @@ def enrich_task(
     dispatch_id: str,
     run_id: str,
 ) -> str | dict:
-    """enrich 阶段：设计线索增强（12 段落摄影级 prompt）。终态：结算积分。"""
+    """enrich 兼容阶段：不生成服务端设计提示词，终态仍由 finalizer 结算。"""
     return _run_stage(
         "enrich",
         script_id,

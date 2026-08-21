@@ -47,7 +47,6 @@ from app.schemas.asset import (
 from app.services import review as review_service
 from app.services.audit import best_effort_log as audit_log
 from app.services.audit import log as strict_audit_log
-from app.services.pipeline.enrich import load_current_design_prompts
 
 router = APIRouter()
 
@@ -123,25 +122,8 @@ async def list_subjects(
     """主体列表 — 含 image_entry/audio_entries/pending_candidate_count/review_status_label。"""
     await _load_script_or_403(db, script_id, user, action=Action.READ)
     subjects, total = await asset_crud.list_subjects(db, script_id, limit, offset)
-    episode_map, episode_snapshot_by_no = await asset_crud.get_episode_context_maps(
-        db, script_id
-    )
-    design_prompts = await load_current_design_prompts(
-        db,
-        script_id,
-        subjects,
-        episode_snapshot_by_no,
-    )
-    items: list[SubjectAssetOut] = []
-    for subject in subjects:
-        item = asset_crud.serialize_subject(subject, episode_map)
-        current_prompt = design_prompts.get(subject.id)
-        if current_prompt is not None:
-            item.design_prompt = current_prompt["prompt"]
-            item.design_prompt_source = current_prompt["source"]
-            item.design_prompt_version = current_prompt["version"]
-            item.design_prompt_template_version = current_prompt["template_version"]
-        items.append(item)
+    episode_map, _ = await asset_crud.get_episode_context_maps(db, script_id)
+    items = [asset_crud.serialize_subject(subject, episode_map) for subject in subjects]
     return SubjectListOut(
         items=items,
         total=total,
@@ -168,7 +150,6 @@ async def create_subject(
         name=payload.name,
         description=payload.description,
         episode_nos=[int(episode_no) for episode_no in payload.episode_nos],
-        visual_style=payload.visual_style,
     )
     # 主体与审计共用同一事务：审计失败时请求依赖统一 rollback，不能留下无审计主体。
     await strict_audit_log(
@@ -183,11 +164,6 @@ async def create_subject(
             "type": subject.type,
             "name": subject.name,
             "description": subject.description,
-            **(
-                {"visual_style": subject.visual_style}
-                if "visual_style" in payload.model_fields_set
-                else {}
-            ),
             "episode_nos": list(subject.episode_nos or []),
             "review_status": subject.review_status,
         },
@@ -248,16 +224,12 @@ async def update_subject(
     before = {
         "name": subject.name,
         "description": subject.description,
-        "visual_style": subject.visual_style,
         "name_locked": bool(subject.name_locked),
         "description_locked": bool(subject.description_locked),
         "subject_version": int(subject.subject_version or 1),
     }
 
     update_data = payload.model_dump(exclude_none=True)
-    # visual_style=null 表示清除实体覆盖并恢复继承，不能被 exclude_none 吞掉。
-    if "visual_style" in payload.model_fields_set:
-        update_data["visual_style"] = payload.visual_style
     expected_subject_version = update_data.pop("expected_subject_version", None)
     await asset_crud.update_subject(
         db,
@@ -275,7 +247,6 @@ async def update_subject(
         after={
             "name": subject.name,
             "description": subject.description,
-            "visual_style": subject.visual_style,
             "name_locked": bool(subject.name_locked),
             "description_locked": bool(subject.description_locked),
             "subject_version": int(subject.subject_version or 1),

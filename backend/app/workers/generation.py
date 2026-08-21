@@ -1,7 +1,7 @@
 """生成任务 Celery worker — 文生图异步执行。
 
 generate_images_task(job_id) 流程：
-1. 读 input_json.resolved_prompts.final（回退 input_json.prompt）作为生图 prompt
+1. 读取任务冻结的 input_json.prompt 与可选 negative_prompt 作为生图提示词
 2. 解析 script_id（job.script_id 优先，兜底从 material.script_id 查询）
 3. get_image_provider(model).generate() 调用对应供应商生成图片（可生成多张选一）
 4. 通过 StorageProvider 持久化 (/generate_images/<mid>/<id>.png) + 计算 sha256
@@ -58,12 +58,9 @@ from app.providers.image_gen import (
 )
 from app.providers.registry import ProviderError
 from app.providers.storage import get_storage, storage_key_for_write
-from app.schemas.materials import CHARACTER_SHEET_MARKER, LEGACY_CHARACTER_SHEET_MARKERS
 from app.services.credits import release as credits_release
 from app.services.credits import settle as credits_settle
-from app.services.generation import _apply_character_sheet_constraints, _resolve_image_prompt
 from app.services.media_storage_jobs import enqueue_delete
-from app.services.prompt_style import find_style
 from app.services.task_dispatch import cancel_outbox_task
 from app.workers.async_runtime import run_worker_async
 from app.workers.celery_app import celery_app
@@ -71,12 +68,6 @@ from app.workers.celery_app import celery_app
 logger = logging.getLogger(__name__)
 _LEASE_SECONDS = 300
 _TERMINAL_STATUSES = {"succeeded", "failed", "canceled"}
-_LEGACY_SERVICE_CHARACTER_SHEET_MARKER = "【人物设定图服务端构图硬约束】"
-_QUEUED_CHARACTER_SHEET_MARKERS = (
-    CHARACTER_SHEET_MARKER,
-    *LEGACY_CHARACTER_SHEET_MARKERS,
-    _LEGACY_SERVICE_CHARACTER_SHEET_MARKER,
-)
 _SAFETY_GENERATION_ATTEMPTS: tuple[PromptSoftenLevel | None, ...] = (
     None,
     PromptSoftenLevel.CONSERVATIVE,
@@ -137,34 +128,13 @@ def _safety_retry_metrics(
 
 
 def _resolve_job_prompts(input_json: dict[str, Any], prompt: str) -> tuple[str, str]:
-    """读取任务提示词，并为部署前已排队的旧任务做只读回退解析。"""
-    if "negative_prompt" in input_json:
-        stored = input_json.get("negative_prompt")
-        return prompt, stored if isinstance(stored, str) else ""
-
-    explicit_style = None
-    style_id = input_json.get("style_id")
-    if isinstance(style_id, str):
-        candidate = find_style(style_id)
-        if candidate is not None and "image" in candidate["target"]:
-            explicit_style = candidate
-    positive_prompt, negative_prompt, _ = _resolve_image_prompt(prompt, explicit_style)
-    return positive_prompt, negative_prompt
-
-
-def _normalize_queued_character_sheet_prompt(
-    prompt: str,
-    negative_prompt: str,
-    aspect: str,
-) -> tuple[str, str]:
-    """让部署前已入队的角色图任务也使用当前唯一的三视图约束。
-
-    新任务在创建时已完成规范化。此处仅根据明确的历史/当前标记处理旧任务，
-    避免把任意普通图片任务误判为角色设定图。
-    """
-    if not any(marker in prompt for marker in _QUEUED_CHARACTER_SHEET_MARKERS):
-        return prompt, negative_prompt
-    return _apply_character_sheet_constraints(prompt, negative_prompt, "character", aspect)
+    """读取任务冻结的提示词，不在 Worker 重新套用任何风格或模板。"""
+    if input_json.get("prompt_source") == "client":
+        stored_prompt = input_json.get("prompt")
+        if isinstance(stored_prompt, str) and stored_prompt.strip():
+            prompt = stored_prompt
+    stored_negative = input_json.get("negative_prompt")
+    return prompt, stored_negative if isinstance(stored_negative, str) else ""
 
 
 @dataclass(frozen=True)
@@ -641,12 +611,6 @@ async def _input_version_is_current(db: Any, job: GenerationJob) -> bool:
         and int(subject.subject_version or 1) != int(expected_subject_version)
     ):
         return False
-    expected_enrich_version = input_json.get("enrich_version")
-    if (
-        expected_enrich_version is not None
-        and int(subject.enrich_version or 1) != int(expected_enrich_version)
-    ):
-        return False
     episode_snapshot = input_json.get("episode_snapshot") or {}
     if episode_snapshot:
         normalized_snapshot = {int(key): value for key, value in episode_snapshot.items()}
@@ -881,16 +845,11 @@ async def run_generation_once(
             )
         return
 
-    prompt = (input_json.get("resolved_prompts") or {}).get("final") or input_json.get("prompt") or ""
+    prompt = input_json.get("prompt") or ""
     model = input_json.get("model", "qwen-image-2.0")
     size = input_json.get("size", "2k")
     aspect = input_json.get("aspect", "16:9")
     prompt, negative_prompt = _resolve_job_prompts(input_json, prompt)
-    prompt, negative_prompt = _normalize_queued_character_sheet_prompt(
-        prompt,
-        negative_prompt,
-        aspect,
-    )
     count = int(input_json.get("count", 1) or 1)
     subject_id = input_json.get("subject_id") or job.subject_id
     material_id = job.material_id

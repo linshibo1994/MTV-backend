@@ -16,7 +16,6 @@ from sqlalchemy import (
     UniqueConstraint,
     create_engine,
     select,
-    update,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -35,16 +34,13 @@ from app.models.generation_batch_request import GenerationBatchRequest
 from app.models.generation_job import GenerationJob
 from app.models.materials import Materials
 from app.models.media_storage_job import MediaStorageJob
-from app.models.pipeline_stage import PipelineStage
 from app.models.script import Script
 from app.models.subject import Subject
 from app.models.task_dispatch_outbox import TaskDispatchOutbox
 from app.models.user import User
 from app.providers.image_gen import ImageResult, image_result_from_url
 from app.schemas.generation import BatchCreateJobIn, CreateJobIn
-from app.schemas.materials import CHARACTER_SHEET_MARKER
 from app.services import generation as generation_service
-from app.services.pipeline.enrich import build_base_prompt
 from app.workers import generation as generation_worker
 
 
@@ -117,30 +113,6 @@ def _webp() -> bytes:
     return out.getvalue()
 
 
-def _twelve_sections() -> str:
-    names = [
-        "形制描述",
-        "材质钉死",
-        "使用痕迹",
-        "摆放姿态",
-        "反悬浮锁",
-        "时代锚定",
-        "画面构图",
-        "画风统一锁",
-        "三点柔光箱白底布光",
-        "反水印锁",
-        "文字渲染降级方案",
-        "写实质感锚定",
-    ]
-    return "\n".join(f"【{name}】内容 {index}" for index, name in enumerate(names, 1))
-
-
-def _numbered_twelve_sections() -> str:
-    return "\n".join(
-        f"{index}. {line}" for index, line in enumerate(_twelve_sections().splitlines(), 1)
-    )
-
-
 def _make_db() -> tuple[object, Session]:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     for table in (
@@ -149,7 +121,6 @@ def _make_db() -> tuple[object, Session]:
         Materials.__table__,
         Subject.__table__,
         Episode.__table__,
-        PipelineStage.__table__,
         GenerationBatchRequest.__table__,
         CreditAccount.__table__,
         CreditReservation.__table__,
@@ -196,24 +167,6 @@ def _seed(raw: Session, *, subject_type: str = "character") -> SimpleNamespace:
         episode_nos=[1],
         review_status="not_designed",
     )
-    enrich = PipelineStage(
-        id="stage-enrich",
-        script_id=script.id,
-        stage="enrich",
-        status="done",
-        detail={
-            "input_version": episode.episode_version,
-            "prompts": {
-                subject.id: {
-                    "subject_version": 1,
-                    "enrich_version": 1,
-                    "resolved_prompts": {
-                        "final": _twelve_sections(),
-                    },
-                }
-            },
-        },
-    )
     account = CreditAccount(
         id="account-1",
         owner_type="user",
@@ -222,7 +175,7 @@ def _seed(raw: Session, *, subject_type: str = "character") -> SimpleNamespace:
         frozen_points=0,
         status="active",
     )
-    raw.add_all([user, script, material, episode, subject, enrich, account])
+    raw.add_all([user, script, material, episode, subject, account])
     raw.commit()
     return SimpleNamespace(
         user=user,
@@ -230,7 +183,6 @@ def _seed(raw: Session, *, subject_type: str = "character") -> SimpleNamespace:
         material=material,
         episode=episode,
         subject=subject,
-        enrich=enrich,
         account=account,
     )
 
@@ -239,6 +191,7 @@ def _create_payload(**overrides) -> CreateJobIn:
     data = {
         "material_id": "material-1",
         "subject_id": "subject-1",
+        "prompt": "客户端默认生图提示词",
         "model": "banana-2",
         "size": "2k",
         "aspect": "16:9",
@@ -246,20 +199,6 @@ def _create_payload(**overrides) -> CreateJobIn:
     }
     data.update(overrides)
     return CreateJobIn(**data)
-
-
-def _expected_character_sheet(
-    prompt: str,
-    negative_prompt: str = "",
-    aspect: str = "16:9",
-) -> tuple[str, str]:
-    return generation_service._apply_character_sheet_constraints(
-        prompt,
-        negative_prompt,
-        "character",
-        aspect,
-    )
-
 
 @pytest.fixture(autouse=True)
 def _no_real_permissions(monkeypatch):
@@ -375,11 +314,11 @@ def test_generation_batch_request_model_records_exact_batch_fact():
     )
 
 
-def test_subject_model_has_generation_input_version_fields():
+def test_subject_model_has_single_generation_input_version_field():
     column_names = {column.name for column in Subject.__table__.columns}
-    assert {"subject_version", "enrich_version"} <= column_names
+    assert {"subject_version"} <= column_names
+    assert "enrich_version" not in column_names
     assert Subject.__table__.c["subject_version"].nullable is False
-    assert Subject.__table__.c["enrich_version"].nullable is False
     index_columns = {
         index.name: [column.name for column in index.columns]
         for index in Subject.__table__.indexes
@@ -392,24 +331,20 @@ def test_subject_model_has_generation_input_version_fields():
     ]
 
 
-def test_generation_schema_accepts_optional_trimmed_prompt_with_length_limit():
-    without_prompt = CreateJobIn(
-        material_id="material-1",
-        subject_id="subject-1",
-    )
-    assert without_prompt.prompt is None
-    assert without_prompt.model == "qwen-image-2.0"
-    assert without_prompt.aspect == "auto"
-    batch_without_prompt = BatchCreateJobIn(material_id="material-1")
-    assert batch_without_prompt.model == "qwen-image-2.0"
-    assert batch_without_prompt.aspect == "auto"
+def test_generation_schema_requires_trimmed_client_prompts_with_length_limit():
+    with pytest.raises(ValidationError):
+        CreateJobIn(material_id="material-1", subject_id="subject-1")
+    with pytest.raises(ValidationError):
+        BatchCreateJobIn(material_id="material-1")
 
     with_prompt = CreateJobIn(
         material_id="material-1",
         subject_id="subject-1",
         prompt="  客户端最终提示词\n",
+        negative_prompt="  不要水印\n",
     )
     assert with_prompt.prompt == "客户端最终提示词"
+    assert with_prompt.negative_prompt == "不要水印"
     assert CreateJobIn(
         material_id="material-1",
         subject_id="subject-1",
@@ -423,73 +358,6 @@ def test_generation_schema_accepts_optional_trimmed_prompt_with_length_limit():
                 subject_id="subject-1",
                 prompt=invalid_prompt,
             )
-
-
-def test_character_sheet_constraints_use_v2_layout_are_idempotent_and_character_only():
-    prompt, negative_prompt = _expected_character_sheet(
-        "原始提示词",
-        "已有负面提示",
-        "3:4",
-    )
-
-    for required in (
-        CHARACTER_SHEET_MARKER,
-        "左侧 33%",
-        "extreme facial close-up",
-        "肩部不入镜",
-        "右侧 67%",
-        "三个等宽、不重叠的全身栏",
-        "正面 0°、标准侧面 90°、背面 180°",
-        "orthographic projection",
-        "头脚完整，无裁切、遮挡或透视变形",
-        "额外人物、额外视图或剧情动作",
-    ):
-        assert required in prompt
-    assert prompt.count(generation_service._CHARACTER_SHEET_MARKER) == 1
-    assert negative_prompt.startswith("已有负面提示, ")
-    assert generation_service._CHARACTER_SHEET_NEGATIVE_PROMPT in negative_prompt
-    assert generation_service._apply_character_sheet_constraints(
-        prompt,
-        negative_prompt,
-        "character",
-        "3:4",
-    ) == (prompt, negative_prompt)
-    assert generation_service._apply_character_sheet_constraints(
-        "场景提示词",
-        "场景负面提示",
-        "scene",
-        "16:9",
-    ) == ("场景提示词", "场景负面提示")
-
-    landscape_prompt, _ = _expected_character_sheet("横版人物提示词", aspect="16:9")
-    assert CHARACTER_SHEET_MARKER in landscape_prompt
-    assert "左侧 33%" in landscape_prompt
-
-    legacy_prompt = (
-        "原始提示词\n"
-        "【人物设定图构图硬约束】单张组合图，所有视图位于同一张图内。"
-        "左侧约 45% 为头肩或半身正面主视觉；右侧约 55% 恰好依次为正面、标准侧面、"
-        "背面三幅等比例全身视图。三幅全身视图采用自然 A-Pose 或放松站姿，从头到脚无遮挡、无裁切。"
-        "\n【风格渲染约束】high-quality Japanese anime rendering"
-    )
-    server_prompt, _ = _expected_character_sheet(legacy_prompt, aspect="3:4")
-    assert "原始提示词" in server_prompt
-    assert "【风格渲染约束】high-quality Japanese anime rendering" in server_prompt
-    assert "左侧约 45%" not in server_prompt
-    assert server_prompt.count(CHARACTER_SHEET_MARKER) == 1
-
-    multiline_legacy = (
-        "原始提示词\n"
-        "【人物设定图构图硬约束 v2】旧版错误版式\n"
-        "左侧约 45% 为头肩主视觉\n"
-        "右侧约 55% 为正面、侧面、背面\n"
-        "【风格渲染约束】photorealistic high-detail rendering"
-    )
-    normalized_prompt, _ = _expected_character_sheet(multiline_legacy, aspect="3:4")
-    assert "左侧约 45%" not in normalized_prompt
-    assert "右侧约 55%" not in normalized_prompt
-    assert "【风格渲染约束】photorealistic high-detail rendering" in normalized_prompt
-    assert normalized_prompt.count(CHARACTER_SHEET_MARKER) == 1
 
 
 @pytest.mark.parametrize(
@@ -511,19 +379,26 @@ def test_auto_aspect_resolves_by_subject_type_and_keeps_explicit_ratio(
     assert generation_service._resolve_subject_image_aspect(aspect, subject_type) == expected
 
 
-def test_generation_schema_rejects_client_resolved_prompt_forgery():
-    with pytest.raises(ValidationError):
-        CreateJobIn(
-            material_id="material-1",
-            subject_id="subject-1",
-            prompt="client prompt",
-            resolved_prompt="forged",
-        )
-    with pytest.raises(ValidationError):
-        BatchCreateJobIn(
-            material_id="material-1",
-            resolved_prompt="forged",
-        )
+def test_generation_schema_rejects_server_and_removed_style_fields():
+    for field, value in (
+        ("resolved_prompt", "forged"),
+        ("style_id", "comic-book"),
+        ("art_style_id", "anime"),
+        ("visual_style", "cinematic"),
+    ):
+        with pytest.raises(ValidationError):
+            CreateJobIn(
+                material_id="material-1",
+                subject_id="subject-1",
+                prompt="client prompt",
+                **{field: value},
+            )
+        with pytest.raises(ValidationError):
+            BatchCreateJobIn(
+                material_id="material-1",
+                prompts={"subject-1": "client prompt"},
+                **{field: value},
+            )
 
 
 def test_generation_rejects_too_long_idempotency_key():
@@ -556,15 +431,10 @@ def test_load_batch_jobs_rejects_incomplete_reload(job_ids, loaded_job_ids):
     asyncio.run(scenario())
 
 
-def test_create_generation_job_uses_client_prompt_without_valid_enrich(monkeypatch):
+def test_create_generation_job_freezes_client_prompts_without_enrich_dependency(monkeypatch):
     async def scenario() -> None:
         _, raw = _make_db()
         seeded = _seed(raw)
-        seeded.enrich.detail = {
-            "input_version": seeded.episode.episode_version,
-            "prompts": {},
-        }
-        raw.commit()
         monkeypatch.setattr(generation_service, "enqueue_task", AsyncMock())
 
         job = await generation_service.create_generation_job(
@@ -574,17 +444,21 @@ def test_create_generation_job_uses_client_prompt_without_valid_enrich(monkeypat
                 material_id=seeded.material.id,
                 subject_id=seeded.subject.id,
                 prompt="  客户端自定义生图提示词  ",
+                negative_prompt="  不要水印  ",
             ),
             idempotency_key="client-prompt-without-enrich",
         )
 
         assert job.input_json["prompt"] == "客户端自定义生图提示词"
-        expected_prompt, expected_negative = _expected_character_sheet(
-            "客户端自定义生图提示词",
-            aspect="3:4",
-        )
-        assert job.input_json["resolved_prompts"]["final"] == expected_prompt
-        assert job.input_json["negative_prompt"] == expected_negative
+        assert job.input_json["negative_prompt"] == "不要水印"
+        assert job.input_json["prompt_source"] == "client"
+        assert {
+            "resolved_prompts",
+            "style_id",
+            "art_style_id",
+            "visual_style",
+            "enrich_version",
+        }.isdisjoint(job.input_json)
         assert job.input_json["aspect"] == "3:4"
 
     asyncio.run(scenario())
@@ -596,11 +470,6 @@ def test_create_generation_job_keeps_non_character_prompt_and_resolves_auto_land
     async def scenario() -> None:
         _, raw = _make_db()
         seeded = _seed(raw, subject_type="scene")
-        seeded.enrich.detail = {
-            "input_version": seeded.episode.episode_version,
-            "prompts": {},
-        }
-        raw.commit()
         monkeypatch.setattr(generation_service, "enqueue_task", AsyncMock())
 
         job = await generation_service.create_generation_job(
@@ -614,172 +483,9 @@ def test_create_generation_job_keeps_non_character_prompt_and_resolves_auto_land
             idempotency_key="scene-auto-aspect",
         )
 
-        assert job.input_json["resolved_prompts"]["final"] == "场景原始提示词"
+        assert job.input_json["prompt"] == "场景原始提示词"
         assert job.input_json["negative_prompt"] == ""
         assert job.input_json["aspect"] == "16:9"
-
-    asyncio.run(scenario())
-
-
-def test_create_generation_job_applies_explicit_style_once_and_preserves_hash_contract(monkeypatch):
-    async def scenario() -> None:
-        _, raw = _make_db()
-        seeded = _seed(raw)
-        db = _AsyncSessionAdapter(raw)
-        monkeypatch.setattr(generation_service, "enqueue_task", AsyncMock())
-
-        style = generation_service.find_style("comic-book")
-        assert style is not None
-        styled_final, styled_negative = generation_service.apply_style(
-            "comic-book", "a reporter holding a phone", "image"
-        )
-        expected_final, expected_negative = _expected_character_sheet(
-            styled_final,
-            styled_negative,
-        )
-        job = await generation_service.create_generation_job(
-            db,
-            user=seeded.user,
-            payload=_create_payload(
-                prompt="a reporter holding a phone",
-                style_id="comic-book",
-            ),
-            idempotency_key="explicit-comic-style",
-        )
-
-        assert job.input_json["resolved_prompts"]["final"] == expected_final
-        assert job.input_json["negative_prompt"] == expected_negative
-        assert job.input_json["style_id"] == "comic-book"
-        assert job.input_json["aspect"] == "16:9"
-        assert expected_final.count(str(style["prompt_template"]).split("{prompt}", 1)[0]) == 1
-        expected_hash_payload = {
-            "material_id": seeded.material.id,
-            "script_id": seeded.script.id,
-            "subject_id": seeded.subject.id,
-            "model": "banana-2",
-            "size": "2k",
-            "aspect": "16:9",
-            "count": 2,
-            "prompt": "a reporter holding a phone",
-            "resolved_prompt": "a reporter holding a phone",
-            "style_id": "comic-book",
-            "input_version": seeded.episode.episode_version,
-            "input_client_save_seq": 0,
-            "episode_snapshot": {
-                1: {
-                    "episode_id": seeded.episode.episode_id,
-                    "episode_version": seeded.episode.episode_version,
-                    "client_save_seq": 0,
-                }
-            },
-            "subject_version": 1,
-            "enrich_version": 1,
-        }
-        assert job.request_hash == generation_service._request_hash(expected_hash_payload)
-
-        monkeypatch.setattr(generation_service, "find_style", lambda _style_id: None)
-        replay = await generation_service.create_generation_job(
-            db,
-            user=seeded.user,
-            payload=_create_payload(
-                prompt="a reporter holding a phone",
-                style_id="comic-book",
-            ),
-            idempotency_key="explicit-comic-style",
-        )
-        assert replay.job_id == job.job_id
-
-    asyncio.run(scenario())
-
-
-def test_create_generation_job_infers_exact_prewrapped_style_without_duplicate(monkeypatch):
-    async def scenario() -> None:
-        _, raw = _make_db()
-        seeded = _seed(raw)
-        db = _AsyncSessionAdapter(raw)
-        monkeypatch.setattr(generation_service, "enqueue_task", AsyncMock())
-
-        wrapped_prompt, expected_negative = generation_service.apply_style(
-            "comic-book", "a reporter holding a phone", "image"
-        )
-        expected_prompt, expected_negative = _expected_character_sheet(
-            wrapped_prompt,
-            expected_negative,
-        )
-        job = await generation_service.create_generation_job(
-            db,
-            user=seeded.user,
-            payload=_create_payload(prompt=wrapped_prompt),
-            idempotency_key="inferred-comic-style",
-        )
-
-        assert job.input_json["resolved_prompts"]["final"] == expected_prompt
-        assert job.input_json["negative_prompt"] == expected_negative
-        assert job.input_json["style_id"] == "comic-book"
-
-        near_match = f"{wrapped_prompt} extra text"
-        unmatched = await generation_service.create_generation_job(
-            db,
-            user=seeded.user,
-            payload=_create_payload(prompt=near_match),
-            idempotency_key="not-an-exact-style-wrapper",
-        )
-        expected_near_match, expected_near_negative = _expected_character_sheet(near_match)
-        assert unmatched.input_json["resolved_prompts"]["final"] == expected_near_match
-        assert unmatched.input_json["negative_prompt"] == expected_near_negative
-        assert unmatched.input_json["style_id"] is None
-
-    asyncio.run(scenario())
-
-
-def test_inferred_style_requires_a_unique_exact_template_match(monkeypatch):
-    style = generation_service.find_style("comic-book")
-    assert style is not None
-    wrapped_prompt, _ = generation_service.apply_style("comic-book", "subject", "image")
-    duplicate = {**style, "id": "duplicate-comic"}
-    monkeypatch.setattr(generation_service, "get_styles", lambda target: [style, duplicate])
-
-    assert generation_service._resolve_image_prompt(wrapped_prompt, None) == (
-        wrapped_prompt,
-        "",
-        None,
-    )
-
-
-def test_create_generation_job_rejects_unknown_and_non_image_styles(monkeypatch):
-    async def scenario() -> None:
-        _, raw = _make_db()
-        seeded = _seed(raw)
-        db = _AsyncSessionAdapter(raw)
-
-        with pytest.raises(BadRequestError, match="未知风格") as unknown:
-            await generation_service.create_generation_job(
-                db,
-                user=seeded.user,
-                payload=_create_payload(prompt="prompt", style_id="missing-style"),
-                idempotency_key="unknown-style",
-            )
-        assert unknown.value.status_code == 400
-
-        monkeypatch.setattr(
-            generation_service,
-            "find_style",
-            lambda style_id: {
-                "id": style_id,
-                "target": ["video"],
-                "prompt_template": "video style, {prompt}",
-                "negative_prompt": "still image",
-            },
-        )
-        with pytest.raises(BadRequestError, match="不支持图片生成") as unsupported:
-            await generation_service.create_generation_job(
-                db,
-                user=seeded.user,
-                payload=_create_payload(prompt="prompt", style_id="video-only"),
-                idempotency_key="unsupported-image-style",
-            )
-        assert unsupported.value.status_code == 400
-        assert raw.scalars(select(GenerationJob)).all() == []
 
     asyncio.run(scenario())
 
@@ -818,7 +524,7 @@ def test_create_generation_job_same_idempotency_key_rejects_changed_client_promp
     asyncio.run(scenario())
 
 
-def test_create_generation_job_requires_server_prompt_and_idempotent_outbox(monkeypatch):
+def test_create_generation_job_freezes_client_prompt_and_uses_idempotent_outbox(monkeypatch):
     async def scenario() -> None:
         _, raw = _make_db()
         seeded = _seed(raw)
@@ -855,10 +561,9 @@ def test_create_generation_job_requires_server_prompt_and_idempotent_outbox(monk
         assert len(enqueued) == 1
         assert enqueued[0]["task_type"] == "generation.generate_images"
         assert raw.scalars(select(TaskDispatchOutbox)).all() == []
-        assert job.input_json["prompt"] == build_base_prompt(seeded.subject)
-        expected_prompt, expected_negative = _expected_character_sheet(_twelve_sections())
-        assert job.input_json["resolved_prompts"]["final"] == expected_prompt
-        assert job.input_json["negative_prompt"] == expected_negative
+        assert job.input_json["prompt"] == "客户端默认生图提示词"
+        assert job.input_json["negative_prompt"] == ""
+        assert job.input_json["prompt_source"] == "client"
         assert job.input_json["input_version"] == seeded.episode.episode_version
         assert job.input_json["reservation_id"]
         assert raw.scalars(select(CreditReservation)).one().status == "reserved"
@@ -872,61 +577,6 @@ def test_create_generation_job_requires_server_prompt_and_idempotent_outbox(monk
             )
 
     asyncio.run(scenario())
-
-
-def test_enrich_prompt_accepts_free_format_and_normalizes_legacy_numbering():
-    assert generation_service._validate_twelve_section_prompt(_twelve_sections()) == _twelve_sections()
-    assert (
-        generation_service._validate_twelve_section_prompt(_numbered_twelve_sections())
-        == _twelve_sections()
-    )
-    free_prompts = [
-        _twelve_sections().replace("【写实质感锚定】", "【形制描述】"),
-        "\n".join(reversed(_twelve_sections().splitlines())),
-        "\n".join(_twelve_sections().splitlines()[:-1]),
-        f"{_twelve_sections()}\n【额外段落】允许",
-        _numbered_twelve_sections().replace("2. 【材质钉死】", "3. 【材质钉死】"),
-        "模型生成的一段自由格式摄影提示词",
-    ]
-    for prompt in free_prompts:
-        assert generation_service._validate_twelve_section_prompt(prompt)
-
-    with pytest.raises(ConflictError):
-        generation_service._validate_twelve_section_prompt("   ")
-
-
-def test_create_generation_job_accepts_and_normalizes_numbered_legacy_enrich_prompt(
-    monkeypatch,
-):
-    async def scenario() -> None:
-        _, raw = _make_db()
-        seeded = _seed(raw)
-        stage = seeded.enrich
-        stage.detail = {
-            **stage.detail,
-            "prompts": {
-                seeded.subject.id: {
-                    **stage.detail["prompts"][seeded.subject.id],
-                    "resolved_prompts": {"final": _numbered_twelve_sections()},
-                }
-            },
-        }
-        raw.commit()
-        monkeypatch.setattr(generation_service, "enqueue_task", AsyncMock())
-
-        job = await generation_service.create_generation_job(
-            _AsyncSessionAdapter(raw),
-            user=seeded.user,
-            payload=_create_payload(),
-            idempotency_key="numbered-legacy",
-        )
-
-        expected_prompt, _ = _expected_character_sheet(_twelve_sections())
-        assert job.input_json["resolved_prompts"]["final"] == expected_prompt
-
-    asyncio.run(scenario())
-
-
 def test_batch_requires_idempotency_key_and_reuses_same_payload(monkeypatch):
     async def scenario() -> None:
         _, raw = _make_db()
@@ -949,6 +599,7 @@ def test_batch_requires_idempotency_key_and_reuses_same_payload(monkeypatch):
         payload = BatchCreateJobIn(
             material_id=seeded.material.id,
             subject_ids=[seeded.subject.id],
+            prompts={seeded.subject.id: "批量默认客户端提示词"},
             count=1,
         )
         with pytest.raises(BadRequestError):
@@ -981,6 +632,7 @@ def test_batch_requires_idempotency_key_and_reuses_same_payload(monkeypatch):
                 payload=BatchCreateJobIn(
                     material_id=seeded.material.id,
                     subject_ids=[seeded.subject.id],
+                    prompts={seeded.subject.id: "批量默认客户端提示词"},
                     count=2,
                 ),
                 idempotency_key="batch-key",
@@ -989,15 +641,10 @@ def test_batch_requires_idempotency_key_and_reuses_same_payload(monkeypatch):
     asyncio.run(scenario())
 
 
-def test_batch_explicit_prompt_mapping_overrides_invalid_enrich(monkeypatch):
+def test_batch_freezes_explicit_client_prompt_and_negative_prompt(monkeypatch):
     async def scenario() -> None:
         _, raw = _make_db()
         seeded = _seed(raw)
-        seeded.enrich.detail = {
-            "input_version": seeded.episode.episode_version,
-            "prompts": {},
-        }
-        raw.commit()
         monkeypatch.setattr(generation_service, "enqueue_task", AsyncMock())
 
         created, skipped, failed = await generation_service.create_batch_generation_jobs(
@@ -1007,6 +654,7 @@ def test_batch_explicit_prompt_mapping_overrides_invalid_enrich(monkeypatch):
                 material_id=seeded.material.id,
                 subject_ids=[seeded.subject.id],
                 prompts={seeded.subject.id: "  批量客户端自定义提示词  "},
+                negative_prompts={seeded.subject.id: "  不要水印  "},
                 count=1,
             ),
             idempotency_key="batch-client-prompt",
@@ -1016,12 +664,9 @@ def test_batch_explicit_prompt_mapping_overrides_invalid_enrich(monkeypatch):
         assert failed == []
         assert len(created) == 1
         assert created[0].input_json["prompt"] == "批量客户端自定义提示词"
-        expected_prompt, expected_negative = _expected_character_sheet(
-            "批量客户端自定义提示词",
-            aspect="3:4",
-        )
-        assert created[0].input_json["resolved_prompts"]["final"] == expected_prompt
-        assert created[0].input_json["negative_prompt"] == expected_negative
+        assert created[0].input_json["negative_prompt"] == "不要水印"
+        assert created[0].input_json["prompt_source"] == "client"
+        assert "resolved_prompts" not in created[0].input_json
         assert created[0].input_json["aspect"] == "3:4"
 
     asyncio.run(scenario())
@@ -1090,36 +735,13 @@ def test_batch_idempotency_uses_exact_batch_fact_not_sql_like(monkeypatch):
             payload=BatchCreateJobIn(
                 material_id=seeded.material.id,
                 subject_ids=[seeded.subject.id],
+                prompts={seeded.subject.id: "批量默认客户端提示词"},
                 count=1,
             ),
             idempotency_key="batch:literal%",
         )
         assert len(created) == 1
         assert skipped == failed == []
-
-    asyncio.run(scenario())
-
-
-def test_batch_empty_target_replay_is_stable(monkeypatch):
-    async def scenario() -> None:
-        _, raw = _make_db()
-        seeded = _seed(raw, subject_type="sound")
-        raw.get(Subject, seeded.subject.id).review_status = "approved"
-        raw.commit()
-        db = _AsyncSessionAdapter(raw)
-        payload = BatchCreateJobIn(material_id=seeded.material.id, subject_ids=None, count=1)
-
-        first = await generation_service.create_batch_generation_jobs(
-            db, user=seeded.user, payload=payload, idempotency_key="empty-batch"
-        )
-        second = await generation_service.create_batch_generation_jobs(
-            db, user=seeded.user, payload=payload, idempotency_key="empty-batch"
-        )
-
-        assert first == second == ([], [], [])
-        from app.models.generation_batch_request import GenerationBatchRequest
-
-        assert len(raw.scalars(select(GenerationBatchRequest)).all()) == 1
 
     asyncio.run(scenario())
 
@@ -1138,27 +760,12 @@ def test_batch_persists_manifest_for_all_skipped_or_failed_replay(monkeypatch):
                 review_status="not_designed",
             )
         )
-        raw.execute(
-            update(PipelineStage)
-            .where(PipelineStage.id == "stage-enrich")
-            .values(
-                detail={
-                    "input_version": seeded.episode.episode_version,
-                    "prompts": {
-                        seeded.subject.id: {
-                            "subject_version": seeded.subject.subject_version,
-                            "enrich_version": seeded.subject.enrich_version,
-                            "resolved_prompts": {"final": _twelve_sections()},
-                        }
-                    },
-                }
-            )
-        )
         raw.commit()
         db = _AsyncSessionAdapter(raw)
         payload = BatchCreateJobIn(
             material_id=seeded.material.id,
             subject_ids=["subject-sound", seeded.subject.id],
+            prompts={seeded.subject.id: "批量默认客户端提示词"},
             count=1,
         )
 
@@ -1183,7 +790,7 @@ def test_batch_persists_manifest_for_all_skipped_or_failed_replay(monkeypatch):
             }
         ]
         batch = raw.scalars(select(GenerationBatchRequest)).one()
-        assert batch.target_subject_ids == ["subject-sound", seeded.subject.id]
+        assert batch.target_subject_ids == [seeded.subject.id]
         assert batch.job_ids == []
         assert batch.skipped_subject_ids == ["subject-sound"]
         assert batch.failed_items == first_failed
@@ -1275,6 +882,7 @@ async def test_generation_returns_loaded_jobs_with_expire_on_commit(monkeypatch)
     payload = CreateJobIn(
         material_id=material_id,
         subject_id=subject_id,
+        prompt="客户端 PostgreSQL 回归提示词",
         count=1,
     )
 
@@ -1287,16 +895,12 @@ async def test_generation_returns_loaded_jobs_with_expire_on_commit(monkeypatch)
     async def subject_snapshot(*args, **kwargs):
         return None, 1, None, {}
 
-    async def resolved_prompt(*args, **kwargs):
-        return _twelve_sections()
-
     async def reserve_without_persistence(*args, **kwargs):
         return f"reservation-{kwargs['source_id']}"
 
     monkeypatch.setattr(generation_service, "_load_material_script", load_material_script)
     monkeypatch.setattr(generation_service, "_load_credit_account", load_credit_account)
     monkeypatch.setattr(generation_service, "_subject_episode_snapshot", subject_snapshot)
-    monkeypatch.setattr(generation_service, "_load_server_resolved_prompt", resolved_prompt)
     monkeypatch.setattr(generation_service, "reserve", reserve_without_persistence)
 
     try:
@@ -1345,6 +949,7 @@ async def test_generation_returns_loaded_jobs_with_expire_on_commit(monkeypatch)
                 payload=BatchCreateJobIn(
                     material_id=material_id,
                     subject_ids=[subject_id],
+                    prompts={subject_id: "客户端 PostgreSQL 回归提示词"},
                     count=1,
                 ),
                 idempotency_key=f"expire-batch-{suffix}",
@@ -1410,6 +1015,10 @@ def test_batch_explicit_subject_ids_404_and_403_without_partial_create(monkeypat
         payload = BatchCreateJobIn(
             material_id=seeded.material.id,
             subject_ids=[seeded.subject.id, "missing-subject"],
+            prompts={
+                seeded.subject.id: "客户端默认提示词",
+                "missing-subject": "缺失主体提示词",
+            },
         )
         with pytest.raises(NotFoundError):
             await generation_service.create_batch_generation_jobs(
@@ -1435,6 +1044,10 @@ def test_batch_explicit_subject_ids_404_and_403_without_partial_create(monkeypat
                 payload=BatchCreateJobIn(
                     material_id=seeded.material.id,
                     subject_ids=[seeded.subject.id, "subject-foreign"],
+                    prompts={
+                        seeded.subject.id: "客户端默认提示词",
+                        "subject-foreign": "外部主体提示词",
+                    },
                 ),
                 idempotency_key="batch-foreign",
             )
@@ -1443,11 +1056,12 @@ def test_batch_explicit_subject_ids_404_and_403_without_partial_create(monkeypat
     asyncio.run(scenario())
 
 
-def test_create_generation_job_rejects_sound_and_missing_enrich_snapshot():
+def test_create_generation_job_rejects_sound_and_does_not_require_enrich(monkeypatch):
     async def scenario() -> None:
         _, raw = _make_db()
         seeded = _seed(raw, subject_type="sound")
         db = _AsyncSessionAdapter(raw)
+        monkeypatch.setattr(generation_service, "enqueue_task", AsyncMock())
         with pytest.raises(BadRequestError):
             await generation_service.create_generation_job(
                 db,
@@ -1456,53 +1070,14 @@ def test_create_generation_job_rejects_sound_and_missing_enrich_snapshot():
                 idempotency_key="key-sound",
             )
         seeded.subject.type = "character"
-        raw.execute(
-            update(PipelineStage)
-            .where(PipelineStage.id == "stage-enrich")
-            .values(detail={"input_version": 6, "prompts": {}})
-        )
         raw.commit()
-        with pytest.raises(ConflictError):
-            await generation_service.create_generation_job(
-                db,
-                user=seeded.user,
-                payload=_create_payload(),
-                idempotency_key="key-stale-enrich",
-            )
-
-    asyncio.run(scenario())
-
-
-def test_create_generation_job_rejects_stale_subject_version_in_enrich_prompt():
-    async def scenario() -> None:
-        _, raw = _make_db()
-        seeded = _seed(raw)
-        db = _AsyncSessionAdapter(raw)
-        raw.execute(
-            update(PipelineStage)
-            .where(PipelineStage.id == "stage-enrich")
-            .values(
-                detail={
-                    "input_version": seeded.episode.episode_version,
-                    "prompts": {
-                        seeded.subject.id: {
-                            "subject_version": seeded.subject.subject_version - 1,
-                            "enrich_version": seeded.subject.enrich_version,
-                            "resolved_prompts": {"final": _twelve_sections()},
-                        }
-                    },
-                }
-            )
+        job = await generation_service.create_generation_job(
+            db,
+            user=seeded.user,
+            payload=_create_payload(),
+            idempotency_key="key-without-enrich",
         )
-        raw.commit()
-
-        with pytest.raises(ConflictError):
-            await generation_service.create_generation_job(
-                db,
-                user=seeded.user,
-                payload=_create_payload(),
-                idempotency_key="key-stale-subject-version",
-            )
+        assert job.input_json["prompt"] == "客户端默认生图提示词"
 
     asyncio.run(scenario())
 
@@ -1764,12 +1339,12 @@ def test_generation_job_output_sanitizes_public_metrics_and_errors() -> None:
         error_message="provider_or_storage_error",
         input_json={
             "prompt": "公开 prompt",
+            "negative_prompt": "不要水印",
             "model": "qwen-image-2.0",
             "size": "2k",
             "aspect": "3:4",
             "reservation_id": "reservation-secret",
-            "resolved_prompts": {
-                "final": _twelve_sections(),
+            "internal_debug": {
                 "debug_token": "Authorization=secret-token /private/path",
                 "extra": {"provider_response": "raw"},
             },
@@ -1786,10 +1361,10 @@ def test_generation_job_output_sanitizes_public_metrics_and_errors() -> None:
     assert out.subject_id == "subject-1"
     assert out.input_json == {
         "prompt": "公开 prompt",
+        "negative_prompt": "不要水印",
         "model": "qwen-image-2.0",
         "size": "2k",
         "aspect": "3:4",
-        "resolved_prompts": {"final": _twelve_sections()},
     }
     assert out.metrics == {"actual_points": 10, "count": 1}
     failed = GenerationJob(
@@ -1829,7 +1404,7 @@ def test_generation_create_batch_and_poll_share_public_subject_mapping(monkeypat
                 progress=0,
                 input_json={
                     "prompt": f"公开 prompt {subject_id}",
-                    "resolved_prompts": {"final": _twelve_sections()},
+                    "negative_prompt": "不要水印",
                     "subject_id": subject_id,
                     "reservation_id": f"reservation-{job_id}",
                 },
@@ -1858,13 +1433,21 @@ def test_generation_create_batch_and_poll_share_public_subject_mapping(monkeypat
         actor = SimpleNamespace(user_id="user-1")
         db = SimpleNamespace()
         created = await generation_api.create_job_endpoint(
-            CreateJobIn(material_id="material-1", subject_id="subject-single"),
+            CreateJobIn(
+                material_id="material-1",
+                subject_id="subject-single",
+                prompt="单任务客户端提示词",
+            ),
             "single-key",
             db=db,
             user=actor,
         )
         batch = await generation_api.create_batch_jobs_endpoint(
-            BatchCreateJobIn(material_id="material-1", subject_ids=["subject-batch"]),
+            BatchCreateJobIn(
+                material_id="material-1",
+                subject_ids=["subject-batch"],
+                prompts={"subject-batch": "批量客户端提示词"},
+            ),
             "batch-key",
             db=db,
             user=actor,
@@ -1964,49 +1547,17 @@ def test_generation_worker_forwards_negative_prompt_to_provider() -> None:
     asyncio.run(scenario())
 
 
-def test_generation_worker_recovers_negative_prompt_for_queued_legacy_jobs() -> None:
-    wrapped_prompt, expected_negative = generation_service.apply_style(
-        "comic-book", "a reporter holding a phone", "image"
-    )
-
+def test_generation_worker_uses_frozen_client_prompts_without_template_recovery() -> None:
     assert generation_worker._resolve_job_prompts(
-        {"style_id": "comic-book"}, "an unwrapped prompt"
-    ) == generation_service.apply_style("comic-book", "an unwrapped prompt", "image")
-    assert generation_worker._resolve_job_prompts({}, wrapped_prompt) == (
-        wrapped_prompt,
-        expected_negative,
-    )
-    assert generation_worker._resolve_job_prompts({}, "plain prompt") == ("plain prompt", "")
-    assert generation_worker._resolve_job_prompts(
-        {"style_id": "comic-book", "negative_prompt": ""},
-        "an unwrapped prompt",
-    ) == ("an unwrapped prompt", "")
-
-
-def test_generation_worker_upgrades_queued_legacy_character_sheet_prompt() -> None:
-    historical_prompt = (
-        "【视觉资产设定提示词】\n"
-        "主体事实：现代大学生\n"
-        "【人物设定图构图硬约束】\n"
-        "左侧约 45% 为头肩或半身正面主视觉；右侧约 55% 为三幅全身视图。\n"
-        "【风格渲染约束】写实摄影"
-    )
-
-    prompt, negative_prompt = generation_worker._normalize_queued_character_sheet_prompt(
-        historical_prompt,
-        "原有负面提示",
-        "3:4",
-    )
-
-    assert prompt.count(CHARACTER_SHEET_MARKER) == 1
-    assert "左侧约 45%" not in prompt
-    assert "【风格渲染约束】写实摄影" in prompt
-    assert generation_service._CHARACTER_SHEET_NEGATIVE_PROMPT in negative_prompt
-    assert generation_worker._normalize_queued_character_sheet_prompt(
-        "普通场景提示词",
-        "场景负面提示",
-        "16:9",
-    ) == ("普通场景提示词", "场景负面提示")
+        {
+            "prompt_source": "client",
+            "prompt": "客户端冻结提示词",
+            "negative_prompt": "不要水印",
+            "style_id": "legacy-style-is-ignored",
+        },
+        "旧任务回退提示词",
+    ) == ("客户端冻结提示词", "不要水印")
+    assert generation_worker._resolve_job_prompts({}, "普通提示词") == ("普通提示词", "")
 
 
 @pytest.mark.parametrize(("provider_count", "expected_actual"), [(2, 20), (1, 10)])
@@ -2032,7 +1583,7 @@ def test_run_generation_persists_candidates_settles_actual_and_guards_old_versio
             progress=0,
             input_json={
                 "prompt": "原始主体描述",
-                "resolved_prompts": {"final": _twelve_sections()},
+                "prompt_source": "client",
                 "model": "banana-2",
                 "size": "2k",
                 "aspect": "16:9",
@@ -2107,7 +1658,7 @@ def test_run_generation_persists_candidates_settles_actual_and_guards_old_versio
             progress=0,
             input_json={
                 "prompt": "旧描述",
-                "resolved_prompts": {"final": _twelve_sections()},
+                "prompt_source": "client",
                 "model": "banana-2",
                 "size": "2k",
                 "aspect": "16:9",
@@ -2166,7 +1717,7 @@ def test_run_generation_stops_before_provider_when_heartbeat_fails(monkeypatch):
                 progress=0,
                 input_json={
                     "prompt": "原始主体描述",
-                    "resolved_prompts": {"final": _twelve_sections()},
+                    "prompt_source": "client",
                     "model": "banana-2",
                     "size": "2k",
                     "aspect": "16:9",
@@ -2239,7 +1790,7 @@ def test_run_generation_cancels_when_subject_version_changed_before_provider(mon
                 progress=0,
                 input_json={
                     "prompt": "原始主体描述",
-                    "resolved_prompts": {"final": _twelve_sections()},
+                    "prompt_source": "client",
                     "model": "banana-2",
                     "size": "2k",
                     "aspect": "16:9",
@@ -2247,7 +1798,6 @@ def test_run_generation_cancels_when_subject_version_changed_before_provider(mon
                     "subject_id": "subject-1",
                     "input_version": 7,
                     "subject_version": 1,
-                    "enrich_version": 1,
                     "reservation_id": "reservation-subject-stale",
                 },
             )
@@ -2288,6 +1838,36 @@ def test_run_generation_cancels_when_subject_version_changed_before_provider(mon
     asyncio.run(scenario())
 
 
+def test_generation_worker_ignores_retired_enrich_version_snapshot() -> None:
+    async def scenario() -> None:
+        _, raw = _make_db()
+        _seed(raw)
+        job = GenerationJob(
+            job_id="job-legacy-enrich-snapshot",
+            owner_user_id="user-1",
+            material_id="material-1",
+            script_id="script-1",
+            subject_id="subject-1",
+            episode_id="episode-1",
+            idempotency_key="legacy-enrich-snapshot",
+            request_hash="legacy-enrich-snapshot-hash",
+            input_version=7,
+            attempt=1,
+            job_type="generate_images",
+            input_json={
+                "subject_version": 1,
+                "enrich_version": 999,
+            },
+        )
+
+        assert await generation_worker._input_version_is_current(
+            _AsyncSessionAdapter(raw),
+            job,
+        )
+
+    asyncio.run(scenario())
+
+
 def test_run_generation_rolls_back_when_terminal_cas_fails(monkeypatch):
     async def scenario() -> None:
         _, raw = _make_db()
@@ -2309,7 +1889,7 @@ def test_run_generation_rolls_back_when_terminal_cas_fails(monkeypatch):
                 progress=0,
                 input_json={
                     "prompt": "原始主体描述",
-                    "resolved_prompts": {"final": _twelve_sections()},
+                    "prompt_source": "client",
                     "model": "banana-2",
                     "size": "2k",
                     "aspect": "16:9",
@@ -2540,7 +2120,7 @@ def test_run_generation_uses_lease_scoped_temp_keys_and_delete_compensation(monk
                 progress=0,
                 input_json={
                     "prompt": "原始主体描述",
-                    "resolved_prompts": {"final": _twelve_sections()},
+                    "prompt_source": "client",
                     "model": "banana-2",
                     "size": "2k",
                     "aspect": "16:9",
@@ -2649,7 +2229,7 @@ def test_generation_failure_rolls_back_candidates_and_financial_cleanup_reconcil
                 progress=0,
                 input_json={
                     "prompt": "原始主体描述",
-                    "resolved_prompts": {"final": _twelve_sections()},
+                    "prompt_source": "client",
                     "model": "banana-2",
                     "size": "2k",
                     "aspect": "16:9",
@@ -2735,7 +2315,7 @@ def test_settle_db_failure_records_financial_cleanup_action_and_actual_points(mo
                 progress=0,
                 input_json={
                     "prompt": "原始主体描述",
-                    "resolved_prompts": {"final": _twelve_sections()},
+                    "prompt_source": "client",
                     "model": "banana-2",
                     "size": "2k",
                     "aspect": "16:9",
@@ -2743,7 +2323,6 @@ def test_settle_db_failure_records_financial_cleanup_action_and_actual_points(mo
                     "subject_id": "subject-1",
                     "input_version": 7,
                     "subject_version": 1,
-                    "enrich_version": 1,
                     "reservation_id": "reservation-settle-failure",
                 },
             )
@@ -2918,8 +2497,8 @@ def test_run_generation_deletes_written_objects_when_db_side_effect_fails(monkey
                 status="starting",
                 progress=0,
                 input_json={
-                    "prompt": build_base_prompt(raw.get(Subject, "subject-1")),
-                    "resolved_prompts": {"final": _twelve_sections()},
+                    "prompt": "客户端冻结提示词",
+                    "prompt_source": "client",
                     "model": "banana-2",
                     "size": "2k",
                     "aspect": "16:9",
@@ -3062,7 +2641,11 @@ async def test_generation_jobs_asgi_requires_non_blank_idempotency_key(client, m
 
     response = await client.post(
         "/v3api/generation-jobs",
-        json={"material_id": seeded.material.id, "subject_id": seeded.subject.id},
+        json={
+            "material_id": seeded.material.id,
+            "subject_id": seeded.subject.id,
+            "prompt": "客户端接口提示词",
+        },
         headers={"Idempotency-Key": "   "},
     )
     assert response.status_code == 400
@@ -3157,6 +2740,7 @@ def test_bailian_image_model_is_accepted_and_routes_to_provider() -> None:
     request = CreateJobIn(
         material_id="material-1",
         subject_id="subject-1",
+        prompt="模型路由测试提示词",
         model="qwen-image-2.0",
     )
 
@@ -3178,6 +2762,7 @@ def test_neolink_image_model_is_accepted_and_routes_to_provider() -> None:
     request = CreateJobIn(
         material_id="material-1",
         subject_id="subject-1",
+        prompt="模型路由测试提示词",
         model="gp-im-2",
     )
     node_data = SubjectImageNodeData(model="gp-im-2")

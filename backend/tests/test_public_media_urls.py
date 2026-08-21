@@ -8,7 +8,6 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.schemas.art_style import ArtStyleOut
 from app.schemas.asset import AssetEntryOut, CandidateOut
 from app.schemas.generation import GenerationJobOut
 from app.schemas.materials import CanvasNodeOut, ImageAssetOut
@@ -91,23 +90,6 @@ def test_resource_output_models_expose_cdn_urls(public_oss) -> None:
         status="starting",
         output_storage_key=video_key,
     )
-    style = ArtStyleOut(
-        id="style-1",
-        script_id="script-1",
-        name="电影风",
-        prompt_zh="中文提示词",
-        prompt_en="English prompt",
-        negative_prompt="",
-        source_asset_ids=["asset-1"],
-        source_hashes=["hash"],
-        thumbnail_storage_key=image_key,
-        extraction_version=1,
-        is_active=True,
-        created_by_user_id="user-1",
-        updated_by_user_id="user-1",
-        created_at=now,
-        updated_at=now,
-    )
     frames = ReferenceFramesOut(first_frame=image_key, last_frame=image_key)
     cover = CoverOut(script_id="script-1", cover=image_key, mime_type="image/png")
 
@@ -121,7 +103,6 @@ def test_resource_output_models_expose_cdn_urls(public_oss) -> None:
     assert render_status.public_url == f"https://cdn-ai-public.commind.com/{video_key}"
     assert render_status.output_public_url == render_status.public_url
     assert render_job.output_public_url == render_status.public_url
-    assert style.thumbnail_public_url == f"https://cdn-ai-public.commind.com/{image_key}"
     assert frames.first_frame_public_url == f"https://cdn-ai-public.commind.com/{image_key}"
     assert frames.last_frame_public_url == f"https://cdn-ai-public.commind.com/{image_key}"
     assert cover.public_url == f"https://cdn-ai-public.commind.com/{image_key}"

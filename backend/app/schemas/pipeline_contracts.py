@@ -9,7 +9,6 @@ from pydantic import (
     Field,
     StringConstraints,
     ValidationError,
-    field_validator,
     model_validator,
 )
 
@@ -65,8 +64,6 @@ _DIAGNOSTIC_FIELDS = frozenset(
         "episode_nos",
         "evidence",
         "quote",
-        "resolved_prompts",
-        "final",
         "parent_subjects",
         "child_count",
         "child_ids",
@@ -175,53 +172,11 @@ SubjectType = Literal["character", "scene", "prop", "sound"]
 ParentType = Literal["character", "background", "scene", "prop", "sound"]
 PipelineVersion = Literal["pipeline.v1"]
 NonEmptyText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
-EnrichPromptText = Annotated[
-    str,
-    StringConstraints(strip_whitespace=True, min_length=1, max_length=32_000),
-]
 ShortNonEmptyText = Annotated[
     str,
     StringConstraints(strip_whitespace=True, min_length=1, max_length=255),
 ]
 PositiveEpisodeNo = Annotated[int, Field(strict=True, ge=1)]
-ENRICH_SECTION_LABELS = (
-    "形制描述",
-    "材质钉死",
-    "使用痕迹",
-    "摆放姿态",
-    "反悬浮锁",
-    "时代锚定",
-    "画面构图",
-    "画风统一锁",
-    "三点柔光箱白底布光",
-    "反水印锁",
-    "文字渲染降级方案",
-    "写实质感锚定",
-)
-
-
-def normalize_enrich_prompt(prompt: str) -> str:
-    """宽松归一化 enrich prompt。
-
-    下游真正需要的是一段非空的生图提示词，而不是固定标题的排版。这里仅做
-    首尾空白清理，并兼容移除历史 ``1. 【标题】`` 编号；不再因模型添加引导语、
-    缺少某个标题或调整段落顺序而拒绝整次结果。
-    """
-    lines: list[str] = []
-    for line in prompt.strip().splitlines():
-        stripped = line.strip()
-        for index, label in enumerate(ENRICH_SECTION_LABELS, 1):
-            prefix = f"{index}. 【{label}】"
-            if stripped.startswith(prefix):
-                stripped = stripped.removeprefix(f"{index}. ").lstrip()
-                break
-        lines.append(stripped)
-    normalized = "\n".join(lines).strip()
-    if not normalized:
-        raise ValueError("enrich prompt 不能为空")
-    if len(normalized) > 32_000:
-        raise ValueError("enrich prompt 超过最大长度")
-    return normalized
 
 
 class StrictPipelineModel(BaseModel):
@@ -305,20 +260,6 @@ class MergeOutput(StrictPipelineModel):
         return self
 
 
-class ResolvedPrompts(StrictPipelineModel):
-    final: EnrichPromptText
-
-    @field_validator("final")
-    @classmethod
-    def normalize_prompt_whitespace(cls, value: str) -> str:
-        return normalize_enrich_prompt(value)
-
-
-class EnrichOutput(StrictPipelineModel):
-    schema_version: PipelineVersion
-    resolved_prompts: ResolvedPrompts
-
-
 class ParentSubjectContract(StrictPipelineModel):
     name: ShortNonEmptyText
     type: ParentType
@@ -336,8 +277,3 @@ class ParentSubjectContract(StrictPipelineModel):
 class ParentsOutput(StrictPipelineModel):
     schema_version: PipelineVersion
     parent_subjects: list[ParentSubjectContract]
-
-
-def should_enrich_subject(subject_type: str) -> bool:
-    """声音主体不进入视觉提示词增强。"""
-    return subject_type != "sound"

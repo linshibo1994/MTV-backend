@@ -214,9 +214,7 @@ async def _prepare_staged_subjects(
             item.update(
                 id=new_id(),
                 base_subject_version=None,
-                base_enrich_version=None,
                 subject_version=1,
-                enrich_version=1,
             )
         else:
             matched_ids.add(subject.id)
@@ -250,22 +248,10 @@ async def _prepare_staged_subjects(
                 or not subject.is_active
             )
             base_subject_version = int(subject.subject_version or 1)
-            base_enrich_version = int(subject.enrich_version or 1)
-            prompt_changed = (
-                subject.name != item.get("name")
-                or subject.type != item.get("type")
-                or (subject.description or "") != (item.get("description") or "")
-            )
             item.update(
                 id=subject.id,
                 base_subject_version=base_subject_version,
-                base_enrich_version=base_enrich_version,
                 subject_version=base_subject_version + int(changed),
-                enrich_version=(
-                    base_enrich_version + 1
-                    if item.get("type") != "sound" and prompt_changed
-                    else base_enrich_version
-                ),
             )
             if suggestions:
                 item["field_suggestions"] = suggestions
@@ -278,7 +264,6 @@ async def _prepare_staged_subjects(
         ):
             continue
         version = int(subject.subject_version or 1)
-        enrich_version = int(subject.enrich_version or 1)
         staged.append(
             {
                 "id": subject.id,
@@ -288,9 +273,7 @@ async def _prepare_staged_subjects(
                 "is_child": bool(subject.is_child),
                 "episode_nos": list(subject.episode_nos or []),
                 "base_subject_version": version,
-                "base_enrich_version": enrich_version,
                 "subject_version": version,
-                "enrich_version": enrich_version,
             }
         )
     return staged

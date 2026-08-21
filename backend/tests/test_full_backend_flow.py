@@ -282,24 +282,6 @@ def _subjects_payload() -> list[dict[str, Any]]:
     ]
 
 
-def _twelve_section_prompt() -> str:
-    labels = (
-        "形制描述",
-        "材质钉死",
-        "使用痕迹",
-        "摆放姿态",
-        "反悬浮锁",
-        "时代锚定",
-        "画面构图",
-        "画风统一锁",
-        "三点柔光箱白底布光",
-        "反水印锁",
-        "文字渲染降级方案",
-        "写实质感锚定",
-    )
-    return "\n".join(f"【{label}】确定性验收内容" for label in labels)
-
-
 def _storyboard_payload() -> dict[str, Any]:
     return {
         "schema_version": "storyboard.v2",
@@ -682,12 +664,7 @@ async def test_full_backend_flow_reaches_succeeded_render_job(monkeypatch, tmp_p
         )
         == 5
     )
-    enrich_provider = _StaticLLM(
-        {
-            "schema_version": "pipeline.v1",
-            "resolved_prompts": {"final": _twelve_section_prompt()},
-        }
-    )
+    enrich_provider = _StaticLLM({"schema_version": "pipeline.v1"})
     assert (
         await run_enrich(
             db,
@@ -697,9 +674,9 @@ async def test_full_backend_flow_reaches_succeeded_render_job(monkeypatch, tmp_p
             input_client_save_seq=1,
             provider=enrich_provider,
         )
-        == 4
+        == 0
     )
-    assert enrich_provider.calls == 4
+    assert enrich_provider.calls == 0
     assert (
         await run_parents(
             db,
@@ -787,6 +764,7 @@ async def test_full_backend_flow_reaches_succeeded_render_job(monkeypatch, tmp_p
                             "subjectName": "客户端伪造名称",
                             "subjectType": "prop",
                             "subjectDescription": "客户端伪造描述",
+                            "prompt": "前端传入的阿明角色设定最终生图提示词",
                         },
                     }
                 ],

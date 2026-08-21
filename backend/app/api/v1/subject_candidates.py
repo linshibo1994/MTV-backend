@@ -100,7 +100,6 @@ async def post_resolve_subject_candidate(
         action=payload.action,
         actor_user_id=user.user_id,
         subject_id=payload.subject_id,
-        visual_style=payload.visual_style,
     )
     if not replayed:
         await audit_log(

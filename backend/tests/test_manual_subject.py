@@ -27,7 +27,6 @@ from app.models.script import Script
 from app.models.subject import Subject
 from app.models.user import User
 from app.schemas.asset import SubjectCreateIn
-from app.schemas.materials import SUBJECT_DESIGN_PROMPT_TEMPLATE_VERSION, build_subject_prompt
 
 
 @compiles(JSONB, "sqlite")
@@ -147,8 +146,12 @@ async def test_create_background_subject_normalizes_and_writes_audit() -> None:
         assert body["episode_nos"] == [1, 2]
         assert body["episode_ids"] == ["episode-1", "episode-2"]
         assert body["review_status"] == "not_designed"
-        assert body["design_prompt_source"] == "template_fallback"
-        assert "【2 空间布局】" in body["design_prompt"]
+        assert {
+            "design_prompt",
+            "design_prompt_source",
+            "design_prompt_version",
+            "design_prompt_template_version",
+        }.isdisjoint(body)
         assert listed.status_code == 200
         assert listed.json()["items"][0]["subject_id"] == body["subject_id"]
 
@@ -176,7 +179,7 @@ async def test_create_background_subject_normalizes_and_writes_audit() -> None:
 
 
 @pytest.mark.asyncio
-async def test_subject_list_prefers_current_enrich_prompt_and_rejects_stale_entry() -> None:
+async def test_subject_list_does_not_expose_server_prompt_fields() -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     _create_tables(engine)
     with Session(engine, expire_on_commit=False) as raw:
@@ -189,92 +192,24 @@ async def test_subject_list_prefers_current_enrich_prompt_and_rejects_stale_entr
             description="老年男性，满脸皱纹，穿粗布衣",
             episode_nos=[1],
             subject_version=2,
-            enrich_version=3,
             review_status="not_designed",
         )
-        stage = PipelineStage(
-            id="stage-enrich",
-            script_id="script-1",
-            stage="enrich",
-            status="done",
-            detail={
-                "prompts": {
-                    subject.id: {
-                        "subject_version": 2,
-                        "enrich_version": 3,
-                        "prompt_template_version": SUBJECT_DESIGN_PROMPT_TEMPLATE_VERSION,
-                        "resolved_prompts": {
-                            "final": "服务端生成的老农设定提示词。\n"
-                            + build_subject_prompt(
-                                "老农",
-                                "character",
-                                "年迈农民，稳定面容，穿粗布衣与草帽",
-                            )
-                        },
-                        "episode_snapshot": {
-                            "1": {
-                                "episode_id": episode.episode_id,
-                                "episode_version": 1,
-                                "client_save_seq": 0,
-                            }
-                        },
-                        "source": "generated",
-                    }
-                }
-            },
-        )
-        raw.add_all([_script(), episode, subject, stage])
+        raw.add_all([_script(), episode, subject])
         raw.commit()
 
         async with AsyncClient(
             transport=ASGITransport(app=_app(_AsyncSessionAdapter(raw), _owner())),
             base_url="http://test",
         ) as client:
-            current = await client.get("/scripts/script-1/asset-library/subjects")
+            response = await client.get("/scripts/script-1/asset-library/subjects")
 
-            stage.detail = {
-                **stage.detail,
-                "prompts": {
-                    subject.id: {
-                        **stage.detail["prompts"][subject.id],
-                        "prompt_template_version": 1,
-                    }
-                },
-            }
-            raw.commit()
-            old_template = await client.get("/scripts/script-1/asset-library/subjects")
-
-            stage.detail = {
-                **stage.detail,
-                "prompts": {
-                    subject.id: {
-                        **stage.detail["prompts"][subject.id],
-                        "prompt_template_version": SUBJECT_DESIGN_PROMPT_TEMPLATE_VERSION,
-                        "subject_version": 1,
-                    }
-                },
-            }
-            raw.commit()
-            stale = await client.get("/scripts/script-1/asset-library/subjects")
-
-        assert current.status_code == 200
-        current_item = current.json()["items"][0]
-        assert "服务端生成的老农设定提示词" in current_item["design_prompt"]
-        assert "【视觉资产设定提示词】" in current_item["design_prompt"]
-        assert "【人物设定图构图硬约束 v2】" in current_item["design_prompt"]
-        assert current_item["design_prompt_source"] == "generated"
-        assert current_item["design_prompt_version"] == 3
-        assert current_item["design_prompt_template_version"] == SUBJECT_DESIGN_PROMPT_TEMPLATE_VERSION
-
-        assert old_template.status_code == 200
-        old_template_item = old_template.json()["items"][0]
-        assert old_template_item["design_prompt_source"] == "template_fallback"
-        assert "服务端生成的老农设定提示词" not in old_template_item["design_prompt"]
-
-        assert stale.status_code == 200
-        stale_item = stale.json()["items"][0]
-        assert stale_item["design_prompt_source"] == "template_fallback"
-        assert "请为以下角色制作" in stale_item["design_prompt"]
+        assert response.status_code == 200
+        assert {
+            "design_prompt",
+            "design_prompt_source",
+            "design_prompt_version",
+            "design_prompt_template_version",
+        }.isdisjoint(response.json()["items"][0])
 
 
 @pytest.mark.asyncio
@@ -315,12 +250,12 @@ async def test_create_subject_supports_every_documented_type(
         assert response.status_code == 201
         body = response.json()
         assert body["subject_type"] == output_type
-        if output_type == "sound":
-            assert body["design_prompt"] is None
-            assert body["design_prompt_source"] is None
-        else:
-            assert body["design_prompt"]
-            assert body["design_prompt_source"] == "template_fallback"
+        assert {
+            "design_prompt",
+            "design_prompt_source",
+            "design_prompt_version",
+            "design_prompt_template_version",
+        }.isdisjoint(body)
         subject = raw.scalar(select(Subject))
         assert subject is not None
         assert subject.type == stored_type

@@ -20,7 +20,7 @@
 """
 
 import logging
-from typing import Any, cast
+from typing import Any
 
 from fastapi import APIRouter, Depends, File, Query, UploadFile, status
 from sqlalchemy import select
@@ -154,8 +154,6 @@ async def list_scripts_page(
                 owner_username=owner_map.get(it.owner_user_id),
                 org_id=it.org_id,
                 created_by_user_id=it.created_by_user_id,
-                visual_style=cast(Any, it.visual_style),
-                unify_style=it.unify_style,
                 current_user_project_role=role,
                 updated_at=it.updated_at,
             )
@@ -170,19 +168,11 @@ async def create_script(
     user: User = Depends(get_current_user),
 ) -> ScriptOut:
     """新建剧本。"""
-    # 保持旧调用契约：只有客户端显式使用新字段时才传关键字参数，便于灰度发布
-    # 与既有集成/mock 调用继续工作。
-    style_options: dict[str, Any] = {}
-    if "visual_style" in body.model_fields_set:
-        style_options["visual_style"] = body.visual_style
-    if "unify_style" in body.model_fields_set:
-        style_options["unify_style"] = body.unify_style
     script = await script_crud.create_script(
         db,
         body.title,
         body.scope,
         user,
-        **style_options,
     )
     return ScriptOut.model_validate(script)
 
@@ -334,36 +324,13 @@ async def rename_script(
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> ScriptOut:
-    """更新剧本标题与渲染媒介设置。"""
+    """更新剧本标题。"""
     script = await script_crud.get_script(db, script_id)
     await check_script_access(db, user, script, action=Action.EDIT)
-    style_update = bool({"visual_style", "unify_style"} & body.model_fields_set)
     before: dict[str, Any] = {"title": script.title}
-    if style_update:
-        before.update(
-            visual_style=getattr(script, "visual_style", None),
-            unify_style=getattr(script, "unify_style", True),
-        )
     try:
-        if style_update:
-            await script_crud.rename_script(
-                db,
-                script,
-                body.title,
-                visual_style=body.visual_style,
-                visual_style_provided="visual_style" in body.model_fields_set,
-                unify_style=body.unify_style,
-                commit=False,
-            )
-        else:
-            # 保持旧扩展/测试替身的仅重命名调用签名兼容。
-            await script_crud.rename_script(db, script, body.title, commit=False)
+        await script_crud.rename_script(db, script, body.title, commit=False)
         after: dict[str, Any] = {"title": script.title}
-        if style_update:
-            after.update(
-                visual_style=getattr(script, "visual_style", None),
-                unify_style=getattr(script, "unify_style", True),
-            )
         await audit_log(
             db,
             actor=user,

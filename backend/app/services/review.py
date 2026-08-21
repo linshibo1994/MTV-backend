@@ -28,7 +28,6 @@ from app.schemas.asset import (
     ImpactSummaryOut,
     SubjectAssetOut,
 )
-from app.schemas.materials import build_subject_prompt as _build_subject_prompt
 
 # ---- 状态机常量 ----
 
@@ -38,14 +37,6 @@ STATUS_APPROVED = "approved"
 
 # materials JSONB 各类别键
 _MATERIALS_CATEGORIES = ("character", "background", "prop", "other")
-
-
-def build_subject_prompt(
-    subject_name: str, subject_type: str, subject_description: str
-) -> str:
-    """通过审核服务暴露统一 prompt helper。"""
-    return _build_subject_prompt(subject_name, subject_type, subject_description)
-
 
 def material_references_subject(
     materials: dict | None,

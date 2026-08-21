@@ -154,13 +154,6 @@ def publish_outbox_payload(task_type: str, payload: dict) -> Any:
             payload["job_id"],
             payload.get("attempt"),
         ).apply_async()
-    if task_type == "art_style.extract":
-        from app.workers import art_style_extraction as art_style_worker
-
-        return art_style_worker.extract_art_style_task.s(
-            payload["job_id"],
-            payload["attempt"],
-        ).apply_async()
     if task_type != "pipeline.dag":
         raise ValueError("未知 outbox task_type")
     from app.workers.pipeline import (

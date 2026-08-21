@@ -32,11 +32,6 @@ from app.providers.image_gen import (
     image_gen_provider_is_selected,
 )
 from app.providers.registry import ProviderConfigurationError
-from app.schemas.materials import (
-    CHARACTER_SHEET_MARKER,
-    LEGACY_CHARACTER_SHEET_MARKERS,
-    SUBJECT_DESIGN_PROMPT_MARKER,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -45,8 +40,6 @@ _POLL_TIMEOUT = 300  # 5 分钟
 _RETRYABLE_SUBMIT_STATUSES = {429}
 _MAX_SUBMIT_ATTEMPTS = 5
 _MAX_RETRY_DELAY_SECONDS = 20.0
-_STYLE_RENDER_CONSTRAINT_MARKER = "【风格渲染约束】"
-_LEGACY_CHARACTER_SHEET_MARKER = "【人物设定图服务端构图硬约束】"
 
 
 def _raise_if_safety_rejected(payload: object) -> None:
@@ -193,15 +186,8 @@ def _uses_sync_multimodal_api(model: str) -> bool:
 
 
 def _should_extend_prompt(prompt: str) -> bool:
-    """仅让供应商扩展简短自由提示词，保留结构化设定图的版式硬约束。"""
-    structured_markers = (
-        _STYLE_RENDER_CONSTRAINT_MARKER,
-        SUBJECT_DESIGN_PROMPT_MARKER,
-        CHARACTER_SHEET_MARKER,
-        _LEGACY_CHARACTER_SHEET_MARKER,
-        *LEGACY_CHARACTER_SHEET_MARKERS,
-    )
-    return not any(marker in prompt for marker in structured_markers)
+    """客户端已确认最终提示词，禁止供应商侧再次扩展。"""
+    return False
 
 
 def _extract_multimodal_urls(payload: dict) -> list[str]:
@@ -358,8 +344,8 @@ class BailianImageGenProvider:
             "prompt_extend": _should_extend_prompt(prompt),
             "watermark": False,
         }
-        if normalized_negative_prompt := (negative_prompt or "").strip():
-            parameters["negative_prompt"] = normalized_negative_prompt
+        if negative_prompt:
+            parameters["negative_prompt"] = negative_prompt
         body = {
             "model": model,
             "input": {"messages": [{"role": "user", "content": [{"text": prompt}]}]},
@@ -398,8 +384,8 @@ class BailianImageGenProvider:
             "X-DashScope-Async": "enable",
         }
         input_payload = {"prompt": prompt}
-        if normalized_negative_prompt := (negative_prompt or "").strip():
-            input_payload["negative_prompt"] = normalized_negative_prompt
+        if negative_prompt:
+            input_payload["negative_prompt"] = negative_prompt
         body = {
             "model": model,
             "input": input_payload,

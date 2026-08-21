@@ -7,7 +7,7 @@
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.providers.storage import public_url_for_output_key
 from app.schemas.shot import StoryboardFieldsOut
@@ -27,16 +27,8 @@ class ScriptOut(BaseModel):
     owner_user_id: str
     org_id: str | None = None
     created_by_user_id: str
-    visual_style: Literal["live_action", "anime"] | None = None
-    unify_style: bool = True
     created_at: datetime
     updated_at: datetime
-
-    @field_validator("unify_style", mode="before")
-    @classmethod
-    def legacy_null_unify_style(cls, value: object) -> bool:
-        """历史 ORM/测试夹具缺少新列值时按迁移默认 true 输出。"""
-        return True if value is None else bool(value)
 
 
 class ScriptListItem(BaseModel):
@@ -54,15 +46,8 @@ class ScriptListItem(BaseModel):
     owner_username: str | None = None
     org_id: str | None = None
     created_by_user_id: str
-    visual_style: Literal["live_action", "anime"] | None = None
-    unify_style: bool = True
     current_user_project_role: str | None = None
     updated_at: datetime
-
-    @field_validator("unify_style", mode="before")
-    @classmethod
-    def legacy_null_unify_style(cls, value: object) -> bool:
-        return True if value is None else bool(value)
 
 
 class ScriptCreateIn(BaseModel):
@@ -70,16 +55,12 @@ class ScriptCreateIn(BaseModel):
 
     title: str = Field(min_length=1, max_length=512)
     scope: Literal["personal", "team"] = "personal"
-    visual_style: Literal["live_action", "anime"] | None = None
-    unify_style: bool = True
 
 
 class ScriptUpdateIn(BaseModel):
-    """更新剧本标题与媒介风格设置。"""
+    """更新剧本标题。"""
 
     title: str | None = Field(default=None, min_length=1, max_length=512)
-    visual_style: Literal["live_action", "anime"] | None = None
-    unify_style: bool | None = None
 
     @model_validator(mode="after")
     def at_least_one_field(self) -> "ScriptUpdateIn":
@@ -328,12 +309,12 @@ class BreakdownOut(BaseModel):
 # --------------------------------------------------------------------------- #
 # Pipeline status
 # --------------------------------------------------------------------------- #
-# 5 阶段顺序与中文名（与 04 文档 2.3 节一致）
+# 5 阶段顺序与中文名。enrich 保留为兼容同步阶段，维持既有状态字段和顺序。
 _STAGE_LABELS: dict[str, str] = {
     "split": "剧集拆分",
     "extract": "提取主体",
     "merge": "合并主体",
-    "enrich": "设计线索增强",
+    "enrich": "兼容同步",
     "parents": "归纳父主体",
 }
 
@@ -361,6 +342,10 @@ class PipelineStageOut(BaseModel):
 
     @model_validator(mode="after")
     def _detail_to_display_str(self) -> "PipelineStageOut":
+        # enrich 已下线提示词增强，历史 detail 也必须归一为中性同步文案。
+        if self.stage == "enrich":
+            self.detail = "已同步" if self.status == "done" else ""
+            return self
         d = self.detail
         # None / 空态 -> 空字符串（契约 pending 阶段 detail 为 ""）
         if d is None:
@@ -390,8 +375,6 @@ class PipelineStageOut(BaseModel):
                 self.detail = f"{n} 集"
         elif self.stage == "merge":
             self.detail = f"{count} 个子主体" if isinstance(count, int) else ""
-        elif self.stage == "enrich":
-            self.detail = f"{count} 条线索增强" if isinstance(count, int) else ""
         elif self.stage == "parents":
             self.detail = f"{count} 个父主体" if isinstance(count, int) else ""
         else:

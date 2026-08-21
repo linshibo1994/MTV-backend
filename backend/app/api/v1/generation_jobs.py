@@ -43,7 +43,7 @@ router = APIRouter()
 def _sanitize_input_json(raw: dict[str, Any] | None) -> dict[str, Any] | None:
     """裁剪 input_json 出参，仅保留 02 §4.7.1 / 04 §1.13 契约字段。
 
-    保留调用者需要核验的最终提示词、风格和请求级生成参数；实现层为 worker
+    保留调用者需要核验的客户端最终提示词和请求级生成参数；实现层为 worker
     settle/release 额外写入 reservation_id（内部冻结流水 ID）以及 subject_id/
     subject_name/count 等内部字段。reservation_id 属内部审计关联键，可被用于拼接积分
     查询枚举，因此不得对调用方暴露。此处仅在出参时过滤，存储层保持不变，worker 仍可
@@ -54,14 +54,11 @@ def _sanitize_input_json(raw: dict[str, Any] | None) -> dict[str, Any] | None:
     sanitized: dict[str, Any] = {}
     if "prompt" in raw:
         sanitized["prompt"] = raw["prompt"]
-    if "style_id" in raw and (raw["style_id"] is None or isinstance(raw["style_id"], str)):
-        sanitized["style_id"] = raw["style_id"]
+    if "negative_prompt" in raw and isinstance(raw["negative_prompt"], str):
+        sanitized["negative_prompt"] = raw["negative_prompt"]
     for key in ("model", "size", "aspect"):
         if isinstance(raw.get(key), str):
             sanitized[key] = raw[key]
-    resolved_final = (raw.get("resolved_prompts") or {}).get("final")
-    if isinstance(resolved_final, str):
-        sanitized["resolved_prompts"] = {"final": resolved_final}
     return sanitized or None
 
 

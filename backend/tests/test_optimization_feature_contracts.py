@@ -1,4 +1,4 @@
-"""F06/F10/F16/F18 优化功能的专项契约与状态机测试。"""
+"""F06/F16 优化功能的专项契约与状态机测试。"""
 
 from __future__ import annotations
 
@@ -15,9 +15,6 @@ from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import Session
 
 from app.core.errors import BadRequestError, ConflictError
-from app.crud import asset as asset_crud
-from app.crud import script as script_crud
-from app.models.art_style import ArtStyle
 from app.models.asset_entry import AssetEntry
 from app.models.episode import Episode
 from app.models.scene import Scene
@@ -27,9 +24,6 @@ from app.models.subject import Subject
 from app.models.subject_candidate import SubjectCandidate
 from app.models.task_dispatch_outbox import TaskDispatchOutbox
 from app.models.user import User
-from app.schemas.generation import CreateJobIn
-from app.services import generation as generation_service
-from app.services.art_styles import extract_art_style, get_art_style_definition
 from app.services.scene_auditions import (
     claim_queued_audition,
     confirm_audition,
@@ -93,7 +87,6 @@ def _make_db() -> tuple[object, Session]:
         Subject.__table__,
         AssetEntry.__table__,
         SubjectCandidate.__table__,
-        ArtStyle.__table__,
         SceneAudition.__table__,
         TaskDispatchOutbox.__table__,
     ):
@@ -115,8 +108,6 @@ def _seed_script(raw: Session) -> SimpleNamespace:
         scope="personal",
         owner_user_id=user.user_id,
         created_by_user_id=user.user_id,
-        visual_style="live_action",
-        unify_style=True,
     )
     episode = Episode(
         episode_id="episode-optimization",
@@ -134,7 +125,6 @@ def _seed_script(raw: Session) -> SimpleNamespace:
         name="主角",
         pipeline_name="主角",
         description="穿深色风衣的调查员",
-        visual_style=None,
         episode_nos=[1],
         review_status="not_designed",
     )
@@ -229,11 +219,7 @@ async def test_subject_candidate_api_state_machine_and_replay(client, monkeypatc
 
     resolved = await client.post(
         f"/v3api/scripts/{seeded.script.id}/subject-candidates/{candidate['id']}/resolve",
-        json={
-            "action": "create_subject",
-            "expected_version": 1,
-            "visual_style": "anime",
-        },
+        json={"action": "create_subject", "expected_version": 1},
     )
     assert resolved.status_code == 200, resolved.text
     linked = resolved.json()
@@ -242,16 +228,11 @@ async def test_subject_candidate_api_state_machine_and_replay(client, monkeypatc
     assert linked["linked_subject_id"]
     created_subject = raw.get(Subject, linked["linked_subject_id"])
     assert created_subject is not None
-    assert created_subject.visual_style == "anime"
     assert created_subject.pipeline_name == "新角色"
 
     replay = await client.post(
         f"/v3api/scripts/{seeded.script.id}/subject-candidates/{candidate['id']}/resolve",
-        json={
-            "action": "create_subject",
-            "expected_version": 1,
-            "visual_style": "anime",
-        },
+        json={"action": "create_subject", "expected_version": 1},
     )
     assert replay.status_code == 200
     assert replay.json()["linked_subject_id"] == linked["linked_subject_id"]
@@ -270,123 +251,6 @@ async def test_subject_candidate_api_state_machine_and_replay(client, monkeypatc
     )
     assert stale.status_code == 409
     assert "已被处理" in stale.json()["detail"]
-
-
-def test_art_style_extracts_only_authorized_valid_images_and_builds_definition() -> None:
-    """F10：只读取当前剧本授权图片，并持久化可直接参与生成的动态定义。"""
-
-    async def scenario() -> None:
-        _, raw = _make_db()
-        seeded = _seed_script(raw)
-        good = AssetEntry(
-            id="asset-good",
-            script_id=seeded.script.id,
-            subject_id=seeded.subject.id,
-            kind="image",
-            storage_key="upload_images/material-1/good.png",
-            mime_type="image/png",
-            size_bytes=8,
-            source="upload_images",
-            sha256="a" * 64,
-            status="approved",
-        )
-        bad_mime = AssetEntry(
-            id="asset-bad-mime",
-            script_id=seeded.script.id,
-            subject_id=seeded.subject.id,
-            kind="image",
-            storage_key="upload_images/material-1/not-image.bin",
-            mime_type="application/octet-stream",
-            size_bytes=8,
-            source="upload_images",
-            sha256="b" * 64,
-            status="candidate",
-        )
-        foreign = AssetEntry(
-            id="asset-foreign",
-            script_id="another-script",
-            subject_id="another-subject",
-            kind="image",
-            storage_key="upload_images/material-2/foreign.png",
-            mime_type="image/png",
-            size_bytes=8,
-            source="upload_images",
-            sha256="c" * 64,
-            status="candidate",
-        )
-        raw.add_all([good, bad_mime, foreign])
-        raw.commit()
-        db = _AsyncSessionAdapter(raw)
-        storage = SimpleNamespace(get=AsyncMock(return_value=b"png-data"))
-        provider = SimpleNamespace(
-            provider_name="vision-test",
-            model_name="vision-v1",
-            extract_style=AsyncMock(
-                return_value={
-                    "prompt_zh": "克制的冷峻黑色电影风格",
-                    "prompt_en": "restrained cold noir visual language",
-                    "negative_prompt": "flat lighting",
-                    "visual_style": "live_action",
-                }
-            ),
-        )
-
-        row = await extract_art_style(
-            db,
-            script_id=seeded.script.id,
-            name="冷峻黑色电影",
-            asset_ids=[good.id],
-            actor_user_id=seeded.user.user_id,
-            provider=provider,
-            storage=storage,
-        )
-        assert row.source_asset_ids == [good.id]
-        assert row.source_hashes == ["a" * 64]
-        assert row.thumbnail_storage_key == good.storage_key
-        assert row.extraction_provider == "vision-test"
-        assert row.extraction_model == "vision-v1"
-        storage.get.assert_awaited_once_with(good.storage_key)
-        provider.extract_style.assert_awaited_once_with([(b"png-data", "image/png")])
-
-        definition = await get_art_style_definition(
-            db,
-            script_id=seeded.script.id,
-            art_style_id=row.id,
-        )
-        assert definition == {
-            "id": row.id,
-            "name_zh": "冷峻黑色电影",
-            "target": ["image", "video"],
-            "prompt_template": "restrained cold noir visual language, {prompt}",
-            "negative_prompt": "flat lighting",
-            "default_prompt": "restrained cold noir visual language",
-            "best_for": ["项目自定义画风"],
-            "visual_style": "live_action",
-            "source": "art_style",
-        }
-
-        with pytest.raises(BadRequestError, match="不属于当前剧本"):
-            await extract_art_style(
-                db,
-                script_id=seeded.script.id,
-                name="越权画风",
-                asset_ids=[foreign.id],
-                actor_user_id=seeded.user.user_id,
-                provider=provider,
-                storage=storage,
-            )
-        with pytest.raises(BadRequestError, match="格式或大小"):
-            await extract_art_style(
-                db,
-                script_id=seeded.script.id,
-                name="非法格式",
-                asset_ids=[bad_mime.id],
-                actor_user_id=seeded.user.user_id,
-                provider=provider,
-                storage=storage,
-            )
-
-    asyncio.run(scenario())
 
 
 def _audition_plans() -> dict:
@@ -910,128 +774,8 @@ def test_scene_audition_periodic_recovery_finishes_worker_lost_without_user_acti
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize(
-    ("request_style", "subject_style", "script_style", "unify_style", "expected"),
-    [
-        ("anime", "live_action", "live_action", True, "anime"),
-        (None, "anime", "live_action", True, "anime"),
-        (None, None, "live_action", True, "live_action"),
-        (None, None, "live_action", False, None),
-    ],
-)
-def test_visual_style_generation_priority(
-    monkeypatch,
-    request_style: str | None,
-    subject_style: str | None,
-    script_style: str | None,
-    unify_style: bool,
-    expected: str | None,
-) -> None:
-    """F18：请求 > 主体 > 开启统一风格的剧本 > 系统默认。"""
-
-    async def scenario() -> None:
-        user = SimpleNamespace(user_id="user-style")
-        material = SimpleNamespace(id="material-style")
-        script = SimpleNamespace(
-            id="script-style",
-            visual_style=script_style,
-            unify_style=unify_style,
-        )
-        subject = SimpleNamespace(
-            id="subject-style",
-            script_id=script.id,
-            type="character",
-            name="角色",
-            description="角色描述",
-            visual_style=subject_style,
-            subject_version=1,
-            enrich_version=1,
-            episode_nos=[],
-        )
-        result = SimpleNamespace(scalar_one_or_none=lambda: subject)
-        db = SimpleNamespace(execute=AsyncMock(return_value=result))
-        create = AsyncMock(return_value=SimpleNamespace(job_id="job-style"))
-        monkeypatch.setattr(
-            generation_service,
-            "_load_material_script",
-            AsyncMock(return_value=(material, script)),
-        )
-        monkeypatch.setattr(generation_service, "check_script_access", AsyncMock())
-        monkeypatch.setattr(
-            generation_service,
-            "_subject_episode_snapshot",
-            AsyncMock(return_value=(None, 1, 0, {})),
-        )
-        monkeypatch.setattr(
-            generation_service,
-            "_find_idempotent_job",
-            AsyncMock(return_value=None),
-        )
-        monkeypatch.setattr(
-            generation_service,
-            "_load_credit_account",
-            AsyncMock(return_value=SimpleNamespace(id="account-style")),
-        )
-        monkeypatch.setattr(generation_service, "_create_one_job", create)
-
-        await generation_service.create_generation_job(
-            db,
-            user=user,
-            payload=CreateJobIn(
-                material_id=material.id,
-                subject_id=subject.id,
-                prompt="雨夜中的角色",
-                visual_style=request_style,
-            ),
-            idempotency_key=f"style-{expected}-{unify_style}",
-        )
-        assert create.await_args.kwargs["visual_style"] == expected
-        final_prompt = create.await_args.kwargs["resolved_prompt"]
-        if expected == "anime":
-            assert "animated production medium" in final_prompt
-        elif expected == "live_action":
-            assert "live-action physical production" in final_prompt
-        else:
-            assert "production medium" not in final_prompt
-
-    asyncio.run(scenario())
-
-
-def test_visual_style_null_clears_subject_and_script_inheritance_override() -> None:
-    """F18：PATCH 显式 null 必须清除覆盖，而不是被 exclude_none 忽略。"""
-
-    async def scenario() -> None:
-        _, raw = _make_db()
-        seeded = _seed_script(raw)
-        db = _AsyncSessionAdapter(raw)
-        seeded.subject.visual_style = "anime"
-        raw.commit()
-
-        await asset_crud.update_subject(
-            db,
-            seeded.subject,
-            {"visual_style": None},
-            expected_subject_version=1,
-        )
-        assert seeded.subject.visual_style is None
-        assert seeded.subject.subject_version == 2
-        assert seeded.subject.enrich_version == 2
-
-        await script_crud.rename_script(
-            db,
-            seeded.script,
-            None,
-            visual_style=None,
-            visual_style_provided=True,
-            commit=False,
-        )
-        assert seeded.script.visual_style is None
-
-    asyncio.run(scenario())
-
-
-def test_openapi_exposes_optimization_paths_and_new_contract_fields() -> None:
-    """F06/F10/F16/F18：聚合路由与请求契约进入 OpenAPI。"""
+def test_openapi_exposes_active_optimization_paths_and_client_prompt_contract() -> None:
+    """保留的候选/导演方案接口进入 OpenAPI，生图不再暴露风格字段。"""
 
     from app.main import create_app
 
@@ -1039,8 +783,7 @@ def test_openapi_exposes_optimization_paths_and_new_contract_fields() -> None:
     paths = schema["paths"]
     assert "/v3api/scripts/{script_id}/subject-candidates" in paths
     assert "/v3api/scripts/{script_id}/subject-candidates/{candidate_id}/resolve" in paths
-    assert "/v3api/scripts/{script_id}/art-styles/extract" in paths
-    assert "/v3api/scripts/{script_id}/art-styles/{art_style_id}" in paths
+    assert not any("/art-styles" in path for path in paths)
     assert "/v3api/scripts/{script_id}/episodes/{episode_id}/scene-auditions/generate" in paths
     assert (
         "/v3api/scripts/{script_id}/episodes/{episode_id}/scene-auditions/{audition_id}/confirm"
@@ -1048,13 +791,21 @@ def test_openapi_exposes_optimization_paths_and_new_contract_fields() -> None:
     )
 
     components = schema["components"]["schemas"]
-    assert {"visual_style", "unify_style"} <= set(components["ScriptCreateIn"]["properties"])
-    assert {"visual_style", "unify_style"} <= set(components["ScriptUpdateIn"]["properties"])
-    assert {"art_style_id", "visual_style"} <= set(components["CreateJobIn"]["properties"])
-    assert {"art_style_id", "visual_style"} <= set(
-        components["BatchCreateJobIn"]["properties"]
+    assert "visual_style" not in components["ScriptCreateIn"]["properties"]
+    assert "unify_style" not in components["ScriptCreateIn"]["properties"]
+    assert "visual_style" not in components["ScriptUpdateIn"]["properties"]
+    assert "unify_style" not in components["ScriptUpdateIn"]["properties"]
+    image_properties = components["CreateJobIn"]["properties"]
+    batch_image_properties = components["BatchCreateJobIn"]["properties"]
+    assert {"prompt", "negative_prompt"} <= set(image_properties)
+    assert "prompt" in components["CreateJobIn"]["required"]
+    assert "prompts" in components["BatchCreateJobIn"]["required"]
+    assert {"style_id", "style_ids", "art_style_id", "visual_style"}.isdisjoint(image_properties)
+    assert {"style_id", "style_ids", "art_style_id", "visual_style"}.isdisjoint(
+        batch_image_properties
     )
     assert "expected_version" in components["SubjectCandidateResolveIn"]["properties"]
+    assert "visual_style" not in components["SubjectCandidateResolveIn"]["properties"]
     assert "expected_input_version" in components["SceneAuditionConfirmIn"]["properties"]
     generate_schema = components["SceneAuditionGenerateIn"]["properties"]["scene_type"]
     assert set(generate_schema["enum"]) == {

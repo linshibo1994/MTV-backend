@@ -1,12 +1,7 @@
 """剧本处理流水线服务包 — split / extract / merge / enrich / parents。
 
-阶段顺序: split → extract → merge → enrich → parents
-每阶段:
-  1. 标记 pipeline_stage 为 running
-  2. 构造 LLM prompt（严格遵循 06 文档第 12 节契约）
-  3. 调 app.providers.llm.complete_json
-  4. 落库 subjects/parent_subjects 或写 pipeline_stage.detail
-  5. 更新 pipeline_stage 状态为 done / failed
+阶段顺序: split → extract → merge → enrich → parents。其中 enrich 是保留给既有
+流水线收尾的兼容同步阶段，不执行模型调用或提示词增强。
 """
 
 from sqlalchemy import case, func, select, update
@@ -24,7 +19,7 @@ STAGE_LABELS: dict[str, str] = {
     "split": "剧集拆分",
     "extract": "提取主体",
     "merge": "合并主体",
-    "enrich": "设计线索增强",
+    "enrich": "兼容同步",
     "parents": "归纳父主体",
 }
 

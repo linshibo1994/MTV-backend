@@ -25,13 +25,11 @@ def _resolution_request_hash(
     *,
     action: str,
     subject_id: str | None,
-    visual_style: str | None,
 ) -> str:
     payload = json.dumps(
         {
             "action": action,
             "subject_id": subject_id,
-            "visual_style": visual_style,
         },
         ensure_ascii=False,
         sort_keys=True,
@@ -120,7 +118,6 @@ async def resolve_candidate(
     action: str,
     actor_user_id: str,
     subject_id: str | None = None,
-    visual_style: str | None = None,
 ) -> tuple[SubjectCandidate, bool]:
     await db.execute(select(Script.id).where(Script.id == script_id).with_for_update())
     candidate = (
@@ -139,7 +136,6 @@ async def resolve_candidate(
     request_hash = _resolution_request_hash(
         action=action,
         subject_id=subject_id,
-        visual_style=visual_style,
     )
     if candidate.status != "pending":
         if (
@@ -186,9 +182,7 @@ async def resolve_candidate(
                 name=candidate.name,
                 pipeline_name=candidate.pipeline_name,
                 description=candidate.description,
-                visual_style=visual_style,
                 subject_version=1,
-                enrich_version=1,
                 is_child=True,
                 is_parent=False,
                 episode_nos=candidate.episode_nos,

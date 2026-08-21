@@ -7,7 +7,6 @@ from starlette.status import (
     HTTP_400_BAD_REQUEST,
     HTTP_401_UNAUTHORIZED,
     HTTP_409_CONFLICT,
-    HTTP_429_TOO_MANY_REQUESTS,
 )
 
 
@@ -23,13 +22,6 @@ class BadRequestError(HTTPException):
 
     def __init__(self, detail: str = "请求参数错误") -> None:
         super().__init__(status_code=HTTP_400_BAD_REQUEST, detail=detail)
-
-
-class TooManyRequestsError(HTTPException):
-    """请求频率超限 — 429。"""
-
-    def __init__(self, detail: str = "请求过于频繁，请稍后再试") -> None:
-        super().__init__(status_code=HTTP_429_TOO_MANY_REQUESTS, detail=detail)
 
 
 class ForbiddenError(HTTPException):

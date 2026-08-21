@@ -161,8 +161,6 @@ async def create_script(
     scope: str,
     user: User,
     *,
-    visual_style: str | None = None,
-    unify_style: bool = True,
     commit: bool = True,
 ) -> Script:
     active_org_id = getattr(user, "active_org_id", None)
@@ -176,8 +174,6 @@ async def create_script(
         owner_user_id=user.user_id,
         org_id=active_org_id if scope == "team" else None,
         created_by_user_id=user.user_id,
-        visual_style=visual_style,
-        unify_style=unify_style,
     )
     db.add(script)
     # 团队项目：创建者为 owner 成员
@@ -205,18 +201,11 @@ async def rename_script(
     script: Script,
     title: str | None,
     *,
-    visual_style: str | None = None,
-    visual_style_provided: bool = False,
-    unify_style: bool | None = None,
     commit: bool = True,
 ) -> Script:
     """重命名剧本，并允许调用方把审计纳入同一事务。"""
     if title is not None:
         script.title = title
-    if visual_style_provided:
-        script.visual_style = visual_style
-    if unify_style is not None:
-        script.unify_style = unify_style
     if commit:
         await db.commit()
         await db.refresh(script)
@@ -243,8 +232,6 @@ async def copy_script(
         target_title,
         target_scope,
         user,
-        visual_style=source.visual_style,
-        unify_style=source.unify_style,
         commit=False,
     )
     episodes = await list_episodes(db, source.id)
@@ -1717,8 +1704,6 @@ async def replace_subjects(
             if (
                 int(subject.subject_version or 1)
                 != int(item["base_subject_version"])
-                or int(subject.enrich_version or 1)
-                != int(item["base_enrich_version"])
             ):
                 raise ConflictError("主体版本已变化，拒绝发布旧流水线结果")
         elif staged:
@@ -1737,7 +1722,6 @@ async def replace_subjects(
             subject.is_active = True
             if staged:
                 subject.subject_version = int(item["subject_version"])
-                subject.enrich_version = int(item["enrich_version"])
             kept_ids.add(subject.id)
         else:
             subject = Subject(
@@ -1753,7 +1737,6 @@ async def replace_subjects(
                 is_active=True,
                 review_status="not_designed",
                 subject_version=int(item.get("subject_version") or 1),
-                enrich_version=int(item.get("enrich_version") or 1),
             )
             db.add(subject)
             new_subjects.append(subject)

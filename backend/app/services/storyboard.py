@@ -802,7 +802,6 @@ def _subject_provenance_snapshot(subject: Subject) -> dict[str, object]:
         "subject_id": str(subject.id),
         "type": subject.type,
         "subject_version": int(getattr(subject, "subject_version", 1) or 1),
-        "enrich_version": int(getattr(subject, "enrich_version", 1) or 1),
         "is_active": bool(getattr(subject, "is_active", True)),
         "episode_nos": list(subject.episode_nos or []),
     }

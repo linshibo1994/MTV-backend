@@ -2,8 +2,6 @@
 
 # 资源域模型统一聚合 import，确保 Base.metadata 注册全部表
 from app.models import (  # noqa: F401
-    art_style,
-    art_style_extraction_job,
     asset_entry,
     audit_event,
     canvas_edge,
@@ -64,8 +62,6 @@ __all__ = [
     "task_dispatch_outbox",
     "timeline_render_job",
     "parent_subject",
-    "art_style",
-    "art_style_extraction_job",
     "asset_entry",
     "media_storage_job",
     "media_upload",

@@ -148,11 +148,42 @@ def test_shot_group_delete_openapi_requires_version_and_explicit_confirmation() 
 def test_image_and_video_generation_openapi_expose_prompt_overrides() -> None:
     schemas = app.openapi()["components"]["schemas"]
 
-    for single_name in ("CreateJobIn", "VideoJobCreateIn"):
+    image_single = schemas["CreateJobIn"]
+    image_properties = image_single["properties"]
+    assert image_properties["prompt"] == {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 32000,
+        "title": "Prompt",
+        "description": "客户端确认的最终生图提示词",
+    }
+    assert image_properties["negative_prompt"]["default"] == ""
+    assert "prompt" in image_single["required"]
+    assert {"style_id", "style_ids", "art_style_id", "visual_style"}.isdisjoint(image_properties)
+
+    image_batch = schemas["BatchCreateJobIn"]
+    image_batch_properties = image_batch["properties"]
+    assert image_batch_properties["prompts"] == {
+        "type": "object",
+        "minProperties": 1,
+        "additionalProperties": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 32000,
+        },
+        "title": "Prompts",
+        "description": "每个主体的客户端确认最终生图提示词，键为 subject_id",
+    }
+    assert "prompts" in image_batch["required"]
+    assert {"style_id", "style_ids", "art_style_id", "visual_style"}.isdisjoint(
+        image_batch_properties
+    )
+
+    for single_name in ("VideoJobCreateIn",):
         prompt = schemas[single_name]["properties"]["prompt"]["anyOf"][0]
         assert prompt == {"type": "string", "minLength": 1, "maxLength": 32000}
 
-    for batch_name in ("BatchCreateJobIn", "VideoJobBatchCreateIn"):
+    for batch_name in ("VideoJobBatchCreateIn",):
         prompts = schemas[batch_name]["properties"]["prompts"]["anyOf"][0]
         assert prompts["type"] == "object"
         assert prompts["additionalProperties"] == {
@@ -162,16 +193,17 @@ def test_image_and_video_generation_openapi_expose_prompt_overrides() -> None:
         }
 
 
-def test_batch_image_generation_openapi_exposes_per_subject_style_mapping() -> None:
+def test_batch_image_generation_openapi_exposes_client_prompt_mappings() -> None:
     schema = app.openapi()
-    style_ids = schema["components"]["schemas"]["BatchCreateJobIn"]["properties"][
-        "style_ids"
+    negative_prompts = schema["components"]["schemas"]["BatchCreateJobIn"]["properties"][
+        "negative_prompts"
     ]
 
-    assert style_ids["anyOf"][0] == {
+    assert negative_prompts["anyOf"][0] == {
         "type": "object",
         "additionalProperties": {
-            "anyOf": [{"type": "string"}, {"type": "null"}],
+            "type": "string",
+            "maxLength": 32000,
         },
     }
     request = schema["paths"]["/v3api/generation-jobs/batch"]["post"]["requestBody"][

@@ -221,7 +221,6 @@ async def create_video_generation_job(
         user_id=user.user_id,
         idempotency_key=idempotency_key,
         prompt=body.prompt,
-        style_id=body.style_id,
     )
     return VideoJobOut.model_validate(job)
 
@@ -575,7 +574,6 @@ async def batch_create_video_generation_jobs(
                 user_id=user.user_id,
                 idempotency_key=key,
                 prompt=(body.prompts or {}).get(sg_id),
-                style_id=body.style_id,
             )
             success.append(VideoJobOut.model_validate(job))
         except HTTPException as exc:

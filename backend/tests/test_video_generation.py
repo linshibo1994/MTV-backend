@@ -908,7 +908,7 @@ def test_create_video_job_requires_idempotency_key_and_uses_transactional_outbox
     asyncio.run(scenario())
 
 
-def test_create_video_job_persists_explicit_prompt_with_exactly_one_full_constraint_lock(
+def test_create_video_job_persists_explicit_prompt_without_video_template(
     monkeypatch,
 ) -> None:
     async def scenario() -> None:
@@ -931,6 +931,24 @@ def test_create_video_job_persists_explicit_prompt_with_exactly_one_full_constra
             return row
 
         monkeypatch.setattr(video_generation, "enqueue_task", fake_enqueue)
+        template_resolver = AsyncMock(
+            side_effect=AssertionError("视频创建不应解析 video.constraint_lock")
+        )
+        template_renderer = Mock(
+            side_effect=AssertionError("视频创建不应渲染 video.constraint_lock")
+        )
+        monkeypatch.setattr(
+            video_generation,
+            "resolve_prompt_template",
+            template_resolver,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            video_generation,
+            "render_prompt_template_with_fallback",
+            template_renderer,
+            raising=False,
+        )
 
         job = await video_generation.create_video_job(
             db,
@@ -946,7 +964,7 @@ def test_create_video_job_persists_explicit_prompt_with_exactly_one_full_constra
             "## 图片内容说明\n"
             "图1: 阿明（短引用 无；类型 character）\n"
             "## 图片内容说明结束\n"
-            f"客户端自定义运镜\n{video_generation._CONSTRAINT_LOCK_TEXT}"
+            "客户端自定义运镜"
         )
         assert job.input_json["prompt"] == expected
         assert job.input_json["base_prompt"] == "客户端自定义运镜"
@@ -957,8 +975,7 @@ def test_create_video_job_persists_explicit_prompt_with_exactly_one_full_constra
         ).hexdigest()
         assert job.input_json["adapter_version"] == "video-prompt-adapter.v1"
         assert job.input_json["prompt_adapter"]["version"] == "video-prompt-adapter.v1"
-        assert job.input_json["constraint_prompt_template"]["key"] == "video.constraint_lock"
-        assert job.input_json["constraint_prompt_template"]["source"] == "fallback"
+        assert "constraint_prompt_template" not in job.input_json
         assert job.input_json["reference_token_map"] == {
             "图1": {
                 "ref": None,
@@ -969,25 +986,18 @@ def test_create_video_job_persists_explicit_prompt_with_exactly_one_full_constra
                 "sha256": "a" * 64,
             },
         }
-        assert job.input_json["prompt"].count(video_generation._CONSTRAINT_LOCK_TEXT) == 1
-        assert video_generation._ensure_constraint_lock(expected) == expected
+        template_resolver.assert_not_awaited()
+        template_renderer.assert_not_called()
 
-        hollow_heading = "客户端自定义运镜\n【约束】"
-        repaired = video_generation._ensure_constraint_lock(hollow_heading)
-        assert repaired == f"客户端自定义运镜\n{video_generation._CONSTRAINT_LOCK_TEXT}"
-        assert repaired.count(video_generation._CONSTRAINT_LOCK_TEXT) == 1
+        from app.schemas.video import VideoJobOut
 
-        storyboard_lock = (
-            "客户端自定义运镜\n【约束】\n1. 人物特征高度一致\n2. 禁止字幕"
-        )
-        normalized = video_generation._ensure_constraint_lock(storyboard_lock)
-        assert normalized == f"客户端自定义运镜\n{video_generation._CONSTRAINT_LOCK_TEXT}"
-        assert normalized.count("【约束】") == 1
+        response = VideoJobOut.model_validate(job)
+        assert "constraint_prompt_template" not in response.input_json
 
     asyncio.run(scenario())
 
 
-def test_create_video_job_enhances_structured_prompt_before_constraint_and_adapter(
+def test_create_video_job_enhances_structured_prompt_before_adapter(
     monkeypatch,
 ) -> None:
     async def scenario() -> None:
@@ -1075,11 +1085,13 @@ def test_create_video_job_enhances_structured_prompt_before_constraint_and_adapt
         assert "0s～3s：阿明：推门进入" in source
         assert "3s～6s：阿明：停下并回头" in source
         assert source.index("## 图片内容说明") < source.index("镜头组提示词")
-        assert source.index("【主体时长动作 subject-over-duration】") < source.index("【约束】")
-        assert source.index("【冻结边界事实 boundary-facts】") < source.index("【约束】")
+        assert source.index("【主体时长动作 subject-over-duration】") < source.index(
+            "【冻结边界事实 boundary-facts】"
+        )
         assert "起始边界：阿明位于门外，右手刚触及门把。" in source
         assert "结束边界：阿明已进入室内并回望门口。" in source
-        assert source.count(video_generation._CONSTRAINT_LOCK_TEXT) == 1
+        assert "【约束】" not in source
+        assert "constraint_prompt_template" not in job.input_json
         assert job.input_json["prompt"] == source
         assert job.input_json["boundary_prompt_fragments"] == [
             "起始边界：阿明位于门外，右手刚触及门把。",
@@ -5017,6 +5029,51 @@ def test_single_create_forwards_client_prompt(monkeypatch) -> None:
     asyncio.run(scenario())
 
 
+def test_video_api_does_not_forward_style_id(monkeypatch) -> None:
+    async def scenario() -> None:
+        from app.api.v1 import video_generation as api
+        from app.schemas.video import VideoJobBatchCreateIn, VideoJobCreateIn
+
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        job = _add_worker_job(
+            raw,
+            seeded,
+            job_id="job-no-style-forward",
+            reservation_id="reservation-no-style-forward",
+        )
+        create = AsyncMock(return_value=job)
+        monkeypatch.setattr("app.services.video_generation.create_video_job", create)
+        monkeypatch.setattr(api, "_load_and_check_script", AsyncMock(return_value=seeded.script))
+
+        await api.create_video_generation_job(
+            VideoJobCreateIn(
+                script_id=seeded.script.id,
+                episode_id=seeded.episode.episode_id,
+                shot_group_id=seeded.shot_group.shot_group_id,
+            ),
+            db=_AsyncSessionAdapter(raw),
+            user=seeded.user,
+            idempotency_key="no-style-forward-single",
+        )
+        assert "style_id" not in create.await_args.kwargs
+
+        create.reset_mock()
+        await api.batch_create_video_generation_jobs(
+            VideoJobBatchCreateIn(
+                script_id=seeded.script.id,
+                episode_id=seeded.episode.episode_id,
+                shot_group_ids=[seeded.shot_group.shot_group_id],
+            ),
+            db=_AsyncSessionAdapter(raw),
+            user=seeded.user,
+            idempotency_key="no-style-forward-batch",
+        )
+        assert "style_id" not in create.await_args.kwargs
+
+    asyncio.run(scenario())
+
+
 def test_batch_create_rolls_back_each_failed_item(monkeypatch) -> None:
     async def scenario() -> None:
         from app.api.v1 import video_generation as api
@@ -5045,6 +5102,73 @@ def test_batch_create_rolls_back_each_failed_item(monkeypatch) -> None:
         assert result.success == []
         assert [item.shot_group_id for item in result.failed] == ["sg-foreign"]
         assert db.rollback_count == 1
+
+    asyncio.run(scenario())
+
+
+def test_video_creation_schemas_exclude_style_id() -> None:
+    """视频创建契约不再公开风格元数据字段。"""
+    from app.schemas.video import VideoJobBatchCreateIn, VideoJobCreateIn
+
+    assert "style_id" not in VideoJobCreateIn.model_fields
+    assert "style_id" not in VideoJobBatchCreateIn.model_fields
+
+
+def test_video_create_service_removes_style_id_metadata_and_ignores_legacy_value(monkeypatch) -> None:
+    async def scenario() -> None:
+        from app.services import video_generation
+
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        db = _AsyncSessionAdapter(raw)
+
+        async def fake_enqueue(db, **kwargs):
+            row = TaskDispatchOutbox(
+                id="dispatch-no-style-metadata",
+                task_type=kwargs["task_type"],
+                job_id=kwargs["job_id"],
+                attempt=kwargs["attempt"],
+                payload=kwargs["payload"],
+                status="pending",
+            )
+            db.add(row)
+            return row
+
+        monkeypatch.setattr(video_generation, "enqueue_task", fake_enqueue)
+
+        job = await video_generation.create_video_job(
+            db,
+            script_id=seeded.script.id,
+            episode_id=seeded.episode.episode_id,
+            shot_group_id=seeded.shot_group.shot_group_id,
+            user_id=seeded.user.user_id,
+            idempotency_key="no-style-metadata",
+        )
+
+        assert "style_id" not in job.input_json
+
+        job.input_json = {**job.input_json, "style_id": "legacy-style"}
+        raw.commit()
+        reused = await video_generation.create_video_job(
+            db,
+            script_id=seeded.script.id,
+            episode_id=seeded.episode.episode_id,
+            shot_group_id=seeded.shot_group.shot_group_id,
+            user_id=seeded.user.user_id,
+            idempotency_key="no-style-metadata-replay",
+        )
+        assert reused.job_id == job.job_id
+
+        with pytest.raises(TypeError, match="unexpected keyword argument 'style_id'"):
+            await video_generation.create_video_job(
+                None,
+                script_id=seeded.script.id,
+                episode_id=seeded.episode.episode_id,
+                shot_group_id=seeded.shot_group.shot_group_id,
+                user_id=seeded.user.user_id,
+                idempotency_key="legacy-style-argument",
+                style_id="legacy-style",
+            )
 
     asyncio.run(scenario())
 

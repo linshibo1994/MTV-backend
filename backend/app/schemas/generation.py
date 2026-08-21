@@ -40,6 +40,13 @@ ImagePrompt = Annotated[
         max_length=MAX_IMAGE_PROMPT_LENGTH,
     ),
 ]
+ImageNegativePrompt = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True,
+        max_length=MAX_IMAGE_PROMPT_LENGTH,
+    ),
+]
 
 
 class CreateJobIn(BaseModel):
@@ -49,14 +56,9 @@ class CreateJobIn(BaseModel):
 
     material_id: str = Field(..., description="画布项目 ID")
     subject_id: str = Field(..., description="关联主体 ID")
-    prompt: ImagePrompt | None = Field(
-        None,
-        description="客户端可编辑的最终生图提示词；缺省时兼容旧客户端并回退服务端 enrich",
-    )
-    style_id: str | None = Field(None, description="风格 ID")
-    art_style_id: str | None = Field(None, description="项目动态画风 ID，优先于 style_id")
-    visual_style: Literal["live_action", "anime"] | None = Field(
-        None, description="媒介维度；请求 > 主体 > 剧本 > 系统默认"
+    prompt: ImagePrompt = Field(..., description="客户端确认的最终生图提示词")
+    negative_prompt: ImageNegativePrompt = Field(
+        "", description="客户端确认的最终负向提示词；为空表示不附加负向约束"
     )
     model: ImageModelName = Field("qwen-image-2.0", description="生图模型")
     size: str = Field("2k", description="尺寸，如 2k")
@@ -68,8 +70,7 @@ class BatchCreateJobIn(BaseModel):
     """一键设计 N 批量生图入参（06 §3.5）。
 
     subject_ids 为空时自动选取该剧本下未设计(not_designed)且非声音的主体。
-    prompts 按 subject_id 分别覆盖最终生图提示词；缺失项兼容旧客户端并回退服务端 enrich。
-    style_ids 按 subject_id 覆盖兼容字段 style_id；显式 null 表示该主体不应用风格。
+    prompts 必须按 subject_id 提供每个目标主体的最终生图提示词。
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -78,17 +79,15 @@ class BatchCreateJobIn(BaseModel):
     subject_ids: list[str] | None = Field(
         None, description="显式指定的主体 ID 列表；为空则自动选取未设计主体"
     )
-    prompts: dict[str, ImagePrompt] | None = Field(
-        None,
-        description="每个主体的客户端可编辑最终生图提示词，键为 subject_id",
+    prompts: dict[str, ImagePrompt] = Field(
+        ...,
+        min_length=1,
+        description="每个主体的客户端确认最终生图提示词，键为 subject_id",
     )
-    style_id: str | None = Field(None, description="风格 ID")
-    style_ids: dict[str, str | None] | None = Field(
+    negative_prompts: dict[str, ImageNegativePrompt] | None = Field(
         None,
-        description="每个主体的风格 ID，键为 subject_id；单项优先于兼容字段 style_id",
+        description="每个主体的客户端确认负向提示词，键为 subject_id；缺失项为空",
     )
-    art_style_id: str | None = Field(None, description="项目动态画风 ID")
-    visual_style: Literal["live_action", "anime"] | None = None
     model: ImageModelName = Field("qwen-image-2.0", description="生图模型")
     size: str = Field("2k", description="尺寸，如 2k")
     aspect: str = Field("auto", description="比例；auto 按主体类型选择，或显式传入 16:9、3:4 等")

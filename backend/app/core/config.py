@@ -155,7 +155,6 @@ class Settings(BaseSettings):
     # 积分定价
     price_extract_per_episode: int = 10
     price_merge: int = 20
-    price_enrich_per_subject: int = 5
     price_image_gen: int = 30
     price_storyboard_per_episode: int = 50
     # 成功分镜的输入溯源批量校验默认关闭；开启后仅告警，不阻断恢复任务。
@@ -164,8 +163,6 @@ class Settings(BaseSettings):
     price_video_gen: int = 900
     # 剧本分集主体提取的模型并发上限，避免串行等待同时限制供应商压力。
     pipeline_extract_concurrency: int = Field(default=4, ge=1, le=16)
-    # 视觉主体增强的模型并发上限；可按供应商限流能力在部署环境中调整。
-    pipeline_enrich_concurrency: int = Field(default=6, ge=1, le=16)
     # 视频生成冻结量（doc 08 §2.4：reserved frozen=210、settle actual=784，冻结与实际分离）
     price_video_gen_frozen: int = 210
 

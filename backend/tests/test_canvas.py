@@ -24,11 +24,9 @@ from app.models.parent_subject import ParentSubject
 from app.models.script import Script
 from app.models.subject import Subject
 from app.schemas.materials import (
-    CHARACTER_SHEET_MARKER,
     CanvasDeltaIn,
     CanvasNodeOut,
     NodeUpsertIn,
-    build_subject_prompt,
 )
 
 
@@ -195,7 +193,32 @@ def test_task_node_data_round_trips_without_dropping_fields():
     ).upsert_nodes[0].data == data
 
 
-def test_node_schema_rejects_unknown_type_and_builds_prompt_from_subject_data():
+def test_image_upload_requires_frontend_prompt_even_with_complete_subject_metadata():
+    with pytest.raises(ValueError, match="节点缺少非空 prompt"):
+        NodeUpsertIn(
+            id="node-1",
+            type="imageUpload",
+            data={
+                "subjectId": "subject-1",
+                "subjectName": "主角",
+                "subjectType": "character",
+                "subjectDescription": "蓝色外套",
+                "model": "banana-2",
+            },
+        )
+
+
+def test_canvas_output_keeps_legacy_image_upload_node_readable_without_prompt():
+    node = CanvasNodeOut(
+        id="legacy-node-1",
+        type="imageUpload",
+        data={"title": "历史图片节点", "subjectId": "subject-1"},
+    )
+
+    assert node.data == {"title": "历史图片节点", "subjectId": "subject-1"}
+
+
+def test_node_schema_rejects_unknown_type_and_preserves_frontend_prompt():
     with pytest.raises(ValueError):
         NodeUpsertIn(id="node-1", type="untyped", data={"title": "x"})
 
@@ -209,6 +232,7 @@ def test_node_schema_rejects_unknown_type_and_builds_prompt_from_subject_data():
             "subjectName": "主角",
             "subjectType": "character",
             "subjectDescription": "蓝色外套",
+            "prompt": "前端提供的主角设计提示词",
             "model": "banana-2",
             "size": "2k",
             "aspect": "16:9",
@@ -224,33 +248,9 @@ def test_node_schema_rejects_unknown_type_and_builds_prompt_from_subject_data():
         },
     )
 
-    assert "主体名称：主角" in materials_crud.build_prompt_from_node_data(node.data)
+    assert node.data["prompt"] == "前端提供的主角设计提示词"
     assert node.data["imageOutputs"][0]["assetId"] == "image-1"
     assert node.data["imageOutputs"][0]["width"] == 1728
-
-
-def test_subject_design_prompt_uses_type_specific_detailed_templates():
-    character = build_subject_prompt(
-        "老农",
-        "character",
-        "老年男性，满脸皱纹，戴草帽，穿粗布衣，手拿烙饼",
-    )
-    scene = build_subject_prompt("旧院落", "scene", "二十世纪末中国北方农村院落")
-    prop = build_subject_prompt("烙饼", "prop", "表面焦黄、边缘不规则的手工烙饼")
-
-    assert CHARACTER_SHEET_MARKER in character
-    assert "左侧 33%" in character
-    assert "正面 0°、标准侧面 90°、背面 180°" in character
-    assert "orthographic projection" in character
-    assert "3:4" not in character
-    assert "剧情动作只作身份线索，不进入设定姿态" in character
-    assert "符合年龄、职业和经历的真实比例" in character
-    assert "【2 空间布局】" in scene
-    assert "单张 16:9 横版场景设定图" in scene
-    assert CHARACTER_SHEET_MARKER not in scene
-    assert "【5 多视图构图】" in prop
-    assert "人物、手部" in prop
-    assert "【2 面容与视线约束】" not in prop
 
 
 @pytest.mark.asyncio
@@ -327,6 +327,7 @@ def test_complete_image_node_data_round_trips_through_real_canvas_transaction():
             "subjectName": "主角",
             "subjectType": "character",
             "subjectDescription": "蓝色外套",
+            "prompt": "前端提交的主角设计提示词",
             "subjectEpisodeIds": ["episode-1"],
             "subjectEpisodeNos": [1],
             "subjectDesignStatus": "pending",
@@ -367,12 +368,12 @@ def test_complete_image_node_data_round_trips_through_real_canvas_transaction():
                     ],
                 ),
             )
-            assert saved.nodes[0].data == {**data, "prompt": materials_crud.build_prompt_from_node_data(data)}
+            assert saved.nodes[0].data == data
 
     asyncio.run(scenario())
 
 
-def test_image_upload_uses_persisted_subject_and_preserves_client_prompt():
+def test_image_upload_uses_persisted_subject_and_preserves_frontend_prompt_verbatim():
     async def scenario() -> None:
         engine = create_engine("sqlite+pysqlite:///:memory:")
         _canvas_tables(engine)
@@ -426,7 +427,7 @@ def test_image_upload_uses_persisted_subject_and_preserves_client_prompt():
             assert node_data["subjectName"] == "真实主角"
             assert node_data["subjectType"] == "character"
             assert node_data["subjectDescription"] == "真实描述"
-            assert node_data["prompt"] == "客户端编辑后的 prompt"
+            assert node_data["prompt"] == "  客户端编辑后的 prompt  "
 
     asyncio.run(scenario())
 
@@ -442,6 +443,7 @@ def test_image_upload_prompt_helper_failure_rolls_back_canvas_cas_and_node(monke
             "subjectName": "主角",
             "subjectType": "character",
             "subjectDescription": "蓝色外套",
+            "prompt": "前端提交的主角设计提示词",
             "model": "banana-2",
             "size": "2k",
             "aspect": "16:9",
@@ -950,7 +952,7 @@ def test_canvas_delta_http_maps_upsert_delete_and_edge_boundaries(monkeypatch):
     asyncio.run(scenario())
 
 
-def test_canvas_delta_http_rejects_missing_null_and_negative_version_without_mutation(monkeypatch):
+def test_canvas_delta_http_rejects_invalid_version_or_image_upload_prompt_without_mutation(monkeypatch):
     async def scenario() -> None:
         from app.api.v1 import materials as materials_api
 
@@ -1007,8 +1009,40 @@ def test_canvas_delta_http_rejects_missing_null_and_negative_version_without_mut
                         ],
                     },
                 )
+                missing_image_prompt = await client.post(
+                    "/materials/material-1/canvas/delta",
+                    json={
+                        "version": 0,
+                        "upsert_nodes": [
+                            {
+                                "id": "node-image-missing-prompt",
+                                "type": "imageUpload",
+                                "data": {"subjectId": "subject-1"},
+                            }
+                        ],
+                    },
+                )
+                blank_image_prompt = await client.post(
+                    "/materials/material-1/canvas/delta",
+                    json={
+                        "version": 0,
+                        "upsert_nodes": [
+                            {
+                                "id": "node-image-blank-prompt",
+                                "type": "imageUpload",
+                                "data": {"subjectId": "subject-1", "prompt": " \t "},
+                            }
+                        ],
+                    },
+                )
 
-            assert [missing.status_code, null.status_code, negative.status_code] == [422, 422, 422]
+            assert [
+                missing.status_code,
+                null.status_code,
+                negative.status_code,
+                missing_image_prompt.status_code,
+                blank_image_prompt.status_code,
+            ] == [422, 422, 422, 422, 422]
             assert raw.get(Materials, "material-1").version == 0
             assert raw.scalars(select(CanvasNode)).all() == []
 

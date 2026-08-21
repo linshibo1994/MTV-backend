@@ -1566,14 +1566,11 @@ def test_bailian_size_mapping_rejects_unsupported_tiers(
         _map_size(model, size, "3:4")
 
 
-def test_bailian_prompt_extension_preserves_structured_constraints() -> None:
+def test_bailian_disables_prompt_extension_for_all_client_prompts() -> None:
     from app.providers.image_gen_bailian import _should_extend_prompt
 
-    assert _should_extend_prompt("一只纸飞机") is True
-    assert (
-        _should_extend_prompt("主体事实：一只纸飞机\n\n【风格渲染约束】赛博朋克风格")
-        is False
-    )
+    assert _should_extend_prompt("一只纸飞机") is False
+    assert _should_extend_prompt("主体事实：一只纸飞机\n\n【风格渲染约束】赛博朋克风格") is False
     assert _should_extend_prompt("【视觉资产设定提示词】\n【人物设定图构图硬约束 v2】") is False
     assert _should_extend_prompt("【人物设定图构图硬约束】存量角色图") is False
 
@@ -1810,7 +1807,7 @@ async def test_neolink_image_provider_applies_generic_override_when_neolink_is_s
 
 
 @pytest.mark.asyncio
-async def test_bailian_qwen_image_2_uses_sync_multimodal_api(monkeypatch) -> None:
+async def test_bailian_qwen_image_2_passes_client_prompts_verbatim(monkeypatch) -> None:
     from app.providers import image_gen_bailian
     from app.providers.image_gen import ImageResult
     from app.providers.image_gen_bailian import BailianImageGenProvider
@@ -1863,24 +1860,25 @@ async def test_bailian_qwen_image_2_uses_sync_multimodal_api(monkeypatch) -> Non
     download = AsyncMock(return_value=ImageResult(data=b"image", mime_type="image/png"))
     monkeypatch.setattr(provider, "_download", download)
 
-    styled_prompt = "主体事实：一只纸飞机\n\n【风格渲染约束】赛博朋克风格"
+    client_prompt = "  客户端最终正向提示词  "
+    client_negative_prompt = "  客户端最终负向提示词  "
     result = await provider.generate(
-        styled_prompt,
+        client_prompt,
         "ignored",
         "2k",
         "1:1",
-        negative_prompt="写实摄影",
+        negative_prompt=client_negative_prompt,
     )
 
     assert result[0].data == b"image"
     assert calls["post"]["url"].endswith("/api/v1/services/aigc/multimodal-generation/generation")
     assert "X-DashScope-Async" not in calls["post"]["headers"]
     assert calls["post"]["json"]["input"]["messages"][0]["content"] == [
-        {"text": styled_prompt}
+        {"text": client_prompt}
     ]
     assert calls["post"]["json"]["parameters"]["size"] == "2048*2048"
     assert calls["post"]["json"]["parameters"]["prompt_extend"] is False
-    assert calls["post"]["json"]["parameters"]["negative_prompt"] == "写实摄影"
+    assert calls["post"]["json"]["parameters"]["negative_prompt"] == client_negative_prompt
     download.assert_awaited_once_with(
         "https://oss.aliyuncs.com/result.png",
         base_url="https://dashscope.example",
@@ -1888,7 +1886,7 @@ async def test_bailian_qwen_image_2_uses_sync_multimodal_api(monkeypatch) -> Non
 
 
 @pytest.mark.asyncio
-async def test_bailian_qwen_image_legacy_passes_negative_prompt(monkeypatch) -> None:
+async def test_bailian_qwen_image_legacy_passes_client_prompts_verbatim(monkeypatch) -> None:
     from app.providers import image_gen_bailian
     from app.providers.image_gen import ImageResult
     from app.providers.image_gen_bailian import BailianImageGenProvider
@@ -1936,20 +1934,21 @@ async def test_bailian_qwen_image_legacy_passes_negative_prompt(monkeypatch) -> 
         AsyncMock(return_value=ImageResult(data=b"image", mime_type="image/png")),
     )
 
-    styled_prompt = "主体事实：一只纸飞机\n\n【风格渲染约束】赛博朋克风格"
+    client_prompt = "  客户端最终正向提示词  "
+    client_negative_prompt = "  客户端最终负向提示词  "
     result = await provider.generate(
-        styled_prompt,
+        client_prompt,
         "ignored",
         "1k",
         "1:1",
-        negative_prompt="写实摄影",
+        negative_prompt=client_negative_prompt,
     )
 
     assert result[0].data == b"image"
     assert calls["post"]["url"].endswith("/api/v1/services/aigc/text2image/image-synthesis")
     assert calls["post"]["headers"]["X-DashScope-Async"] == "enable"
-    assert calls["post"]["json"]["input"]["prompt"] == styled_prompt
-    assert calls["post"]["json"]["input"]["negative_prompt"] == "写实摄影"
+    assert calls["post"]["json"]["input"]["prompt"] == client_prompt
+    assert calls["post"]["json"]["input"]["negative_prompt"] == client_negative_prompt
     assert calls["post"]["json"]["parameters"]["size"] == "1328*1328"
     assert calls["post"]["json"]["parameters"]["prompt_extend"] is False
 

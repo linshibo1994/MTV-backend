@@ -9,7 +9,6 @@ from fastapi import APIRouter
 
 from app.api.v1 import (
     analysis_jobs,
-    art_styles,
     asset_library,
     auth,
     credits,
@@ -17,7 +16,6 @@ from app.api.v1 import (
     materials,
     pipeline_runs,
     project_members,
-    prompt_styles,
     prompt_templates,
     runtime_models,
     scene_auditions,
@@ -60,9 +58,6 @@ api_router.include_router(shots.router, tags=["分镜"])
 api_router.include_router(video_generation.router, tags=["视频生成"])
 # 当前部署实际使用的模型配置（不暴露密钥和服务地址）。
 api_router.include_router(runtime_models.router, tags=["运行时配置"])
-# 提示词风格目录与优化（router 内部包含两个独立完整路径）。
-api_router.include_router(prompt_styles.router, tags=["提示词风格"])
-api_router.include_router(art_styles.router, tags=["项目画风"])
 api_router.include_router(prompt_templates.router, tags=["提示词模板"])
 api_router.include_router(subject_candidates.router, tags=["主体候选"])
 api_router.include_router(scene_auditions.router, tags=["导演方案"])

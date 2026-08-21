@@ -93,18 +93,15 @@ class SubjectCandidateResolveIn(BaseModel):
     action: Literal["link_existing", "create_subject", "ignore"]
     expected_version: int = Field(ge=1)
     subject_id: str | None = None
-    visual_style: Literal["live_action", "anime"] | None = None
 
     @model_validator(mode="after")
     def validate_action_payload(self) -> "SubjectCandidateResolveIn":
         if self.action == "link_existing":
             if not self.subject_id:
                 raise ValueError("关联已有主体时必须提供 subject_id")
-            if self.visual_style is not None:
-                raise ValueError("关联已有主体时不得提交 visual_style")
         elif self.action == "create_subject":
             if self.subject_id is not None:
                 raise ValueError("创建主体时不得提交 subject_id")
-        elif self.subject_id is not None or self.visual_style is not None:
+        elif self.subject_id is not None:
             raise ValueError("忽略候选时不得提交主体字段")
         return self

@@ -82,7 +82,6 @@ def _subject(
         is_active=True,
         episode_nos=[1],
         subject_version=4,
-        enrich_version=7,
         name_locked=False,
         description_locked=False,
     )
@@ -293,7 +292,7 @@ def test_merge_defaults_to_deterministic_baseline_without_model(monkeypatch) -> 
     asyncio.run(scenario())
 
 
-def test_merge_only_increments_enrich_version_when_prompt_input_changes() -> None:
+def test_merge_stages_only_subject_version_without_enrich_snapshot() -> None:
     subject = _subject("subject-1", "主角", "character", "红衣角色")
     db = _QuerySession([subject])
 
@@ -324,8 +323,10 @@ def test_merge_only_increments_enrich_version_when_prompt_input_changes() -> Non
                 }
             ],
         )
-        assert unchanged[0]["enrich_version"] == 7
-        assert changed[0]["enrich_version"] == 8
+        assert unchanged[0]["subject_version"] == 4
+        assert changed[0]["subject_version"] == 5
+        assert {"base_enrich_version", "enrich_version"}.isdisjoint(unchanged[0])
+        assert {"base_enrich_version", "enrich_version"}.isdisjoint(changed[0])
 
     asyncio.run(scenario())
 

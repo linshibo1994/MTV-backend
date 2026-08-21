@@ -55,11 +55,6 @@ from app.providers.video_gen import (
     get_video_provider,
 )
 from app.services import runtime_models
-from app.services.prompt_template import (
-    PromptTemplateSnapshot,
-    render_prompt_template_with_fallback,
-    resolve_prompt_template,
-)
 from app.services.reference_aggregator import aggregate_references
 from app.services.reference_image_audit import (
     audit_not_required_state,
@@ -113,7 +108,6 @@ async def create_video_job(
     user_id: str,
     idempotency_key: str | None = None,
     prompt: str | None = None,
-    style_id: str | None = None,
 ) -> "VideoGenerationJob":
     """创建视频生成任务 — 幂等去重 → 汇聚参考图/音频 → 落库 → reserve 积分 → 投递 worker。
 
@@ -125,7 +119,6 @@ async def create_video_job(
         user_id: 触发用户（积分扣减归属，按 user owner 维度账户）。
         idempotency_key: 可选幂等键（来自 Idempotency-Key 头）。
         prompt: 客户端显式视频提示词；缺省时回退镜头组 prompt。
-        style_id: 客户端选择的风格 ID，仅记录并参与幂等判断。
 
     Returns:
         VideoGenerationJob ORM 对象（重复创建时返回已存在任务）。
@@ -150,11 +143,9 @@ async def create_video_job(
         "episode_id": episode_id,
         "shot_group_id": shot_group_id,
     }
-    # 缺省时保持历史 hash 结构，兼容部署中的旧客户端和旧幂等绑定。
+    # 仅在客户端提供提示词时纳入哈希，缺省请求保持基础载荷结构。
     if client_prompt is not None:
         request_payload["prompt"] = client_prompt
-    if style_id is not None:
-        request_payload["style_id"] = style_id
     request_hash = _request_hash(request_payload)
 
     # 1. 幂等去重（doc 08 §4.2）
@@ -245,8 +236,6 @@ async def create_video_job(
             base_prompt,
         ):
             raise ConflictError("该镜头组已有使用不同提示词的生成任务，请等待完成或取消后重试")
-        if style_id is not None and active_input.get("style_id") != style_id:
-            raise ConflictError("该镜头组已有使用不同风格的生成任务，请等待完成或取消后重试")
         logger.info(
             "视频生成任务活动单元复用 job_id=%s unit_id=%s",
             active_job.job_id,
@@ -329,7 +318,6 @@ async def create_video_job(
             )
     boundary_fragments = _boundary_prompt_fragments(shot_group.reference_frames)
     prompt_text = append_boundary_facts(prompt_text, boundary_fragments)
-    prompt_text, constraint_snapshot = await _resolve_video_constraint_prompt(db, prompt_text)
     try:
         adapted = adapt_prompt(
             prompt_text,
@@ -341,8 +329,6 @@ async def create_video_job(
     adapted_prompt_hash = hashlib.sha256(adapted.text.encode("utf-8")).hexdigest()
 
     # 6. 构造 input_json 并落库任务
-    # prompt 兜底：约束锁9条属上游 enrich/分镜产物，video 模块仅透传；但上游漏写
-    # 时补齐，保证传入 provider 的 prompt 含约束段（doc06 §8.1）。
     input_json = {
         "model": model,
         # prompt 保持为 worker 实际提交文本；source_prompt 单独保留适配前快照，
@@ -363,8 +349,6 @@ async def create_video_job(
             "adapted_characters": adapted.adapted_characters,
             "adapted_prompt_sha256": adapted_prompt_hash,
         },
-        "constraint_prompt_template": constraint_snapshot.public_metadata(),
-        "style_id": style_id,
         "reference_images": aggregated.reference_images,
         "reference_image_names": aggregated.reference_image_names,
         "reference_image_refs": list(
@@ -1256,40 +1240,12 @@ async def _persist_first_frame(
     shot_group.reference_frames = ref_frames
 
 
-# 约束锁兜底文本（doc06 §8.1 原文）。上游 enrich/分镜已注入则透传，漏写时追加。
-_CONSTRAINT_LOCK_TEXT = (
-    "【约束】"
-    "人物特征高度一致，角色不脸崩、肢体不畸形，多镜头切镜丝滑平顺，画面质量4K稳定。"
-    "语音清晰，情感表达贴合角色性格，台词与唇形/动作精准对位。"
-    "禁止出现任何形式的字幕。"
-)
-_VIDEO_CONSTRAINT_TEMPLATE_KEY = "video.constraint_lock"
-
-
 def _prompt_contains_base(stored_prompt: object, base_prompt: str) -> bool:
     """兼容新旧任务判断显式提示词；不依赖当前 active 模板内容。"""
     if not isinstance(stored_prompt, str):
         return False
     normalized = base_prompt.strip()
     return stored_prompt == normalized or stored_prompt.startswith(f"{normalized}\n")
-
-
-async def _resolve_video_constraint_prompt(
-    db: AsyncSession,
-    prompt: str,
-) -> tuple[str, PromptTemplateSnapshot]:
-    """冻结本次使用的约束模板快照；查询或渲染失败均回退内置常量。"""
-    snapshot = await resolve_prompt_template(
-        db,
-        _VIDEO_CONSTRAINT_TEMPLATE_KEY,
-        fallback=_CONSTRAINT_LOCK_TEXT,
-    )
-    rendered_constraint, used_snapshot = render_prompt_template_with_fallback(
-        snapshot,
-        {},
-        fallback=_CONSTRAINT_LOCK_TEXT,
-    )
-    return _ensure_constraint_lock(prompt, constraint_text=rendered_constraint), used_snapshot
 
 
 def _freeze_reference_token_map(aggregated: Any) -> dict[str, dict[str, str | None]]:
@@ -1379,29 +1335,6 @@ async def _load_structured_video_prompt_context(
         }
         snapshots.append(snapshot)
     return camera_movement, snapshots
-
-
-def _ensure_constraint_lock(
-    prompt: str,
-    *,
-    constraint_text: str = _CONSTRAINT_LOCK_TEXT,
-) -> str:
-    """若 prompt 未含【约束】段则追加约束锁9条兜底文本（doc06 §8.1）。
-
-    video 模块仅透传上游 enrich 产出的 prompt；此处仅作上游漏写兜底，
-    不替代 enrich 阶段的 12 段落扩展（doc06 §12 LLM-3，属上游职责）。
-    """
-    if not prompt:
-        return constraint_text
-    if constraint_text in prompt:
-        return prompt
-    # 分镜模板和视频模板可能使用不同正文，但它们都以受控标题开始。
-    # 视频侧必须只有一个权威约束段：若上游已带旧/分镜约束，替换该尾段，
-    # 避免把第二个【约束】追加到真实 group.prompt。
-    heading_index = prompt.rfind("【约束】")
-    if heading_index >= 0:
-        return f"{prompt[:heading_index].rstrip()}\n{constraint_text}"
-    return f"{prompt}\n{constraint_text}"
 
 
 def _natural_group_number(group_no: str | None) -> int:

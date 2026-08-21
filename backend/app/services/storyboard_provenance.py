@@ -16,7 +16,9 @@ from app.models.storyboard_job import StoryboardJob
 from app.models.subject import Subject
 
 ProvenanceStatus = Literal["current", "stale", "legacy"]
-_PROVENANCE_SCHEMA = "storyboard.provenance.v2"
+# v3 删除了主体目录中的 enrich_version。保留 v2 原始快照并视为 legacy，
+# 避免依据新目录形状重算后将历史审计记录误报为 stale。
+_PROVENANCE_SCHEMA = "storyboard.provenance.v3"
 _PROMPT_WORKFLOW_SCHEMA = "storyboard.prompt-workflow.v1"
 _HASH_FIELDS = (
     "episode_script_sha256",
@@ -103,18 +105,11 @@ def canonical_subject_catalog(subjects: Sequence[Mapping[str, object]]) -> list[
             if type(raw_subject_version) is int and raw_subject_version >= 1
             else 1
         )
-        raw_enrich_version = subject.get("enrich_version")
-        enrich_version = (
-            raw_enrich_version
-            if type(raw_enrich_version) is int and raw_enrich_version >= 1
-            else 1
-        )
         catalog.append(
             {
                 "subject_id": subject_id,
                 "type": str(subject.get("type") or ""),
                 "subject_version": subject_version,
-                "enrich_version": enrich_version,
                 "is_active": bool(subject.get("is_active", True)),
                 "episode_nos": sorted(
                     int(item)
@@ -197,7 +192,7 @@ def compare_storyboard_provenance(
     stored: object,
     current: Mapping[str, object],
 ) -> ProvenanceReport:
-    """比较两个脱敏快照；v1 及更早任务标 legacy，差异仅称 stale。"""
+    """比较两个脱敏快照；非 v3 历史任务标 legacy，差异仅称 stale。"""
     if not isinstance(stored, Mapping) or stored.get("schema") != _PROVENANCE_SCHEMA:
         return ProvenanceReport(job_id=job_id, status="legacy")
     stored_templates = stored.get("prompt_templates")
