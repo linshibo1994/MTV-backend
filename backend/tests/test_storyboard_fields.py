@@ -90,6 +90,63 @@ def test_parse_storyboard_fields_reads_v2_composition_and_sound_design() -> None
     assert fields.sound_design == "环境音/动作音描述"
 
 
+def test_parse_storyboard_fields_reads_optional_dialogue_and_sound_segments() -> None:
+    from app.core.storyboard_fields import parse_storyboard_fields
+
+    line_without_dialogue = (
+        "【镜头1:0s～3s】场景是办公室，全景·平视，固定，"
+        "冷色顶光，阿明推门进入，紧张"
+    )
+    cases = (
+        (
+            f"{line_without_dialogue}，构图是【三分法、前景遮挡】，声音设计是【环境音】",
+            "三分法、前景遮挡",
+            "环境音",
+            None,
+            None,
+        ),
+        (
+            f"{line_without_dialogue}，声音设计是【环境音】",
+            None,
+            "环境音",
+            None,
+            None,
+        ),
+        (
+            f"{line_without_dialogue}，构图是【三分法】",
+            "三分法",
+            None,
+            None,
+            None,
+        ),
+        (
+            f"{_SHOT_LINE}，构图是【三分法】，声音设计是【环境音】，台词类型是【dialogue】",
+            "三分法",
+            "环境音",
+            "我们谈谈",
+            "dialogue",
+        ),
+    )
+
+    for shot_line, composition, sound_design, dialogue_text, dialogue_kind in cases:
+        fields = parse_storyboard_fields(
+            _DESCRIPTION,
+            shot_line,
+            display_no=1,
+            start_seconds=0,
+            end_seconds=3,
+        )
+
+        assert fields.scene == "办公室"
+        assert fields.camera_movement == "固定"
+        assert fields.action == "推门进入"
+        assert fields.emotion == "紧张"
+        assert fields.composition == composition
+        assert fields.sound_design == sound_design
+        assert fields.dialogue_text == dialogue_text
+        assert fields.dialogue_kind == dialogue_kind
+
+
 def test_parse_storyboard_fields_preserves_multiline_dialogue_and_rejects_unknown_kind() -> None:
     from app.core.storyboard_fields import parse_storyboard_fields
 

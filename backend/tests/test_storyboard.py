@@ -245,6 +245,241 @@ def test_storyboard_v2_contract_renders_legacy_fields_deterministically() -> Non
     assert fields.sound_design == "门轴轻响，室内环境声短暂停顿"
 
 
+def test_storyboard_v2_render_cleans_absent_content_from_legacy_shot_template() -> None:
+    """已激活的旧模板也不能让空字段重新污染组合 Prompt。"""
+    from app.schemas.storyboard_contracts import validate_storyboard_v2_contract
+    from app.services import storyboard as storyboard_service
+    from app.services.prompt_template import fallback_snapshot
+
+    payload = _valid_storyboard_v2_payload()
+    raw_shot = payload["scenes"][0]["shot_groups"][0]["shots"][1]
+    raw_shot["visual"].update(
+        lighting="冷色顶光。",
+        action="小林停下工作并抬头。",
+        emotion="迟疑，",
+    )
+    references = _subject_references()
+    contract = validate_storyboard_v2_contract(
+        payload,
+        {ref: item.subject_type for ref, item in references.items()},
+    )
+    legacy_template = fallback_snapshot(
+        "storyboard.shot",
+        (
+            "【镜头{{ n }}:{{ start }}s～{{ end }}s】场景是{{ scene }}，"
+            "{{ shot_scale }}·{{ camera }}，{{ camera_movement }}，"
+            "{{ lighting }}，{{ action }}，{{ emotion }}，{{ characters }}:{{ dialogue }}，"
+            "构图是【{{ composition }}】，声音设计是【{{ sound_design }}】，"
+            "台词类型是【{{ dialogue_kind }}】"
+        ),
+    )
+
+    rendered = storyboard_service._render_v2_contract(
+        contract,
+        subject_reference_names={ref: item.name for ref, item in references.items()},
+        shot_template=legacy_template,
+    )
+    shot_line = rendered.scenes[0].shot_groups[0].shots[1].shot_line
+
+    assert "声音设计" not in shot_line
+    assert "台词类型" not in shot_line
+    assert "环境与场景" not in shot_line
+    assert all(token not in shot_line for token in ("。，", "，。", "，，", ":，"))
+
+
+def test_storyboard_v2_render_cleans_newline_legacy_optional_fields() -> None:
+    """自定义旧模板即使用换行分隔尾部字段，也不能泄漏内部类型。"""
+    from app.schemas.storyboard_contracts import validate_storyboard_v2_contract
+    from app.services import storyboard as storyboard_service
+    from app.services.prompt_template import fallback_snapshot
+
+    payload = _valid_storyboard_v2_payload()
+    raw_shot = payload["scenes"][0]["shot_groups"][0]["shots"][1]
+    raw_shot["sound_design"] = "无"
+    references = _subject_references()
+    contract = validate_storyboard_v2_contract(
+        payload,
+        {ref: item.subject_type for ref, item in references.items()},
+    )
+    legacy_template = fallback_snapshot(
+        "storyboard.shot",
+        (
+            "【镜头{{ n }}:{{ start }}s～{{ end }}s】场景是{{ scene }}，"
+            "{{ shot_scale }}·{{ camera }}，{{ camera_movement }}，"
+            "{{ lighting }}，{{ action }}，{{ emotion }}，{{ characters }}:{{ dialogue }}\n"
+            "构图是【{{ composition }}】\n"
+            "声音设计是【{{ sound_design }}】\n"
+            "台词类型是【{{ dialogue_kind }}】"
+        ),
+    )
+
+    rendered = storyboard_service._render_v2_contract(
+        contract,
+        subject_reference_names={ref: item.name for ref, item in references.items()},
+        shot_template=legacy_template,
+    )
+    shot_line = rendered.scenes[0].shot_groups[0].shots[1].shot_line
+
+    assert "环境与场景：" not in shot_line
+    assert "声音设计是" not in shot_line
+    assert "台词类型是" not in shot_line
+    assert all(kind not in shot_line for kind in ("dialogue", "voice_over", "inner_monologue", "none"))
+
+
+def test_storyboard_v2_render_cleans_legacy_optional_fields_without_composition() -> None:
+    """旧自定义模板即使省略构图字段，也不能泄漏展示层内部枚举。"""
+    from app.schemas.storyboard_contracts import validate_storyboard_v2_contract
+    from app.services import storyboard as storyboard_service
+    from app.services.prompt_template import fallback_snapshot
+
+    payload = _valid_storyboard_v2_payload()
+    raw_shot = payload["scenes"][0]["shot_groups"][0]["shots"][1]
+    raw_shot["sound_design"] = "无"
+    references = _subject_references()
+    contract = validate_storyboard_v2_contract(
+        payload,
+        {ref: item.subject_type for ref, item in references.items()},
+    )
+    legacy_template = fallback_snapshot(
+        "storyboard.shot",
+        (
+            "【镜头{{ n }}:{{ start }}s～{{ end }}s】场景是{{ scene }}，"
+            "{{ shot_scale }}·{{ camera }}，{{ camera_movement }}，"
+            "{{ lighting }}，{{ action }}，{{ emotion }}，{{ characters }}:{{ dialogue }}\n"
+            "声音设计是【{{ sound_design }}】\n"
+            "台词类型是【{{ dialogue_kind }}】"
+        ),
+    )
+
+    rendered = storyboard_service._render_v2_contract(
+        contract,
+        subject_reference_names={ref: item.name for ref, item in references.items()},
+        shot_template=legacy_template,
+    )
+    shot_line = rendered.scenes[0].shot_groups[0].shots[1].shot_line
+
+    assert "环境与场景：" not in shot_line
+    assert "声音设计是" not in shot_line
+    assert "台词类型是" not in shot_line
+    assert all(kind not in shot_line for kind in ("dialogue", "voice_over", "inner_monologue", "none"))
+
+
+def test_storyboard_v2_render_preserves_dialogue_with_label_like_text_in_no_composition_template() -> None:
+    """无构图旧模板清理尾段时仍要保留真实台词中的同形文字。"""
+    from app.schemas.storyboard_contracts import validate_storyboard_v2_contract
+    from app.services import storyboard as storyboard_service
+    from app.services.prompt_template import fallback_snapshot
+
+    dialogue = "先听，声音设计是【无】不是这次的问题。"
+    payload = _valid_storyboard_v2_payload()
+    raw_shot = payload["scenes"][0]["shot_groups"][0]["shots"][0]
+    raw_shot["dialogue"] = {"speaker_ref": "C01", "text": dialogue, "kind": "dialogue"}
+    raw_shot["sound_design"] = "无"
+    references = _subject_references()
+    contract = validate_storyboard_v2_contract(
+        payload,
+        {ref: item.subject_type for ref, item in references.items()},
+    )
+    legacy_template = fallback_snapshot(
+        "storyboard.shot",
+        (
+            "【镜头{{ n }}:{{ start }}s～{{ end }}s】场景是{{ scene }}，"
+            "{{ shot_scale }}·{{ camera }}，{{ camera_movement }}，"
+            "{{ lighting }}，{{ action }}，{{ emotion }}，{{ characters }}:{{ dialogue }}\n"
+            "声音设计是【{{ sound_design }}】\n"
+            "台词类型是【{{ dialogue_kind }}】"
+        ),
+    )
+
+    rendered = storyboard_service._render_v2_contract(
+        contract,
+        subject_reference_names={ref: item.name for ref, item in references.items()},
+        shot_template=legacy_template,
+    )
+    shot_line = rendered.scenes[0].shot_groups[0].shots[0].shot_line
+
+    assert f"阿明:{dialogue}" in shot_line
+    assert shot_line.count("声音设计是【无】") == 1
+    assert "台词类型是" not in shot_line
+
+
+@pytest.mark.parametrize("sound_design", ["无", "", "无。", "none。", "无音效。"])
+def test_storyboard_v2_render_omits_absent_optional_content_and_normalizes_punctuation(
+    sound_design: str,
+) -> None:
+    """无台词或无声音时不保留占位字段，字段末尾标点不能污染镜头分隔符。"""
+    from app.schemas.storyboard_contracts import validate_storyboard_v2_contract
+    from app.services import storyboard as storyboard_service
+
+    payload = _valid_storyboard_v2_payload()
+    raw_shot = payload["scenes"][0]["shot_groups"][0]["shots"][1]
+    raw_shot["character_refs"] = []
+    raw_shot["visual"].update(
+        lighting="冷色顶光。",
+        action="小林停下工作并抬头。，",
+        emotion="迟疑，",
+    )
+    references = _subject_references()
+    contract = validate_storyboard_v2_contract(
+        payload,
+        {ref: item.subject_type for ref, item in references.items()},
+    )
+    contract_shot = contract.scenes[0].shot_groups[0].shots[1]
+    # 空字符串不符合入站契约，但渲染层仍须把它作为无声音处理，避免历史数据污染输出。
+    contract_shot.sound_design = sound_design
+
+    rendered = storyboard_service._render_v2_contract(
+        contract,
+        subject_reference_names={ref: item.name for ref, item in references.items()},
+    )
+    shot_line = rendered.scenes[0].shot_groups[0].shots[1].shot_line
+
+    assert "台词类型" not in shot_line
+    assert "none" not in shot_line
+    assert "声音设计" not in shot_line
+    assert shot_line.count(":") == 1
+    assert all(token not in shot_line for token in ("。，", "，。", "，，", ":，"))
+
+
+@pytest.mark.parametrize(
+    ("dialogue_kind", "dialogue_text"),
+    [
+        ("dialogue", "技术迭代一天都不能停"),
+        ("voice_over", "深夜的办公楼依旧灯火通明"),
+        ("inner_monologue", "我还不能停下来"),
+    ],
+)
+def test_storyboard_v2_render_hides_internal_dialogue_kind(
+    dialogue_kind: str,
+    dialogue_text: str,
+) -> None:
+    """镜头组合提示只保留中文说话人和台词，不泄漏内部枚举。"""
+    from app.schemas.storyboard_contracts import validate_storyboard_v2_contract
+    from app.services import storyboard as storyboard_service
+
+    payload = _valid_storyboard_v2_payload()
+    payload["scenes"][0]["shot_groups"][0]["shots"][0]["dialogue"] = {
+        "speaker_ref": "C01",
+        "text": dialogue_text,
+        "kind": dialogue_kind,
+    }
+    references = _subject_references()
+    contract = validate_storyboard_v2_contract(
+        payload,
+        {ref: item.subject_type for ref, item in references.items()},
+    )
+
+    rendered = storyboard_service._render_v2_contract(
+        contract,
+        subject_reference_names={ref: item.name for ref, item in references.items()},
+    )
+    shot_line = rendered.scenes[0].shot_groups[0].shots[0].shot_line
+
+    assert f"阿明：{dialogue_text}" in shot_line
+    assert "台词类型" not in shot_line
+    assert all(kind not in shot_line for kind in ("dialogue", "voice_over", "inner_monologue"))
+
+
 def test_storyboard_v2_contract_accepts_single_shot_video_unit() -> None:
     """定场、反应和转场允许作为单镜头 3 秒视频单元落库。"""
     from app.services import storyboard as storyboard_service
@@ -296,7 +531,7 @@ def test_storyboard_v2_continuity_diagnostic_has_safe_rule_code_and_path() -> No
     }
 
 
-def test_storyboard_v2_voice_over_without_speaker_preserves_kind_and_multiline_text() -> None:
+def test_storyboard_v2_voice_over_without_speaker_preserves_multiline_text_without_rendering_kind() -> None:
     from app.core.storyboard_fields import parse_storyboard_fields
     from app.services import storyboard as storyboard_service
 
@@ -327,7 +562,7 @@ def test_storyboard_v2_voice_over_without_speaker_preserves_kind_and_multiline_t
         end_seconds=shot.end_seconds,
     )
     assert fields.dialogue_text == "第一句旁白\n第二句旁白"
-    assert fields.dialogue_kind == "voice_over"
+    assert fields.dialogue_kind is None
 
 
 @pytest.mark.parametrize(

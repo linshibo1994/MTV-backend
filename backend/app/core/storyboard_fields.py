@@ -21,7 +21,7 @@ _DESCRIPTION_PATTERN = re.compile(
 )
 
 # v2 可在末尾追加构图、声音设计与台词类型标记。台词捕获使用非贪婪匹配，
-# 确保可选标记不被误并入 dialogue_text；v1 的无标记行仍完全兼容。
+# 确保可选标记不被误并入 dialogue_text；无台词镜头会整体省略“角色:台词”段。
 _SHOT_LINE_PATTERN = re.compile(
     r"^【镜头(?P<display_no>\d+):(?P<start_seconds>\d+)s～(?P<end_seconds>\d+)s】"
     r"场景是(?P<scene>[^，]+)，"
@@ -29,9 +29,8 @@ _SHOT_LINE_PATTERN = re.compile(
     r"(?P<camera_movement>[^，]+)，"
     r"(?P<lighting>[^，]+)，"
     r"(?P<action>[^，]+)，"
-    r"(?P<emotion>[^，]+)，"
-    r"(?P<characters>[^:：，]+)[:：]"
-    r"(?P<dialogue_text>.*?)"
+    r"(?P<emotion>[^，]+)"
+    r"(?:，(?P<characters>[^:：，]+)[:：](?P<dialogue_text>.*?))?"
     r"(?:，构图是【(?P<composition>[^】]+)】)?"
     r"(?:，声音设计是【(?P<sound_design>[^】]+)】)?"
     r"(?:，台词类型是【(?P<dialogue_kind>[^】]+)】)?$",
@@ -93,7 +92,6 @@ def _match_shot_line(
         "lighting",
         "action",
         "emotion",
-        "characters",
     )
     values = {name: _clean(match[name]) for name in required_names}
     if any(value is None for value in values.values()):

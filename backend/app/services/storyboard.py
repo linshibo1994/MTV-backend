@@ -167,9 +167,31 @@ DESCRIPTION_TEMPLATE = (
 SHOT_LINE_TEMPLATE = (
     "【镜头{n}:{start}s～{end}s】场景是{scene}，"
     "{shot_scale}·{camera}，{camera_movement}，"
-    "{lighting}，{action}，{emotion}，{characters}:{dialogue}，"
-    "构图是【{composition}】，声音设计是【{sound_design}】，"
-    "台词类型是【{dialogue_kind}】"
+    "{lighting}，{action}，{emotion}{dialogue_segment}，"
+    "构图是【{composition}】{sound_design_segment}"
+)
+
+_EMPTY_SOUND_DESIGN_VALUES = frozenset(
+    {"", "none", "null", "nil", "n/a", "无", "暂无", "无声", "无声音", "无音效"}
+)
+_SHOT_LINE_TRAILING_PUNCTUATION_RE = re.compile(r"[\s，,。．.;；、:：]+$")
+_SHOT_LINE_OPTIONAL_TAIL_START_RE = re.compile(
+    r"(?P<delimiter>[，,]|\s+)(?P<label>构图是|声音设计是|台词类型是)【"
+)
+_SHOT_LINE_LABELED_FIELD_RE = re.compile(
+    r"(?P<delimiter>[，,]|\s+)\s*(?P<label>声音设计是|台词类型是)【(?P<value>[^】]*)】"
+)
+_SHOT_LINE_EMPTY_DIALOGUE_SEGMENT_RE = re.compile(
+    r"[，,]\s*(?P<character>[^，,:：\n]+)[:：](?=(?:[，,]|\s)+|$)"
+)
+_SHOT_LINE_DIALOGUE_CONTENT_RE = re.compile(
+    r"[，,]\s*[^，,:：\n]+[:：]\s*(?!声音设计是【|台词类型是【|构图是【)[^，,\s][\s\S]*$"
+)
+_SHOT_LINE_LABELED_TRAILING_PUNCTUATION_RE = re.compile(
+    r"(?P<field>(?:构图是|声音设计是|台词类型是)【[^】]*?)[，,。．.;；、]+】"
+)
+_SHOT_LINE_TRAILING_OPTIONAL_FIELD_RE = re.compile(
+    r"(?P<delimiter>[，,]|\s+)(?P<label>构图是|声音设计是|台词类型是)【(?P<value>[^】]*)】\s*$"
 )
 
 _STORYBOARD_SYSTEM_TEMPLATE_KEY = "storyboard.system"
@@ -243,9 +265,8 @@ _DESCRIPTION_TEMPLATE_FALLBACK = (
 _SHOT_TEMPLATE_FALLBACK = (
     "【镜头{{ n }}:{{ start }}s～{{ end }}s】场景是{{ scene }}，"
     "{{ shot_scale }}·{{ camera }}，{{ camera_movement }}，"
-    "{{ lighting }}，{{ action }}，{{ emotion }}，{{ characters }}:{{ dialogue }}，"
-    "构图是【{{ composition }}】，声音设计是【{{ sound_design }}】，"
-    "台词类型是【{{ dialogue_kind }}】"
+    "{{ lighting }}，{{ action }}，{{ emotion }}{{ dialogue_segment }}，"
+    "构图是【{{ composition }}】{{ sound_design_segment }}"
 )
 _GROUP_TEMPLATE_FALLBACK = (
     "{{ shot_lines }}\n【角色】{{ referenced_names }}\n"
@@ -750,7 +771,11 @@ async def _resolve_storyboard_prompt_context(
             "dialogue": "台词",
             "composition": "三分法",
             "sound_design": "环境音",
-            "dialogue_kind": "dialogue",
+            "dialogue_kind": "",
+            "dialogue_segment": "，角色：台词",
+            "sound_design_segment": "，声音设计是【环境音】",
+            # 为已保存的旧模板保留变量，但不再向最终 Prompt 输出内部类型。
+            "dialogue_kind_segment": "",
         },
         fallback=_SHOT_TEMPLATE_FALLBACK,
     )
@@ -1268,9 +1293,137 @@ def _safe_template_text(value: str) -> str:
     return value.strip().replace("【", "〔").replace("】", "〕")
 
 
+def _strip_shot_line_trailing_punctuation(value: str) -> str:
+    """移除结构字段末尾会与模板分隔符重复的标点。"""
+
+    return _SHOT_LINE_TRAILING_PUNCTUATION_RE.sub("", value.strip())
+
+
 def _safe_shot_line_text(value: str) -> str:
     """单行字段使用顿号分隔内部短语，保留模板逗号作为结构边界。"""
-    return _safe_template_text(value).replace("，", "、").replace("\n", " ")
+
+    return _strip_shot_line_trailing_punctuation(
+        _safe_template_text(value).replace("，", "、").replace("\n", " ")
+    )
+
+
+def _safe_optional_shot_line_text(value: str) -> str:
+    """清理可选字段的边界标点，同时保留字段内部的声音节奏描述。"""
+
+    return _strip_shot_line_trailing_punctuation(
+        _safe_template_text(value).replace("\n", " ")
+    )
+
+
+def _is_absent_sound_design(value: object) -> bool:
+    """判断声音字段是否只是 Provider 的无值占位，而非实际声音描述。"""
+
+    return (
+        not isinstance(value, str)
+        or _strip_shot_line_trailing_punctuation(value).casefold() in _EMPTY_SOUND_DESIGN_VALUES
+    )
+
+
+def _is_empty_optional_value(value: str) -> bool:
+    """统一识别历史模板中无内容的可选字段占位。"""
+
+    return _strip_shot_line_trailing_punctuation(value).casefold() in _EMPTY_SOUND_DESIGN_VALUES
+
+
+def _trailing_optional_tail_start(text: str) -> int | None:
+    """返回连续镜头尾部字段的起点，避免把台词中间的同形短语当作字段。"""
+
+    remaining = text.rstrip()
+    tail_start: int | None = None
+    labels: list[str] = []
+    while match := _SHOT_LINE_TRAILING_OPTIONAL_FIELD_RE.search(remaining):
+        tail_start = match.start()
+        labels.append(match.group("label"))
+        remaining = remaining[:match.start()].rstrip()
+
+    if "构图是" in labels or "台词类型是" in labels:
+        return tail_start
+    return None
+
+
+def _normalize_shot_line_optional_content(
+    shot_line: str,
+    *,
+    has_dialogue: bool | None = None,
+    has_sound_design: bool | None = None,
+    dialogue_text: str | None = None,
+) -> str:
+    """清理镜头行的空可选字段和字段边界的重复标点。
+
+    新模板通过可选片段直接避免空字段；这里仍需兼容已经存储的旧模板文本，
+    以便镜头组合并、时长重排后不会再次把 ``none`` 或悬空标点带入视频 Prompt。
+    """
+
+    text = shot_line.strip()
+    empty_dialogue = has_dialogue is False
+
+    # 优先从构图开始识别结构化尾段；自定义旧模板省略构图时，使用调用方已知的
+    # 台词边界或“无台词”事实定位尾段，避免误删真实台词中的同形文字。
+    tail_starts = list(_SHOT_LINE_OPTIONAL_TAIL_START_RE.finditer(text))
+    composition_tail_starts = [match for match in tail_starts if match.group("label") == "构图是"]
+    trailing_optional_tail_start = _trailing_optional_tail_start(text)
+    optional_tail_start: int | None = None
+    if composition_tail_starts:
+        optional_tail_start = composition_tail_starts[-1].start()
+    elif has_dialogue is False:
+        optional_tail_start = tail_starts[0].start() if tail_starts else None
+    elif dialogue_text:
+        dialogue_end = text.rfind(dialogue_text)
+        if dialogue_end >= 0:
+            dialogue_end += len(dialogue_text)
+            trailing_fields = [match for match in tail_starts if match.start() >= dialogue_end]
+            optional_tail_start = trailing_fields[0].start() if trailing_fields else None
+    elif trailing_optional_tail_start is not None:
+        optional_tail_start = trailing_optional_tail_start
+    elif has_dialogue is None and not _SHOT_LINE_DIALOGUE_CONTENT_RE.search(text):
+        optional_tail_start = tail_starts[0].start() if tail_starts else None
+
+    if optional_tail_start is not None:
+        dialogue_prefix = text[:optional_tail_start]
+        optional_tail = text[optional_tail_start:]
+    else:
+        dialogue_prefix = text
+        optional_tail = ""
+
+    def replace_labeled_field(match: re.Match[str]) -> str:
+        label = match.group("label")
+        value = match.group("value")
+        if label == "台词类型是":
+            return ""
+        if label != "声音设计是":
+            return match.group(0)
+        should_remove = (
+            has_sound_design is False
+            or (has_sound_design is None and _is_empty_optional_value(value))
+        )
+        if should_remove:
+            return ""
+        return match.group(0)
+
+    optional_tail = _SHOT_LINE_LABELED_FIELD_RE.sub(replace_labeled_field, optional_tail)
+    if has_dialogue is None:
+        empty_dialogue = not _SHOT_LINE_DIALOGUE_CONTENT_RE.search(dialogue_prefix)
+    if empty_dialogue:
+        dialogue_prefix = _SHOT_LINE_EMPTY_DIALOGUE_SEGMENT_RE.sub("", dialogue_prefix)
+
+    # 标签内的句末标点与闭合括号相邻时属于格式噪声，而非声音正文的一部分。
+    optional_tail = _SHOT_LINE_LABELED_TRAILING_PUNCTUATION_RE.sub(r"\g<field>】", optional_tail)
+    optional_tail = re.sub(r"[，,]\s*[，,]+", "，", optional_tail)
+    text = dialogue_prefix + optional_tail
+    if empty_dialogue:
+        # 无台词时不存在需要保真的台词正文，可安全修正历史空字段周围的连写标点。
+        text = re.sub(r"[。．]\s*[，,]", "，", text)
+        text = re.sub(r"[，,]\s*[。．]", "，", text)
+        text = re.sub(r"[。．]\s*】", "", text)
+        text = re.sub(r"[:：]\s*[，,]", "，", text)
+        text = re.sub(r"[，,]\s*[，,]+", "，", text)
+        return text.rstrip("，, ")
+    return text
 
 
 def _render_v2_contract(
@@ -1294,18 +1447,30 @@ def _render_v2_contract(
                 sounds = [subject_reference_names[ref] for ref in shot.sound_refs]
                 dialogue_character = ""
                 dialogue_text = ""
-                dialogue_kind = "none"
                 if shot.dialogue is not None:
                     if shot.dialogue.speaker_ref is not None:
                         dialogue_character = subject_reference_names[shot.dialogue.speaker_ref]
                     dialogue_text = shot.dialogue.text.strip()
-                    dialogue_kind = shot.dialogue.kind
                 character_text = "、".join(characters) or "环境与场景"
                 action = _safe_template_text(visual.action)
                 frame_description = _safe_template_text(visual.frame_description)
                 lighting = _safe_template_text(visual.lighting)
                 emotion = _safe_template_text(visual.emotion)
                 narrative_purpose = _safe_template_text(shot.narrative_purpose)
+                sound_design = (
+                    ""
+                    if _is_absent_sound_design(shot.sound_design)
+                    else _safe_optional_shot_line_text(shot.sound_design)
+                )
+                has_dialogue = bool(dialogue_text)
+                has_sound_design = bool(sound_design)
+                dialogue_speaker = _safe_shot_line_text(dialogue_character or character_text)
+                dialogue_segment = (
+                    f"，{dialogue_speaker}：{dialogue_text}" if has_dialogue else ""
+                )
+                sound_design_segment = (
+                    f"，声音设计是【{sound_design}】" if has_sound_design else ""
+                )
                 description_variables = {
                     "background": _safe_template_text(background),
                     "camera": visual.camera_angle,
@@ -1335,13 +1500,23 @@ def _render_v2_contract(
                     "characters": _safe_shot_line_text(character_text),
                     "dialogue": dialogue_text,
                     "composition": "、".join(visual.composition),
-                    "sound_design": _safe_template_text(shot.sound_design),
-                    "dialogue_kind": dialogue_kind,
+                    "sound_design": sound_design,
+                    # 兼容旧模板的未声明变量；内部枚举绝不进入展示 Prompt。
+                    "dialogue_kind": "",
+                    "dialogue_segment": dialogue_segment,
+                    "sound_design_segment": sound_design_segment,
+                    "dialogue_kind_segment": "",
                 }
                 shot_line = (
                     render_prompt_template(shot_template, shot_variables)
                     if shot_template is not None
                     else SHOT_LINE_TEMPLATE.format(**shot_variables)
+                )
+                shot_line = _normalize_shot_line_optional_content(
+                    shot_line,
+                    has_dialogue=has_dialogue,
+                    has_sound_design=has_sound_design,
+                    dialogue_text=dialogue_text,
                 )
                 shots.append(
                     {

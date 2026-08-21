@@ -70,6 +70,131 @@ def test_partition_preserves_llm_narrative_boundaries() -> None:
     assert [sum(durations[shot.shot_id] for shot in group) for group in groups] == [5, 4]
 
 
+@pytest.mark.parametrize(
+    ("legacy_line", "expected"),
+    [
+        (
+            "【镜头9:18s～21s】场景是开放办公区。，冷白屏光，老姜抬手揉按太阳穴。，"
+            "疲惫，老姜:，构图是【中央构图】，声音设计是【无】，台词类型是【none】",
+            "【镜头2:3s～6s】场景是开放办公区，冷白屏光，老姜抬手揉按太阳穴，"
+            "疲惫，构图是【中央构图】",
+        ),
+        (
+            "【镜头9:18s～21s】场景是开放办公区，突发不安，环境与场景:，，"
+            "楼内空调低鸣。】，开放办公区灯光持续亮着。，构图是【三分法】，"
+            "声音设计是【none】，台词类型是【】",
+            "【镜头2:3s～6s】场景是开放办公区，突发不安，楼内空调低鸣，"
+            "开放办公区灯光持续亮着，构图是【三分法】",
+        ),
+        (
+            "【镜头9:18s～21s】场景是开放办公区，老姜:，构图是【三分法】，"
+            "声音设计是【】，台词类型是【 】",
+            "【镜头2:3s～6s】场景是开放办公区，构图是【三分法】",
+        ),
+    ],
+)
+def test_rewrite_shot_line_removes_absent_fields_and_normalizes_punctuation(
+    legacy_line: str,
+    expected: str,
+) -> None:
+    from app.services.shot_group_merge import _rewrite_shot_line
+
+    shot = SimpleNamespace(shot_line=legacy_line, content="兜底内容")
+
+    assert _rewrite_shot_line(shot, display_no=2, start=3, end=6) == expected
+
+
+@pytest.mark.parametrize("dialogue_kind", ["dialogue", "voice_over", "inner_monologue"])
+def test_rewrite_shot_line_keeps_actual_sound_and_dialogue_but_removes_legacy_dialogue_kind(
+    dialogue_kind: str,
+) -> None:
+    from app.services.shot_group_merge import _rewrite_shot_line
+
+    shot = SimpleNamespace(
+        shot_line=(
+            "【镜头9:18s～21s】老姜端起茶杯，老姜:“系统性变革到了深水区。”，"
+            "构图是【留白】，声音设计是【茶杯轻碰桌面的瓷声，办公室底噪持续】，"
+            f"台词类型是【{dialogue_kind}】"
+        ),
+        content="兜底内容",
+    )
+
+    rewritten = _rewrite_shot_line(shot, display_no=2, start=3, end=6)
+
+    assert rewritten == (
+        "【镜头2:3s～6s】老姜端起茶杯，老姜:“系统性变革到了深水区。”，"
+        "构图是【留白】，声音设计是【茶杯轻碰桌面的瓷声，办公室底噪持续】"
+    )
+    assert "台词类型是" not in rewritten
+    assert dialogue_kind not in rewritten
+
+
+@pytest.mark.parametrize(
+    "dialogue",
+    [
+        "先听，声音设计是【无】不是这次的问题。",
+        "我说，台词类型是【voice_over】不能删。",
+    ],
+)
+def test_rewrite_shot_line_does_not_treat_dialogue_text_as_optional_metadata(
+    dialogue: str,
+) -> None:
+    """历史清理只能处理镜头尾部字段，不能改写角色实际说出的内容。"""
+    from app.services.shot_group_merge import _rewrite_shot_line
+
+    shot = SimpleNamespace(
+        shot_line=(
+            f"【镜头9:18s～21s】老姜端起茶杯，老姜：{dialogue}，"
+            "构图是【留白】，声音设计是【无】，台词类型是【voice_over】"
+        ),
+        content="兜底内容",
+    )
+
+    rewritten = _rewrite_shot_line(shot, display_no=2, start=3, end=6)
+
+    assert rewritten == (
+        f"【镜头2:3s～6s】老姜端起茶杯，老姜：{dialogue}，构图是【留白】"
+    )
+
+
+def test_rewrite_shot_line_normalizes_absent_dialogue_without_role_segment() -> None:
+    """无“角色：”段的旧模板行也要清除字段边界的异常标点。"""
+    from app.services.shot_group_merge import _rewrite_shot_line
+
+    shot = SimpleNamespace(
+        shot_line=(
+            "【镜头9:18s～21s】场景是开放办公区。，冷白屏光，老姜抬手揉按太阳穴。，"
+            "疲惫，构图是【中央构图】，声音设计是【无】，台词类型是【none】"
+        ),
+        content="兜底内容",
+    )
+
+    assert _rewrite_shot_line(shot, display_no=2, start=3, end=6) == (
+        "【镜头2:3s～6s】场景是开放办公区，冷白屏光，老姜抬手揉按太阳穴，"
+        "疲惫，构图是【中央构图】"
+    )
+
+
+def test_rewrite_shot_line_removes_no_composition_metadata_after_real_dialogue() -> None:
+    """历史行没有构图字段时，也要仅清理真实台词后的连续元数据尾段。"""
+    from app.services.shot_group_merge import _rewrite_shot_line
+
+    shot = SimpleNamespace(
+        shot_line=(
+            "【镜头9:18s～21s】场景是开放办公区，近景·平视，固定，冷白屏光，"
+            "老姜端起茶杯，疲惫，老姜：别走\n"
+            "声音设计是【无】\n"
+            "台词类型是【voice_over】"
+        ),
+        content="兜底内容",
+    )
+
+    assert _rewrite_shot_line(shot, display_no=2, start=3, end=6) == (
+        "【镜头2:3s～6s】场景是开放办公区，近景·平视，固定，冷白屏光，"
+        "老姜端起茶杯，疲惫，老姜：别走"
+    )
+
+
 async def test_refresh_group_retimes_structure_and_rebuilds_quality() -> None:
     from app.services.shot_group_merge import _refresh_group
 

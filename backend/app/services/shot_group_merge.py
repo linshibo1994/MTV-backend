@@ -41,6 +41,7 @@ from app.services.storyboard import (
     _classify_reference_materials,
     _extract_audio_elements,
     _gen_shot_no,
+    _normalize_shot_line_optional_content,
     _SubjectReference,
 )
 from app.services.storyboard_quality import (
@@ -78,8 +79,10 @@ def _rewrite_shot_line(shot: Shot, display_no: int, start: int, end: int) -> str
     prefix = f"【镜头{display_no}:{start}s～{end}s】"
     original = shot.shot_line or ""
     if _SHOT_LINE_PREFIX.match(original):
-        return _SHOT_LINE_PREFIX.sub(prefix, original, count=1)
-    return f"{prefix}{original or shot.content}"
+        rewritten = _SHOT_LINE_PREFIX.sub(prefix, original, count=1)
+    else:
+        rewritten = f"{prefix}{original or shot.content}"
+    return _normalize_shot_line_optional_content(rewritten)
 
 
 def _ordered_unique(values: list[str]) -> list[str]:
