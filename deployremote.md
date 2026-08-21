@@ -67,13 +67,15 @@ git add -A && git commit -m "feat: xxx"
 4. 远端校验归档完整性 → 加载镜像 → 同步代码（不覆盖服务器 `.env`）
 5. 启动 PostgreSQL/Redis 并等待健康检查
 6. **停止旧 API/worker/beat**（避免迁移期并发写入）
-7. **自动执行数据库迁移**：`alembic upgrade head && python -m app.db.drift_repair` + `--check-only` 门禁
+7. **自动执行数据库迁移**：先受控回正已移除的错误 revision，再执行
+   `alembic upgrade head && python -m app.db.drift_repair` + `--check-only` 门禁
 8. 启动新 API/worker/beat → 健康检查 → 完成
 
 ### 迁移行为说明
 - 默认 `DEPLOY_RUN_MIGRATIONS=true`、`DEPLOY_ALLOW_DATABASE_MIGRATION=true`，**迁移自动执行**，无需手动选迁移文件。
-- 迁移含幂等漂移修复：补建线上 stamp 漂移导致的缺表/缺列/缺约束 + 回填 owner 成员，已一致时为 no-op。
-- 迁移**前**会 `pg_dump` 备份到服务器（`MTV_DB_BACKUP_DIR`，默认 postgres 数据目录同级 `backups/`）；设 `MTV_SKIP_DB_BACKUP=true` 可跳过。
+- 对已登记为错误 revision `e8a1f2b3c4d5` 的数据库，迁移容器只会将版本簿记回正到唯一基线 `d4b7e1c9a362`；未知或混合 revision 会拒绝自动处理，避免盲目 `stamp`。
+- 迁移含幂等漂移修复：补建线上 stamp 漂移导致的缺表/缺列/缺约束，清理已下线的动态画风表、旧列、旧模板和任务 JSON 快照，并回填 owner 成员；已一致时为 no-op。
+- 本远程脚本会要求确认数据库备份，但**不会自行执行 `pg_dump`**。这次迁移会删除已下线数据，执行 `deploy` 前必须先完成并验证服务器卷快照或逻辑备份；`DEPLOY_ALLOW_DATABASE_MIGRATION=true` 不是备份的替代。
 - **迁移失败时应用保持停止**（不拉起新代码在半迁移 schema 上跑），看日志排查后重新 `deploy`。
 
 ### 只构建不部署 / 复用镜像

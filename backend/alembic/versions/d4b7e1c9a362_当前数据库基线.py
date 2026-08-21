@@ -13,20 +13,22 @@ Create Date: 2026-08-13 16:34:15.031028
 - 已有线上数据库：曾被 stamp 到本基线 ``d4b7e1c9a362``，但 stamp 不执行 DDL，
   可能存在 schema 漂移（缺表/缺列）。``alembic upgrade head`` 因已盖章到 head 而
   no-op，漂移由 ``app.db.drift_repair`` 在 migrate 流程中幂等修复。
-- 后续 schema 变更：用 ``alembic revision`` 新建迁移文件追加到链尾
-  （down_revision 指向当前 head），保持标准 alembic 增量模式。
+- 后续 schema 变更：仅追加到本基线文件；已存在数据库不能重跑基线，必须由
+  ``app.db.drift_repair`` 在 migrate 流程中幂等收敛。
 
 downgrade 受保护：默认拒绝 DROP 全部业务表，避免 ``alembic downgrade base``
-造成灾难性数据丢失；确需重置 schema 时设置 ``MTV_ALLOW_BASELINE_DOWNGRADE=true``。
+造成灾难性数据丢失；确需重置 schema 时应按运维流程手动备份并重建。
 
 """
 
 import hashlib
+import json
 from collections.abc import Sequence
 
-from alembic import op
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
+
+from alembic import op
 
 revision: str = "d4b7e1c9a362"
 down_revision: str | None = None
@@ -156,13 +158,6 @@ Episode -> Scene（连续时空段落）-> Shot Group（3~15 秒叙事单元）-
         "4. 多镜头切镜丝滑平顺\n5. 画面质量4K稳定\n6. 语音清晰\n"
         "7. 情感表达贴合角色性格\n8. 台词与唇形/动作精准对位\n"
         "9. 禁止出现任何形式的字幕",
-        {},
-    ),
-    (
-        "video.constraint_lock",
-        "【约束】人物特征高度一致，角色不脸崩、肢体不畸形，多镜头切镜丝滑平顺，"
-        "画面质量4K稳定。语音清晰，情感表达贴合角色性格，台词与唇形/动作精准对位。"
-        "禁止出现任何形式的字幕。",
         {},
     ),
 )
@@ -314,7 +309,11 @@ def upgrade() -> None:
                 "version": 1,
                 "content": content,
                 "content_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
-                "variables_schema": variables,
+                # JSONB 默认不支持 Alembic 离线字面量渲染；这里是迁移内固定常量，
+                # 使用 inline_literal 使 ``alembic upgrade --sql`` 与在线迁移一致。
+                "variables_schema": op.inline_literal(
+                    json.dumps(variables, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                ),
                 "is_active": True,
                 "created_by_user_id": None,
             }
@@ -323,6 +322,7 @@ def upgrade() -> None:
                 start=1,
             )
         ],
+        multiinsert=False,
     )
 
     op.create_table('scripts',
@@ -331,8 +331,6 @@ def upgrade() -> None:
     sa.Column('owner_user_id', sa.String(length=36), nullable=False),
     sa.Column('org_id', sa.String(length=36), nullable=True),
     sa.Column('created_by_user_id', sa.String(length=36), nullable=False),
-    sa.Column('visual_style', sa.String(length=32), nullable=True),
-    sa.Column('unify_style', sa.Boolean(), server_default='true', nullable=False),
     sa.Column('id', sa.String(length=36), nullable=False),
     sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
     sa.Column('updated_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
@@ -378,35 +376,6 @@ def upgrade() -> None:
     sa.PrimaryKeyConstraint('id'),
     sa.UniqueConstraint('provider_key', 'job_type', name='uq_video_provider_key_job')
     )
-    op.create_table('art_styles',
-    sa.Column('script_id', sa.String(length=36), nullable=False),
-    sa.Column('name', sa.String(length=255), nullable=False),
-    sa.Column('prompt_zh', sa.Text(), nullable=False),
-    sa.Column('prompt_en', sa.Text(), nullable=False),
-    sa.Column('negative_prompt', sa.Text(), nullable=False),
-    sa.Column('visual_style', sa.String(length=32), nullable=True),
-    sa.Column('source_asset_ids', postgresql.JSONB(astext_type=sa.Text()), nullable=False),
-    sa.Column('source_hashes', postgresql.JSONB(astext_type=sa.Text()), nullable=False),
-    sa.Column('thumbnail_storage_key', sa.String(length=512), nullable=True),
-    sa.Column('extraction_provider', sa.String(length=64), nullable=True),
-    sa.Column('extraction_model', sa.String(length=255), nullable=True),
-    sa.Column('extraction_version', sa.Integer(), nullable=False),
-    sa.Column('is_active', sa.Boolean(), nullable=False),
-    sa.Column('created_by_user_id', sa.String(length=36), nullable=False),
-    sa.Column('updated_by_user_id', sa.String(length=36), nullable=False),
-    sa.Column('id', sa.String(length=36), nullable=False),
-    sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
-    sa.Column('updated_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
-    sa.CheckConstraint('extraction_version >= 1', name='ck_art_styles_extraction_version_positive'),
-    sa.ForeignKeyConstraint(['script_id'], ['scripts.id'], ondelete='CASCADE'),
-    sa.PrimaryKeyConstraint('id'),
-    sa.UniqueConstraint('script_id', 'name', name='uq_art_styles_script_name')
-    )
-    op.create_index(op.f('ix_art_styles_created_by_user_id'), 'art_styles', ['created_by_user_id'], unique=False)
-    op.create_index(op.f('ix_art_styles_is_active'), 'art_styles', ['is_active'], unique=False)
-    op.create_index('ix_art_styles_script_active', 'art_styles', ['script_id', 'is_active'], unique=False)
-    op.create_index(op.f('ix_art_styles_script_id'), 'art_styles', ['script_id'], unique=False)
-    op.create_index(op.f('ix_art_styles_updated_by_user_id'), 'art_styles', ['updated_by_user_id'], unique=False)
     op.create_table('credit_logs',
     sa.Column('account_id', sa.String(length=36), nullable=False),
     sa.Column('actor_user_id', sa.String(length=36), nullable=True),
@@ -526,50 +495,6 @@ def upgrade() -> None:
     sa.UniqueConstraint('script_id', 'stage', name='uq_pipeline_stages_script_stage')
     )
     op.create_index(op.f('ix_pipeline_stages_script_id'), 'pipeline_stages', ['script_id'], unique=False)
-    op.create_table('art_style_extraction_jobs',
-    sa.Column('script_id', sa.String(length=36), nullable=False),
-    sa.Column('actor_user_id', sa.String(length=36), nullable=False),
-    sa.Column('idempotency_key', sa.String(length=128), nullable=False),
-    sa.Column('request_hash', sa.String(length=64), nullable=False),
-    sa.Column('name', sa.String(length=255), nullable=False),
-    sa.Column('source_asset_ids', postgresql.JSONB(astext_type=sa.Text()), nullable=False),
-    sa.Column('source_hashes', postgresql.JSONB(astext_type=sa.Text()), nullable=False),
-    sa.Column('input_snapshot', postgresql.JSONB(astext_type=sa.Text()), nullable=False),
-    sa.Column('input_version_hash', sa.String(length=64), nullable=False),
-    sa.Column('status', sa.String(length=32), nullable=False),
-    sa.Column('attempt_count', sa.Integer(), server_default=sa.text('1'), nullable=False),
-    sa.Column('lease_owner', sa.String(length=128), nullable=True),
-    sa.Column('lease_token', sa.String(length=128), nullable=True),
-    sa.Column('leased_until', sa.DateTime(timezone=True), nullable=True),
-    sa.Column('heartbeat_at', sa.DateTime(timezone=True), nullable=True),
-    sa.Column('started_at', sa.DateTime(timezone=True), nullable=True),
-    sa.Column('finished_at', sa.DateTime(timezone=True), nullable=True),
-    sa.Column('error_code', sa.String(length=64), nullable=True),
-    sa.Column('error_message', sa.Text(), nullable=True),
-    sa.Column('extraction_provider', sa.String(length=64), nullable=True),
-    sa.Column('extraction_model', sa.String(length=255), nullable=True),
-    sa.Column('art_style_id', sa.String(length=36), nullable=True),
-    sa.Column('billing_mode', sa.String(length=32), server_default=sa.text("'unmetered'"), nullable=False),
-    sa.Column('id', sa.String(length=36), nullable=False),
-    sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
-    sa.Column('updated_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
-    sa.CheckConstraint("billing_mode = 'unmetered'", name='ck_art_style_extraction_jobs_unmetered'),
-    sa.CheckConstraint("status IN ('queued', 'running', 'succeeded', 'failed')", name='ck_art_style_extraction_jobs_status'),
-    sa.CheckConstraint('attempt_count >= 1', name='ck_art_style_extraction_jobs_attempt_positive'),
-    sa.ForeignKeyConstraint(['art_style_id'], ['art_styles.id'], ondelete='SET NULL'),
-    sa.ForeignKeyConstraint(['script_id'], ['scripts.id'], ondelete='CASCADE'),
-    sa.PrimaryKeyConstraint('id'),
-    sa.UniqueConstraint('script_id', 'actor_user_id', 'idempotency_key', name='uq_art_style_extraction_jobs_actor_idempotency')
-    )
-    op.create_index(op.f('ix_art_style_extraction_jobs_actor_user_id'), 'art_style_extraction_jobs', ['actor_user_id'], unique=False)
-    op.create_index(op.f('ix_art_style_extraction_jobs_art_style_id'), 'art_style_extraction_jobs', ['art_style_id'], unique=False)
-    op.create_index(op.f('ix_art_style_extraction_jobs_lease_owner'), 'art_style_extraction_jobs', ['lease_owner'], unique=False)
-    op.create_index(op.f('ix_art_style_extraction_jobs_lease_token'), 'art_style_extraction_jobs', ['lease_token'], unique=False)
-    op.create_index(op.f('ix_art_style_extraction_jobs_leased_until'), 'art_style_extraction_jobs', ['leased_until'], unique=False)
-    op.create_index(op.f('ix_art_style_extraction_jobs_script_id'), 'art_style_extraction_jobs', ['script_id'], unique=False)
-    op.create_index('ix_art_style_extraction_jobs_script_status', 'art_style_extraction_jobs', ['script_id', 'status'], unique=False)
-    op.create_index(op.f('ix_art_style_extraction_jobs_status'), 'art_style_extraction_jobs', ['status'], unique=False)
-    op.create_index('uq_art_style_extraction_jobs_active_name', 'art_style_extraction_jobs', ['script_id', 'name'], unique=True, postgresql_where=sa.text("status IN ('queued', 'running')"), sqlite_where=sa.text("status IN ('queued', 'running')"))
     op.create_table('canvas_nodes',
     sa.Column('id', sa.String(length=255), nullable=False),
     sa.Column('material_id', sa.String(length=36), nullable=False),
@@ -729,9 +654,7 @@ def upgrade() -> None:
     sa.Column('name', sa.String(length=255), nullable=False),
     sa.Column('pipeline_name', sa.String(length=255), nullable=False),
     sa.Column('description', sa.Text(), nullable=True),
-    sa.Column('visual_style', sa.String(length=32), nullable=True),
     sa.Column('subject_version', sa.Integer(), nullable=False),
-    sa.Column('enrich_version', sa.Integer(), nullable=False),
     sa.Column('name_locked', sa.Boolean(), nullable=False),
     sa.Column('description_locked', sa.Boolean(), nullable=False),
     sa.Column('is_child', sa.Boolean(), nullable=False),

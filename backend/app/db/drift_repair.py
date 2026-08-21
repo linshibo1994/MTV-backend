@@ -1,4 +1,4 @@
-"""幂等 schema 漂移修复与团队项目 owner 成员数据回填。
+"""幂等 schema 漂移修复、已下线对象清理与团队项目 owner 成员数据回填。
 
 背景
 ----
@@ -11,6 +11,8 @@
   两列及对应 CHECK 约束；
 - 团队项目 owner 成员数据修复迁移 ``f6c9a31e8b42`` 在 stamp 时未真正执行，
   部分团队项目可能缺少合法 owner 成员行。
+- 动态画风下线前已存在的 ``art_styles``、``art_style_extraction_jobs``、旧列和
+  生成任务 JSON 快照仍可能遗留在已盖章的数据库中。
 
 由于线上已被 stamp 到基线 ``d4b7e1c9a362``（= head），``alembic upgrade head``
 变为 no-op，无法修复上述漂移。本模块在 ``alembic upgrade head`` 之后幂等补齐，
@@ -19,7 +21,7 @@
 行为
 ----
 - **全新数据库**：``alembic upgrade head`` 已创建全部 schema，本模块全部 no-op。
-- **漂移数据库**：补建缺表 / 缺列 / 缺约束，回填 owner 成员。
+- **漂移数据库**：补建缺表 / 缺列 / 缺约束，清理已下线对象并回填 owner 成员。
 - **已修复数据库**：全部幂等 no-op，可安全地在每次部署时执行。
 
 CLI
@@ -28,6 +30,8 @@ CLI
 
     python -m app.db.drift_repair             # 执行幂等修复
     python -m app.db.drift_repair --check-only  # 仅检测，发现漂移则退出码 1
+    python -m app.db.drift_repair --normalize-alembic-revision
+                                               # 仅映射已知的错误 revision
 
 ``--check-only`` 用于部署门禁：在 ``alembic upgrade head`` 与修复之后运行，
 若仍有 schema 漂移或 owner 数据不一致，则阻断应用启动。
@@ -43,6 +47,7 @@ from sqlalchemy.engine import Connection
 
 from app.core.config import settings
 from app.models import Base  # noqa: F401  触发各模型注册到 Base.metadata
+from app.models.storage_reference_guard import STORAGE_REFERENCE_GUARD_BYPASS
 
 # ---------------------------------------------------------------------------
 # 已知漂移列：基线 create_table 已含这些列，但线上旧表（stamp 前已存在）
@@ -73,6 +78,131 @@ _KNOWN_DRIFT_CHECK_CONSTRAINTS: tuple[tuple[str, str, str], ...] = (
     ),
 )
 
+# ---------------------------------------------------------------------------
+# 动态画风与生成提示词模板已下线。基线文件只描述最终 schema；已存在且被 stamp
+# 到基线的数据库不会重跑基线 upgrade，因此必须在这里幂等收敛。
+# ---------------------------------------------------------------------------
+_RETIRED_ART_STYLE_TABLES = ("art_style_extraction_jobs", "art_styles")
+_RETIRED_ART_STYLE_COLUMNS = (
+    ("scripts", "visual_style"),
+    ("scripts", "unify_style"),
+    ("subjects", "visual_style"),
+    ("subjects", "enrich_version"),
+)
+_LEGACY_ALEMBIC_REVISION_REPLACEMENTS = {"e8a1f2b3c4d5": "d4b7e1c9a362"}
+
+
+@dataclass(frozen=True, slots=True)
+class _RetiredDataArtifact:
+    name: str
+    required_tables: frozenset[str]
+    exists_sql: str
+    cleanup_sql: str
+
+
+_RETIRED_ART_STYLE_DATA_ARTIFACTS: tuple[_RetiredDataArtifact, ...] = (
+    _RetiredDataArtifact(
+        name="task_dispatch_outbox.art_style.extract",
+        required_tables=frozenset({"task_dispatch_outbox"}),
+        exists_sql="SELECT EXISTS (SELECT 1 FROM task_dispatch_outbox WHERE task_type = 'art_style.extract')",
+        cleanup_sql="DELETE FROM task_dispatch_outbox WHERE task_type = 'art_style.extract'",
+    ),
+    _RetiredDataArtifact(
+        name="prompt_templates.video.constraint_lock",
+        required_tables=frozenset({"prompt_templates"}),
+        exists_sql="SELECT EXISTS (SELECT 1 FROM prompt_templates WHERE key = 'video.constraint_lock')",
+        cleanup_sql="DELETE FROM prompt_templates WHERE key = 'video.constraint_lock'",
+    ),
+    _RetiredDataArtifact(
+        name="generation_jobs.retired_prompt_fields",
+        required_tables=frozenset({"generation_jobs"}),
+        exists_sql=(
+            "SELECT EXISTS (SELECT 1 FROM generation_jobs "
+            "WHERE jsonb_typeof(input_json) = 'object' "
+            "AND input_json ?| ARRAY['style_id', 'art_style_id', 'visual_style', 'unify_style', "
+            "'resolved_prompts', 'enrich_version'])"
+        ),
+        cleanup_sql=(
+            "UPDATE generation_jobs "
+            "SET input_json = input_json - 'style_id' - 'art_style_id' - 'visual_style' - 'unify_style' "
+            "- 'resolved_prompts' - 'enrich_version' "
+            "WHERE jsonb_typeof(input_json) = 'object' "
+            "AND input_json ?| ARRAY['style_id', 'art_style_id', 'visual_style', 'unify_style', "
+            "'resolved_prompts', 'enrich_version']"
+        ),
+    ),
+    _RetiredDataArtifact(
+        name="video_generation_jobs.retired_prompt_fields",
+        required_tables=frozenset({"video_generation_jobs"}),
+        exists_sql=(
+            "SELECT EXISTS (SELECT 1 FROM video_generation_jobs "
+            "WHERE jsonb_typeof(input_json) = 'object' "
+            "AND input_json ?| ARRAY['style_id', 'art_style_id', 'visual_style', 'unify_style', "
+            "'constraint_prompt_template'])"
+        ),
+        cleanup_sql=(
+            "UPDATE video_generation_jobs "
+            "SET input_json = input_json - 'style_id' - 'art_style_id' - 'visual_style' - 'unify_style' "
+            "- 'constraint_prompt_template' "
+            "WHERE jsonb_typeof(input_json) = 'object' "
+            "AND input_json ?| ARRAY['style_id', 'art_style_id', 'visual_style', 'unify_style', "
+            "'constraint_prompt_template']"
+        ),
+    ),
+    _RetiredDataArtifact(
+        name="pipeline_stages.enrich_prompts",
+        required_tables=frozenset({"pipeline_stages"}),
+        exists_sql=(
+            "SELECT EXISTS (SELECT 1 FROM pipeline_stages "
+            "WHERE stage = 'enrich' AND jsonb_typeof(detail) = 'object' AND detail ? 'prompts')"
+        ),
+        cleanup_sql=(
+            "UPDATE pipeline_stages SET detail = detail - 'prompts' "
+            "WHERE stage = 'enrich' AND jsonb_typeof(detail) = 'object' AND detail ? 'prompts'"
+        ),
+    ),
+    _RetiredDataArtifact(
+        name="pipeline_jobs.enrich_prompts",
+        required_tables=frozenset({"pipeline_jobs"}),
+        exists_sql=(
+            "SELECT EXISTS (SELECT 1 FROM pipeline_jobs "
+            "WHERE stage = 'enrich' AND jsonb_typeof(output_json) = 'object' AND output_json ? 'prompts')"
+        ),
+        cleanup_sql=(
+            "UPDATE pipeline_jobs SET output_json = output_json - 'prompts' "
+            "WHERE stage = 'enrich' AND jsonb_typeof(output_json) = 'object' AND output_json ? 'prompts'"
+        ),
+    ),
+    _RetiredDataArtifact(
+        name="pipeline_jobs.merge_enrich_versions",
+        required_tables=frozenset({"pipeline_jobs"}),
+        exists_sql=(
+            "SELECT EXISTS (SELECT 1 FROM pipeline_jobs "
+            "WHERE stage = 'merge' AND jsonb_typeof(output_json) = 'object' AND EXISTS ("
+            "SELECT 1 FROM jsonb_array_elements(CASE "
+            "WHEN jsonb_typeof(output_json -> 'subjects') = 'array' "
+            "THEN output_json -> 'subjects' ELSE '[]'::jsonb END) AS subjects(item) "
+            "WHERE jsonb_typeof(item) = 'object' "
+            "AND item ?| ARRAY['base_enrich_version', 'enrich_version']))"
+        ),
+        cleanup_sql=(
+            "UPDATE pipeline_jobs SET output_json = jsonb_set("
+            "output_json, '{subjects}', (SELECT jsonb_agg(CASE "
+            "WHEN jsonb_typeof(item) = 'object' "
+            "THEN item - 'base_enrich_version' - 'enrich_version' ELSE item END ORDER BY ordinal) "
+            "FROM jsonb_array_elements(CASE WHEN jsonb_typeof(output_json -> 'subjects') = 'array' "
+            "THEN output_json -> 'subjects' ELSE '[]'::jsonb END) "
+            "WITH ORDINALITY AS subjects(item, ordinal))) "
+            "WHERE stage = 'merge' AND jsonb_typeof(output_json) = 'object' AND EXISTS ("
+            "SELECT 1 FROM jsonb_array_elements(CASE "
+            "WHEN jsonb_typeof(output_json -> 'subjects') = 'array' "
+            "THEN output_json -> 'subjects' ELSE '[]'::jsonb END) AS subjects(item) "
+            "WHERE jsonb_typeof(item) = 'object' "
+            "AND item ?| ARRAY['base_enrich_version', 'enrich_version'])"
+        ),
+    ),
+)
+
 
 @dataclass(slots=True)
 class DriftReport:
@@ -81,6 +211,10 @@ class DriftReport:
     missing_tables: list[str]
     missing_columns: list[str]
     missing_constraints: list[str]
+    retired_tables: list[str]
+    retired_columns: list[str]
+    retired_data: list[str]
+    legacy_alembic_revisions: list[str]
     owner_data_inconsistent: bool
 
     @property
@@ -89,6 +223,10 @@ class DriftReport:
             self.missing_tables
             or self.missing_columns
             or self.missing_constraints
+            or self.retired_tables
+            or self.retired_columns
+            or self.retired_data
+            or self.legacy_alembic_revisions
             or self.owner_data_inconsistent
         )
 
@@ -100,6 +238,14 @@ class DriftReport:
             lines.append("  缺列: " + "; ".join(self.missing_columns))
         if self.missing_constraints:
             lines.append("  缺约束: " + ", ".join(self.missing_constraints))
+        if self.retired_tables:
+            lines.append("  待清理旧表: " + ", ".join(self.retired_tables))
+        if self.retired_columns:
+            lines.append("  待清理旧列: " + "; ".join(self.retired_columns))
+        if self.retired_data:
+            lines.append("  待清理旧数据: " + "; ".join(self.retired_data))
+        if self.legacy_alembic_revisions:
+            lines.append("  待回正 Alembic revision: " + ", ".join(self.legacy_alembic_revisions))
         if self.owner_data_inconsistent:
             lines.append("  团队项目 owner 成员数据不一致（存在无 owner 或多 owner 的团队项目）")
         return "\n".join(lines)
@@ -182,6 +328,93 @@ def _repair_known_drift_constraints(conn: Connection) -> list[str]:
         if constraint_name not in _existing_constraints(conn, table):
             still_missing.append(constraint_name)
     return still_missing
+
+
+def _detect_retired_art_style_tables(existing: set[str]) -> list[str]:
+    return [table for table in _RETIRED_ART_STYLE_TABLES if table in existing]
+
+
+def _detect_retired_art_style_columns(conn: Connection, existing: set[str]) -> list[str]:
+    retired_columns: list[str] = []
+    for table, column in _RETIRED_ART_STYLE_COLUMNS:
+        if table in existing and column in _existing_columns(conn, table):
+            retired_columns.append(f"{table}.{column}")
+    return retired_columns
+
+
+def _detect_retired_art_style_data(conn: Connection, existing: set[str]) -> list[str]:
+    retired_data: list[str] = []
+    for artifact in _RETIRED_ART_STYLE_DATA_ARTIFACTS:
+        if artifact.required_tables.issubset(existing):
+            if bool(conn.execute(text(artifact.exists_sql)).scalar()):
+                retired_data.append(artifact.name)
+    return retired_data
+
+
+def _repair_retired_art_style_artifacts(conn: Connection, existing: set[str]) -> None:
+    """幂等清理已下线的动态画风及生成提示词模板遗留对象。"""
+    for artifact in _RETIRED_ART_STYLE_DATA_ARTIFACTS:
+        if artifact.required_tables.issubset(existing):
+            conn.execute(text(artifact.cleanup_sql))
+
+    # 子表先于父表，且不用 CASCADE，避免意外删除未在本次清理范围中的依赖对象。
+    if "art_style_extraction_jobs" in existing:
+        conn.execute(text("DELETE FROM art_style_extraction_jobs"))
+        conn.execute(text("DROP TABLE IF EXISTS art_style_extraction_jobs"))
+    if "art_styles" in existing:
+        conn.execute(text("DELETE FROM art_styles"))
+        conn.execute(text("DROP TABLE IF EXISTS art_styles"))
+
+    for table, column in _RETIRED_ART_STYLE_COLUMNS:
+        if table in existing:
+            conn.execute(text(f"ALTER TABLE {table} DROP COLUMN IF EXISTS {column}"))
+
+
+def _legacy_alembic_revisions(conn: Connection, existing: set[str]) -> list[str]:
+    if "alembic_version" not in existing:
+        return []
+    revisions = set(conn.execute(text("SELECT version_num FROM alembic_version")).scalars())
+    return sorted(revisions & _LEGACY_ALEMBIC_REVISION_REPLACEMENTS.keys())
+
+
+def _resolve_legacy_revision_replacement(revisions: set[str]) -> str | None:
+    """只允许单一、明确已知的错误 revision 回正到唯一基线。"""
+    legacy_revisions = revisions & _LEGACY_ALEMBIC_REVISION_REPLACEMENTS.keys()
+    if not legacy_revisions:
+        return None
+    if len(revisions) != 1 or len(legacy_revisions) != 1:
+        raise RuntimeError(
+            "Alembic revision 包含未知或混合值，拒绝自动回正；"
+            f"请先人工核对 alembic_version：{', '.join(sorted(revisions))}"
+        )
+    return _LEGACY_ALEMBIC_REVISION_REPLACEMENTS[legacy_revisions.pop()]
+
+
+def normalize_legacy_alembic_revision() -> bool:
+    """把已知错误 revision 回正，令 Alembic 可继续加载唯一基线。"""
+    engine = create_engine(_sync_url(), future=True)
+    try:
+        with engine.begin() as conn:
+            existing = _existing_tables(conn)
+            if "alembic_version" not in existing:
+                return False
+            revisions = set(
+                conn.execute(text("SELECT version_num FROM alembic_version FOR UPDATE")).scalars()
+            )
+            replacement = _resolve_legacy_revision_replacement(revisions)
+            if replacement is None:
+                return False
+            legacy_revision = next(iter(revisions))
+            conn.execute(
+                text(
+                    "UPDATE alembic_version SET version_num = :replacement "
+                    "WHERE version_num = :legacy_revision"
+                ),
+                {"replacement": replacement, "legacy_revision": legacy_revision},
+            )
+            return True
+    finally:
+        engine.dispose()
 
 
 # ---------------------------------------------------------------------------
@@ -313,12 +546,20 @@ def _detect(conn: Connection) -> DriftReport:
         if item not in missing_columns:
             missing_columns.append(item)
 
+    retired_tables = _detect_retired_art_style_tables(existing)
+    retired_columns = _detect_retired_art_style_columns(conn, existing)
+    retired_data = _detect_retired_art_style_data(conn, existing)
+    legacy_alembic_revisions = _legacy_alembic_revisions(conn, existing)
     owner_inconsistent = _owner_data_inconsistent(conn) if "project_members" in existing else False
 
     return DriftReport(
         missing_tables=missing_tables,
         missing_columns=missing_columns,
         missing_constraints=missing_constraints,
+        retired_tables=retired_tables,
+        retired_columns=retired_columns,
+        retired_data=retired_data,
+        legacy_alembic_revisions=legacy_alembic_revisions,
         owner_data_inconsistent=owner_inconsistent,
     )
 
@@ -331,11 +572,15 @@ def run_repair() -> DriftReport:
     """
     engine = create_engine(_sync_url(), future=True)
     try:
-        with engine.begin() as conn:
+        with engine.begin() as raw_conn:
+            # 本事务仅执行受控的 schema/历史数据收敛；与 Alembic 环境一致地显式
+            # 标记，避免存储引用写入保护误拦截对已下线 JSON 字段的删除操作。
+            conn = raw_conn.execution_options(**{STORAGE_REFERENCE_GUARD_BYPASS: True})
             missing_tables = _detect_missing_tables(conn, _existing_tables(conn))
             _repair_missing_tables(conn, missing_tables)
             _repair_known_drift_columns(conn)
             _repair_known_drift_constraints(conn)
+            _repair_retired_art_style_artifacts(conn, _existing_tables(conn))
         # owner 数据回填独立事务：DDL 已提交，回填失败不回滚 schema 修复。
         if "project_members" in _existing_tables_from_engine(engine):
             with engine.begin() as conn:
@@ -363,6 +608,14 @@ def run_check_only() -> DriftReport:
 
 
 def main(argv: list[str]) -> int:
+    if "--normalize-alembic-revision" in argv:
+        changed = normalize_legacy_alembic_revision()
+        if changed:
+            print("已将已知错误 Alembic revision 回正到 d4b7e1c9a362。")
+        else:
+            print("Alembic revision 无需回正。")
+        return 0
+
     check_only = "--check-only" in argv
     if check_only:
         report = run_check_only()
