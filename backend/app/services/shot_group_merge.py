@@ -82,7 +82,27 @@ def _rewrite_shot_line(shot: Shot, display_no: int, start: int, end: int) -> str
         rewritten = _SHOT_LINE_PREFIX.sub(prefix, original, count=1)
     else:
         rewritten = f"{prefix}{original or shot.content}"
-    return _normalize_shot_line_optional_content(rewritten)
+    has_dialogue, dialogue_text = _structured_dialogue_context(shot)
+    return _normalize_shot_line_optional_content(
+        rewritten,
+        has_dialogue=has_dialogue,
+        dialogue_text=dialogue_text,
+    )
+
+
+def _structured_dialogue_context(shot: Shot) -> tuple[bool | None, str | None]:
+    """从 v2 结构快照恢复台词边界；旧自由文本保持未知，避免误删正文。"""
+
+    raw = getattr(shot, "structured_data", None)
+    if not isinstance(raw, dict) or raw.get("schema_version") != "storyboard.shot-structure.v1":
+        return None, None
+    dialogue = raw.get("dialogue")
+    if not isinstance(dialogue, dict):
+        return False, None
+    text = dialogue.get("text")
+    if not isinstance(text, str) or not text.strip():
+        return False, None
+    return True, text.strip()
 
 
 def _ordered_unique(values: list[str]) -> list[str]:

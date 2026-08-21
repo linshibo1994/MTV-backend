@@ -174,7 +174,7 @@ SHOT_LINE_TEMPLATE = (
 _EMPTY_SOUND_DESIGN_VALUES = frozenset(
     {"", "none", "null", "nil", "n/a", "无", "暂无", "无声", "无声音", "无音效"}
 )
-_SHOT_LINE_TRAILING_PUNCTUATION_RE = re.compile(r"[\s，,。．.;；、:：]+$")
+_SHOT_LINE_TRAILING_PUNCTUATION_RE = re.compile(r"[\s，,。．.!！?？;；、:：]+$")
 _SHOT_LINE_OPTIONAL_TAIL_START_RE = re.compile(
     r"(?P<delimiter>[，,]|\s+)(?P<label>构图是|声音设计是|台词类型是)【"
 )
@@ -188,10 +188,7 @@ _SHOT_LINE_DIALOGUE_CONTENT_RE = re.compile(
     r"[，,]\s*[^，,:：\n]+[:：]\s*(?!声音设计是【|台词类型是【|构图是【)[^，,\s][\s\S]*$"
 )
 _SHOT_LINE_LABELED_TRAILING_PUNCTUATION_RE = re.compile(
-    r"(?P<field>(?:构图是|声音设计是|台词类型是)【[^】]*?)[，,。．.;；、]+】"
-)
-_SHOT_LINE_TRAILING_OPTIONAL_FIELD_RE = re.compile(
-    r"(?P<delimiter>[，,]|\s+)(?P<label>构图是|声音设计是|台词类型是)【(?P<value>[^】]*)】\s*$"
+    r"(?P<field>(?:构图是|声音设计是|台词类型是)【[^】]*?)[，,。．.!！?？;；、]+】"
 )
 
 _STORYBOARD_SYSTEM_TEMPLATE_KEY = "storyboard.system"
@@ -1330,20 +1327,14 @@ def _is_empty_optional_value(value: str) -> bool:
     return _strip_shot_line_trailing_punctuation(value).casefold() in _EMPTY_SOUND_DESIGN_VALUES
 
 
-def _trailing_optional_tail_start(text: str) -> int | None:
-    """返回连续镜头尾部字段的起点，避免把台词中间的同形短语当作字段。"""
+def _dialogue_text_end(text: str, dialogue_text: str) -> int | None:
+    """定位“角色:台词”中的台词末端，避免短台词命中后续字段内容。"""
 
-    remaining = text.rstrip()
-    tail_start: int | None = None
-    labels: list[str] = []
-    while match := _SHOT_LINE_TRAILING_OPTIONAL_FIELD_RE.search(remaining):
-        tail_start = match.start()
-        labels.append(match.group("label"))
-        remaining = remaining[:match.start()].rstrip()
-
-    if "构图是" in labels or "台词类型是" in labels:
-        return tail_start
-    return None
+    anchored = re.search(r"[:：][ \t]*" + re.escape(dialogue_text), text)
+    if anchored is not None:
+        return anchored.end()
+    start = text.find(dialogue_text)
+    return start + len(dialogue_text) if start >= 0 else None
 
 
 def _normalize_shot_line_optional_content(
@@ -1366,20 +1357,16 @@ def _normalize_shot_line_optional_content(
     # 台词边界或“无台词”事实定位尾段，避免误删真实台词中的同形文字。
     tail_starts = list(_SHOT_LINE_OPTIONAL_TAIL_START_RE.finditer(text))
     composition_tail_starts = [match for match in tail_starts if match.group("label") == "构图是"]
-    trailing_optional_tail_start = _trailing_optional_tail_start(text)
     optional_tail_start: int | None = None
     if composition_tail_starts:
         optional_tail_start = composition_tail_starts[-1].start()
     elif has_dialogue is False:
         optional_tail_start = tail_starts[0].start() if tail_starts else None
     elif dialogue_text:
-        dialogue_end = text.rfind(dialogue_text)
-        if dialogue_end >= 0:
-            dialogue_end += len(dialogue_text)
+        dialogue_end = _dialogue_text_end(text, dialogue_text)
+        if dialogue_end is not None:
             trailing_fields = [match for match in tail_starts if match.start() >= dialogue_end]
             optional_tail_start = trailing_fields[0].start() if trailing_fields else None
-    elif trailing_optional_tail_start is not None:
-        optional_tail_start = trailing_optional_tail_start
     elif has_dialogue is None and not _SHOT_LINE_DIALOGUE_CONTENT_RE.search(text):
         optional_tail_start = tail_starts[0].start() if tail_starts else None
 
@@ -1414,6 +1401,7 @@ def _normalize_shot_line_optional_content(
     # 标签内的句末标点与闭合括号相邻时属于格式噪声，而非声音正文的一部分。
     optional_tail = _SHOT_LINE_LABELED_TRAILING_PUNCTUATION_RE.sub(r"\g<field>】", optional_tail)
     optional_tail = re.sub(r"[，,]\s*[，,]+", "，", optional_tail)
+    optional_tail = optional_tail.rstrip("，,。．.!！?？;；、 \t\r\n")
     text = dialogue_prefix + optional_tail
     if empty_dialogue:
         # 无台词时不存在需要保真的台词正文，可安全修正历史空字段周围的连写标点。

@@ -187,11 +187,130 @@ def test_rewrite_shot_line_removes_no_composition_metadata_after_real_dialogue()
             "台词类型是【voice_over】"
         ),
         content="兜底内容",
+        structured_data={
+            "schema_version": "storyboard.shot-structure.v1",
+            "dialogue": {"speaker_ref": "C01", "text": "别走", "kind": "voice_over"},
+        },
     )
 
     assert _rewrite_shot_line(shot, display_no=2, start=3, end=6) == (
         "【镜头2:3s～6s】场景是开放办公区，近景·平视，固定，冷白屏光，"
         "老姜端起茶杯，疲惫，老姜：别走"
+    )
+
+
+def test_rewrite_shot_line_preserves_structured_multiline_dialogue_before_metadata_tail() -> None:
+    """结构快照中的多行真实台词必须完整保留，哪怕末行与旧字段同形。"""
+    from app.services.shot_group_merge import _rewrite_shot_line
+
+    dialogue = "请照读以下两行\n声音设计是【无】\n台词类型是【voice_over】"
+    shot = SimpleNamespace(
+        shot_line=(
+            "【镜头9:18s～21s】场景是开放办公区，近景·平视，固定，冷白屏光，"
+            f"老姜端起茶杯，疲惫，老姜：{dialogue}\n"
+            "声音设计是【无】\n"
+            "台词类型是【voice_over】"
+        ),
+        content="兜底内容",
+        structured_data={
+            "schema_version": "storyboard.shot-structure.v1",
+            "dialogue": {"speaker_ref": "C01", "text": dialogue, "kind": "voice_over"},
+        },
+    )
+
+    assert _rewrite_shot_line(shot, display_no=2, start=3, end=6) == (
+        "【镜头2:3s～6s】场景是开放办公区，近景·平视，固定，冷白屏光，"
+        f"老姜端起茶杯，疲惫，老姜：{dialogue}"
+    )
+
+
+@pytest.mark.parametrize("punctuation", ["。", "！", "？"])
+def test_rewrite_shot_line_removes_metadata_tail_with_trailing_sentence_punctuation(
+    punctuation: str,
+) -> None:
+    """旧字段后的常见句末标点不能阻止内部字段被移除。"""
+    from app.services.shot_group_merge import _rewrite_shot_line
+
+    shot = SimpleNamespace(
+        shot_line=(
+            "【镜头9:18s～21s】场景是开放办公区，近景·平视，固定，冷白屏光，"
+            "老姜端起茶杯，疲惫，老姜：别走\n"
+            "声音设计是【无】\n"
+            f"台词类型是【voice_over】{punctuation}"
+        ),
+        content="兜底内容",
+        structured_data={
+            "schema_version": "storyboard.shot-structure.v1",
+            "dialogue": {"speaker_ref": "C01", "text": "别走", "kind": "voice_over"},
+        },
+    )
+
+    assert _rewrite_shot_line(shot, display_no=2, start=3, end=6) == (
+        "【镜头2:3s～6s】场景是开放办公区，近景·平视，固定，冷白屏光，"
+        "老姜端起茶杯，疲惫，老姜：别走"
+    )
+
+
+def test_rewrite_shot_line_cleans_unstructured_legacy_metadata_tail() -> None:
+    """无结构快照且明确没有台词时，旧字段不能继续进入组合 Prompt。"""
+    from app.services.shot_group_merge import _rewrite_shot_line
+
+    shot = SimpleNamespace(
+        shot_line=(
+            "【镜头9:18s～21s】场景是开放办公区，近景·平视，固定，冷白屏光，"
+            "老姜端起茶杯，疲惫\n"
+            "声音设计是【无】\n"
+            "台词类型是【voice_over】"
+        ),
+        content="兜底内容",
+    )
+
+    assert _rewrite_shot_line(shot, display_no=2, start=3, end=6) == (
+        "【镜头2:3s～6s】场景是开放办公区，近景·平视，固定，冷白屏光，"
+        "老姜端起茶杯，疲惫"
+    )
+
+
+def test_rewrite_shot_line_preserves_unstructured_multiline_dialogue_that_looks_like_metadata() -> None:
+    """没有结构快照时，不能推断并删改与字段同形的真实多行台词。"""
+    from app.services.shot_group_merge import _rewrite_shot_line
+
+    dialogue = "请原样读\n声音设计是【无】\n台词类型是【voice_over】"
+    shot = SimpleNamespace(
+        shot_line=(
+            "【镜头9:18s～21s】场景是开放办公区，近景·平视，固定，冷白屏光，"
+            f"老姜端起茶杯，疲惫，老姜：{dialogue}"
+        ),
+        content="兜底内容",
+    )
+
+    assert _rewrite_shot_line(shot, display_no=2, start=3, end=6) == (
+        "【镜头2:3s～6s】场景是开放办公区，近景·平视，固定，冷白屏光，"
+        f"老姜端起茶杯，疲惫，老姜：{dialogue}"
+    )
+
+
+def test_rewrite_shot_line_locates_short_structured_dialogue_before_metadata_tail() -> None:
+    """短台词不能误匹配到后续声音字段中相同的文本。"""
+    from app.services.shot_group_merge import _rewrite_shot_line
+
+    shot = SimpleNamespace(
+        shot_line=(
+            "【镜头9:18s～21s】场景是开放办公区，近景·平视，固定，冷白屏光，"
+            "老姜端起茶杯，疲惫，老姜：无\n"
+            "声音设计是【无】\n"
+            "台词类型是【voice_over】"
+        ),
+        content="兜底内容",
+        structured_data={
+            "schema_version": "storyboard.shot-structure.v1",
+            "dialogue": {"speaker_ref": "C01", "text": "无", "kind": "voice_over"},
+        },
+    )
+
+    assert _rewrite_shot_line(shot, display_no=2, start=3, end=6) == (
+        "【镜头2:3s～6s】场景是开放办公区，近景·平视，固定，冷白屏光，"
+        "老姜端起茶杯，疲惫，老姜：无"
     )
 
 
