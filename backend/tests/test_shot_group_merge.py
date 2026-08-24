@@ -406,7 +406,9 @@ async def test_refresh_group_retimes_structure_and_rebuilds_quality() -> None:
     assert group.reference_frames["boundary_projections"]["start"][
         "prompt_fragment"
     ].startswith("【入画状态】")
-    assert "【导演指令】" in group.prompt
+    assert "【镜头1:0s～2s】中景·平视，镜头保持固定。" in group.prompt
+    assert "构图是【" not in group.prompt
+    assert "【导演指令】" not in group.prompt
     assert group.materials["character"] == [
         {"ref": "C01", "subject_id": "subject-c1", "name": "阿明"}
     ]
@@ -511,7 +513,7 @@ async def test_refresh_group_does_not_self_validate_local_coverage_as_expected()
     assert "coverage_unknown_block" not in warning_codes
 
 
-async def test_refresh_group_keeps_legacy_null_structure_compatible() -> None:
+async def test_refresh_group_keeps_incomplete_legacy_structure_compatible() -> None:
     from app.services.shot_group_merge import _refresh_group
 
     shot = SimpleNamespace(
@@ -529,7 +531,15 @@ async def test_refresh_group_keeps_legacy_null_structure_compatible() -> None:
         props=[],
         sounds=[],
         dialogue_character="",
-        structured_data=None,
+        structured_data={
+            "visual": {
+                "shot_size": "中景",
+                "composition": ["单人"],
+                "camera_angle": "平视",
+                "camera_movement": "固定",
+                "action": "角色走入画面",
+            }
+        },
     )
     group = SimpleNamespace(shot_group_id="final-1", scene_no=1, group_no="G1")
     db = SimpleNamespace(execute=AsyncMock())
@@ -544,7 +554,8 @@ async def test_refresh_group_keeps_legacy_null_structure_compatible() -> None:
         duration_by_shot={"legacy-shot": 3},
     )
 
-    assert shot.structured_data is None
+    assert "【镜头1:0s～3s】旧镜头" in group.prompt
+    assert "【叙事目的】兼容旧镜头" in group.prompt
     assert group.quality_summary == {}
     assert "boundary_projections" not in group.reference_frames
 

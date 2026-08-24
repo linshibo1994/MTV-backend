@@ -7,10 +7,34 @@ import pytest
 from app.providers.prompt_adapter import PromptAdaptationError, adapt_prompt, unicode_safe_prefix
 from app.providers.registry import get_prompt_capability
 from app.services.video_prompt import (
-    CAMERA_MOVEMENT_VIDEO_PHRASES,
-    build_subject_over_duration,
     compose_video_prompt,
+    render_video_execution_prompt,
 )
+
+
+def _complete_structured_snapshot(
+    *,
+    display_no: int,
+    start_seconds: int,
+    end_seconds: int,
+    visual: dict[str, object],
+    sound_design: str = "无",
+    dialogue: dict[str, object] | None = None,
+) -> dict[str, object]:
+    return {
+        "schema_version": "storyboard.shot-structure.v1",
+        "display_no": display_no,
+        "start_seconds": start_seconds,
+        "end_seconds": end_seconds,
+        "visual": visual,
+        "narrative_purpose": "展现角色当前的行动与状态",
+        "character_refs": ["C01"],
+        "prop_refs": [],
+        "sound_refs": [],
+        "sound_design": sound_design,
+        "dialogue": dialogue,
+        "source_block_refs": ["B01"],
+    }
 
 
 def test_prompt_capability_uses_alias_and_model_override() -> None:
@@ -74,66 +98,142 @@ def test_unicode_safe_prefix_does_not_split_emoji_or_combining_character() -> No
     assert unicode_safe_prefix("甲e\u0301乙", 3) == "甲e\u0301"
 
 
-def test_all_controlled_camera_movements_have_a_reusable_phrase() -> None:
-    assert set(CAMERA_MOVEMENT_VIDEO_PHRASES) == {
-        "固定",
-        "推镜",
-        "拉镜",
-        "摇镜",
-        "移镜",
-        "跟拍",
-        "升降",
-        "环绕",
-        "手持",
-    }
-    assert all(phrase.startswith("Camera ") for phrase in CAMERA_MOVEMENT_VIDEO_PHRASES.values())
-
-
-def test_compose_video_prompt_puts_motion_first_subject_timing_before_constraint_tail() -> None:
+def test_render_video_execution_prompt_uses_natural_per_shot_direction() -> None:
     constraint = "【约束】\n1. 人物一致\n2. 禁止字幕"
     shots = [
-        {
-            "display_no": 2,
-            "start_seconds": 3,
-            "end_seconds": 6,
-            "characters": ["阿明"],
-            "action": "停下并回头",
-        },
         {
             "display_no": 1,
             "start_seconds": 0,
             "end_seconds": 3,
             "characters": ["阿明"],
-            "visual": {"action": "推门进入"},
+            "props": ["茶杯"],
+            "structured_data": _complete_structured_snapshot(
+                display_no=1,
+                start_seconds=0,
+                end_seconds=3,
+                visual={
+                    "shot_size": "全景",
+                    "composition": ["三分法", "纵深构图"],
+                    "camera_angle": "平视",
+                    "camera_movement": "固定",
+                    "lighting": "冷色屏幕光与暖色室内灯交织",
+                    "frame_description": "阿明独自在电脑前工作",
+                    "action": "持续敲键盘",
+                    "emotion": "沉稳",
+                },
+                sound_design="键盘轻响与设备风扇声持续",
+            ),
+        },
+        {
+            "display_no": 2,
+            "start_seconds": 3,
+            "end_seconds": 6,
+            "characters": ["阿明"],
+            "dialogue_character": "阿明",
+            "structured_data": _complete_structured_snapshot(
+                display_no=2,
+                start_seconds=3,
+                end_seconds=6,
+                visual={
+                    "shot_size": "近景",
+                    "composition": ["前景遮挡"],
+                    "camera_angle": "斜侧",
+                    "camera_movement": "推镜",
+                    "lighting": "屏幕光照亮面部",
+                    "frame_description": "阿明抬眼看向屏幕",
+                    "action": "停下敲键盘并回头",
+                    "emotion": "警觉",
+                },
+                dialogue={
+                    "speaker_ref": "C01",
+                    "kind": "voice_over",
+                    "text": "系统性变革到了深水区，技术迭代一天都不能停……",
+                },
+            ),
         },
     ]
 
+    rendered = render_video_execution_prompt(
+        shots,
+        background="融媒众创空间大楼-办公桌前-内-夜",
+        duration_seconds=6,
+        subject_names_by_ref={"C01": "老姜"},
+    )
+
+    assert rendered.startswith("故事发生在融媒众创空间大楼-办公桌前-内-夜。\n")
+    assert "【镜头1:0s～3s】全景·平视，镜头保持固定。" in rendered
+    assert "【镜头2:3s～6s】近景·斜侧，镜头缓慢向主体推进。" in rendered
+    assert "主体位于画面一侧，另一侧保留环境空间" in rendered
+    assert "前景有虚化物体局部遮挡画面边缘" in rendered
+    assert "画面中保留茶杯等道具" in rendered
+    assert "环境中可听见键盘轻响与设备风扇声持续" in rendered
+    assert "人物呈现沉稳。" in rendered
+    assert "面部和肢体自然稳定" in rendered
+    assert "老姜的画外音响起，内容为“系统性变革到了深水区，技术迭代一天都不能停……”；画面中的人物不张口" in rendered
+    assert "构图是【" not in rendered
+    assert "声音设计是【" not in rendered
+    assert "【角色】" not in rendered
+    assert "Camera " not in rendered
+    assert (
+        compose_video_prompt(
+            rendered,
+            shots=shots,
+            duration_seconds=6,
+        )
+        == rendered
+    )
+    manual_execution = render_video_execution_prompt(
+        shots,
+        background="融媒众创空间大楼-办公桌前-内-夜",
+        duration_seconds=6,
+        subject_names_by_ref={"C01": "老姜"},
+        include_constraint_lock=False,
+    )
+    completed_manual_execution = compose_video_prompt(
+        manual_execution,
+        shots=shots,
+        duration_seconds=6,
+    )
+    assert completed_manual_execution.count("【镜头1:0s～3s】") == 1
+    assert completed_manual_execution.endswith("画面不出现任何可读文字、字幕、Logo 或水印。")
+
     result = compose_video_prompt(
-        f"场景是办公室\n{constraint}",
-        camera_movement="推镜",
+        f"创作意图\n{constraint}",
         shots=shots,
         duration_seconds=6,
     )
 
-    assert result.startswith("Camera dollies forward smoothly at a steady pace.\n")
-    assert "0s～3s：阿明：推门进入\n3s～6s：阿明：停下并回头" in result
+    assert result.startswith("创作意图\n")
+    assert "【镜头1:0s～3s】全景·平视，镜头保持固定。" in result
+    assert "【镜头2:3s～6s】近景·斜侧，镜头缓慢向主体推进。" in result
     assert result.endswith(constraint)
-    assert compose_video_prompt(
-        result,
-        camera_movement="推镜",
-        shots=shots,
-        duration_seconds=6,
-    ) == result
+    assert compose_video_prompt(result, shots=shots, duration_seconds=6) == result
 
 
-def test_subject_over_duration_rejects_segment_outside_group_duration() -> None:
+def test_render_video_execution_prompt_rejects_segment_outside_group_duration() -> None:
     with pytest.raises(ValueError, match="结束时间"):
-        build_subject_over_duration(
-            [{"start_seconds": 0, "end_seconds": 7, "action": "走入房间"}],
+        render_video_execution_prompt(
+            [
+                {
+                    "display_no": 1,
+                    "start_seconds": 0,
+                    "end_seconds": 7,
+                    "structured_data": _complete_structured_snapshot(
+                        display_no=1,
+                        start_seconds=0,
+                        end_seconds=7,
+                        visual={
+                            "shot_size": "中景",
+                            "composition": ["单人"],
+                            "camera_angle": "平视",
+                            "camera_movement": "固定",
+                            "lighting": "室内灯光",
+                            "frame_description": "人物走入房间",
+                            "action": "走入房间",
+                            "emotion": "平静",
+                        },
+                    ),
+                }
+            ],
             duration_seconds=6,
         )
-
-
-def test_unknown_camera_movement_is_not_silently_guessed() -> None:
-    with pytest.raises(ValueError, match="不支持的运镜类型"):
-        compose_video_prompt("场景", camera_movement="甩镜")

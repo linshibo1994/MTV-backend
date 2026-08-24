@@ -1021,10 +1021,27 @@ def test_create_video_job_enhances_structured_prompt_before_adapter(
                     end_seconds=3,
                     characters=["阿明"],
                     structured_data={
+                        "schema_version": "storyboard.shot-structure.v1",
+                        "display_no": 1,
+                        "start_seconds": 0,
+                        "end_seconds": 3,
                         "visual": {
+                            "shot_size": "全景",
+                            "composition": ["三分法"],
+                            "camera_angle": "平视",
                             "camera_movement": "推镜",
+                            "lighting": "室内暖光",
+                            "frame_description": "阿明站在门边",
                             "action": "推门进入",
-                        }
+                            "emotion": "谨慎",
+                        },
+                        "narrative_purpose": "展现阿明推门进入时的谨慎状态",
+                        "character_refs": ["C01"],
+                        "prop_refs": [],
+                        "sound_refs": [],
+                        "sound_design": "门轴轻响",
+                        "dialogue": None,
+                        "source_block_refs": ["B01"],
                     },
                 ),
                 Shot(
@@ -1041,10 +1058,27 @@ def test_create_video_job_enhances_structured_prompt_before_adapter(
                     end_seconds=6,
                     characters=["阿明"],
                     structured_data={
+                        "schema_version": "storyboard.shot-structure.v1",
+                        "display_no": 2,
+                        "start_seconds": 3,
+                        "end_seconds": 6,
                         "visual": {
+                            "shot_size": "中景",
+                            "composition": ["前景遮挡"],
+                            "camera_angle": "侧拍",
                             "camera_movement": "固定",
+                            "lighting": "门外冷光照入室内",
+                            "frame_description": "阿明停在室内回望门口",
                             "action": "停下并回头",
-                        }
+                            "emotion": "警觉",
+                        },
+                        "narrative_purpose": "展现阿明回望门口时的警觉状态",
+                        "character_refs": ["C01"],
+                        "prop_refs": [],
+                        "sound_refs": [],
+                        "sound_design": "无",
+                        "dialogue": None,
+                        "source_block_refs": ["B02"],
                     },
                 ),
             ]
@@ -1081,16 +1115,14 @@ def test_create_video_job_enhances_structured_prompt_before_adapter(
         )
 
         source = job.input_json["source_prompt"]
-        assert source.startswith("Camera dollies forward smoothly at a steady pace.\n")
-        assert "0s～3s：阿明：推门进入" in source
-        assert "3s～6s：阿明：停下并回头" in source
+        assert "Camera " not in source
+        assert "【镜头1:0s～3s】全景·平视，镜头缓慢向主体推进。" in source
+        assert "【镜头2:3s～6s】中景·侧拍，镜头保持固定。" in source
         assert source.index("## 图片内容说明") < source.index("镜头组提示词")
-        assert source.index("【主体时长动作 subject-over-duration】") < source.index(
-            "【冻结边界事实 boundary-facts】"
-        )
+        assert source.index("【镜头2:3s～6s】") < source.index("【冻结边界事实 boundary-facts】")
         assert "起始边界：阿明位于门外，右手刚触及门把。" in source
         assert "结束边界：阿明已进入室内并回望门口。" in source
-        assert "【约束】" not in source
+        assert source.endswith("画面不出现任何可读文字、字幕、Logo 或水印。")
         assert "constraint_prompt_template" not in job.input_json
         assert job.input_json["prompt"] == source
         assert job.input_json["boundary_prompt_fragments"] == [

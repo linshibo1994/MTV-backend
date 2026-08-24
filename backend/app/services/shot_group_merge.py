@@ -48,6 +48,7 @@ from app.services.storyboard_quality import (
     build_shot_group_quality_summary,
     evaluate_storyboard_quality,
 )
+from app.services.video_prompt import render_video_execution_prompt
 
 _SHOT_LINE_PREFIX = re.compile(r"^【镜头\d+\s*:\s*[^】]+】")
 _ACTIVE_STORYBOARD_STATUSES = ("pending", "running", "retry")
@@ -113,6 +114,20 @@ def _shot_payload(shot: Shot) -> dict:
     return {
         "dialogue_character": shot.dialogue_character,
         "sounds": list(shot.sounds or []),
+    }
+
+
+def _video_execution_shot_payload(shot: Shot) -> dict[str, object]:
+    """提取执行提示词所需事实，不从旧 shot_line 反向解析。"""
+
+    return {
+        "display_no": shot.display_no,
+        "start_seconds": shot.start_seconds,
+        "end_seconds": shot.end_seconds,
+        "characters": list(shot.characters or []),
+        "props": list(shot.props or []),
+        "dialogue_character": shot.dialogue_character,
+        "structured_data": shot.structured_data,
     }
 
 
@@ -386,7 +401,13 @@ async def _refresh_group(
             subjects=subjects,
         )
     )
-    group.prompt = _build_group_prompt(
+    execution_prompt = render_video_execution_prompt(
+        [_video_execution_shot_payload(shot) for shot in shots],
+        background=background,
+        duration_seconds=cursor,
+        subject_names_by_ref=_subject_names_by_ref(shots, subjects),
+    )
+    group.prompt = execution_prompt or _build_group_prompt(
         shot_lines=[shot.shot_line for shot in shots],
         referenced_names=referenced_names,
         narrative_purpose=narrative_purpose,

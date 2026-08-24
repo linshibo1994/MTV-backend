@@ -298,7 +298,7 @@ async def create_video_job(
     model = runtime_video_model.model
     reference_token_map = _freeze_reference_token_map(aggregated)
     prompt_text = bind_reference_tokens_to_prompt(base_prompt, reference_token_map)
-    camera_movement, structured_prompt_shots = await _load_structured_video_prompt_context(
+    structured_prompt_shots = await _load_structured_video_prompt_context(
         db,
         shot_group_id,
     )
@@ -306,7 +306,6 @@ async def create_video_job(
         try:
             prompt_text = compose_video_prompt(
                 prompt_text,
-                camera_movement=camera_movement,
                 shots=structured_prompt_shots,
                 duration_seconds=shot_group.duration_seconds,
             )
@@ -1307,34 +1306,32 @@ def _boundary_prompt_fragments(reference_frames: object) -> list[str]:
 async def _load_structured_video_prompt_context(
     db: AsyncSession,
     shot_group_id: str,
-) -> tuple[str | None, list[dict[str, object]]]:
-    """从 v2 结构快照构造无自由文本解析的运镜与主体时长输入。"""
+) -> list[dict[str, object]]:
+    """从完整 v2 结构快照构造自然语言执行提示词的事实输入。"""
     result = await db.execute(
         select(Shot)
         .where(Shot.shot_group_id == shot_group_id)
         .order_by(Shot.display_no, Shot.shot_id)
     )
     snapshots: list[dict[str, object]] = []
-    camera_movement: str | None = None
     for shot in result.scalars().all():
         raw = shot.structured_data
         if not isinstance(raw, dict):
-            continue
+            return []
         visual = raw.get("visual")
         if not isinstance(visual, dict):
-            continue
-        movement = visual.get("camera_movement")
-        if camera_movement is None and isinstance(movement, str) and movement.strip():
-            camera_movement = movement.strip()
+            return []
         snapshot: dict[str, object] = {
             "display_no": shot.display_no,
             "start_seconds": shot.start_seconds,
             "end_seconds": shot.end_seconds,
             "characters": list(shot.characters or []),
-            "visual": dict(visual),
+            "props": list(shot.props or []),
+            "dialogue_character": shot.dialogue_character,
+            "structured_data": dict(raw),
         }
         snapshots.append(snapshot)
-    return camera_movement, snapshots
+    return snapshots
 
 
 def _natural_group_number(group_no: str | None) -> int:
