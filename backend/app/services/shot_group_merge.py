@@ -36,7 +36,6 @@ from app.schemas.storyboard_contracts import (
 )
 from app.services.storyboard import (
     _build_boundary_reference_frames,
-    _build_group_prompt,
     _classify_materials,
     _classify_reference_materials,
     _extract_audio_elements,
@@ -48,7 +47,10 @@ from app.services.storyboard_quality import (
     build_shot_group_quality_summary,
     evaluate_storyboard_quality,
 )
-from app.services.video_prompt import render_video_execution_prompt
+from app.services.video_prompt import (
+    render_unstructured_video_execution_prompt,
+    render_video_execution_prompt,
+)
 
 _SHOT_LINE_PREFIX = re.compile(r"^【镜头\d+\s*:\s*[^】]+】")
 _ACTIVE_STORYBOARD_STATUSES = ("pending", "running", "retry")
@@ -118,7 +120,7 @@ def _shot_payload(shot: Shot) -> dict:
 
 
 def _video_execution_shot_payload(shot: Shot) -> dict[str, object]:
-    """提取执行提示词所需事实，不从旧 shot_line 反向解析。"""
+    """提取执行提示词所需事实，旧 shot_line 不属于执行 Prompt 输入。"""
 
     return {
         "display_no": shot.display_no,
@@ -128,6 +130,7 @@ def _video_execution_shot_payload(shot: Shot) -> dict[str, object]:
         "props": list(shot.props or []),
         "dialogue_character": shot.dialogue_character,
         "structured_data": shot.structured_data,
+        "content": shot.content,
     }
 
 
@@ -393,7 +396,7 @@ async def _refresh_group(
         [_shot_payload(shot) for shot in shots],
         subjects,
     )
-    quality_summary, reference_frames, director_commands, is_continuation = (
+    quality_summary, reference_frames, _director_commands, is_continuation = (
         _rebuild_structured_group_state(
             shots,
             duration_seconds=cursor,
@@ -407,12 +410,16 @@ async def _refresh_group(
         duration_seconds=cursor,
         subject_names_by_ref=_subject_names_by_ref(shots, subjects),
     )
-    group.prompt = execution_prompt or _build_group_prompt(
-        shot_lines=[shot.shot_line for shot in shots],
-        referenced_names=referenced_names,
-        narrative_purpose=narrative_purpose,
-        director_commands=director_commands,
-    )
+    if not execution_prompt:
+        execution_prompt = render_unstructured_video_execution_prompt(
+            [_video_execution_shot_payload(shot) for shot in shots],
+            background=background,
+            duration_seconds=cursor,
+            subject_names_by_ref=_subject_names_by_ref(shots, subjects),
+        )
+    if not execution_prompt:
+        raise BadRequestError("镜头组合缺少可用于生成视频的时长信息")
+    group.prompt = execution_prompt
     materials = _structured_materials(
         shots,
         subjects,

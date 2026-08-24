@@ -42,6 +42,14 @@ _EXECUTION_CONSTRAINT_LOCK = (
 _BOUNDARY_FACTS_MARKER = "【冻结边界事实 boundary-facts】"
 _TERMINAL_PUNCTUATION = ("。", "！", "？", "!", "?", "…")
 _STRUCTURED_SNAPSHOT_EXTRA_FIELDS = frozenset({"schema_version", "subject_ids_by_ref", "background_ref"})
+_DISALLOWED_EXECUTION_METADATA_MARKERS = (
+    "构图是【",
+    "声音设计是【",
+    "台词类型是【",
+    "【角色】",
+    "【叙事目的】",
+    "【导演指令】",
+)
 
 
 def _clean_text(value: object) -> str:
@@ -84,12 +92,16 @@ def _structured_snapshot(shot: Mapping[str, object]) -> Mapping[str, object]:
     return raw
 
 
-def _composition_description(visual: Mapping[str, object]) -> str:
+def _composition_description_from_values(values: Sequence[str]) -> str:
     descriptions = [
         _COMPOSITION_DESCRIPTIONS.get(value, f"画面保持{value}的空间组织")
-        for value in _string_list(visual.get("composition"))
+        for value in values
     ]
     return "；".join(dict.fromkeys(descriptions))
+
+
+def _composition_description(visual: Mapping[str, object]) -> str:
+    return _composition_description_from_values(_string_list(visual.get("composition")))
 
 
 def _props_description(shot: Mapping[str, object]) -> str:
@@ -148,6 +160,120 @@ def _sound_description(snapshot: Mapping[str, object]) -> str:
     return f"环境中可听见{sound_design}。"
 
 
+def _unstructured_snapshot(shot: Mapping[str, object]) -> Mapping[str, object]:
+    raw = shot.get("structured_data")
+    return raw if isinstance(raw, Mapping) else {}
+
+
+def _visual_value(visual: Mapping[str, object], field_name: str) -> str:
+    return _clean_text(visual.get(field_name))
+
+
+def _contains_disallowed_execution_metadata(value: str) -> bool:
+    return any(marker in value for marker in _DISALLOWED_EXECUTION_METADATA_MARKERS)
+
+
+def _without_disallowed_execution_metadata(value: str) -> str:
+    """旧式字段不进入执行 Prompt；整行丢弃，避免把标签误当真实台词改写。"""
+
+    return "\n".join(
+        line for line in value.splitlines() if not _contains_disallowed_execution_metadata(line)
+    ).strip()
+
+
+def render_unstructured_video_execution_prompt(
+    shots: Sequence[Mapping[str, object]],
+    *,
+    background: str | None = None,
+    duration_seconds: int | None = None,
+    subject_names_by_ref: Mapping[str, str] | None = None,
+    include_constraint_lock: bool = True,
+) -> str:
+    """从非完整结构快照与镜头内容构建新的执行 Prompt，不读取旧式镜头行。"""
+
+    if duration_seconds is not None and (type(duration_seconds) is not int or duration_seconds <= 0):
+        raise ValueError("duration_seconds 必须是正整数")
+
+    prepared: list[tuple[int, int, int, Mapping[str, object]]] = []
+    for source_index, shot in enumerate(shots):
+        start = _shot_time(shot, "start_seconds")
+        end = _shot_time(shot, "end_seconds")
+        if start is None or end is None or end <= start:
+            return ""
+        if duration_seconds is not None and end > duration_seconds:
+            raise ValueError("镜头结束时间不能超过镜头组时长")
+        display_no = _shot_time(shot, "display_no") or source_index + 1
+        prepared.append((start, display_no, end, shot))
+
+    if not prepared:
+        return ""
+
+    names_by_ref = subject_names_by_ref or {}
+    lines: list[str] = []
+    for start, display_no, end, shot in sorted(prepared, key=lambda item: item[:3]):
+        snapshot = _unstructured_snapshot(shot)
+        visual = _as_mapping(snapshot.get("visual"))
+        shot_size = _visual_value(visual, "shot_size")
+        camera_angle = _visual_value(visual, "camera_angle")
+        camera_movement = _visual_value(visual, "camera_movement")
+        movement = _CAMERA_MOVEMENT_DESCRIPTIONS.get(
+            camera_movement,
+            f"镜头以{camera_movement}运动" if camera_movement else "",
+        )
+        heading = f"【镜头{display_no}:{start}s～{end}s】"
+        if shot_size and camera_angle:
+            heading += f"{shot_size}·{camera_angle}"
+        elif shot_size or camera_angle:
+            heading += shot_size or camera_angle
+        if movement:
+            heading += f"，{movement}"
+
+        parts = [_sentence(heading) if len(heading) > len(f"【镜头{display_no}:{start}s～{end}s】") else heading]
+        content = _clean_text(shot.get("content"))
+        if content and not _contains_disallowed_execution_metadata(content):
+            parts.append(_sentence(content))
+        for field_name in ("lighting", "frame_description"):
+            sentence = _sentence(visual.get(field_name))
+            if sentence:
+                parts.append(sentence)
+
+        props = _props_description(shot)
+        if props:
+            parts.append(_sentence(props))
+
+        action = _visual_value(visual, "action")
+        if action:
+            characters = _string_list(shot.get("characters"))
+            subject = "、".join(characters) if characters else "画面主体"
+            visible_action = action if action.startswith(subject) else f"{subject}{action}"
+            parts.append(_sentence(visible_action))
+
+        composition = _composition_description(visual)
+        if composition:
+            parts.append(_sentence(composition))
+
+        emotion = _visual_value(visual, "emotion")
+        if emotion:
+            parts.append(_sentence(f"人物呈现{emotion}"))
+        dialogue = _dialogue_description(shot, snapshot, names_by_ref)
+        if dialogue:
+            parts.append(dialogue)
+
+        sound = _sound_description(snapshot)
+        if sound:
+            parts.append(sound)
+        line = "".join(parts)
+        if len(line) == len(f"【镜头{display_no}:{start}s～{end}s】"):
+            line += "画面主体保持当前动作与空间关系。"
+        lines.append(line)
+
+    result_parts = [f"故事发生在{_clean_text(background)}。"] if _clean_text(background) else []
+    result_parts.append("\n".join(lines))
+    if include_constraint_lock:
+        result_parts.append(_EXECUTION_CONSTRAINT_LOCK)
+    return _without_disallowed_execution_metadata("\n".join(result_parts))
+
+
 def render_video_execution_prompt(
     shots: Sequence[Mapping[str, object]],
     *,
@@ -158,8 +284,8 @@ def render_video_execution_prompt(
 ) -> str:
     """将结构化镜头渲染为逐时段、自然语言化的视频执行提示词。
 
-    渲染只消费完整 storyboard.v2 的可验证事实，不反向解析 ``shot_line``。任何
-    镜头不是完整 v2 快照时返回空串，使历史自由文本继续走原有兼容路径。
+    渲染只消费完整 storyboard.v2 的可验证事实，不读取旧式 ``shot_line``。任何
+    镜头不是完整 v2 快照时返回空串，由无结构回退渲染器基于结构字段与 content 重建。
     """
 
     if duration_seconds is not None and (type(duration_seconds) is not int or duration_seconds <= 0):
@@ -238,7 +364,7 @@ def render_video_execution_prompt(
     parts.append("\n".join(lines))
     if include_constraint_lock:
         parts.append(_EXECUTION_CONSTRAINT_LOCK)
-    return "\n".join(parts)
+    return _without_disallowed_execution_metadata("\n".join(parts))
 
 
 def _insert_before_constraint_tail(prompt: str, block: str) -> str:
@@ -280,16 +406,27 @@ def compose_video_prompt(
     shots: Sequence[Mapping[str, object]] = (),
     duration_seconds: int | None = None,
 ) -> str:
-    """将结构镜头补入基础提示词，保持手工文本与受保护尾段的顺序。"""
+    """将镜头事实补入基础提示词；旧式组提示词会被新的执行 Prompt 整体替换。"""
 
     source = prompt.strip()
+    source_has_disallowed_metadata = _contains_disallowed_execution_metadata(source)
     execution_block = render_video_execution_prompt(
         shots,
         duration_seconds=duration_seconds,
         include_constraint_lock=False,
     )
     if not execution_block:
-        return source
+        execution_block = render_unstructured_video_execution_prompt(
+            shots,
+            duration_seconds=duration_seconds,
+            include_constraint_lock=False,
+        )
+    if not execution_block:
+        return _without_disallowed_execution_metadata(source) if source_has_disallowed_metadata else source
+    if source_has_disallowed_metadata:
+        _, constraint_tail = split_protected_constraint_tail(source)
+        constraint = constraint_tail or _EXECUTION_CONSTRAINT_LOCK
+        return "\n".join((execution_block, constraint))
     has_constraint_tail = bool(split_protected_constraint_tail(source)[1])
     signatures = _execution_shot_signatures(execution_block)
     if signatures and all(signature in source for signature in signatures):
@@ -305,5 +442,6 @@ def compose_video_prompt(
 __all__ = [
     "append_boundary_facts",
     "compose_video_prompt",
+    "render_unstructured_video_execution_prompt",
     "render_video_execution_prompt",
 ]

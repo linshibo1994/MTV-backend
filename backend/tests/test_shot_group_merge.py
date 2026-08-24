@@ -414,6 +414,63 @@ async def test_refresh_group_retimes_structure_and_rebuilds_quality() -> None:
     ]
 
 
+async def test_refresh_group_discards_legacy_shot_line_for_execution_prompt() -> None:
+    from app.services.shot_group_merge import _refresh_group
+
+    shot = SimpleNamespace(
+        shot_id="shot-legacy-1",
+        shot_group_id="draft-1",
+        scene_no=1,
+        group_no="G1",
+        display_no=1,
+        shot_no="old-1",
+        start_seconds=0,
+        end_seconds=3,
+        shot_line=(
+            "【镜头1:0s～3s】老姜独自在电脑前加班，构图是【三分法】，"
+            "声音设计是【远处车流声】"
+        ),
+        content="老姜独自在电脑前加班，专注处理屏幕上的工作。",
+        characters=["老姜"],
+        props=["电脑", "茶杯"],
+        sounds=[],
+        dialogue_character="",
+        structured_data={
+            "visual": {
+                "shot_size": "全景",
+                "composition": ["三分法"],
+                "camera_angle": "平视",
+                "camera_movement": "固定",
+                "lighting": "屏幕冷光与室内暖光交织",
+                "action": "持续处理电脑上的工作",
+                "emotion": "沉稳",
+            },
+            "sound_design": "远处车流声",
+        },
+    )
+    group = SimpleNamespace(shot_group_id="final-legacy-1", scene_no=1, group_no="G1")
+    empty_result = SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: []))
+    db = SimpleNamespace(execute=AsyncMock(return_value=empty_result))
+
+    await _refresh_group(
+        db,
+        group,
+        [shot],
+        background="融媒众创空间大楼-办公桌前-内-夜",
+        narrative_purpose="展现老姜的深夜工作状态",
+        subjects=[],
+        duration_by_shot={"shot-legacy-1": 3},
+    )
+
+    assert "构图是【" not in group.prompt
+    assert "声音设计是【" not in group.prompt
+    assert "【角色】" not in group.prompt
+    assert "【叙事目的】" not in group.prompt
+    assert "老姜独自在电脑前加班，专注处理屏幕上的工作。" in group.prompt
+    assert "主体位于画面一侧，另一侧保留环境空间" in group.prompt
+    assert "环境中可听见远处车流声" in group.prompt
+
+
 async def test_refresh_group_preserves_storyboard_provenance_anchor() -> None:
     from app.services.shot_group_merge import _refresh_group
 
@@ -513,7 +570,7 @@ async def test_refresh_group_does_not_self_validate_local_coverage_as_expected()
     assert "coverage_unknown_block" not in warning_codes
 
 
-async def test_refresh_group_keeps_incomplete_legacy_structure_compatible() -> None:
+async def test_refresh_group_rebuilds_incomplete_structure_without_legacy_prompt() -> None:
     from app.services.shot_group_merge import _refresh_group
 
     shot = SimpleNamespace(
@@ -554,8 +611,11 @@ async def test_refresh_group_keeps_incomplete_legacy_structure_compatible() -> N
         duration_by_shot={"legacy-shot": 3},
     )
 
-    assert "【镜头1:0s～3s】旧镜头" in group.prompt
-    assert "【叙事目的】兼容旧镜头" in group.prompt
+    assert "【镜头1:0s～3s】旧镜头" not in group.prompt
+    assert "【叙事目的】" not in group.prompt
+    assert "【镜头1:0s～3s】中景·平视，镜头保持固定。" in group.prompt
+    assert "旧镜头。" in group.prompt
+    assert "镜头聚焦单一人物。" in group.prompt
     assert group.quality_summary == {}
     assert "boundary_projections" not in group.reference_frames
 

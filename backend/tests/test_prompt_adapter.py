@@ -237,3 +237,50 @@ def test_render_video_execution_prompt_rejects_segment_outside_group_duration() 
             ],
             duration_seconds=6,
         )
+
+
+def test_compose_video_prompt_replaces_legacy_tagged_group_prompt_with_natural_fallback() -> None:
+    legacy_prompt = (
+        "【镜头1:0s～3s】场景是融媒众创空间大楼-办公桌前-内-夜，全景·平视，固定，"
+        "冷色调的屏幕光与暖色调的室内灯光交织，老姜独自在电脑前加班，"
+        "构图是【三分法、纵深构图】，"
+        "声音设计是【远处城市低频车流声，空调外机低鸣；声音桥延续至室内】\n"
+        "【角色】老姜、电脑、茶杯\n"
+        "【叙事目的】建立深夜办公环境与老姜的工作状态\n"
+        "【约束】人物特征高度一致，禁止出现任何形式的字幕。"
+    )
+    shots = [
+        {
+            "display_no": 1,
+            "start_seconds": 0,
+            "end_seconds": 3,
+            "characters": ["老姜"],
+            "props": ["电脑", "茶杯"],
+            "shot_line": legacy_prompt.splitlines()[0],
+            "content": "老姜独自在电脑前加班，专注处理屏幕上的工作。",
+            "structured_data": {
+                "visual": {
+                    "shot_size": "全景",
+                    "composition": ["三分法", "纵深构图"],
+                    "camera_angle": "平视",
+                    "camera_movement": "固定",
+                    "lighting": "冷色调的屏幕光与暖色调的室内灯光交织",
+                    "frame_description": "夜色中的办公区域灯火通明",
+                    "action": "持续处理电脑上的工作",
+                    "emotion": "沉稳",
+                },
+                "sound_design": "远处城市低频车流声，空调外机低鸣；声音桥延续至室内",
+            },
+        }
+    ]
+
+    rendered = compose_video_prompt(legacy_prompt, shots=shots, duration_seconds=3)
+
+    assert "构图是【" not in rendered
+    assert "声音设计是【" not in rendered
+    assert "【角色】" not in rendered
+    assert "【叙事目的】" not in rendered
+    assert "主体位于画面一侧，另一侧保留环境空间" in rendered
+    assert "前景、中景和背景形成明显纵深" in rendered
+    assert "环境中可听见远处城市低频车流声，空调外机低鸣；声音桥延续至室内" in rendered
+    assert rendered.endswith("【约束】人物特征高度一致，禁止出现任何形式的字幕。")

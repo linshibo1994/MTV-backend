@@ -1133,6 +1133,76 @@ def test_create_video_job_enhances_structured_prompt_before_adapter(
     asyncio.run(scenario())
 
 
+def test_create_video_job_replaces_stored_legacy_group_prompt_before_adapter(
+    monkeypatch,
+) -> None:
+    async def scenario() -> None:
+        from app.services import video_generation
+
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        seeded.shot_group.prompt = (
+            "【镜头1:0s～3s】老姜独自在电脑前加班，构图是【三分法】，"
+            "声音设计是【远处车流声】\n"
+            "【角色】老姜、电脑、茶杯\n"
+            "【叙事目的】展现深夜工作状态\n"
+            "【约束】人物特征高度一致，禁止出现任何形式的字幕。"
+        )
+        raw.add(
+            Shot(
+                shot_id="shot-legacy-prompt-1",
+                shot_group_id=seeded.shot_group.shot_group_id,
+                scene_no=1,
+                group_no="G10",
+                shot_no="4x4x4x4x4x",
+                display_no=1,
+                content="老姜独自在电脑前加班，专注处理屏幕上的工作。",
+                description="深夜办公",
+                shot_line="【镜头1:0s～3s】旧式镜头行",
+                start_seconds=0,
+                end_seconds=3,
+                characters=["老姜"],
+                props=["电脑", "茶杯"],
+                structured_data={},
+            )
+        )
+        raw.commit()
+        db = _AsyncSessionAdapter(raw)
+
+        async def fake_enqueue(db, **kwargs):
+            row = TaskDispatchOutbox(
+                id="dispatch-legacy-prompt",
+                task_type=kwargs["task_type"],
+                job_id=kwargs["job_id"],
+                attempt=kwargs["attempt"],
+                payload=kwargs["payload"],
+                status="pending",
+            )
+            db.add(row)
+            return row
+
+        monkeypatch.setattr(video_generation, "enqueue_task", fake_enqueue)
+        job = await video_generation.create_video_job(
+            db,
+            script_id=seeded.script.id,
+            episode_id=seeded.episode.episode_id,
+            shot_group_id=seeded.shot_group.shot_group_id,
+            user_id=seeded.user.user_id,
+            idempotency_key="legacy-group-prompt",
+        )
+
+        source = job.input_json["source_prompt"]
+        assert "构图是【" not in source
+        assert "声音设计是【" not in source
+        assert "【角色】" not in source
+        assert "【叙事目的】" not in source
+        assert "老姜独自在电脑前加班，专注处理屏幕上的工作。" in source
+        assert source.index("## 图片内容说明") < source.index("【镜头1:0s～3s】")
+        assert source.endswith("【约束】人物特征高度一致，禁止出现任何形式的字幕。")
+
+    asyncio.run(scenario())
+
+
 def test_create_video_job_same_idempotency_key_rejects_changed_explicit_prompt(
     monkeypatch,
 ) -> None:

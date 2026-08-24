@@ -297,12 +297,12 @@ async def create_video_job(
     provider_key = runtime_video_model.task_provider_key
     model = runtime_video_model.model
     reference_token_map = _freeze_reference_token_map(aggregated)
-    prompt_text = bind_reference_tokens_to_prompt(base_prompt, reference_token_map)
     structured_prompt_shots = await _load_structured_video_prompt_context(
         db,
         shot_group_id,
     )
-    if structured_prompt_shots:
+    prompt_text = base_prompt
+    if client_prompt is None and structured_prompt_shots:
         try:
             prompt_text = compose_video_prompt(
                 prompt_text,
@@ -315,6 +315,7 @@ async def create_video_job(
                 "视频结构提示增强失败，保留基础提示词 shot_group_id=%s",
                 shot_group_id,
             )
+    prompt_text = bind_reference_tokens_to_prompt(prompt_text, reference_token_map)
     boundary_fragments = _boundary_prompt_fragments(shot_group.reference_frames)
     prompt_text = append_boundary_facts(prompt_text, boundary_fragments)
     try:
@@ -1307,7 +1308,7 @@ async def _load_structured_video_prompt_context(
     db: AsyncSession,
     shot_group_id: str,
 ) -> list[dict[str, object]]:
-    """从完整 v2 结构快照构造自然语言执行提示词的事实输入。"""
+    """加载执行 Prompt 所需的新结构字段与镜头内容，不读取旧 shot_line。"""
     result = await db.execute(
         select(Shot)
         .where(Shot.shot_group_id == shot_group_id)
@@ -1316,11 +1317,6 @@ async def _load_structured_video_prompt_context(
     snapshots: list[dict[str, object]] = []
     for shot in result.scalars().all():
         raw = shot.structured_data
-        if not isinstance(raw, dict):
-            return []
-        visual = raw.get("visual")
-        if not isinstance(visual, dict):
-            return []
         snapshot: dict[str, object] = {
             "display_no": shot.display_no,
             "start_seconds": shot.start_seconds,
@@ -1328,7 +1324,8 @@ async def _load_structured_video_prompt_context(
             "characters": list(shot.characters or []),
             "props": list(shot.props or []),
             "dialogue_character": shot.dialogue_character,
-            "structured_data": dict(raw),
+            "structured_data": dict(raw) if isinstance(raw, dict) else {},
+            "content": shot.content,
         }
         snapshots.append(snapshot)
     return snapshots
