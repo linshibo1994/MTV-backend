@@ -27,6 +27,21 @@ from app.services.prompt_builder import (
 
 WarningSeverity = Literal["warning"]
 
+# 这些字段会被拼进交给视频模型的执行提示词，超长会挤掉后续镜头，
+# 上限与 storyboard.system 提示词中的“字段精简”段保持一致。
+_EXECUTION_FIELD_LIMITS: tuple[tuple[str, int], ...] = (
+    ("frame_description", 30),
+    ("action", 20),
+    ("lighting", 16),
+    ("emotion", 8),
+)
+_SOUND_DESIGN_LIMIT = 20
+# 执行提示词的约束尾段要求画面无任何可读文字，画面字段不得反过来要求字幕。
+# 屏幕文字检查只覆盖 storyboard.system 提示词里明确下禁令的四个画面字段；
+# emotion 不描述画面内容，不在禁令内。
+_ON_SCREEN_TEXT_FIELDS = frozenset({"frame_description", "action", "lighting", "sound_design"})
+_ON_SCREEN_TEXT_WORDS = ("字幕", "片名", "预告文字", "logo", "水印", "标题卡")
+
 
 @dataclass(frozen=True)
 class ScriptBlock:
@@ -581,6 +596,45 @@ def evaluate_audience_visibility(contract: StoryboardV2Contract) -> list[Quality
     return warnings
 
 
+def _execution_field_values(shot: StoryboardV2ShotContract) -> tuple[tuple[str, str, int], ...]:
+    values = [
+        (name, getattr(shot.visual, name), limit) for name, limit in _EXECUTION_FIELD_LIMITS
+    ]
+    values.append(("sound_design", shot.sound_design, _SOUND_DESIGN_LIMIT))
+    return tuple(values)
+
+
+def evaluate_execution_field_economy(contract: StoryboardV2Contract) -> list[QualityWarning]:
+    """提示会进入执行提示词的字段超长或写入屏幕文字。"""
+
+    warnings: list[QualityWarning] = []
+    for scene_index, group_index, shot_index, shot in _iter_shots(contract):
+        path = _shot_path(scene_index, group_index, shot_index)
+        for name, value, limit in _execution_field_values(shot):
+            field_path = f"{path}.sound_design" if name == "sound_design" else f"{path}.visual.{name}"
+            if len(value) > limit:
+                warnings.append(
+                    QualityWarning(
+                        code="execution_field_too_long",
+                        path=field_path,
+                        message=f"{name} 超出执行提示词建议长度，过长会挤掉后续镜头",
+                        details={"field": name, "length": len(value), "limit": limit},
+                    )
+                )
+            if name in _ON_SCREEN_TEXT_FIELDS:
+                matched = [word for word in _ON_SCREEN_TEXT_WORDS if word in value.casefold()]
+                if matched:
+                    warnings.append(
+                        QualityWarning(
+                            code="execution_field_requests_on_screen_text",
+                            path=field_path,
+                            message=f"{name} 要求画面出现可读文字，与执行提示词的无字幕约束冲突",
+                            details={"field": name, "matched": matched},
+                        )
+                    )
+    return warnings
+
+
 def build_shot_structured_data(
     shot: StoryboardV2ShotContract,
     *,
@@ -643,13 +697,20 @@ def evaluate_storyboard_quality(
     contract: StoryboardV2Contract,
     *,
     expected_source_blocks: Sequence[str | ScriptBlock] = (),
+    check_execution_field_economy: bool = False,
 ) -> QualityReport:
-    """运行全部首版纯规则，始终返回报告且不因质量问题抛异常。"""
+    """运行全部首版纯规则，始终返回报告且不因质量问题抛异常。
+
+    ``check_execution_field_economy`` 只在分镜生成时开启：字段长度由 Provider
+    决定，重组既有镜头改不了它，合并路径开启只会重复刷同一批告警。
+    """
 
     coverage, warnings = evaluate_coverage(contract, expected_source_blocks)
     warnings.extend(evaluate_boundary_continuity(contract))
     warnings.extend(evaluate_position_continuity(contract))
     warnings.extend(evaluate_audience_visibility(contract))
+    if check_execution_field_economy:
+        warnings.extend(evaluate_execution_field_economy(contract))
     guidance: list[dict[str, object]] = []
     for scene_index, scene in enumerate(contract.scenes):
         for group_index, group in enumerate(scene.shot_groups):
@@ -676,6 +737,7 @@ __all__ = [
     "evaluate_audience_visibility",
     "evaluate_boundary_continuity",
     "evaluate_coverage",
+    "evaluate_execution_field_economy",
     "evaluate_position_continuity",
     "evaluate_storyboard_quality",
 ]

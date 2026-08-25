@@ -27,6 +27,7 @@ from app.services.storyboard_quality import (
     build_shot_group_quality_summary,
     build_shot_structured_data,
     canonical_source_block_ref,
+    evaluate_execution_field_economy,
     evaluate_storyboard_quality,
 )
 
@@ -497,3 +498,82 @@ def test_shot_models_expose_structured_fields_and_hash_covers_quality_and_contin
     assert shot_group_content_hash(base) == legacy_hash
     assert shot_group_content_hash(base) != shot_group_content_hash(with_quality)
     assert shot_group_content_hash(base) != shot_group_content_hash(continuation)
+
+
+def _economy_payload(visual_overrides: dict, *, sound_design: str = "环境底噪") -> dict:
+    payload = _legacy_v2_payload()
+    shot = payload["scenes"][0]["shot_groups"][0]["shots"][0]
+    shot["visual"].update(visual_overrides)
+    shot["sound_design"] = sound_design
+    return payload
+
+
+def test_execution_field_economy_flags_overlong_fields() -> None:
+    contract = StoryboardV2Contract.model_validate(
+        _economy_payload(
+            {
+                "frame_description": "老姜位于画面右侧办公桌前，身体朝左侧电脑屏幕，"
+                "左侧前景为显示器边缘，后景是亮着顶灯的开放办公区",
+            }
+        )
+    )
+
+    warnings = evaluate_execution_field_economy(contract)
+
+    overlong = [item for item in warnings if item.code == "execution_field_too_long"]
+    assert [item.details["field"] for item in overlong] == ["frame_description"]
+    assert overlong[0].path.endswith(".visual.frame_description")
+    assert overlong[0].details["limit"] == 30
+    assert overlong[0].severity == "warning"
+
+
+def test_execution_field_economy_flags_on_screen_text_requests() -> None:
+    contract = StoryboardV2Contract.model_validate(
+        _economy_payload({"action": "画面浮现预告字幕"}, sound_design="低沉悬念音衔接")
+    )
+
+    warnings = evaluate_execution_field_economy(contract)
+
+    requested = [
+        item for item in warnings if item.code == "execution_field_requests_on_screen_text"
+    ]
+    assert [item.details["field"] for item in requested] == ["action"]
+    assert requested[0].details["matched"] == ["字幕"]
+
+
+def test_execution_field_economy_accepts_concise_fields() -> None:
+    contract = StoryboardV2Contract.model_validate(
+        _economy_payload(
+            {
+                "frame_description": "老姜在办公桌前，后景开放办公区",
+                "action": "抬手揉按太阳穴",
+                "lighting": "电脑冷白光照侧脸",
+                "emotion": "疲惫",
+            },
+            sound_design="空调低鸣，键盘轻响停下",
+        )
+    )
+
+    assert evaluate_execution_field_economy(contract) == []
+
+
+def test_execution_field_economy_runs_only_when_requested() -> None:
+    contract = StoryboardV2Contract.model_validate(
+        _economy_payload({"action": "画面浮现预告字幕"})
+    )
+    economy_codes = {
+        "execution_field_too_long",
+        "execution_field_requests_on_screen_text",
+    }
+
+    default_codes = {item.code for item in evaluate_storyboard_quality(contract).warnings}
+    enabled_codes = {
+        item.code
+        for item in evaluate_storyboard_quality(
+            contract,
+            check_execution_field_economy=True,
+        ).warnings
+    }
+
+    assert not (default_codes & economy_codes)
+    assert economy_codes & enabled_codes

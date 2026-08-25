@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping, Sequence
 
 from app.providers.prompt_adapter import split_protected_constraint_tail
@@ -12,16 +13,30 @@ _EMPTY_SOUND_DESIGN_VALUES = frozenset(
 )
 _COMPOSITION_DESCRIPTIONS: dict[str, str] = {
     "单人": "镜头聚焦单一人物",
-    "双人": "两人同处画面，互动关系清晰",
-    "多人": "多人在画面中保持清晰层次",
-    "过肩": "以前景人物肩部作为取景前景",
-    "对称": "画面保持稳定对称",
-    "三分法": "主体位于画面一侧，另一侧保留环境空间",
-    "中央构图": "主体居于画面中央",
-    "框景": "利用门窗或前景形成取景框",
-    "前景遮挡": "前景有虚化物体局部遮挡画面边缘",
-    "留白": "画面保留安静留白",
-    "纵深构图": "前景、中景和背景形成明显纵深",
+    "双人": "两人同框互动清晰",
+    "多人": "多人层次清晰",
+    "过肩": "以前景人物肩部取景",
+    "对称": "画面对称稳定",
+    "三分法": "主体居一侧留出环境空间",
+    "中央构图": "主体居中",
+    "框景": "以门窗前景形成取景框",
+    "前景遮挡": "前景虚化物遮挡画面边缘",
+    "留白": "画面保留留白",
+    "纵深构图": "画面有前中后景纵深",
+}
+# 构图模板语的去重关键词。只在画面描述已把同一构图讲清时才丢弃，宁可保留
+# 一句略冗余的构图，也不丢掉画面描述并未表达的构图意图：
+# ``min_hits`` 要求命中多个景层词，``all_of`` 要求关键词共现。
+_COMPOSITION_REDUNDANCY_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "纵深构图": ("前景", "中景", "后景", "远景", "纵深"),
+    "前景遮挡": ("前景", "遮挡", "虚化"),
+    "中央构图": ("画面中央", "居中", "正中"),
+    "框景": ("门框", "窗框", "取景框"),
+    "留白": ("留白",),
+}
+_COMPOSITION_REDUNDANCY_MIN_HITS: dict[str, int] = {"纵深构图": 2}
+_COMPOSITION_REDUNDANCY_ALL_OF: dict[str, tuple[str, ...]] = {
+    "前景遮挡": ("前景",),
 }
 _CAMERA_MOVEMENT_DESCRIPTIONS: dict[str, str] = {
     "固定": "镜头保持固定",
@@ -41,6 +56,14 @@ _EXECUTION_CONSTRAINT_LOCK = (
 )
 _BOUNDARY_FACTS_MARKER = "【冻结边界事实 boundary-facts】"
 _TERMINAL_PUNCTUATION = ("。", "！", "？", "!", "?", "…")
+_FRAGMENT_TAIL_PUNCTUATION = ("。", "，")
+_OPENING_QUOTES = ("“", "「", '"')
+_CLOSING_QUOTES = ("”", "」", '"')
+# 逐镜签名：镜头号 + 景别·机位 + 运镜，止于下一个分句标点。缺摄影字段时退化为镜头号。
+_EXECUTION_SHOT_HEADING_RE = re.compile(
+    r"^(?P<signature>【镜头\d+\s*:\s*[^】]+】(?:[^，。\n]+·[^，。\n]+，[^，。\n]+)?)"
+)
+_INTERNAL_SENTENCE_PUNCTUATION = ("。", "！", "？", "!", "?", "…")
 _STRUCTURED_SNAPSHOT_EXTRA_FIELDS = frozenset({"schema_version", "subject_ids_by_ref", "background_ref"})
 _DISALLOWED_EXECUTION_METADATA_MARKERS = (
     "构图是【",
@@ -70,9 +93,49 @@ def _sentence(value: object) -> str:
     text = _clean_text(value)
     if not text:
         return ""
+    if text.endswith(("”", "」", '"')) and len(text) > 1 and text[-2] in _TERMINAL_PUNCTUATION:
+        return text
     if text.endswith(_TERMINAL_PUNCTUATION):
         return text
     return f"{text}。"
+
+
+def _normalize_fragment(value: object) -> str:
+    text = _clean_text(value)
+    while text.endswith(_FRAGMENT_TAIL_PUNCTUATION):
+        text = text[:-1].rstrip()
+    return text
+
+
+def _join_fragments(fragments: Sequence[object]) -> str:
+    """把镜头片段压成连续句子，保留片段内部已有的完整句。"""
+
+    sentences: list[str] = []
+    buffer = ""
+    for value in fragments:
+        fragment = _normalize_fragment(value)
+        if not fragment:
+            continue
+        if any(mark in fragment for mark in _INTERNAL_SENTENCE_PUNCTUATION):
+            # 只剩镜头号的缓冲区不能单独成句，否则输出 `【镜头1:0s～3s】。`。
+            if buffer.endswith("】"):
+                sentences.append(_sentence(f"{buffer}{fragment}"))
+            else:
+                if buffer:
+                    sentences.append(_sentence(buffer))
+                sentences.append(_sentence(fragment))
+            buffer = ""
+            continue
+        if not buffer:
+            buffer = fragment
+        elif buffer.endswith("】"):
+            # 头部缺摄影字段时只剩镜头号，逗号不能紧跟右括号。
+            buffer = f"{buffer}{fragment}"
+        else:
+            buffer = f"{buffer}，{fragment}"
+    if buffer:
+        sentences.append(_sentence(buffer))
+    return "".join(sentences)
 
 
 def _shot_time(shot: Mapping[str, object], field_name: str) -> int | None:
@@ -85,6 +148,8 @@ def _structured_snapshot(shot: Mapping[str, object]) -> Mapping[str, object]:
     if not isinstance(raw, Mapping) or raw.get("schema_version") != "storyboard.shot-structure.v1":
         return {}
     payload = {key: value for key, value in raw.items() if key not in _STRUCTURED_SNAPSHOT_EXTRA_FIELDS}
+    if "dialogue" not in payload:
+        payload["dialogue"] = None
     try:
         StoryboardV2ShotContract.model_validate(payload)
     except ValueError:
@@ -97,16 +162,49 @@ def _composition_description_from_values(values: Sequence[str]) -> str:
         _COMPOSITION_DESCRIPTIONS.get(value, f"画面保持{value}的空间组织")
         for value in values
     ]
-    return "；".join(dict.fromkeys(descriptions))
+    return "，".join(dict.fromkeys(descriptions))
+
+
+def _composition_already_in_frame(value: str, frame_description: str) -> bool:
+    keywords = _COMPOSITION_REDUNDANCY_KEYWORDS.get(value, ())
+    if not keywords:
+        return False
+    required = _COMPOSITION_REDUNDANCY_ALL_OF.get(value, ())
+    if any(keyword not in frame_description for keyword in required):
+        return False
+    hits = sum(1 for keyword in keywords if keyword in frame_description)
+    return hits >= _COMPOSITION_REDUNDANCY_MIN_HITS.get(value, 1)
 
 
 def _composition_description(visual: Mapping[str, object]) -> str:
-    return _composition_description_from_values(_string_list(visual.get("composition")))
+    """构图模板语与画面描述重复时丢弃，避免同一空间事实写两遍。"""
+
+    frame_description = _visual_value(visual, "frame_description")
+    values = [
+        value
+        for value in _string_list(visual.get("composition"))
+        if not _composition_already_in_frame(value, frame_description)
+    ]
+    return _composition_description_from_values(values)
 
 
-def _props_description(shot: Mapping[str, object]) -> str:
+def _props_description(shot: Mapping[str, object], visual: Mapping[str, object]) -> str:
     props = _string_list(shot.get("props"))
-    return f"画面中保留{'、'.join(props)}等道具" if props else ""
+    if not props:
+        return ""
+    visible_text = " ".join(
+        value
+        for value in (
+            _visual_value(visual, "frame_description"),
+            _visual_value(visual, "action"),
+        )
+        if value
+    )
+    # 画面描述已点名的道具不再复读，只补画面里没被提到的。
+    unmentioned = [prop for prop in props if prop not in visible_text]
+    if not unmentioned:
+        return ""
+    return f"画面中保留{'、'.join(unmentioned)}等道具"
 
 
 def _speaker_name(
@@ -125,6 +223,24 @@ def _speaker_name(
 
 
 def _quoted_dialogue(text: str) -> str:
+    """台词自带引号时原样保留，只给裸台词补引号。
+
+    剧本台词必须逐字保留，因此不改写引号内外的标点；只清掉句尾多余的逗号与
+    空白，并把仅由引号和标点组成的空台词判为无台词。
+    """
+
+    text = text.strip()
+    # 只清句尾多余的逗号；句号属于台词原文标点，剥掉即为改写。
+    while text.endswith("，"):
+        text = text[:-1].rstrip()
+    if not text:
+        return ""
+    if text.startswith(_OPENING_QUOTES):
+        if not text.strip("".join((*_OPENING_QUOTES, *_CLOSING_QUOTES))).strip(
+            "".join((*_TERMINAL_PUNCTUATION, *_FRAGMENT_TAIL_PUNCTUATION, " "))
+        ):
+            return ""
+        return _sentence(text)
     if text.endswith(_TERMINAL_PUNCTUATION):
         return f"“{text}”"
     return f"“{text}”。"
@@ -142,22 +258,26 @@ def _dialogue_description(
     speaker = _speaker_name(shot, dialogue, subject_names_by_ref)
     kind = _clean_text(dialogue.get("kind"))
     quoted = _quoted_dialogue(text)
+    if not quoted:
+        return ""
     if kind == "voice_over":
-        prefix = f"{speaker}的" if speaker else ""
-        return f"{prefix}画外音响起，内容为{quoted}；画面中的人物不张口。"
+        if quoted.endswith("”。"):
+            quoted = quoted[:-1]
+        prefix = f"{speaker}" if speaker else ""
+        return f"{prefix}画外音：{quoted}，画面中人物不张口"
     if kind == "inner_monologue":
-        prefix = f"{speaker}的" if speaker else ""
-        return f"{prefix}内心独白以画外音呈现，内容为{quoted}；画面中的人物不张口。"
-    if speaker:
-        return f"{speaker}开口说：{quoted}"
-    return f"人物开口说：{quoted}"
+        if quoted.endswith("”。"):
+            quoted = quoted[:-1]
+        prefix = f"{speaker}" if speaker else ""
+        return f"{prefix}内心独白（画外音）：{quoted}，画面中人物不张口"
+    return f"{speaker or '人物'}开口说：{quoted}"
 
 
 def _sound_description(snapshot: Mapping[str, object]) -> str:
     sound_design = _clean_text(snapshot.get("sound_design"))
     if not sound_design or sound_design.casefold() in _EMPTY_SOUND_DESIGN_VALUES:
         return ""
-    return f"环境中可听见{sound_design}。"
+    return f"环境音为{sound_design}"
 
 
 def _unstructured_snapshot(shot: Mapping[str, object]) -> Mapping[str, object]:
@@ -167,6 +287,16 @@ def _unstructured_snapshot(shot: Mapping[str, object]) -> Mapping[str, object]:
 
 def _visual_value(visual: Mapping[str, object], field_name: str) -> str:
     return _clean_text(visual.get(field_name))
+
+
+def _same_content_as_frame(content: str, frame_description: str) -> bool:
+    def normalize(value: str) -> str:
+        text = value.strip()
+        while text.endswith(("。", ".")):
+            text = text[:-1].rstrip()
+        return text
+
+    return bool(normalize(content)) and normalize(content) == normalize(frame_description)
 
 
 def _contains_disallowed_execution_metadata(value: str) -> bool:
@@ -179,6 +309,64 @@ def _without_disallowed_execution_metadata(value: str) -> str:
     return "\n".join(
         line for line in value.splitlines() if not _contains_disallowed_execution_metadata(line)
     ).strip()
+
+
+def _render_shot_line(
+    heading: str,
+    shot: Mapping[str, object],
+    snapshot: Mapping[str, object],
+    visual: Mapping[str, object],
+    subject_names_by_ref: Mapping[str, str],
+    *,
+    content: str = "",
+    heading_has_details: bool = True,
+) -> str:
+    fragments: list[object] = [heading]
+    for field_name in ("lighting", "frame_description"):
+        value = _visual_value(visual, field_name)
+        if value:
+            fragments.append(value)
+
+    if content and not _contains_disallowed_execution_metadata(content):
+        frame_description = _visual_value(visual, "frame_description")
+        if not _same_content_as_frame(content, frame_description):
+            fragments.append(content)
+
+    props = _props_description(shot, visual)
+    if props:
+        fragments.append(props)
+
+    action = _visual_value(visual, "action")
+    characters = _string_list(shot.get("characters"))
+    if action:
+        if characters:
+            subject = "、".join(characters)
+            visible_action = action if action.startswith(subject) else f"{subject}{action}"
+        else:
+            visible_action = action
+        fragments.append(visible_action)
+
+    composition = _composition_description(visual)
+    if composition:
+        fragments.append(composition)
+
+    if characters:
+        emotion = _visual_value(visual, "emotion")
+        if emotion:
+            fragments.append(f"情绪{emotion}")
+
+    dialogue = _dialogue_description(shot, snapshot, subject_names_by_ref)
+    sound = _sound_description(snapshot)
+    standalone = [value for value in (dialogue, sound) if value]
+
+    if len(fragments) == 1 and not standalone:
+        if heading_has_details:
+            return _sentence(heading)
+        default_action = "画面主体保持当前动作与空间关系" if characters else "保持当前动作与空间关系"
+        return f"{heading}{_sentence(default_action)}"
+
+    line = _join_fragments(fragments)
+    return line + "".join(_join_fragments([value]) for value in standalone)
 
 
 def render_unstructured_video_execution_prompt(
@@ -228,43 +416,16 @@ def render_unstructured_video_execution_prompt(
         if movement:
             heading += f"，{movement}"
 
-        parts = [_sentence(heading) if len(heading) > len(f"【镜头{display_no}:{start}s～{end}s】") else heading]
         content = _clean_text(shot.get("content"))
-        if content and not _contains_disallowed_execution_metadata(content):
-            parts.append(_sentence(content))
-        for field_name in ("lighting", "frame_description"):
-            sentence = _sentence(visual.get(field_name))
-            if sentence:
-                parts.append(sentence)
-
-        props = _props_description(shot)
-        if props:
-            parts.append(_sentence(props))
-
-        action = _visual_value(visual, "action")
-        if action:
-            characters = _string_list(shot.get("characters"))
-            subject = "、".join(characters) if characters else "画面主体"
-            visible_action = action if action.startswith(subject) else f"{subject}{action}"
-            parts.append(_sentence(visible_action))
-
-        composition = _composition_description(visual)
-        if composition:
-            parts.append(_sentence(composition))
-
-        emotion = _visual_value(visual, "emotion")
-        if emotion:
-            parts.append(_sentence(f"人物呈现{emotion}"))
-        dialogue = _dialogue_description(shot, snapshot, names_by_ref)
-        if dialogue:
-            parts.append(dialogue)
-
-        sound = _sound_description(snapshot)
-        if sound:
-            parts.append(sound)
-        line = "".join(parts)
-        if len(line) == len(f"【镜头{display_no}:{start}s～{end}s】"):
-            line += "画面主体保持当前动作与空间关系。"
+        line = _render_shot_line(
+            heading,
+            shot,
+            snapshot,
+            visual,
+            names_by_ref,
+            content=content,
+            heading_has_details=bool(shot_size or camera_angle or movement),
+        )
         lines.append(line)
 
     result_parts = [f"故事发生在{_clean_text(background)}。"] if _clean_text(background) else []
@@ -330,35 +491,15 @@ def render_video_execution_prompt(
             camera_movement,
             f"镜头以{camera_movement}运动",
         )
-        parts = [f"【镜头{display_no}:{start}s～{end}s】{shot_size}·{camera_angle}，{movement}。"]
-        for value in (visual.get("lighting"), visual.get("frame_description")):
-            sentence = _sentence(value)
-            if sentence:
-                parts.append(sentence)
-
-        props = _props_description(shot)
-        if props:
-            parts.append(_sentence(props))
-
-        action = _clean_text(visual.get("action"))
-        characters = _string_list(shot.get("characters"))
-        subject = "、".join(characters) if characters else "画面主体"
-        visible_action = action if action.startswith(subject) else f"{subject}{action}"
-        parts.append(_sentence(visible_action))
-
-        composition = _composition_description(visual)
-        if composition:
-            parts.append(_sentence(composition))
-        emotion = _clean_text(visual.get("emotion"))
-        if emotion:
-            parts.append(_sentence(f"人物呈现{emotion}"))
-        dialogue = _dialogue_description(shot, snapshot, names_by_ref)
-        if dialogue:
-            parts.append(dialogue)
-        sound = _sound_description(snapshot)
-        if sound:
-            parts.append(sound)
-        lines.append("".join(parts))
+        lines.append(
+            _render_shot_line(
+                f"【镜头{display_no}:{start}s～{end}s】{shot_size}·{camera_angle}，{movement}",
+                shot,
+                snapshot,
+                visual,
+                names_by_ref,
+            )
+        )
 
     parts = [f"故事发生在{_clean_text(background)}。"] if _clean_text(background) else []
     parts.append("\n".join(lines))
@@ -378,15 +519,18 @@ def _insert_before_constraint_tail(prompt: str, block: str) -> str:
 
 
 def _execution_shot_signatures(execution_block: str) -> list[str]:
-    """提取不依赖角色名称的逐镜摄影首句，用于识别已经存在的执行块。"""
+    """提取逐镜的镜头号与摄影抬头，用于识别已经存在的执行块。
+
+    签名只取到运镜描述为止，不含光影、动作与角色名，因此对"逐镜多句"与
+    "逐镜逗号连缀单句"两种排版都稳定；否则改排版会让历史落库 Prompt 匹配
+    不上，被再追加一份执行块。
+    """
 
     signatures: list[str] = []
     for line in execution_block.splitlines():
-        if not line.startswith("【镜头"):
-            continue
-        first_sentence, separator, _ = line.partition("。")
-        if separator:
-            signatures.append(f"{first_sentence}{separator}")
+        match = _EXECUTION_SHOT_HEADING_RE.match(line)
+        if match:
+            signatures.append(match.group("signature"))
     return signatures
 
 

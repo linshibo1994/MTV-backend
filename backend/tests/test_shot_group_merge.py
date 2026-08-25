@@ -406,7 +406,7 @@ async def test_refresh_group_retimes_structure_and_rebuilds_quality() -> None:
     assert group.reference_frames["boundary_projections"]["start"][
         "prompt_fragment"
     ].startswith("【入画状态】")
-    assert "【镜头1:0s～2s】中景·平视，镜头保持固定。" in group.prompt
+    assert "【镜头1:0s～2s】中景·平视，镜头保持固定，" in group.prompt
     assert "构图是【" not in group.prompt
     assert "【导演指令】" not in group.prompt
     assert group.materials["character"] == [
@@ -466,9 +466,9 @@ async def test_refresh_group_discards_legacy_shot_line_for_execution_prompt() ->
     assert "声音设计是【" not in group.prompt
     assert "【角色】" not in group.prompt
     assert "【叙事目的】" not in group.prompt
-    assert "老姜独自在电脑前加班，专注处理屏幕上的工作。" in group.prompt
-    assert "主体位于画面一侧，另一侧保留环境空间" in group.prompt
-    assert "环境中可听见远处车流声" in group.prompt
+    assert "老姜独自在电脑前加班，专注处理屏幕上的工作" in group.prompt
+    assert "主体居一侧留出环境空间" in group.prompt
+    assert "环境音为远处车流声" in group.prompt
 
 
 async def test_refresh_group_preserves_storyboard_provenance_anchor() -> None:
@@ -613,9 +613,9 @@ async def test_refresh_group_rebuilds_incomplete_structure_without_legacy_prompt
 
     assert "【镜头1:0s～3s】旧镜头" not in group.prompt
     assert "【叙事目的】" not in group.prompt
-    assert "【镜头1:0s～3s】中景·平视，镜头保持固定。" in group.prompt
-    assert "旧镜头。" in group.prompt
-    assert "镜头聚焦单一人物。" in group.prompt
+    assert "【镜头1:0s～3s】中景·平视，镜头保持固定，" in group.prompt
+    assert "旧镜头" in group.prompt
+    assert "镜头聚焦单一人物" in group.prompt
     assert group.quality_summary == {}
     assert "boundary_projections" not in group.reference_frames
 

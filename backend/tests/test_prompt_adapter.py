@@ -7,7 +7,9 @@ import pytest
 from app.providers.prompt_adapter import PromptAdaptationError, adapt_prompt, unicode_safe_prefix
 from app.providers.registry import get_prompt_capability
 from app.services.video_prompt import (
+    _quoted_dialogue,
     compose_video_prompt,
+    render_unstructured_video_execution_prompt,
     render_video_execution_prompt,
 )
 
@@ -161,15 +163,16 @@ def test_render_video_execution_prompt_uses_natural_per_shot_direction() -> None
     )
 
     assert rendered.startswith("故事发生在融媒众创空间大楼-办公桌前-内-夜。\n")
-    assert "【镜头1:0s～3s】全景·平视，镜头保持固定。" in rendered
-    assert "【镜头2:3s～6s】近景·斜侧，镜头缓慢向主体推进。" in rendered
-    assert "主体位于画面一侧，另一侧保留环境空间" in rendered
-    assert "前景有虚化物体局部遮挡画面边缘" in rendered
+    assert "【镜头1:0s～3s】全景·平视，镜头保持固定，" in rendered
+    assert "【镜头2:3s～6s】近景·斜侧，镜头缓慢向主体推进，" in rendered
+    assert "主体居一侧留出环境空间" in rendered
+    assert "前景虚化物遮挡画面边缘" in rendered
     assert "画面中保留茶杯等道具" in rendered
-    assert "环境中可听见键盘轻响与设备风扇声持续" in rendered
-    assert "人物呈现沉稳。" in rendered
+    assert "环境音为键盘轻响与设备风扇声持续" in rendered
+    assert "情绪沉稳" in rendered
     assert "面部和肢体自然稳定" in rendered
-    assert "老姜的画外音响起，内容为“系统性变革到了深水区，技术迭代一天都不能停……”；画面中的人物不张口" in rendered
+    assert "老姜画外音：“系统性变革到了深水区，技术迭代一天都不能停……”" in rendered
+    assert "画面中人物不张口" in rendered
     assert "构图是【" not in rendered
     assert "声音设计是【" not in rendered
     assert "【角色】" not in rendered
@@ -204,8 +207,8 @@ def test_render_video_execution_prompt_uses_natural_per_shot_direction() -> None
     )
 
     assert result.startswith("创作意图\n")
-    assert "【镜头1:0s～3s】全景·平视，镜头保持固定。" in result
-    assert "【镜头2:3s～6s】近景·斜侧，镜头缓慢向主体推进。" in result
+    assert "【镜头1:0s～3s】全景·平视，镜头保持固定，" in result
+    assert "【镜头2:3s～6s】近景·斜侧，镜头缓慢向主体推进，" in result
     assert result.endswith(constraint)
     assert compose_video_prompt(result, shots=shots, duration_seconds=6) == result
 
@@ -280,7 +283,262 @@ def test_compose_video_prompt_replaces_legacy_tagged_group_prompt_with_natural_f
     assert "声音设计是【" not in rendered
     assert "【角色】" not in rendered
     assert "【叙事目的】" not in rendered
-    assert "主体位于画面一侧，另一侧保留环境空间" in rendered
-    assert "前景、中景和背景形成明显纵深" in rendered
-    assert "环境中可听见远处城市低频车流声，空调外机低鸣；声音桥延续至室内" in rendered
+    assert "主体居一侧留出环境空间" in rendered
+    assert "画面有前中后景纵深" in rendered
+    assert "环境音为远处城市低频车流声，空调外机低鸣；声音桥延续至室内" in rendered
     assert rendered.endswith("【约束】人物特征高度一致，禁止出现任何形式的字幕。")
+
+
+def test_structured_snapshot_without_dialogue_uses_structured_renderer_once() -> None:
+    snapshot = _complete_structured_snapshot(
+        display_no=1,
+        start_seconds=0,
+        end_seconds=3,
+        visual={
+            "shot_size": "大远景",
+            "composition": ["纵深构图"],
+            "camera_angle": "平视",
+            "camera_movement": "固定",
+            "lighting": "深蓝夜色与窗内暖白灯光形成冷暖对比",
+            "frame_description": "夜色中的办公大楼多层窗格亮着灯",
+            "action": "镜头停在灯火通明的办公楼",
+            "emotion": "安静而紧绷",
+        },
+    )
+    snapshot.pop("dialogue")
+    frame_description = snapshot["visual"]["frame_description"]
+    legacy_content = "仅旧回退路径会出现的派生内容"
+    rendered = compose_video_prompt(
+        "基础提示",
+        shots=[
+            {
+                "display_no": 1,
+                "start_seconds": 0,
+                "end_seconds": 3,
+                "characters": [],
+                "content": legacy_content,
+                "structured_data": snapshot,
+            }
+        ],
+        duration_seconds=3,
+    )
+
+    assert rendered
+    assert rendered.count(frame_description) == 1
+    assert legacy_content not in rendered
+
+
+def test_dialogue_with_existing_outer_quotes_is_wrapped_once() -> None:
+    snapshot = _complete_structured_snapshot(
+        display_no=1,
+        start_seconds=0,
+        end_seconds=3,
+        visual={
+            "shot_size": "近景",
+            "composition": ["单人"],
+            "camera_angle": "平视",
+            "camera_movement": "固定",
+            "lighting": "屏幕光照亮面部",
+            "frame_description": "老姜端起水杯",
+            "action": "老姜喝水",
+            "emotion": "沉静",
+        },
+        dialogue={
+            "speaker_ref": "C01",
+            "kind": "voice_over",
+            "text": "“系统性变革到了深水区，技术迭代一天都不能停……”",
+        },
+    )
+    rendered = render_video_execution_prompt(
+        [
+            {
+                "display_no": 1,
+                "start_seconds": 0,
+                "end_seconds": 3,
+                "characters": ["老姜"],
+                "structured_data": snapshot,
+            }
+        ],
+        duration_seconds=3,
+        subject_names_by_ref={"C01": "老姜"},
+    )
+
+    assert "老姜画外音：“系统性变革到了深水区，技术迭代一天都不能停……”" in rendered
+    assert "““" not in rendered
+    assert "””" not in rendered
+
+
+def test_dialogue_with_outer_quote_and_terminal_punctuation_is_wrapped_once() -> None:
+    snapshot = _complete_structured_snapshot(
+        display_no=1,
+        start_seconds=0,
+        end_seconds=3,
+        visual={
+            "shot_size": "近景",
+            "composition": ["单人"],
+            "camera_angle": "平视",
+            "camera_movement": "固定",
+            "lighting": "屏幕光照亮面部",
+            "frame_description": "老姜端起水杯",
+            "action": "老姜喝水",
+            "emotion": "沉静",
+        },
+        dialogue={
+            "speaker_ref": "C01",
+            "kind": "dialogue",
+            "text": "“今天继续！”！",
+        },
+    )
+    rendered = render_video_execution_prompt(
+        [
+            {
+                "display_no": 1,
+                "start_seconds": 0,
+                "end_seconds": 3,
+                "characters": ["老姜"],
+                "structured_data": snapshot,
+            }
+        ],
+        duration_seconds=3,
+        subject_names_by_ref={"C01": "老姜"},
+    )
+
+    assert "老姜开口说：“今天继续！”" in rendered
+    assert "““" not in rendered
+    assert "””" not in rendered
+
+
+def test_quoted_dialogue_ignores_empty_quotes_and_spaced_outer_punctuation() -> None:
+    assert _quoted_dialogue("“”！") == ""
+    assert _quoted_dialogue("“”……") == ""
+    assert _quoted_dialogue("“你好” ，") == "“你好”。"
+    # 台词自带引号时逐字保留，只给句尾补句号，不再重排标点。
+    assert _quoted_dialogue("“你好”……") == "“你好”……"
+    assert _quoted_dialogue("“真的吗？”她低声问") == "“真的吗？”她低声问。"
+    assert _quoted_dialogue("“我不走") == "“我不走。"
+
+
+def test_empty_characters_do_not_add_subject_or_emotion_in_both_renderers() -> None:
+    snapshot = _complete_structured_snapshot(
+        display_no=1,
+        start_seconds=0,
+        end_seconds=3,
+        visual={
+            "shot_size": "大远景",
+            "composition": ["纵深构图"],
+            "camera_angle": "平视",
+            "camera_movement": "固定",
+            "lighting": "夜色灯光",
+            "frame_description": "办公大楼窗格亮着灯",
+            "action": "镜头停在楼体",
+            "emotion": "紧绷",
+        },
+    )
+    structured_shot = {
+        "display_no": 1,
+        "start_seconds": 0,
+        "end_seconds": 3,
+        "characters": [],
+        "structured_data": snapshot,
+    }
+    structured = render_video_execution_prompt([structured_shot], duration_seconds=3)
+    fallback = render_unstructured_video_execution_prompt(
+        [
+            {
+                **structured_shot,
+                "structured_data": {
+                    "visual": snapshot["visual"],
+                    "sound_design": "无",
+                },
+            }
+        ],
+        duration_seconds=3,
+    )
+
+    for rendered in (structured, fallback):
+        shot_text = rendered.split("【约束】", 1)[0]
+        assert "镜头停在楼体" in shot_text
+        assert "画面主体" not in shot_text
+        assert "人物呈现" not in shot_text
+        assert "情绪紧绷" not in shot_text
+
+
+def test_unstructured_renderer_deduplicates_content_and_frame_description() -> None:
+    repeated = "夜色中的办公大楼多层窗格亮着灯"
+    rendered = render_unstructured_video_execution_prompt(
+        [
+            {
+                "display_no": 1,
+                "start_seconds": 0,
+                "end_seconds": 3,
+                "characters": [],
+                "content": f"  {repeated}。",
+                "structured_data": {
+                    "visual": {
+                        "shot_size": "大远景",
+                        "camera_angle": "平视",
+                        "camera_movement": "固定",
+                        "frame_description": repeated,
+                        "action": "镜头停在楼体",
+                    }
+                },
+            }
+        ],
+        duration_seconds=3,
+    )
+
+    assert rendered.count(repeated) == 1
+
+
+def test_unstructured_renderer_omits_comma_after_bare_shot_heading() -> None:
+    rendered = render_unstructured_video_execution_prompt(
+        [
+            {
+                "display_no": 1,
+                "start_seconds": 0,
+                "end_seconds": 3,
+                "content": "老姜独自在电脑前加班",
+            }
+        ],
+        duration_seconds=3,
+        include_constraint_lock=False,
+    )
+
+    assert "【镜头1:0s～3s】老姜独自在电脑前加班。" in rendered
+    assert "】，" not in rendered
+
+
+def test_composition_is_deduplicated_when_frame_description_has_spatial_facts() -> None:
+    frame_description = "前景为暗色楼外空间，中景为金色湖面，远景为城市天际线"
+    action = "镜头缓慢向湖面推进"
+    rendered = render_video_execution_prompt(
+        [
+            {
+                "display_no": 1,
+                "start_seconds": 0,
+                "end_seconds": 3,
+                "characters": [],
+                "structured_data": _complete_structured_snapshot(
+                    display_no=1,
+                    start_seconds=0,
+                    end_seconds=3,
+                    visual={
+                        "shot_size": "全景",
+                        "composition": ["纵深构图"],
+                        "camera_angle": "平视",
+                        "camera_movement": "推镜",
+                        "lighting": "暮色自然光",
+                        "frame_description": frame_description,
+                        "action": action,
+                        "emotion": "宁静",
+                    },
+                ),
+            }
+        ],
+        duration_seconds=3,
+        include_constraint_lock=False,
+    )
+
+    assert frame_description in rendered
+    assert action in rendered
+    assert "画面有前中后景纵深" not in rendered

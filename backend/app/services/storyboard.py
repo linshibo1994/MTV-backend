@@ -213,7 +213,7 @@ Episode -> Scene（连续时空段落）-> Shot Group（3~15 秒叙事单元）-
 2. 每个新场景最多用 1~2 个镜头完成定场；每镜只承载一个主要动作或信息变化，避免无叙事作用的装饰镜头。
 3. 景别随叙事逐步聚焦或释放，避免连续三镜使用相同景别；运镜必须服务于发现、强调、跟随或情绪变化。
 4. 相邻镜头保持人物位置、朝向、视线与动作进度连续；用反应镜、动作桥或声音桥承接情绪和转场。
-5. frame_description 只写可见的主体、动作状态与前中后景空间，不写无法拍摄的心理判断。
+5. frame_description 只写“谁在画面何处、前中后景各是什么”的静态构图，不写运动过程，也不写无法拍摄的心理判断；action 只写本镜发生变化的那一个动作节拍，不重复 frame_description 已交代的位置、外观与空间。两字段一旦出现同一事实即为不合格。
 6. 剧本中的对白、旁白和内心独白必须逐字保留；不得增删或改写。有语言内容时，speaker_ref、kind、text 必须全部嵌套在 dialogue 对象内，不得平铺在 Shot 层；无语言内容时 dialogue 必须为 null。
 7. 只可引用输入目录中的短引用；不得输出主体名称、subject_id、asset_entry_id，也不得创造新资产。
 8. 不要输出 content、description 或 shot_line；这些派生字段由服务端生成。
@@ -226,6 +226,15 @@ Episode -> Scene（连续时空段落）-> Shot Group（3~15 秒叙事单元）-
 - composition: {'/'.join(COMPOSITION_VALUES)}（每镜 1~3 项）
 - camera_angle: {'/'.join(CAMERA_ANGLE_VALUES)}
 - camera_movement: {'/'.join(CAMERA_MOVEMENT_VALUES)}
+
+## 字段精简（强制）
+这些字段会被拼成交给视频模型的执行提示词，过长会挤掉后面的镜头。每镜按上限写足即止，宁短不冗：
+- frame_description 不超过 30 字，只保留主体位置与关键景层，不堆叠形容词。
+- action 不超过 20 字，只写本镜的动作变化，主语可省略。
+- lighting 不超过 16 字，写光质、方向与冷暖，不复述画面内容。
+- sound_design 不超过 20 字，写可执行的声音，不解释情绪与用意。
+- emotion 不超过 8 字，只写情绪词本身，不写因果。
+- 禁止在 frame_description、action、lighting、sound_design 中写字幕、片名、预告文字、Logo 或任何屏幕上的可读文字；这些字段描述的画面必须是无字幕画面。
 
 ## 结构与时码
 - schema_version 必须是 storyboard.v2。
@@ -4546,6 +4555,7 @@ async def generate_storyboard(
         evaluate_storyboard_quality(
             validated.v2_contract,
             expected_source_blocks=script_blocks,
+            check_execution_field_economy=True,
         )
         if validated.v2_contract is not None
         else None

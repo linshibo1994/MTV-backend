@@ -1116,8 +1116,8 @@ def test_create_video_job_enhances_structured_prompt_before_adapter(
 
         source = job.input_json["source_prompt"]
         assert "Camera " not in source
-        assert "【镜头1:0s～3s】全景·平视，镜头缓慢向主体推进。" in source
-        assert "【镜头2:3s～6s】中景·侧拍，镜头保持固定。" in source
+        assert "【镜头1:0s～3s】全景·平视，镜头缓慢向主体推进，" in source
+        assert "【镜头2:3s～6s】中景·侧拍，镜头保持固定，" in source
         assert source.index("## 图片内容说明") < source.index("镜头组提示词")
         assert source.index("【镜头2:3s～6s】") < source.index("【冻结边界事实 boundary-facts】")
         assert "起始边界：阿明位于门外，右手刚触及门把。" in source
@@ -1196,7 +1196,7 @@ def test_create_video_job_replaces_stored_legacy_group_prompt_before_adapter(
         assert "声音设计是【" not in source
         assert "【角色】" not in source
         assert "【叙事目的】" not in source
-        assert "老姜独自在电脑前加班，专注处理屏幕上的工作。" in source
+        assert "老姜独自在电脑前加班，专注处理屏幕上的工作" in source
         assert source.index("## 图片内容说明") < source.index("【镜头1:0s～3s】")
         assert source.endswith("【约束】人物特征高度一致，禁止出现任何形式的字幕。")
 
