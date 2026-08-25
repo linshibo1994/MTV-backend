@@ -679,13 +679,15 @@ async def merge_shot_group(
 ) -> VideoWorkbenchOut:
     """原子生成整集正式镜头组并返回可直接替换页面状态的完整工作台。"""
 
+    # 版本校验交由 service 层持锁后统一判定：路由层无锁预校验会在
+    # "首次合并已成功、客户端带旧版本号重试"时先抛 409，挡住 service 的
+    # 幂等降级（全正式组直接返回当前结果）。此处仅保留权限与归属校验。
     await _validate_script_episode(
         db,
         user,
         script_id,
         episode_id,
         action=Action.EDIT,
-        expected_episode_version=payload.expected_episode_version,
     )
     result = await merge_shots_into_group(
         db,
@@ -700,7 +702,10 @@ async def merge_shot_group(
         action="shot_group_merge",
         resource_type="episode",
         resource_id=episode_id,
-        before={"shot_count": len(payload.shot_ids)},
+        before={
+            "shot_count": len(payload.shot_ids),
+            "expected_episode_version": payload.expected_episode_version,
+        },
         after={
             "episode_version": result.episode_version,
             "shot_group_ids": list(result.shot_group_ids),

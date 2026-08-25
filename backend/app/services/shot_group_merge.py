@@ -499,8 +499,10 @@ async def merge_shots_into_groups(
     ).scalar_one_or_none()
     if episode is None:
         raise NotFoundError("分集不存在")
-    if episode.episode_version != expected_episode_version:
-        raise ConflictError("episode_version 冲突")
+    # 版本冲突不在持锁后立即拒绝：首次合并成功并涨版本后，客户端带着旧
+    # 版本号的网络重试/重复点击会先落到下方"全正式组"幂等分支，直接返回
+    # 当前结果；只有组状态非幂等（存在 draft 组）时才真正判定为 409。
+    version_conflict = episode.episode_version != expected_episode_version
 
     active_storyboard_id = (
         await db.execute(
@@ -574,12 +576,16 @@ async def merge_shots_into_groups(
     draft_groups = [group for group in source_groups if _is_draft_group(group)]
     if len(final_groups) == len(source_groups):
         # 网络重试或重复点击：全量 ID 一致时直接返回当前结果，不重复改组和涨版本。
+        # 版本不匹配的重复请求（首次合并已成功并涨版本后的网络重试/重复点击）
+        # 也属于幂等重放，同样在此返回当前结果，而非按过期版本号 409。
         return ShotGroupMergeResult(
             shot_group_ids=tuple(group.shot_group_id for group in final_groups),
             removed_shot_group_ids=(),
             episode_version=episode.episode_version,
             already_grouped=True,
         )
+    if version_conflict:
+        raise ConflictError("episode_version 冲突")
     if len(draft_groups) != len(source_groups):
         raise ConflictError("当前分集镜头组状态不一致，请重新生成分镜")
 

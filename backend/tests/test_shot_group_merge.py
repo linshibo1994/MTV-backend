@@ -833,7 +833,11 @@ def test_postgres_merge_all_storyboard_shots_into_video_units() -> None:
                     ordered_ids.extend(shot.shot_id for shot in merged_shots)
                     assert merged_shots[0].start_seconds == 0
                     assert merged_shots[-1].end_seconds == group.duration_seconds
-                    assert "老姜" in group.prompt and "手机" in group.prompt
+                    # 本测试造数未写 structured_data.visual.action，新渲染器
+                    # （e4ab49d 起）只在 action 片段里带出角色名，无结构化
+                    # action 时 prompt 只有 content + 道具；角色归属改由
+                    # materials/audio 断言覆盖，prompt 断言退化为背景与道具。
+                    assert "手机" in group.prompt
                     assert [item["name"] for item in group.materials["character"]] == ["老姜"]
                     assert [item["name"] for item in group.materials["prop"]] == ["手机"]
                     assert group.audio_elements["sounds"][0]["name"] == "环境音乐"
@@ -855,6 +859,374 @@ def test_postgres_merge_all_storyboard_shots_into_video_units() -> None:
                 await db.execute(
                     delete(VideoGenerationJob).where(VideoGenerationJob.episode_id == episode_id)
                 )
+                await db.execute(delete(Shot).where(Shot.shot_id.in_(shot_ids)))
+                await db.execute(delete(ShotGroup).where(ShotGroup.episode_id == episode_id))
+                await db.execute(delete(Scene).where(Scene.episode_id == episode_id))
+                await db.execute(delete(Subject).where(Subject.script_id == script_id))
+                await db.execute(delete(Episode).where(Episode.episode_id == episode_id))
+                await db.execute(delete(Script).where(Script.id == script_id))
+                await db.commit()
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.skipif(
+    not os.getenv("MTV_TEST_POSTGRES_URL"),
+    reason="未提供 MTV_TEST_POSTGRES_URL，跳过真实 PostgreSQL 镜头组合测试",
+)
+def test_postgres_merge_replay_with_stale_version_is_idempotent() -> None:
+    """首次合并成功后，带旧版本号重放相同请求应幂等返回而非 409。"""
+
+    import asyncio
+
+    from sqlalchemy import delete, select
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    from app.core.ids import new_id
+    from app.models.episode import Episode
+    from app.models.scene import Scene
+    from app.models.script import Script
+    from app.models.shot import Shot
+    from app.models.shot_group import ShotGroup
+    from app.models.subject import Subject
+    from app.services.shot_group_merge import merge_shots_into_groups
+
+    async def scenario() -> None:
+        database_url = os.environ["MTV_TEST_POSTGRES_URL"]
+        if database_url.startswith("postgresql://"):
+            database_url = database_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+        engine = create_async_engine(database_url)
+        session_factory = async_sessionmaker(engine, expire_on_commit=False)
+        suffix = secrets.token_hex(5)
+        script_id = f"script-replay-{suffix}"
+        episode_id = f"episode-replay-{suffix}"
+        group_ids = [f"draft-{index}-{suffix}" for index in range(1, 4)]
+        shot_ids = [f"shot-{index}-{suffix}" for index in range(1, 7)]
+        group_specs = (
+            (1, group_ids[0], (3, 2), "建立办公室冲突"),
+            (1, group_ids[1], (2, 2), "推进人物行动"),
+            (2, group_ids[2], (3, 3), "切换到街道"),
+        )
+
+        try:
+            async with session_factory() as db:
+                db.add(
+                    Script(
+                        id=script_id,
+                        title="镜头组合幂等重放测试",
+                        scope="personal",
+                        owner_user_id="user-merge",
+                        created_by_user_id="user-merge",
+                    )
+                )
+                await db.flush()
+                db.add(
+                    Episode(
+                        episode_id=episode_id,
+                        script_id=script_id,
+                        episode_no=1,
+                        title="第一集",
+                        episode_version=1,
+                    )
+                )
+                subjects = [
+                    Subject(id=new_id(), script_id=script_id, type="background", name="办公室"),
+                    Subject(id=new_id(), script_id=script_id, type="background", name="街道"),
+                    Subject(id=new_id(), script_id=script_id, type="character", name="老姜"),
+                    Subject(id=new_id(), script_id=script_id, type="prop", name="手机"),
+                ]
+                db.add_all(subjects)
+                db.add_all(
+                    [
+                        Scene(
+                            id=new_id(),
+                            episode_id=episode_id,
+                            scene_no=scene_no,
+                            scene_key=f"bg:{background}",
+                            background=background,
+                            label=f"场 {scene_no} · {background}",
+                            shot_group_count=0,
+                            pending_shot_count=4 if scene_no == 1 else 2,
+                        )
+                        for scene_no, background in ((1, "办公室"), (2, "街道"))
+                    ]
+                )
+                await db.flush()
+
+                shot_index = 0
+                for group_index, (scene_no, group_id, durations, narrative) in enumerate(
+                    group_specs, start=1
+                ):
+                    background = "办公室" if scene_no == 1 else "街道"
+                    db.add(
+                        ShotGroup(
+                            shot_group_id=group_id,
+                            script_id=script_id,
+                            episode_id=episode_id,
+                            scene_no=scene_no,
+                            group_index=group_index,
+                            group_no=f"G{group_index}",
+                            unit_id=f"draft:{group_id}",
+                            unit_runtime_key=f"{episode_id}:{scene_no}:draft:{group_id}",
+                            duration_seconds=sum(durations),
+                            video_duration_seconds=sum(durations),
+                            description_text=narrative,
+                        )
+                    )
+                    await db.flush()
+                    cursor = 0
+                    for display_no, duration in enumerate(durations, start=1):
+                        shot_id = shot_ids[shot_index]
+                        shot_index += 1
+                        db.add(
+                            Shot(
+                                shot_id=shot_id,
+                                scene_no=scene_no,
+                                shot_group_id=group_id,
+                                group_no=f"G{group_index}",
+                                shot_no=f"old-{display_no}",
+                                display_no=display_no,
+                                content=f"镜头{shot_index}",
+                                description=f"镜头{shot_index}描述",
+                                shot_line=(
+                                    f"【镜头{display_no}:{cursor}s～{cursor + duration}s】"
+                                    f"场景是{background}，老姜查看手机"
+                                ),
+                                start_seconds=cursor,
+                                end_seconds=cursor + duration,
+                                characters=["老姜"],
+                                props=["手机"],
+                                dialogue_character="老姜" if display_no == 1 else "",
+                            )
+                        )
+                        cursor += duration
+                await db.commit()
+
+            # 首次合并：版本 1 -> 2。
+            async with session_factory() as db:
+                first = await merge_shots_into_groups(
+                    db,
+                    script_id=script_id,
+                    episode_id=episode_id,
+                    shot_ids=list(shot_ids),
+                    expected_episode_version=1,
+                )
+                await db.commit()
+                assert first.already_grouped is False
+                assert len(first.shot_group_ids) == 3
+
+            async with session_factory() as db:
+                snapshot_groups = list(
+                    (
+                        await db.execute(
+                            select(ShotGroup)
+                            .where(ShotGroup.episode_id == episode_id)
+                            .order_by(ShotGroup.group_index, ShotGroup.shot_group_id)
+                        )
+                    ).scalars().all()
+                )
+            snapshot_ids = [group.shot_group_id for group in snapshot_groups]
+
+            # 网络重试/重复点击：携带过期版本号 1 重放完全相同的 shot_ids。
+            async with session_factory() as db:
+                replay = await merge_shots_into_groups(
+                    db,
+                    script_id=script_id,
+                    episode_id=episode_id,
+                    shot_ids=list(shot_ids),
+                    expected_episode_version=1,
+                )
+                await db.commit()
+
+            assert replay.already_grouped is True
+            assert replay.episode_version == 2
+            assert list(replay.shot_group_ids) == snapshot_ids
+            assert replay.removed_shot_group_ids == ()
+
+            async with session_factory() as db:
+                episode = await db.get(Episode, episode_id)
+                assert episode is not None and episode.episode_version == 2
+                groups = list(
+                    (
+                        await db.execute(
+                            select(ShotGroup)
+                            .where(ShotGroup.episode_id == episode_id)
+                            .order_by(ShotGroup.group_index, ShotGroup.shot_group_id)
+                        )
+                    ).scalars().all()
+                )
+                assert [group.shot_group_id for group in groups] == snapshot_ids
+                assert all(group.unit_id == f"group:{group.shot_group_id}" for group in groups)
+        finally:
+            async with session_factory() as db:
+                await db.execute(delete(Shot).where(Shot.shot_id.in_(shot_ids)))
+                await db.execute(delete(ShotGroup).where(ShotGroup.episode_id == episode_id))
+                await db.execute(delete(Scene).where(Scene.episode_id == episode_id))
+                await db.execute(delete(Subject).where(Subject.script_id == script_id))
+                await db.execute(delete(Episode).where(Episode.episode_id == episode_id))
+                await db.execute(delete(Script).where(Script.id == script_id))
+                await db.commit()
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.skipif(
+    not os.getenv("MTV_TEST_POSTGRES_URL"),
+    reason="未提供 MTV_TEST_POSTGRES_URL，跳过真实 PostgreSQL 镜头组合测试",
+)
+def test_postgres_merge_stale_version_with_draft_groups_conflicts() -> None:
+    """版本过期且存在 draft 组（非幂等状态）时仍应按乐观锁拒绝 409。"""
+
+    import asyncio
+
+    from sqlalchemy import delete, select
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    from app.core.errors import ConflictError
+    from app.core.ids import new_id
+    from app.models.episode import Episode
+    from app.models.scene import Scene
+    from app.models.script import Script
+    from app.models.shot import Shot
+    from app.models.shot_group import ShotGroup
+    from app.models.subject import Subject
+    from app.services.shot_group_merge import merge_shots_into_groups
+
+    async def scenario() -> None:
+        database_url = os.environ["MTV_TEST_POSTGRES_URL"]
+        if database_url.startswith("postgresql://"):
+            database_url = database_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+        engine = create_async_engine(database_url)
+        session_factory = async_sessionmaker(engine, expire_on_commit=False)
+        suffix = secrets.token_hex(5)
+        script_id = f"script-stale-{suffix}"
+        episode_id = f"episode-stale-{suffix}"
+        group_ids = [f"draft-{index}-{suffix}" for index in range(1, 3)]
+        shot_ids = [f"shot-{index}-{suffix}" for index in range(1, 5)]
+        group_specs = (
+            (1, group_ids[0], (3, 2), "建立办公室冲突"),
+            (1, group_ids[1], (2, 2), "推进人物行动"),
+        )
+
+        try:
+            async with session_factory() as db:
+                db.add(
+                    Script(
+                        id=script_id,
+                        title="镜头组合版本冲突测试",
+                        scope="personal",
+                        owner_user_id="user-merge",
+                        created_by_user_id="user-merge",
+                    )
+                )
+                await db.flush()
+                db.add(
+                    Episode(
+                        episode_id=episode_id,
+                        script_id=script_id,
+                        episode_no=1,
+                        title="第一集",
+                        # 服务端版本已前进到 3，客户端仍持有 2。
+                        episode_version=3,
+                    )
+                )
+                subjects = [
+                    Subject(id=new_id(), script_id=script_id, type="background", name="办公室"),
+                    Subject(id=new_id(), script_id=script_id, type="character", name="老姜"),
+                ]
+                db.add_all(subjects)
+                db.add(
+                    Scene(
+                        id=new_id(),
+                        episode_id=episode_id,
+                        scene_no=1,
+                        scene_key="bg:办公室",
+                        background="办公室",
+                        label="场 1 · 办公室",
+                        shot_group_count=0,
+                        pending_shot_count=4,
+                    )
+                )
+                await db.flush()
+
+                shot_index = 0
+                for group_index, (scene_no, group_id, durations, narrative) in enumerate(
+                    group_specs, start=1
+                ):
+                    db.add(
+                        ShotGroup(
+                            shot_group_id=group_id,
+                            script_id=script_id,
+                            episode_id=episode_id,
+                            scene_no=scene_no,
+                            group_index=group_index,
+                            group_no=f"G{group_index}",
+                            unit_id=f"draft:{group_id}",
+                            unit_runtime_key=f"{episode_id}:{scene_no}:draft:{group_id}",
+                            duration_seconds=sum(durations),
+                            video_duration_seconds=sum(durations),
+                            description_text=narrative,
+                        )
+                    )
+                    await db.flush()
+                    cursor = 0
+                    for display_no, duration in enumerate(durations, start=1):
+                        shot_id = shot_ids[shot_index]
+                        shot_index += 1
+                        db.add(
+                            Shot(
+                                shot_id=shot_id,
+                                scene_no=scene_no,
+                                shot_group_id=group_id,
+                                group_no=f"G{group_index}",
+                                shot_no=f"old-{display_no}",
+                                display_no=display_no,
+                                content=f"镜头{shot_index}",
+                                description=f"镜头{shot_index}描述",
+                                shot_line=(
+                                    f"【镜头{display_no}:{cursor}s～{cursor + duration}s】"
+                                    "场景是办公室，老姜查看手机"
+                                ),
+                                start_seconds=cursor,
+                                end_seconds=cursor + duration,
+                                characters=["老姜"],
+                                dialogue_character="老姜" if display_no == 1 else "",
+                            )
+                        )
+                        cursor += duration
+                await db.commit()
+
+            # draft 组状态 + 版本不匹配：不属于幂等重放，必须 409。
+            async with session_factory() as db:
+                with pytest.raises(ConflictError, match="episode_version 冲突"):
+                    await merge_shots_into_groups(
+                        db,
+                        script_id=script_id,
+                        episode_id=episode_id,
+                        shot_ids=list(shot_ids),
+                        expected_episode_version=2,
+                    )
+                await db.rollback()
+
+            async with session_factory() as db:
+                episode = await db.get(Episode, episode_id)
+                assert episode is not None and episode.episode_version == 3
+                groups = list(
+                    (
+                        await db.execute(
+                            select(ShotGroup)
+                            .where(ShotGroup.episode_id == episode_id)
+                            .order_by(ShotGroup.group_index, ShotGroup.shot_group_id)
+                        )
+                    ).scalars().all()
+                )
+                # 版本冲突被拒后 draft 组保持原状。
+                assert [group.shot_group_id for group in groups] == group_ids
+                assert all(group.unit_id == f"draft:{group.shot_group_id}" for group in groups)
+        finally:
+            async with session_factory() as db:
                 await db.execute(delete(Shot).where(Shot.shot_id.in_(shot_ids)))
                 await db.execute(delete(ShotGroup).where(ShotGroup.episode_id == episode_id))
                 await db.execute(delete(Scene).where(Scene.episode_id == episode_id))
