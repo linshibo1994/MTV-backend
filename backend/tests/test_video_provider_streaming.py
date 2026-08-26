@@ -1782,6 +1782,8 @@ async def test_openai_provider_download_uses_512_mib_limit(monkeypatch, tmp_path
         "https://dashscope.aliyuncs.com/api/v1/tasks/task-id",
         "https://dashscope-result.oss-cn-hangzhou.aliyuncs.com/video.mp4",
         "https://dashscope-result.oss-cn-hangzhou.aliyuncs.com:443/video.mp4",
+        "https://dashscope-result-bj.oss-cn-beijing.aliyuncs.com/video.mp4",
+        "https://dashscope-result-sg.oss-ap-southeast-1.aliyuncs.com/video.mp4",
     ],
 )
 def test_bailian_download_host_allows_audited_official_origins(

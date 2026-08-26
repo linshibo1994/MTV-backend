@@ -223,6 +223,141 @@ async def test_wan27_i2v_uses_media_protocol_with_driving_audio() -> None:
 
 
 @pytest.mark.asyncio
+async def test_wan30_pure_text_generation_omits_media() -> None:
+    provider = BailianVideoGenProvider()
+
+    body = await provider._build_body(
+        _request(model="wan3.0-video-prime", reference_images=[]),
+        "wan3.0-video-prime",
+        lambda *_args: None,
+    )
+
+    # wan3.0 的 prompt 与 media 必填其一，纯文生无需强制传图。
+    assert body == {
+        "model": "wan3.0-video-prime",
+        "input": {"prompt": "一名角色缓慢转身，看向镜头外。"},
+        "parameters": {
+            "prompt_extend": True,
+            "watermark": False,
+            "duration": 10,
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_wan30_first_frame_uses_media_protocol() -> None:
+    provider = BailianVideoGenProvider()
+    provider._encode_single = AsyncMock(return_value="data:image/webp;base64,aW1hZ2U=")
+
+    body = await provider._build_body(
+        _request(
+            model="wan3.0-video-prime",
+            reference_images=[],
+            first_frame="frames/previous-tail.png",
+        ),
+        "wan3.0-video-prime",
+        lambda *_args: None,
+    )
+
+    assert body["input"] == {
+        "prompt": "一名角色缓慢转身，看向镜头外。",
+        "media": [
+            {"type": "first_frame", "url": "data:image/webp;base64,aW1hZ2U="},
+        ],
+    }
+    assert body["parameters"] == {
+        "prompt_extend": True,
+        "watermark": False,
+        "duration": 10,
+    }
+    provider._encode_single.assert_awaited_once_with("frames/previous-tail.png", "image/png")
+
+
+@pytest.mark.asyncio
+async def test_wan30_first_frame_omits_audio_due_to_official_exclusivity() -> None:
+    provider = BailianVideoGenProvider()
+    provider._encode_single = AsyncMock(return_value="data:image/webp;base64,aW1hZ2U=")
+
+    body = await provider._build_body(
+        _request(
+            model="wan3.0-video-prime",
+            reference_images=[],
+            first_frame="frames/previous-tail.png",
+            reference_audios=[
+                {"storage_key": "references/voice.wav", "mime_type": "audio/wav"}
+            ],
+        ),
+        "wan3.0-video-prime",
+        lambda *_args: None,
+    )
+
+    # 官方文档：reference_xx 与 first_frame/last_frame 类型互斥，不能混用；
+    # 首帧存在时保守省略参考音频，且不得照搬 wan2.7 的 driving_audio 类型名。
+    assert body["input"]["media"] == [
+        {"type": "first_frame", "url": "data:image/webp;base64,aW1hZ2U="},
+    ]
+    provider._encode_single.assert_awaited_once_with("frames/previous-tail.png", "image/png")
+
+
+@pytest.mark.asyncio
+async def test_wan30_audio_without_first_frame_submits_reference_audio() -> None:
+    provider = BailianVideoGenProvider()
+    provider._encode_single = AsyncMock(return_value="data:audio/wav;base64,YXVkaW8=")
+
+    body = await provider._build_body(
+        _request(
+            model="wan3.0-video-prime",
+            reference_images=[],
+            reference_audios=[
+                {"storage_key": "references/voice.wav", "mime_type": "audio/wav"}
+            ],
+        ),
+        "wan3.0-video-prime",
+        lambda *_args: None,
+    )
+
+    assert body["input"]["media"] == [
+        {"type": "reference_audio", "url": "data:audio/wav;base64,YXVkaW8="},
+    ]
+    provider._encode_single.assert_awaited_once_with("references/voice.wav", "audio/wav")
+
+
+@pytest.mark.asyncio
+async def test_wan30_reference_image_falls_back_to_first_image_as_first_frame() -> None:
+    provider = BailianVideoGenProvider()
+    provider._encode_single = AsyncMock(return_value="data:image/webp;base64,aW1hZ2U=")
+
+    body = await provider._build_body(
+        _request(model="wan3.0-video-prime"),
+        "wan3.0-video-prime",
+        lambda *_args: None,
+    )
+
+    # 无独立首帧字段时，materials 第一张图沿用首帧语义提交。
+    assert body["input"]["media"] == [
+        {"type": "first_frame", "url": "data:image/webp;base64,aW1hZ2U="},
+    ]
+    provider._encode_single.assert_awaited_once_with("references/first.webp", "image/webp")
+
+
+@pytest.mark.asyncio
+async def test_wan30_truncates_prompt_to_20000_characters() -> None:
+    provider = BailianVideoGenProvider()
+
+    request = replace(
+        _request(model="wan3.0-video-prime", reference_images=[]),
+        prompt="图" * 20001,
+    )
+    body = await provider._build_body(
+        request,
+        "wan3.0-video-prime",
+        lambda *_args: None,
+    )
+
+    assert body["input"]["prompt"] == "图" * 20000
+
+
+@pytest.mark.asyncio
 async def test_happyhorse_i2v_uses_first_frame_media_and_its_capabilities() -> None:
     provider = BailianVideoGenProvider()
     provider._encode_single = AsyncMock(return_value="data:image/webp;base64,aW1hZ2U=")

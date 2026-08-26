@@ -61,11 +61,18 @@ _BAILIAN_RESULT_DOWNLOAD_HOSTS = frozenset(
     {
         "dashscope-result.oss-cn-hangzhou.aliyuncs.com",
         "dashscope-result-sh.oss-accelerate.aliyuncs.com",
+        # 万相 3.0 等新模型的结果落在北京/新加坡桶（官方文档 video_url 示例）。
+        "dashscope-result-bj.oss-cn-beijing.aliyuncs.com",
+        "dashscope-result-sg.oss-ap-southeast-1.aliyuncs.com",
     }
 )
 
 # 2.7 使用新版 media 协议，早期 I2V 模型使用 img_url 协议。
+# 万相 3.0（wan3.0-video / wan3.0-video-prime 及后续变体）也使用 media
+# 协议，但 reference_audio 与 first_frame/last_frame 官方声明互斥。
 _WAN27_I2V_PREFIX = "wan2.7-i2v"
+_WAN30_PREFIX = "wan3.0-video"
+_WAN30_MAX_PROMPT_LENGTH = 20000
 _LEGACY_I2V_PREFIXES = (
     "wanx2.1-i2v",
     "wan2.2-i2v",
@@ -301,11 +308,11 @@ class BailianVideoGenProvider:
     ) -> dict:
         """按模型能力构造百炼文生/图生视频请求体。"""
         normalized_model = model.lower()
-        prompt_limit = (
-            _HAPPYHORSE_MAX_CHINESE_PROMPT_LENGTH
-            if normalized_model in _HAPPYHORSE_I2V_MODELS
-            else 800
-        )
+        prompt_limit = 800
+        if normalized_model in _HAPPYHORSE_I2V_MODELS:
+            prompt_limit = _HAPPYHORSE_MAX_CHINESE_PROMPT_LENGTH
+        elif normalized_model.startswith(_WAN30_PREFIX):
+            prompt_limit = _WAN30_MAX_PROMPT_LENGTH
         input_obj: dict = {"prompt": (request.prompt or "")[:prompt_limit]}
         if (
             normalized_model.startswith(_WAN26_FLASH_PREFIX)
@@ -323,7 +330,34 @@ class BailianVideoGenProvider:
                 diagnostics={"code": "HappyHorseDurationMustBe3To15"}
             )
         image_ref = self._first_image_ref(request)
-        if normalized_model.startswith(_WAN27_I2V_PREFIX):
+        if normalized_model.startswith(_WAN30_PREFIX):
+            # 万相 3.0 同样走 media 协议，但官方文档明确 reference_xx/file/link
+            # 与 first_frame/last_frame 类型互斥，不能在同一请求中混用；因此
+            # 存在首帧图时保守省略参考音频（wan2.7 的 driving_audio 是旧协议
+            # 专属类型名，不能照搬）。无首帧图时音频可独立作为 reference_audio
+            # 提交；两者皆无则纯文生（wan3.0 的 prompt 与 media 必填其一，
+            # 无需强制要图）。
+            media: list[dict] = []
+            if image_ref is not None:
+                _notify("encoding", "正在编码首帧参考图", 12)
+                media.append(
+                    {
+                        "type": "first_frame",
+                        "url": await self._encode_reference(image_ref, "image/png"),
+                    }
+                )
+            elif request.reference_audios:
+                media.append(
+                    {
+                        "type": "reference_audio",
+                        "url": await self._encode_reference(
+                            request.reference_audios[0], "audio/mpeg"
+                        ),
+                    }
+                )
+            if media:
+                input_obj["media"] = media
+        elif normalized_model.startswith(_WAN27_I2V_PREFIX):
             if image_ref is None:
                 raise RuntimeError("Wan 2.7 图生视频需提供首帧参考图")
             _notify("encoding", "正在编码首帧参考图", 12)

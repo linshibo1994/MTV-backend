@@ -119,6 +119,16 @@ def test_limit_violation_list_reports_each_exceeded_category() -> None:
             ReferenceMediaLimits(1, 0, 0, 1, requires_input_image=True),
         ),
         ("bailian", "wan2.1-t2v", ReferenceMediaLimits(0, 0, 0, 0)),
+        (
+            "bailian",
+            "wan3.0-video",
+            ReferenceMediaLimits(1, 1, 0, 2, requires_input_image=False),
+        ),
+        (
+            "bailian",
+            "wan3.0-video-prime",
+            ReferenceMediaLimits(1, 1, 0, 2, requires_input_image=False),
+        ),
     ],
 )
 def test_provider_reference_limits_match_adapter_input_capabilities(
@@ -127,6 +137,20 @@ def test_provider_reference_limits_match_adapter_input_capabilities(
     expected: ReferenceMediaLimits,
 ) -> None:
     assert reference_media_limits_for_provider(provider, model) == expected
+
+
+def test_bailian_wan30_supports_first_frame_and_pure_text_generation() -> None:
+    # wan3.0 支持纯文生（requires_input_image=False），但 images>0 使首帧
+    # 续帧链路（materials 第一图作为 first_frame 提交）保持可用。
+    limits = reference_media_limits_for_provider("bailian", "wan3.0-video-prime")
+
+    assert limits.supports_first_frame is True
+    assert limits.requires_input_image is False
+    # 纯文生：无图无音频不触发 reference_input_image_required。
+    assert reference_media_limit_violations(
+        ReferenceMediaCounts(images=0, audios=0, videos=0),
+        limits=limits,
+    ) == []
 
 
 def test_text_to_video_model_disables_continuation_first_frame_capability() -> None:

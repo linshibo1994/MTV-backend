@@ -50,6 +50,16 @@ def test_prompt_capability_uses_alias_and_model_override() -> None:
     assert happyhorse.supports_reference_audio is True
 
 
+def test_prompt_capability_wan30_models_use_extended_prompt_limit() -> None:
+    standard = get_prompt_capability("bailian", model="wan3.0-video")
+    prime = get_prompt_capability("bailian", model="wan3.0-video-prime")
+
+    assert standard.max_prompt_characters == 20000
+    assert prime.max_prompt_characters == 20000
+    # wan3.0 精确匹配不应影响其他 wan 系列模型的默认 800 上限。
+    assert get_prompt_capability("bailian", model="wan3.1-video").max_prompt_characters == 800
+
+
 def test_prompt_capability_exposes_provider_syntax() -> None:
     assert get_prompt_capability("volcengine").prompt_syntax == "ark_content"
     assert get_prompt_capability("neolink").prompt_syntax == "ark_content"

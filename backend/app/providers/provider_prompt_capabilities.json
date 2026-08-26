@@ -35,6 +35,10 @@
         {
           "exact_models": ["happyhorse-1.0-i2v", "happyhorse-1.1-i2v"],
           "max_prompt_characters": 2500
+        },
+        {
+          "exact_models": ["wan3.0-video", "wan3.0-video-prime"],
+          "max_prompt_characters": 20000
         }
       ]
     },
