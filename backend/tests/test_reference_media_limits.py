@@ -122,12 +122,26 @@ def test_limit_violation_list_reports_each_exceeded_category() -> None:
         (
             "bailian",
             "wan3.0-video",
-            ReferenceMediaLimits(1, 1, 0, 2, requires_input_image=False),
+            ReferenceMediaLimits(
+                10,
+                5,
+                5,
+                20,
+                first_frame_exclusive=True,
+                requires_input_image=False,
+            ),
         ),
         (
             "bailian",
             "wan3.0-video-prime",
-            ReferenceMediaLimits(1, 1, 0, 2, requires_input_image=False),
+            ReferenceMediaLimits(
+                10,
+                5,
+                5,
+                20,
+                first_frame_exclusive=True,
+                requires_input_image=False,
+            ),
         ),
     ],
 )
@@ -151,6 +165,56 @@ def test_bailian_wan30_supports_first_frame_and_pure_text_generation() -> None:
         ReferenceMediaCounts(images=0, audios=0, videos=0),
         limits=limits,
     ) == []
+
+
+def test_wan30_automatic_merge_preserves_all_supported_reference_modalities() -> None:
+    limits = reference_media_limits_for_provider("bailian", "wan3.0-video-prime")
+    materials, audio = trim_automatic_reference_selection(
+        {
+            "character": _items("image", 12),
+            "background": [],
+            "prop": [],
+            "other": [],
+            "video": [
+                {"name": f"video-{index}", "video_job_id": f"job-{index}"}
+                for index in range(7)
+            ],
+        },
+        {
+            "characters": _items("audio", 7),
+            "sounds": [],
+        },
+        limits=limits,
+    )
+
+    assert [item["name"] for item in materials["character"]] == [
+        f"image-{index}" for index in range(10)
+    ]
+    assert [item["name"] for item in audio["characters"]] == [
+        f"audio-{index}" for index in range(5)
+    ]
+    assert [item["name"] for item in materials["video"]] == [
+        f"video-{index}" for index in range(5)
+    ]
+
+
+def test_wan30_first_frame_mode_rejects_reference_media() -> None:
+    limits = reference_media_limits_for_provider("bailian", "wan3.0-video-prime")
+
+    assert limits.first_frame_exclusive is True
+    with pytest.raises(ReferenceMediaLimitExceeded, match="参考图最多支持 1 个"):
+        validate_shot_group_reference_selection(
+            {
+                "character": _items("image", 1),
+                "background": [],
+                "prop": [],
+                "other": [],
+                "video": [],
+            },
+            {"characters": [], "sounds": []},
+            reserve_continuation_first_frame=True,
+            limits=limits,
+        )
 
 
 def test_text_to_video_model_disables_continuation_first_frame_capability() -> None:

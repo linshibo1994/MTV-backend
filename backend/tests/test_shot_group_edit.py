@@ -165,6 +165,57 @@ def test_material_and_audio_references_resolve_approved_assets() -> None:
     ]
 
 
+def test_audio_normalisation_preserves_multiple_approved_entries_for_one_subject() -> None:
+    character = SimpleNamespace(
+        id="subject-character",
+        name="老姜",
+        type="character",
+        image_entry_id=None,
+    )
+    first_audio = SimpleNamespace(
+        id="audio-approved-1",
+        subject_id=character.id,
+        kind="audio",
+    )
+    second_audio = SimpleNamespace(
+        id="audio-approved-2",
+        subject_id=character.id,
+        kind="audio",
+    )
+
+    audio_elements = _normalise_audio_elements(
+        [
+            {
+                "type": "character",
+                "subject_id": character.id,
+                "asset_entry_id": first_audio.id,
+            },
+            {
+                "type": "character",
+                "subject_id": character.id,
+                "asset_entry_id": second_audio.id,
+            },
+        ],
+        subjects=[character],
+        approved_assets=[first_audio, second_audio],
+    )
+
+    assert audio_elements["characters"] == [
+        {
+            "name": "老姜",
+            "type": "character",
+            "subject_id": "subject-character",
+            "asset_entry_id": "audio-approved-1",
+        },
+        {
+            "name": "老姜",
+            "type": "character",
+            "subject_id": "subject-character",
+            "asset_entry_id": "audio-approved-2",
+        },
+    ]
+
+
 async def test_update_shot_group_persists_fields_and_increments_version(monkeypatch) -> None:
     from app.services.runtime_models import RuntimeVideoModel
 

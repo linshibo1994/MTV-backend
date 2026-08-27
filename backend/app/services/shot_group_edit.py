@@ -262,7 +262,7 @@ def _normalise_audio_elements(
             approved_audio_by_subject.setdefault(str(asset_model.subject_id), asset_model)
 
     result: dict[str, list[dict[str, str]]] = {"characters": [], "sounds": []}
-    seen: set[tuple[str, str, str]] = set()
+    seen: set[tuple[str, str, str, str]] = set()
     for item in raw:
         item_type = str(item["type"])
         expected_subject_type = "character" if item_type == "character" else "sound"
@@ -284,7 +284,12 @@ def _normalise_audio_elements(
                 resolved_asset = approved_audio_by_subject.get(str(resolved_subject.id))
         if resolved_asset is not None:
             normalised["asset_entry_id"] = str(resolved_asset.id)
-        dedupe_key = (item_type, normalised.get("subject_id", ""), name)
+        dedupe_key = (
+            item_type,
+            normalised.get("subject_id", ""),
+            normalised.get("asset_entry_id", ""),
+            name,
+        )
         if dedupe_key in seen:
             continue
         seen.add(dedupe_key)

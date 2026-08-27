@@ -156,17 +156,15 @@ def reference_media_limits_for_provider(
             )
         )
         audio_supported = model_name.startswith(("wan2.7-i2v", "wan2.5-i2v", "wan2.6-i2v"))
-        # 万相 3.0（wan3.0-video 标准版 / wan3.0-video-prime 高速版及后续变体）：
-        # 官方"全能参考模式"支持 10 张参考图 + 5 段参考音频，且支持纯文生
-        # （prompt 与 media 必填其一）。但系统的首帧语义（materials 第一张图
-        # 作为 first_frame 提交）目前只消费 1 图 1 音频，故保守起步只开放该
-        # 额度；后续开放多参考需同步改造提示词模板（"图1/图2"指代）。
+        # 万相 3.0 全能参考模式支持 10 张参考图、5 段参考音频、5 段参考视频，
+        # 合计最多 20 个。显式首帧/尾帧与这些参考媒体互斥。
         if model_name.startswith("wan3.0-video"):
             return ReferenceMediaLimits(
-                images=1,
-                audios=1,
-                videos=0,
-                total=2,
+                images=10,
+                audios=5,
+                videos=5,
+                total=20,
+                first_frame_exclusive=True,
                 requires_input_image=False,
             )
         images = 1 if image_supported else 0

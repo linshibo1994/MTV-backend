@@ -22,6 +22,7 @@ import base64
 import logging
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -60,10 +61,11 @@ _POLL_TIMEOUT = 600  # 10 分钟
 
 # 2.7 使用新版 media 协议，早期 I2V 模型使用 img_url 协议。
 # 万相 3.0（wan3.0-video / wan3.0-video-prime 及后续变体）也使用 media
-# 协议，但 reference_audio 与 first_frame/last_frame 官方声明互斥。
+# 协议；reference_xx 与 first_frame/last_frame 官方声明互斥。
 _WAN27_I2V_PREFIX = "wan2.7-i2v"
 _WAN30_PREFIX = "wan3.0-video"
 _WAN30_MAX_PROMPT_LENGTH = 20000
+_REFERENCE_URL_EXPIRY_SECONDS = 900
 _LEGACY_I2V_PREFIXES = (
     "wanx2.1-i2v",
     "wan2.2-i2v",
@@ -132,9 +134,14 @@ class BailianVideoGenProvider:
         on_progress=None,
     ) -> VideoGenerationResult:
         """文生/图生视频 → 返回视频 storage_key。"""
-        if request.reference_videos:
+        use_model = request.model or settings.video_gen_model or "wanx2.1-t2v-turbo"
+        if request.reference_videos and not use_model.lower().startswith(_WAN30_PREFIX):
             raise VideoGenerationSubmitRejected(
                 diagnostics={"code": "ReferenceVideoUnsupported"}
+            )
+        if use_model.lower().startswith(_WAN30_PREFIX) and self._wan30_media_mode_conflict(request):
+            raise VideoGenerationSubmitRejected(
+                diagnostics={"code": "wan30_media_mode_conflict"}
             )
         task_id = str((request.metadata or {}).get("provider_task_id") or "")
         if task_id:
@@ -146,7 +153,6 @@ class BailianVideoGenProvider:
             await raise_if_video_cancel_requested_before_submit(
                 request.cancel_requested
             )
-        use_model = request.model or settings.video_gen_model or "wanx2.1-t2v-turbo"
         if not task_id:
             # 历史任务可能在统一限额上线前创建；首帧会通过独立字段提交，
             # 不能同时再按普通参考图重复计数。
@@ -322,30 +328,47 @@ class BailianVideoGenProvider:
             )
         image_ref = self._first_image_ref(request)
         if normalized_model.startswith(_WAN30_PREFIX):
-            # 万相 3.0 同样走 media 协议，但官方文档明确 reference_xx/file/link
-            # 与 first_frame/last_frame 类型互斥，不能在同一请求中混用；因此
-            # 存在首帧图时保守省略参考音频（wan2.7 的 driving_audio 是旧协议
-            # 专属类型名，不能照搬）。无首帧图时音频可独立作为 reference_audio
-            # 提交；两者皆无则纯文生（wan3.0 的 prompt 与 media 必填其一，
-            # 无需强制要图）。
+            # 万相 3.0 的显式首帧/尾帧与 reference_xx 互斥。历史任务可能把
+            # 同一首帧同时留在 reference_images 中，因此只忽略完全相同的一项。
             media: list[dict] = []
-            if image_ref is not None:
+            if request.first_frame:
+                if self._wan30_media_mode_conflict(request):
+                    raise VideoGenerationSubmitRejected(
+                        diagnostics={"code": "wan30_media_mode_conflict"}
+                    )
                 _notify("encoding", "正在编码首帧参考图", 12)
                 media.append(
                     {
                         "type": "first_frame",
-                        "url": await self._encode_reference(image_ref, "image/png"),
+                        "url": await self._encode_single(request.first_frame, "image/png"),
                     }
                 )
-            elif request.reference_audios:
-                media.append(
-                    {
-                        "type": "reference_audio",
-                        "url": await self._encode_reference(
-                            request.reference_audios[0], "audio/mpeg"
-                        ),
-                    }
-                )
+            else:
+                for reference in request.reference_images:
+                    media.append(
+                        {
+                            "type": "reference_image",
+                            "url": await self._encode_reference(reference, "image/png"),
+                        }
+                    )
+                for reference in request.reference_videos:
+                    media.append(
+                        {
+                            "type": "reference_video",
+                            "url": await self._external_reference_url(
+                                str(reference.get("storage_key") or "")
+                            ),
+                        }
+                    )
+                for reference in request.reference_audios:
+                    media.append(
+                        {
+                            "type": "reference_audio",
+                            "url": await self._external_reference_url(
+                                str(reference.get("storage_key") or "")
+                            ),
+                        }
+                    )
             if media:
                 input_obj["media"] = media
         elif normalized_model.startswith(_WAN27_I2V_PREFIX):
@@ -411,6 +434,67 @@ class BailianVideoGenProvider:
             if isinstance(reference, dict) and isinstance(reference.get("storage_key"), str):
                 return reference
         return None
+
+    @staticmethod
+    def _wan30_media_mode_conflict(request: VideoGenerationRequest) -> bool:
+        """显式首帧模式下，排除历史重复首帧后判断是否仍混入参考媒体。"""
+        if not request.first_frame:
+            return False
+        return (
+            any(
+                not isinstance(reference, dict)
+                or reference.get("storage_key") != request.first_frame
+                for reference in request.reference_images
+            )
+            or bool(request.reference_videos)
+            or bool(request.reference_audios)
+        )
+
+    @staticmethod
+    async def _external_reference_url(storage_key: str) -> str:
+        """返回百炼可读取的短期 HTTPS 音视频地址。"""
+        from app.providers._url_safety import validate_public_http_url
+        from app.providers.storage import get_storage
+
+        if not storage_key:
+            raise ProviderConfigurationError("百炼参考音视频缺少 storage_key")
+        try:
+            url = await get_storage().external_read_url(
+                storage_key,
+                expires_seconds=_REFERENCE_URL_EXPIRY_SECONDS,
+            )
+        except Exception as exc:  # noqa: BLE001 - 不向调用者暴露对象键或存储细节
+            logger.warning(
+                "百炼参考音视频外部读取 URL 生成失败 error_type=%s",
+                type(exc).__name__,
+            )
+            raise ProviderConfigurationError("百炼参考音视频外部读取 URL 生成失败") from None
+        if not isinstance(url, str) or not url.strip():
+            raise ProviderConfigurationError(
+                "当前存储后端无法为百炼参考音视频提供外部 HTTPS URL"
+            )
+
+        value = url.strip()
+        try:
+            parsed = urlsplit(value)
+            port = parsed.port or 443
+            validate_public_http_url(value)
+        except (TypeError, ValueError):
+            raise ProviderConfigurationError(
+                "百炼参考音视频外部读取 URL 必须是绝对 HTTPS URL"
+            ) from None
+        if (
+            parsed.scheme.lower() != "https"
+            or not parsed.hostname
+            or port != 443
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.fragment
+        ):
+            raise ProviderConfigurationError(
+                "百炼参考音视频外部读取 URL 必须是绝对 HTTPS URL"
+            )
+        return value
 
     async def _encode_reference(self, reference: dict, default_mime_type: str) -> str:
         """读取单个媒体参考并按其真实 MIME 类型编码为 data URL。"""

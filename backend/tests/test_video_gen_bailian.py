@@ -16,6 +16,7 @@ def _request(
     duration_seconds: int | None = 10,
     reference_audios: list[dict] | None = None,
     reference_images: list[dict] | None = None,
+    reference_videos: list[dict] | None = None,
     first_frame: str | None = None,
 ) -> VideoGenerationRequest:
     return VideoGenerationRequest(
@@ -33,6 +34,8 @@ def _request(
         reference_image_names=["角色"],
         reference_audios=reference_audios or [],
         reference_audio_names=[],
+        reference_videos=reference_videos or [],
+        reference_video_names=[],
         model=model,
         job_id="bailian-protocol-test",
         first_frame=first_frame,
@@ -274,35 +277,54 @@ async def test_wan30_first_frame_uses_media_protocol() -> None:
 
 
 @pytest.mark.asyncio
-async def test_wan30_first_frame_omits_audio_due_to_official_exclusivity() -> None:
+async def test_wan30_rejects_reference_media_when_explicit_first_frame_is_present() -> None:
     provider = BailianVideoGenProvider()
-    provider._encode_single = AsyncMock(return_value="data:image/webp;base64,aW1hZ2U=")
+    provider._encode_single = AsyncMock(return_value="data:image/png;base64,aW1hZ2U=")
 
-    body = await provider._build_body(
-        _request(
-            model="wan3.0-video-prime",
-            reference_images=[],
-            first_frame="frames/previous-tail.png",
-            reference_audios=[
-                {"storage_key": "references/voice.wav", "mime_type": "audio/wav"}
-            ],
-        ),
-        "wan3.0-video-prime",
-        lambda *_args: None,
-    )
+    with pytest.raises(VideoGenerationSubmitRejected) as exc_info:
+        await provider._build_body(
+            _request(
+                model="wan3.0-video-prime",
+                reference_images=[],
+                first_frame="frames/previous-tail.png",
+                reference_audios=[
+                    {"storage_key": "references/voice.wav", "mime_type": "audio/wav"}
+                ],
+            ),
+            "wan3.0-video-prime",
+            lambda *_args: None,
+        )
 
-    # 官方文档：reference_xx 与 first_frame/last_frame 类型互斥，不能混用；
-    # 首帧存在时保守省略参考音频，且不得照搬 wan2.7 的 driving_audio 类型名。
-    assert body["input"]["media"] == [
-        {"type": "first_frame", "url": "data:image/webp;base64,aW1hZ2U="},
-    ]
-    provider._encode_single.assert_awaited_once_with("frames/previous-tail.png", "image/png")
+    assert exc_info.value.diagnostics == {"code": "wan30_media_mode_conflict"}
+
+
+@pytest.mark.asyncio
+async def test_wan30_generate_rejects_reference_media_with_explicit_first_frame() -> None:
+    provider = BailianVideoGenProvider()
+    provider._check_keys = lambda: None
+
+    with pytest.raises(VideoGenerationSubmitRejected) as exc_info:
+        await provider.generate(
+            _request(
+                model="wan3.0-video-prime",
+                reference_images=[],
+                first_frame="frames/previous-tail.png",
+                reference_audios=[
+                    {"storage_key": "references/voice.wav", "mime_type": "audio/wav"}
+                ],
+            )
+        )
+
+    assert exc_info.value.diagnostics == {"code": "wan30_media_mode_conflict"}
 
 
 @pytest.mark.asyncio
 async def test_wan30_audio_without_first_frame_submits_reference_audio() -> None:
     provider = BailianVideoGenProvider()
     provider._encode_single = AsyncMock(return_value="data:audio/wav;base64,YXVkaW8=")
+    provider._external_reference_url = AsyncMock(
+        return_value="https://storage.example/reference/voice.wav?signature=audio"
+    )
 
     body = await provider._build_body(
         _request(
@@ -317,27 +339,116 @@ async def test_wan30_audio_without_first_frame_submits_reference_audio() -> None
     )
 
     assert body["input"]["media"] == [
-        {"type": "reference_audio", "url": "data:audio/wav;base64,YXVkaW8="},
+        {
+            "type": "reference_audio",
+            "url": "https://storage.example/reference/voice.wav?signature=audio",
+        },
     ]
-    provider._encode_single.assert_awaited_once_with("references/voice.wav", "audio/wav")
+    provider._external_reference_url.assert_awaited_once_with("references/voice.wav")
 
 
 @pytest.mark.asyncio
-async def test_wan30_reference_image_falls_back_to_first_image_as_first_frame() -> None:
+async def test_wan30_serializes_all_reference_media_in_stable_order() -> None:
     provider = BailianVideoGenProvider()
-    provider._encode_single = AsyncMock(return_value="data:image/webp;base64,aW1hZ2U=")
+    provider._encode_single = AsyncMock(
+        side_effect=[
+            "data:image/webp;base64,aW1hZ2Ux",
+            "data:image/png;base64,aW1hZ2Uy",
+        ]
+    )
+    provider._external_reference_url = AsyncMock(
+        side_effect=[
+            "https://storage.example/reference/motion.mp4?signature=video-1",
+            "https://storage.example/reference/style.mov?signature=video-2",
+            "https://storage.example/reference/dialogue.wav?signature=audio-1",
+            "https://storage.example/reference/music.mp3?signature=audio-2",
+        ]
+    )
 
     body = await provider._build_body(
-        _request(model="wan3.0-video-prime"),
+        _request(
+            model="wan3.0-video-prime",
+            reference_images=[
+                {"storage_key": "references/character.webp", "mime_type": "image/webp"},
+                {"storage_key": "references/prop.png", "mime_type": "image/png"},
+            ],
+            reference_videos=[
+                {"storage_key": "references/motion.mp4", "mime_type": "video/mp4"},
+                {"storage_key": "references/style.mov", "mime_type": "video/quicktime"},
+            ],
+            reference_audios=[
+                {"storage_key": "references/dialogue.wav", "mime_type": "audio/wav"},
+                {"storage_key": "references/music.mp3", "mime_type": "audio/mpeg"},
+            ],
+        ),
         "wan3.0-video-prime",
         lambda *_args: None,
     )
 
-    # 无独立首帧字段时，materials 第一张图沿用首帧语义提交。
     assert body["input"]["media"] == [
-        {"type": "first_frame", "url": "data:image/webp;base64,aW1hZ2U="},
+        {"type": "reference_image", "url": "data:image/webp;base64,aW1hZ2Ux"},
+        {"type": "reference_image", "url": "data:image/png;base64,aW1hZ2Uy"},
+        {
+            "type": "reference_video",
+            "url": "https://storage.example/reference/motion.mp4?signature=video-1",
+        },
+        {
+            "type": "reference_video",
+            "url": "https://storage.example/reference/style.mov?signature=video-2",
+        },
+        {
+            "type": "reference_audio",
+            "url": "https://storage.example/reference/dialogue.wav?signature=audio-1",
+        },
+        {
+            "type": "reference_audio",
+            "url": "https://storage.example/reference/music.mp3?signature=audio-2",
+        },
     ]
-    provider._encode_single.assert_awaited_once_with("references/first.webp", "image/webp")
+    assert provider._encode_single.await_args_list == [
+        (("references/character.webp", "image/webp"),),
+        (("references/prop.png", "image/png"),),
+    ]
+    assert provider._external_reference_url.await_args_list == [
+        (("references/motion.mp4",),),
+        (("references/style.mov",),),
+        (("references/dialogue.wav",),),
+        (("references/music.mp3",),),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_wan30_submit_allows_reference_videos(monkeypatch) -> None:
+    from app.providers import video_gen_bailian
+
+    class HttpClient:
+        async def aclose(self) -> None:
+            return None
+
+        async def post(self, *_args, **_kwargs):
+            return SimpleNamespace(
+                status_code=200,
+                json=lambda: {"output": {"task_id": "bailian-task-1"}},
+            )
+
+    provider = BailianVideoGenProvider()
+    provider._check_keys = lambda: None
+    provider._build_body = AsyncMock(return_value={"model": "wan3.0-video-prime", "input": {}})
+    provider._poll = AsyncMock(return_value="https://result.example/video.mp4")
+    provider._download_to_file = AsyncMock(return_value=1)
+    provider._store_video_file = AsyncMock(return_value="video/output.mp4")
+    monkeypatch.setattr(video_gen_bailian.httpx, "AsyncClient", lambda **_kwargs: HttpClient())
+
+    result = await provider.generate(
+        _request(
+            model="wan3.0-video-prime",
+            reference_images=[],
+            reference_videos=[{"storage_key": "references/motion.mp4", "mime_type": "video/mp4"}],
+        )
+    )
+
+    assert result.video_storage_key == "video/output.mp4"
+    provider._build_body.assert_awaited_once()
 
 
 @pytest.mark.asyncio
