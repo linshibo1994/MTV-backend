@@ -40,6 +40,7 @@ from app.providers.storage import storage_key_for_write
 from app.providers.video_gen import (
     VideoCancellationOutcome,
     VideoCancellationResult,
+    VideoGenerationDownloadError,
     VideoGenerationRemoteTerminalError,
     VideoGenerationSubmissionUncertain,
     VideoGenerationSubmitRejected,
@@ -1349,6 +1350,8 @@ async def _input_version_is_current(db: Any, job: Any) -> bool:
 
 
 def _safe_error_type(exc: Exception, fallback: str = "provider_or_storage_error") -> str:
+    if isinstance(exc, VideoGenerationDownloadError):
+        return "provider_download_failed"
     if isinstance(exc, TimeoutError):
         return "provider_timeout"
     if isinstance(exc, RuntimeError) and str(exc) in _PROVIDER_MEDIA_LIMIT_ERRORS:
@@ -2609,7 +2612,19 @@ async def run_video_generation_once(
                     )
                     return
             provider_task_id = authoritative_task_id or provider_task_id
-            if (
+            if isinstance(exc, VideoGenerationDownloadError):
+                # 远端任务已 SUCCEEDED 后才会进入下载/转存阶段；此时远端已终态，
+                # 不存在可取消的运行中任务（百炼等 Provider 明确无法取消已终态
+                # 任务），必须跳过"取消确认门禁"直接失败，否则任务永久卡在
+                # processing 并被 recover_stale_jobs 反复重排。
+                logger.warning(
+                    "视频 Provider 远端已成功但本地下载/转存失败，直接进入失败补偿 "
+                    "job_id=%s task_id=%s reason=%s",
+                    job_id,
+                    provider_task_id,
+                    exc.reason,
+                )
+            elif (
                 not provider_generation_completed
                 and provider_task_id
                 and not await _cancel_provider_task_after_generation_failure(

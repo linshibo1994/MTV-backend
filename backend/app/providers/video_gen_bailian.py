@@ -22,7 +22,6 @@ import base64
 import logging
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from urllib.parse import urlsplit
 
 import httpx
 
@@ -38,6 +37,7 @@ from app.providers.registry import ProviderConfigurationError
 from app.providers.video_gen import (
     CancellationProbe,
     VideoCancellationResult,
+    VideoGenerationDownloadError,
     VideoGenerationProgress,
     VideoGenerationRemoteTerminalError,
     VideoGenerationRequest,
@@ -57,15 +57,6 @@ logger = logging.getLogger(__name__)
 
 _POLL_INTERVAL = 15.0  # 官方建议 15s
 _POLL_TIMEOUT = 600  # 10 分钟
-_BAILIAN_RESULT_DOWNLOAD_HOSTS = frozenset(
-    {
-        "dashscope-result.oss-cn-hangzhou.aliyuncs.com",
-        "dashscope-result-sh.oss-accelerate.aliyuncs.com",
-        # 万相 3.0 等新模型的结果落在北京/新加坡桶（官方文档 video_url 示例）。
-        "dashscope-result-bj.oss-cn-beijing.aliyuncs.com",
-        "dashscope-result-sg.oss-ap-southeast-1.aliyuncs.com",
-    }
-)
 
 # 2.7 使用新版 media 协议，早期 I2V 模型使用 img_url 协议。
 # 万相 3.0（wan3.0-video / wan3.0-video-prime 及后续变体）也使用 media
@@ -503,48 +494,36 @@ class BailianVideoGenProvider:
             await asyncio.sleep(_POLL_INTERVAL)
 
     async def _download_to_file(self, url: str, path: str | Path) -> int:
-        """逐跳校验厂商 URL，并把视频流写入临时文件。"""
+        """把视频流写入临时文件。
+
+        供应商下发的临时公网下载链接不做域名白名单（域名形态持续变化，
+        逐个维护不可持续）；安全边界由 _url_safety 的通用 SSRF 校验保证：
+        仅公网 http/https、连接点公网 IP、逐跳重定向校验、大小上限。
+        下载只发生在远端任务已 SUCCEEDED 之后；任何下载异常都包装为
+        VideoGenerationDownloadError，让 Worker 失败补偿跳过"远端取消确认
+        门禁"（DashScope 视频任务不支持取消已终态任务），避免永久卡死。
+        Celery 时间限制信号必须原样透传，不允许被吞掉。
+        """
+        from billiard.exceptions import SoftTimeLimitExceeded, TimeLimitExceeded
+
         from app.providers._url_safety import MAX_PROVIDER_VIDEO_BYTES, safe_download_to_file
 
-        return await safe_download_to_file(
-            url,
-            path,
-            max_bytes=MAX_PROVIDER_VIDEO_BYTES,
-            timeout=120.0,
-            url_validator=self._validate_download_host,
-        )
-
-    @staticmethod
-    def _validate_download_host(url: str) -> None:
         try:
-            parsed = urlsplit(url)
-            configured = urlsplit(BailianVideoGenProvider._base_url())
-            hostname = (parsed.hostname or "").lower()
-            configured_host = (configured.hostname or "").lower()
-            port = parsed.port or 443
-            configured_port = configured.port or 443
-        except ValueError as exc:
-            raise RuntimeError("provider_download_url_invalid") from exc
-        configured_origin = (
-            configured.scheme.lower() == "https"
-            and bool(configured_host)
-            and configured_port == 443
-            and configured.username is None
-            and configured.password is None
-            and hostname == configured_host
-        )
-        if (
-            parsed.scheme.lower() != "https"
-            or not hostname
-            or port != 443
-            or parsed.username is not None
-            or parsed.password is not None
-            or not (
-                configured_origin
-                or hostname in _BAILIAN_RESULT_DOWNLOAD_HOSTS
+            return await safe_download_to_file(
+                url,
+                path,
+                max_bytes=MAX_PROVIDER_VIDEO_BYTES,
+                timeout=120.0,
             )
+        except (
+            asyncio.CancelledError,
+            SoftTimeLimitExceeded,
+            TimeLimitExceeded,
+            VideoGenerationDownloadError,
         ):
-            raise RuntimeError("provider_download_url_invalid")
+            raise
+        except Exception as exc:
+            raise VideoGenerationDownloadError(str(exc)) from exc
 
     @staticmethod
     def _api_key() -> str:
@@ -594,7 +573,14 @@ class BailianVideoGenProvider:
         job_id: str | None,
         metadata: dict,
     ) -> str:
-        """将临时视频文件原子提升为本次尝试的正式对象。"""
+        """将临时视频文件原子提升为本次尝试的正式对象。
+
+        转存同样只发生在远端任务已 SUCCEEDED 之后；存储异常与下载异常
+        同属"本地产物阶段失败"，一并包装为 VideoGenerationDownloadError，
+        Celery 时间限制信号原样透传。
+        """
+        from billiard.exceptions import SoftTimeLimitExceeded, TimeLimitExceeded
+
         from app.providers.storage import get_storage
         from app.providers.streaming_io import atomic_put_file, storage_attempt_suffix
 
@@ -603,13 +589,23 @@ class BailianVideoGenProvider:
         attempt_suffix = storage_attempt_suffix(metadata)
         suffix = f"-{attempt_suffix}" if attempt_suffix else ""
         storage_key = f"generate_images/video/{ident}{suffix}.mp4"
-        return await atomic_put_file(
-            storage,
-            storage_key,
-            path,
-            attempt_id=attempt_suffix or "legacy",
-            preserve_existing_final=not attempt_suffix,
-        )
+        try:
+            return await atomic_put_file(
+                storage,
+                storage_key,
+                path,
+                attempt_id=attempt_suffix or "legacy",
+                preserve_existing_final=not attempt_suffix,
+            )
+        except (
+            asyncio.CancelledError,
+            SoftTimeLimitExceeded,
+            TimeLimitExceeded,
+            VideoGenerationDownloadError,
+        ):
+            raise
+        except Exception as exc:
+            raise VideoGenerationDownloadError(f"store_failed:{exc}") from exc
 
 
 def _legacy_progress(on_progress):

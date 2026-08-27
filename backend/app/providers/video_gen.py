@@ -142,6 +142,21 @@ class VideoGenerationRemoteTerminalError(RuntimeError):
         super().__init__(f"video_generation_remote_terminal:{normalized}")
 
 
+class VideoGenerationDownloadError(RuntimeError):
+    """远端任务已成功，但本地下载/转存产物阶段失败。
+
+    该异常只会在 Provider 轮询取得成功终态（远端任务已 SUCCEEDED）之后的
+    下载/存储阶段抛出；远端不会再改变状态，也不存在可取消的运行中任务。
+    Worker 失败补偿可以据此跳过"远端取消确认门禁"，直接进入普通失败标记，
+    避免不支持取消已终态任务的 Provider（如百炼 DashScope 视频任务）永久卡在
+    processing。
+    """
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(f"video_generation_download_failed:{reason}")
+
+
 class VideoGenerationSubmissionUncertain(RuntimeError):
     """提交请求可能已被远端接受，但客户端没有取得可恢复任务 ID。"""
 

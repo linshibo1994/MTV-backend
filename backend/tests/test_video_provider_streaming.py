@@ -24,6 +24,16 @@ def _settings(**kwargs) -> Settings:
     return Settings(_env_file=None, **kwargs)  # type: ignore[call-arg]
 
 
+def _raise_value_error() -> None:
+    raise ValueError("video_url_not_allowed")
+
+
+def _reject_loopback_urls(url: str) -> None:
+    """模拟 validate_public_http_url：仅拒绝环回地址，其余放行。"""
+    if "127.0.0.1" in url:
+        _raise_value_error()
+
+
 def _request(
     *,
     job_id: str,
@@ -1274,40 +1284,41 @@ async def test_volcengine_close_compatibility_hook_stays_inside_managed_deadline
     assert video_gen._VIDEO_CLIENT_CLOSE_ORPHANS == set()
 
 
-@pytest.mark.parametrize(
-    "url",
-    [
-        "https://ark-content-generation-cn-beijing.tos-cn-beijing.volces.com/model/video.mp4",
-        "https://ark-acg-cn-beijing.tos-cn-beijing.volces.com/model/video.mp4",
-        "https://ark-content-generation-ap-southeast-1.tos-ap-southeast-1.volces.com/video.mp4",
-        "https://ark-content-generation-cn-beijing.tos-cn-beijing.volces.com:443/video.mp4",
-        "https://ark.cn-beijing.volces.com/api/v3/video.mp4",
-    ],
-)
-def test_volcengine_download_host_allows_official_ark_origins(url: str) -> None:
+@pytest.mark.asyncio
+async def test_volcengine_download_accepts_any_provider_issued_public_url(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """供应商下发的任意公网临时链接都可直接下载，不做域名白名单。
+
+    安全边界由 validate_public_http_url（SSRF/端口/协议/域名合法性）
+    在逐跳请求前保证；本测试 mock 掉该校验以隔离观察"无域名白名单"
+    契约本身。
+    """
+    from app.providers import _url_safety
     from app.providers.video_gen_volcengine import VolcengineVideoGenProvider
 
-    VolcengineVideoGenProvider()._validate_download_host(url)
-
-
-@pytest.mark.parametrize(
-    "url",
-    [
+    arbitrary_urls = [
         "https://cdn.example.com/video.mp4",
-        "http://ark-content-generation-cn-beijing.tos-cn-beijing.volces.com/video.mp4",
-        "https://user:password@ark-content-generation-cn-beijing.tos-cn-beijing.volces.com/video.mp4",
-        "https://ark-content-generation-cn-beijing.tos-cn-beijing.volces.com:8443/video.mp4",
-        "https://ark-content-generation-cn-beijing.tos-cn-beijing.volces.com.evil.test/video.mp4",
-        "https://ark-content-generation-cn-beijing.tos-ap-southeast-1.volces.com/video.mp4",
-        "https://ark-acg-cn-beijing.tos-ap-southeast-1.volces.com/video.mp4",
-        "https://ark-content-generation-cn-beijing.tos-cn-beijing.volces.com:bad/video.mp4",
-    ],
-)
-def test_volcengine_download_host_rejects_untrusted_origin(url: str) -> None:
-    from app.providers.video_gen_volcengine import VolcengineVideoGenProvider
+        "https://ark-content-generation-cn-beijing.tos-cn-beijing.volces.com/model/video.mp4",
+        "https://new-bucket-42.oss-unknown-region.example.org/video.mp4",
+    ]
+    responses = [
+        _StreamResponse(url, chunks=[b"video"]) for url in arbitrary_urls
+    ]
+    client = _StreamHttpClient(responses)
+    monkeypatch.setattr(_url_safety, "validate_public_http_url", lambda _url: None)
+    monkeypatch.setattr(_url_safety.httpx, "AsyncClient", lambda **_kwargs: client)
 
-    with pytest.raises(RuntimeError, match="provider_download_url_invalid"):
-        VolcengineVideoGenProvider()._validate_download_host(url)
+    for url in arbitrary_urls:
+        size = await VolcengineVideoGenProvider()._download_to_file(
+            url,
+            tmp_path / "video.mp4",
+        )
+        assert size == len(b"video")
+        assert (tmp_path / "video.mp4").read_bytes() == b"video"
+
+    assert [url for url, _headers in client.calls] == arbitrary_urls
 
 
 @pytest.mark.asyncio
@@ -1321,12 +1332,11 @@ async def test_volcengine_download_rejects_untrusted_initial_url_before_request(
     client = _StreamHttpClient(
         [_StreamResponse("https://cdn.example.com/video.mp4", chunks=[b"video"])]
     )
-    monkeypatch.setattr(_url_safety, "validate_public_http_url", lambda _url: None)
     monkeypatch.setattr(_url_safety.httpx, "AsyncClient", lambda **_kwargs: client)
 
-    with pytest.raises(RuntimeError, match="provider_download_url_invalid"):
+    with pytest.raises(ValueError, match="video_url_not_allowed"):
         await VolcengineVideoGenProvider()._download_to_file(
-            "https://cdn.example.com/video.mp4",
+            "http://127.0.0.1/private.mp4",
             tmp_path / "video.mp4",
         )
 
@@ -1347,14 +1357,14 @@ async def test_volcengine_download_revalidates_redirect_before_second_request(
     first = _StreamResponse(
         official_url,
         status_code=302,
-        headers={"location": "https://cdn.example.com/video.mp4"},
+        headers={"location": "http://127.0.0.1/private.mp4"},
     )
-    second = _StreamResponse("https://cdn.example.com/video.mp4", chunks=[b"video"])
+    second = _StreamResponse("http://127.0.0.1/private.mp4", chunks=[b"video"])
     client = _StreamHttpClient([first, second])
-    monkeypatch.setattr(_url_safety, "validate_public_http_url", lambda _url: None)
+    monkeypatch.setattr(_url_safety, "validate_public_http_url", _reject_loopback_urls)
     monkeypatch.setattr(_url_safety.httpx, "AsyncClient", lambda **_kwargs: client)
 
-    with pytest.raises(RuntimeError, match="provider_download_url_invalid"):
+    with pytest.raises(ValueError, match="video_url_not_allowed"):
         await VolcengineVideoGenProvider()._download_to_file(
             official_url,
             tmp_path / "video.mp4",
@@ -1776,6 +1786,7 @@ async def test_openai_provider_download_uses_512_mib_limit(monkeypatch, tmp_path
     assert captured["max_bytes"] == 512 * 1024 * 1024
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "url",
     [
@@ -1784,56 +1795,39 @@ async def test_openai_provider_download_uses_512_mib_limit(monkeypatch, tmp_path
         "https://dashscope-result.oss-cn-hangzhou.aliyuncs.com:443/video.mp4",
         "https://dashscope-result-bj.oss-cn-beijing.aliyuncs.com/video.mp4",
         "https://dashscope-result-sg.oss-ap-southeast-1.aliyuncs.com/video.mp4",
+        "https://dashscope-a717.oss-accelerate.aliyuncs.com/video.mp4",
+        "https://unlisted-new-shape.oss-unknown.aliyuncs.com/video.mp4",
+        "https://cdn.example.com/video.mp4",
     ],
 )
-def test_bailian_download_host_allows_audited_official_origins(
+async def test_bailian_download_accepts_any_provider_issued_public_url(
     monkeypatch,
+    tmp_path: Path,
     url: str,
 ) -> None:
-    from app.providers import video_gen_bailian
+    """供应商下发的任意公网临时链接都可直接下载，不做域名白名单。
+
+    安全边界由 validate_public_http_url（SSRF/端口/协议/域名合法性）
+    在逐跳请求前保证；本测试 mock 掉该校验以隔离观察"无域名白名单"
+    契约本身（含真实出现过的 dashscope-aNNN 加速域名等历史形态）。
+    """
+    from app.providers import _url_safety
     from app.providers.video_gen_bailian import BailianVideoGenProvider
 
-    monkeypatch.setattr(
-        video_gen_bailian,
-        "settings",
-        _settings(
-            video_gen_provider="bailian",
-            video_gen_api_key="test-bailian-key",
-            video_gen_base_url="https://dashscope.aliyuncs.com",
-        ),
+    client = _StreamHttpClient(
+        [_StreamResponse(url, chunks=[b"video"])]
+    )
+    monkeypatch.setattr(_url_safety, "validate_public_http_url", lambda _url: None)
+    monkeypatch.setattr(_url_safety.httpx, "AsyncClient", lambda **_kwargs: client)
+
+    size = await BailianVideoGenProvider()._download_to_file(
+        url,
+        tmp_path / "video.mp4",
     )
 
-    BailianVideoGenProvider()._validate_download_host(url)
-
-
-@pytest.mark.parametrize(
-    "url",
-    [
-        "https://attacker.oss-cn-hangzhou.aliyuncs.com/video.mp4",
-        "https://dashscope-result.evil.oss-cn-hangzhou.aliyuncs.com/video.mp4",
-        "https://dashscope-result.oss-cn-hangzhou.aliyuncs.com.evil.test/video.mp4",
-        "http://dashscope-result.oss-cn-hangzhou.aliyuncs.com/video.mp4",
-        "https://user:password@dashscope-result.oss-cn-hangzhou.aliyuncs.com/video.mp4",
-        "https://dashscope-result.oss-cn-hangzhou.aliyuncs.com:8443/video.mp4",
-        "https://dashscope-result.oss-cn-hangzhou.aliyuncs.com:bad/video.mp4",
-    ],
-)
-def test_bailian_download_host_rejects_untrusted_origin(monkeypatch, url: str) -> None:
-    from app.providers import video_gen_bailian
-    from app.providers.video_gen_bailian import BailianVideoGenProvider
-
-    monkeypatch.setattr(
-        video_gen_bailian,
-        "settings",
-        _settings(
-            video_gen_provider="bailian",
-            video_gen_api_key="test-bailian-key",
-            video_gen_base_url="https://dashscope.aliyuncs.com",
-        ),
-    )
-
-    with pytest.raises(RuntimeError, match="provider_download_url_invalid"):
-        BailianVideoGenProvider()._validate_download_host(url)
+    assert size == len(b"video")
+    assert (tmp_path / "video.mp4").read_bytes() == b"video"
+    assert [request_url for request_url, _headers in client.calls] == [url]
 
 
 @pytest.mark.asyncio

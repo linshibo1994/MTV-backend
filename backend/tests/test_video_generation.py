@@ -7499,3 +7499,176 @@ def test_confirmed_remote_cancellation_is_not_downgraded_by_late_failure(
         assert record["attempts"] == 2
 
     asyncio.run(scenario())
+
+
+def test_worker_download_failure_after_remote_success_marks_failed_not_stuck(
+    monkeypatch,
+) -> None:
+    """远端已成功的下载失败必须直接失败补偿，不得被取消确认门禁卡死。"""
+
+    async def scenario() -> None:
+        from app.providers.video_gen import (
+            VideoCancellationOutcome,
+            VideoCancellationResult,
+            VideoGenerationDownloadError,
+        )
+        from app.workers.video_generation import run_video_generation_once
+
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        job = _add_worker_job(
+            raw,
+            seeded,
+            job_id="job-download-failure",
+            reservation_id="reservation-download-failure",
+        )
+        # 复现真实卡死现场：恢复轮询场景，任务已持久化 provider_task_id
+        # 且提交意图已落库（state=submit_intent）；recover_stale_jobs 会把
+        # 租约过期的 processing 重置为 starting 再重排，因此从 starting 领取。
+        job.output_json = {
+            "provider_task_id": "provider-download-failure",
+            "provider_submission": {
+                "state": "submit_intent",
+                "attempt": 1,
+                "provider_key": "modelsai",
+            },
+        }
+        job.metrics = {
+            "provider_task_id": "provider-download-failure",
+            "provider_submission": {
+                "state": "submit_intent",
+                "attempt": 1,
+                "provider_key": "modelsai",
+            },
+        }
+        raw.commit()
+        db = _AsyncSessionAdapter(raw)
+
+        cancel_calls: list[str] = []
+
+        class Provider:
+            async def generate(self, request, on_progress=None):
+                # 远端已 SUCCEEDED 后本地下载/转存失败。
+                raise VideoGenerationDownloadError("provider_download_url_invalid")
+
+            async def cancel(self, provider_task_id: str) -> VideoCancellationResult:
+                cancel_calls.append(provider_task_id)
+                return VideoCancellationResult(
+                    provider_task_id=provider_task_id,
+                    outcome=VideoCancellationOutcome.UNSUPPORTED,
+                )
+
+        release_calls: list[str] = []
+
+        async def fake_release(_db, *, reservation_id, **_kwargs):
+            release_calls.append(reservation_id)
+            reservation = raw.get(CreditReservation, reservation_id)
+            reservation.status = "released"
+
+        monkeypatch.setattr(
+            "app.workers.video_generation._credits_release", fake_release
+        )
+
+        await run_video_generation_once(
+            db,
+            job.job_id,
+            owner="worker",
+            provider=Provider(),
+        )
+
+        raw.expire_all()
+        refreshed = raw.get(VideoGenerationJob, job.job_id)
+        reservation = raw.get(CreditReservation, "reservation-download-failure")
+        assert refreshed.status == "failed"
+        assert refreshed.error_type == "provider_download_failed"
+        assert refreshed.error_message == "provider_download_failed"
+        assert refreshed.retryable is False
+        assert refreshed.lease_token is None
+        assert reservation.status == "released"
+        assert release_calls == ["reservation-download-failure"]
+        # 远端已终态时不应再调用取消确认。
+        assert cancel_calls == []
+
+    asyncio.run(scenario())
+
+
+def test_worker_ordinary_provider_failure_still_requires_cancel_confirmation(
+    monkeypatch,
+) -> None:
+    """远端未终态时的普通失败仍必须通过取消确认门禁，保持原保护语义。"""
+
+    async def scenario() -> None:
+        from app.providers.video_gen import (
+            VideoCancellationOutcome,
+            VideoCancellationResult,
+        )
+        from app.workers.video_generation import run_video_generation_once
+
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        job = _add_worker_job(
+            raw,
+            seeded,
+            job_id="job-cancel-gate-kept",
+            reservation_id="reservation-cancel-gate-kept",
+        )
+        job.output_json = {
+            "provider_task_id": "provider-cancel-gate",
+            "provider_submission": {
+                "state": "submit_intent",
+                "attempt": 1,
+                "provider_key": "modelsai",
+            },
+        }
+        job.metrics = {
+            "provider_task_id": "provider-cancel-gate",
+            "provider_submission": {
+                "state": "submit_intent",
+                "attempt": 1,
+                "provider_key": "modelsai",
+            },
+        }
+        raw.commit()
+        db = _AsyncSessionAdapter(raw)
+
+        cancel_calls: list[str] = []
+
+        class Provider:
+            async def generate(self, request, on_progress=None):
+                # 轮询阶段的普通网络错误，远端状态未知。
+                raise RuntimeError("network error during polling")
+
+            async def cancel(self, provider_task_id: str) -> VideoCancellationResult:
+                cancel_calls.append(provider_task_id)
+                return VideoCancellationResult(
+                    provider_task_id=provider_task_id,
+                    outcome=VideoCancellationOutcome.UNSUPPORTED,
+                )
+
+        release_calls: list[str] = []
+
+        async def fake_release(_db, *, reservation_id, **_kwargs):
+            release_calls.append(reservation_id)
+
+        monkeypatch.setattr(
+            "app.workers.video_generation._credits_release", fake_release
+        )
+
+        await run_video_generation_once(
+            db,
+            job.job_id,
+            owner="worker",
+            provider=Provider(),
+        )
+
+        raw.expire_all()
+        refreshed = raw.get(VideoGenerationJob, job.job_id)
+        reservation = raw.get(CreditReservation, "reservation-cancel-gate-kept")
+        # 取消确认失败（unsupported）时保留 processing 租约，不标失败不释放积分。
+        assert cancel_calls == ["provider-cancel-gate"]
+        assert refreshed.status == "processing"
+        assert refreshed.error_type is None
+        assert release_calls == []
+        assert reservation.status == "reserved"
+
+    asyncio.run(scenario())

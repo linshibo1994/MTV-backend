@@ -411,13 +411,19 @@ async def test_neolink_missing_external_url_fails_before_sdk_submit(monkeypatch)
     submit.assert_not_awaited()
 
 
-def test_neolink_download_host_only_allows_documented_ark_bucket(monkeypatch) -> None:
+def test_neolink_download_accepts_provider_issued_public_urls(monkeypatch) -> None:
+    """NeoLink 与 Volcengine 共用下载链路：供应商临时公网链接不做域名白名单。
+
+    安全边界由 validate_public_http_url 的通用 SSRF 校验保证。
+    """
     _patch_settings(monkeypatch)
     provider = NeolinkVideoGenProvider()
 
-    provider._validate_download_host(_DOCUMENTED_VIDEO_URL)
-    with pytest.raises(RuntimeError, match="provider_download_url_invalid"):
-        provider._validate_download_host("https://cdn.example.com/generated/video.mp4")
+    assert (
+        provider._download_to_file.__func__
+        is VolcengineVideoGenProvider._download_to_file
+    )
+    assert not hasattr(provider, "_validate_download_host")
 
 
 @pytest.mark.asyncio

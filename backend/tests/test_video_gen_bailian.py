@@ -454,3 +454,98 @@ def test_bailian_video_strips_openai_compatible_path_from_explicit_base_url(monk
     )
 
     assert BailianVideoGenProvider._base_url() == "https://dashscope.aliyuncs.com"
+
+
+@pytest.mark.asyncio
+async def test_download_failure_is_wrapped_as_generation_download_error(monkeypatch, tmp_path) -> None:
+    """远端成功后的下载异常必须包装为专用类型，供 Worker 跳过取消确认门禁。"""
+    from app.providers import _url_safety
+    from app.providers.video_gen import VideoGenerationDownloadError
+
+    provider = BailianVideoGenProvider()
+    sentinel = RuntimeError("provider_download_url_invalid")
+
+    async def failing_download(*_args, **_kwargs):
+        raise sentinel
+
+    monkeypatch.setattr(_url_safety, "safe_download_to_file", failing_download)
+
+    with pytest.raises(VideoGenerationDownloadError) as exc_info:
+        await provider._download_to_file(
+            "https://dashscope-a717.oss-accelerate.aliyuncs.com/video.mp4",
+            tmp_path / "video.mp4",
+        )
+
+    assert exc_info.value.reason == "provider_download_url_invalid"
+    assert exc_info.value.__cause__ is sentinel
+
+
+@pytest.mark.asyncio
+async def test_download_time_limit_signals_are_not_wrapped(monkeypatch, tmp_path) -> None:
+    """Celery 时间限制信号必须原样透传，不允许被包装吞掉。"""
+    from billiard.exceptions import SoftTimeLimitExceeded, TimeLimitExceeded
+
+    from app.providers import _url_safety
+    from app.providers.video_gen import VideoGenerationDownloadError
+
+    provider = BailianVideoGenProvider()
+
+    for signal in (SoftTimeLimitExceeded(), TimeLimitExceeded()):
+        async def signal_download(*_args, _signal=signal, **_kwargs):
+            raise _signal
+
+        monkeypatch.setattr(_url_safety, "safe_download_to_file", signal_download)
+
+        with pytest.raises((SoftTimeLimitExceeded, TimeLimitExceeded)) as exc_info:
+            await provider._download_to_file(
+                "https://dashscope-a717.oss-accelerate.aliyuncs.com/video.mp4",
+                tmp_path / "video.mp4",
+            )
+        assert not isinstance(exc_info.value, VideoGenerationDownloadError)
+
+
+@pytest.mark.asyncio
+async def test_download_success_returns_byte_count(monkeypatch, tmp_path) -> None:
+    """正常下载不受包装影响，返回字节数。"""
+    from app.providers import _url_safety
+
+    provider = BailianVideoGenProvider()
+
+    async def ok_download(*_args, **_kwargs):
+        return 12345
+
+    monkeypatch.setattr(_url_safety, "safe_download_to_file", ok_download)
+
+    assert (
+        await provider._download_to_file(
+            "https://dashscope-a717.oss-accelerate.aliyuncs.com/video.mp4",
+            tmp_path / "video.mp4",
+        )
+        == 12345
+    )
+
+
+@pytest.mark.asyncio
+async def test_store_failure_is_wrapped_as_generation_download_error(monkeypatch, tmp_path) -> None:
+    """远端成功后的存储转存异常同样必须包装为专用类型（下载/转存一体防护）。"""
+    from app.providers import streaming_io
+    from app.providers.video_gen import VideoGenerationDownloadError
+
+    provider = BailianVideoGenProvider()
+    sentinel = OSError("disk full")
+
+    async def failing_store(*_args, **_kwargs):
+        raise sentinel
+
+    monkeypatch.setattr(streaming_io, "atomic_put_file", failing_store)
+
+    with pytest.raises(VideoGenerationDownloadError) as exc_info:
+        await provider._store_video_file(
+            tmp_path / "video.mp4",
+            "task-id",
+            "job-id",
+            {"attempt": 1},
+        )
+
+    assert exc_info.value.reason.startswith("store_failed:")
+    assert exc_info.value.__cause__ is sentinel

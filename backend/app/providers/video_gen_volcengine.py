@@ -22,13 +22,11 @@ data URL，避免要求私有对象存储暴露公网地址。
 import asyncio
 import base64
 import logging
-import re
 import time
 from inspect import isawaitable
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
-from urllib.parse import urlsplit
 
 from billiard.exceptions import SoftTimeLimitExceeded, TimeLimitExceeded
 
@@ -66,10 +64,6 @@ _POLL_TIMEOUT = 600
 _CANCEL_SDK_TIMEOUT = 5.0
 _CANCEL_TOTAL_TIMEOUT = 8.0
 _MAX_TOTAL_REFERENCE_BYTES = 200 * 1024 * 1024
-_ARK_CONTENT_DOWNLOAD_HOST = re.compile(
-    r"(?:ark-content-generation|ark-acg)-(?P<region>[a-z0-9]+(?:-[a-z0-9]+)*)\."
-    r"tos-(?P=region)\.volces\.com"
-)
 
 
 def _without_duplicate_first_frame(
@@ -843,7 +837,13 @@ class VolcengineVideoGenProvider:
         *,
         cancellation_probe=None,
     ) -> int:
-        """逐跳校验视频 URL，并把响应流写入临时文件。"""
+        """把响应流写入临时文件。
+
+        供应商下发的临时公网下载链接不做域名白名单（域名形态随区域/桶
+        持续变化，逐个维护不可持续）；安全边界由 _url_safety 的通用 SSRF
+        校验保证：仅公网 http/https、连接点公网 IP、逐跳重定向校验、
+        大小上限。
+        """
         from app.providers._url_safety import MAX_PROVIDER_VIDEO_BYTES, safe_download_to_file
 
         return await safe_download_to_file(
@@ -851,42 +851,8 @@ class VolcengineVideoGenProvider:
             path,
             max_bytes=MAX_PROVIDER_VIDEO_BYTES,
             timeout=120.0,
-            url_validator=self._validate_download_host,
             cancellation_probe=cancellation_probe,
         )
-
-    def _validate_download_host(self, url: str) -> None:
-        """仅允许 Ark API 主机或区域一致的官方内容桶通过 HTTPS 443 下载。"""
-        try:
-            parsed = urlsplit(url)
-            hostname = (parsed.hostname or "").lower()
-            port = parsed.port or 443
-        except ValueError as exc:
-            raise RuntimeError("provider_download_url_invalid") from exc
-
-        try:
-            configured = urlsplit(self._resolve_ark_base_url())
-            configured_host = (configured.hostname or "").lower()
-            configured_port = configured.port or 443
-        except ValueError:
-            configured_host = ""
-            configured_port = 0
-
-        configured_origin = (
-            configured.scheme.lower() == "https"
-            and configured_port == 443
-            and hostname == configured_host
-        )
-        official_content_origin = _ARK_CONTENT_DOWNLOAD_HOST.fullmatch(hostname) is not None
-        if (
-            parsed.scheme.lower() != "https"
-            or not hostname
-            or port != 443
-            or parsed.username is not None
-            or parsed.password is not None
-            or not (configured_origin or official_content_origin)
-        ):
-            raise RuntimeError("provider_download_url_invalid")
 
     async def _store_video_file(
         self,
