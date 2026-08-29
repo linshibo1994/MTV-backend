@@ -33,6 +33,11 @@ services:
       - type: bind
         source: ${MTV_POSTGRES_DATA_DIR:?请在生产环境文件设置 MTV_POSTGRES_DATA_DIR}
         target: /var/lib/postgresql/data
+    # CentOS 7 内核 3.10 上，Docker 默认 seccomp profile 会拦截 postgres 16 (musl) 的
+    # 某个 syscall，导致 initdb 写 postmaster.pid / pg_wal 报 EPERM（Operation not permitted）。
+    # 仅对该服务放宽 seccomp，其余服务仍保持默认 profile。
+    security_opt:
+      - seccomp:unconfined
     healthcheck:
       test: ["CMD-SHELL", "pg_isready --username=\"$$POSTGRES_USER\" --dbname=\"$$POSTGRES_DB\""]
       interval: 5s
