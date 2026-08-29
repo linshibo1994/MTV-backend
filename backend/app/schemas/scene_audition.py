@@ -59,6 +59,9 @@ class SceneAuditionGenerateIn(BaseModel):
         "relationship_reversal",
         "climax_ending",
     ]
+    # 请求级 LLM 路由：显式 provider（及可选 model）时按请求动态构造 LLM。
+    provider: str | None = Field(default=None, min_length=1, max_length=128)
+    model: str | None = Field(default=None, min_length=1, max_length=128)
 
 
 class SceneAuditionConfirmIn(BaseModel):

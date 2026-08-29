@@ -716,11 +716,52 @@ async def _run_stage_async(
     run_id: str,
     retry_exhausted: bool = False,
     input_client_save_seq: int | None = None,
+    llm_provider: str | None = None,
+    llm_model: str | None = None,
 ) -> str | dict:
     """通用阶段异步执行器。
 
     流程见模块文档字符串。成功返回 script_id（作为链路下一任务的入参）。
+    llm_provider/llm_model 为请求级 LLM 路由选择，在阶段执行期间保持
+    contextvar 作用域，供 split/extract 等深层服务动态构造 LLM。
     """
+    from app.services.pipeline_context import LLMSelection, llm_selection_scope
+
+    selection = (
+        LLMSelection(provider=llm_provider, model=llm_model)
+        if (llm_provider or "").strip() or (llm_model or "").strip()
+        else None
+    )
+    with llm_selection_scope(selection):
+        return await _run_stage_async_impl(
+            stage,
+            script_id,
+            episode_id,
+            service_args,
+            input_version,
+            reservation_id,
+            estimated,
+            dispatch_id,
+            run_id,
+            retry_exhausted,
+            input_client_save_seq,
+        )
+
+
+async def _run_stage_async_impl(
+    stage: str,
+    script_id: str | dict,
+    episode_id: str,
+    service_args: tuple,
+    input_version: int,
+    reservation_id: str | None,
+    estimated: int,
+    dispatch_id: str,
+    run_id: str,
+    retry_exhausted: bool = False,
+    input_client_save_seq: int | None = None,
+) -> str | dict:
+    """阶段执行主体；调用方负责请求级 LLM 选择 contextvar 作用域。"""
     if isinstance(script_id, dict):
         context_script_id = script_id.get("script_id")
         if not isinstance(context_script_id, str) or not context_script_id:
@@ -982,6 +1023,8 @@ def _run_stage(
     run_id: str,
     retry_exhausted: bool = False,
     input_client_save_seq: int | None = None,
+    llm_provider: str | None = None,
+    llm_model: str | None = None,
 ) -> str | dict:
     """同步入口：在 worker 持久事件循环中执行 async 主体。"""
     return run_worker_async(
@@ -997,6 +1040,8 @@ def _run_stage(
             run_id,
             retry_exhausted,
             input_client_save_seq=input_client_save_seq,
+            llm_provider=llm_provider,
+            llm_model=llm_model,
         )
     )
 
@@ -1023,6 +1068,8 @@ def split_task(
     estimated: int,
     dispatch_id: str,
     run_id: str,
+    llm_provider: str | None = None,
+    llm_model: str | None = None,
 ) -> str | dict:
     """split 阶段：整段剧本文本 → 多集文本。input_version 绑定输入版本。"""
     return _run_stage(
@@ -1036,6 +1083,8 @@ def split_task(
         dispatch_id,
         run_id,
         self.request.retries >= self.max_retries,
+        llm_provider=llm_provider,
+        llm_model=llm_model,
     )
 
 
@@ -1055,6 +1104,8 @@ def extract_task(
     estimated: int,
     dispatch_id: str,
     run_id: str,
+    llm_provider: str | None = None,
+    llm_model: str | None = None,
 ) -> str | dict:
     """extract 阶段：每集 → 主体列表。"""
     return _run_stage(
@@ -1068,6 +1119,8 @@ def extract_task(
         dispatch_id,
         run_id,
         self.request.retries >= self.max_retries,
+        llm_provider=llm_provider,
+        llm_model=llm_model,
     )
 
 
@@ -1087,6 +1140,8 @@ def merge_task(
     estimated: int,
     dispatch_id: str,
     run_id: str,
+    llm_provider: str | None = None,
+    llm_model: str | None = None,
 ) -> str | dict:
     """merge 阶段：跨集合并去重。"""
     return _run_stage(
@@ -1100,6 +1155,8 @@ def merge_task(
         dispatch_id,
         run_id,
         self.request.retries >= self.max_retries,
+        llm_provider=llm_provider,
+        llm_model=llm_model,
     )
 
 
@@ -1119,6 +1176,8 @@ def enrich_task(
     estimated: int,
     dispatch_id: str,
     run_id: str,
+    llm_provider: str | None = None,
+    llm_model: str | None = None,
 ) -> str | dict:
     """enrich 兼容阶段：不生成服务端设计提示词，终态仍由 finalizer 结算。"""
     return _run_stage(
@@ -1132,6 +1191,8 @@ def enrich_task(
         dispatch_id,
         run_id,
         self.request.retries >= self.max_retries,
+        llm_provider=llm_provider,
+        llm_model=llm_model,
     )
 
 
@@ -1151,6 +1212,8 @@ def parents_task(
     estimated: int,
     dispatch_id: str,
     run_id: str,
+    llm_provider: str | None = None,
+    llm_model: str | None = None,
 ) -> str | dict:
     """parents 阶段：归纳父主体 + child_count。终态：结算积分。"""
     return _run_stage(
@@ -1164,6 +1227,8 @@ def parents_task(
         dispatch_id,
         run_id,
         self.request.retries >= self.max_retries,
+        llm_provider=llm_provider,
+        llm_model=llm_model,
     )
 
 
@@ -1178,8 +1243,14 @@ def finalize_task(
     estimated: int,
     dispatch_id: str,
     run_id: str,
+    llm_provider: str | None = None,
+    llm_model: str | None = None,
 ) -> str:
-    """chord 唯一回调；只有两个叶子任务均成功返回后才执行。"""
+    """chord 唯一回调；只有两个叶子任务均成功返回后才执行。
+
+    finalizer 不调用 LLM，llm 参数仅为签名兼容链路关键字透传。
+    """
+    del llm_provider, llm_model
     return run_worker_async(
         _finalize_pipeline_async(
             script_id,

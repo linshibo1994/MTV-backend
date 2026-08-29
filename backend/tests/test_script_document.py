@@ -143,8 +143,10 @@ async def test_upload_endpoint_creates_source_episode_stores_file_and_triggers_p
         "script-1",
         UploadFile(BytesIO(b"ignored"), filename="完整剧本.txt"),
         True,
-        db,
-        SimpleNamespace(user_id="user-1"),
+        provider=None,
+        model=None,
+        db=db,
+        user=SimpleNamespace(user_id="user-1"),
     )
 
     assert isinstance(result, ScriptUploadOut)
@@ -155,7 +157,13 @@ async def test_upload_endpoint_creates_source_episode_stores_file_and_triggers_p
         f"https://cdn-ai-public.commind.com/{result.script_file_storage_key}"
     )
     storage.put_file.assert_awaited_once()
-    trigger.assert_awaited_once_with(db, "script-1", result.source_episode_id)
+    trigger.assert_awaited_once_with(
+        db,
+        "script-1",
+        result.source_episode_id,
+        llm_provider=None,
+        llm_model=None,
+    )
     assert db.rollback.await_count == 0
 
 
@@ -190,8 +198,10 @@ async def test_upload_endpoint_rejects_existing_episodes_and_does_not_store(monk
             "script-1",
             UploadFile(BytesIO(b"ignored"), filename="完整剧本.txt"),
             True,
-            db,
-            SimpleNamespace(user_id="user-1"),
+            provider=None,
+            model=None,
+            db=db,
+            user=SimpleNamespace(user_id="user-1"),
         )
     storage.put_file.assert_not_awaited()
     storage.delete.assert_not_awaited()
@@ -233,8 +243,10 @@ async def test_upload_endpoint_persists_cleanup_when_remote_delete_fails(monkeyp
             "script-1",
             UploadFile(BytesIO(b"ignored"), filename="完整剧本.txt"),
             True,
-            db,
-            SimpleNamespace(user_id="user-1"),
+            provider=None,
+            model=None,
+            db=db,
+            user=SimpleNamespace(user_id="user-1"),
         )
 
     storage.put_file.assert_awaited_once()

@@ -3318,10 +3318,14 @@ async def _call_llm(
     *,
     response_schema: Mapping[str, object] | None = _PROVIDER_RESPONSE_SCHEMA,
 ) -> dict:
-    """调用共享 LLM Provider；能力允许时下发供应商安全版 Schema。"""
-    from app.providers import get_llm_provider
+    """调用共享 LLM Provider；能力允许时下发供应商安全版 Schema。
 
-    provider = get_llm_provider()
+    优先读取 pipeline contextvar 中的请求级 (provider, model) 选择；未设置
+    时回退 get_llm_provider() 服务端默认单例。
+    """
+    from app.services.pipeline_context import get_llm_from_context
+
+    provider = get_llm_from_context()
     complete_json = provider.complete_json
     try:
         parameters = inspect.signature(complete_json).parameters.values()
@@ -4461,6 +4465,8 @@ async def generate_storyboard(
     expected_client_save_seq: int | None = None,
     source_storyboard_job_id: str | None = None,
     release_db_connection_before_provider: bool = False,
+    llm_provider: str | None = None,
+    llm_model: str | None = None,
 ) -> dict:
     """LLM-5 分镜生成主流程。
 
@@ -4470,7 +4476,41 @@ async def generate_storyboard(
     4. 构造 draft 组合 prompt (含约束锁 9 条)
     5. 解析引用主体填充 materials + audio_elements
     6. 落库 Scene/draft ShotGroup/Shot；正式组由合并接口生成
+
+    llm_provider/llm_model 为请求级显式路由选择（来自 job.detail 的
+    llm_selection）；提供时在本函数作用域内设置 pipeline contextvar，
+    _call_llm 读取后动态构造带保底回退的 LLM 实例。
     """
+    from app.services.pipeline_context import LLMSelection, llm_selection_scope
+
+    selection = (
+        LLMSelection(provider=llm_provider, model=llm_model)
+        if (llm_provider or "").strip() or (llm_model or "").strip()
+        else None
+    )
+    with llm_selection_scope(selection):
+        return await _generate_storyboard_impl(
+            db,
+            script_id,
+            episode_id,
+            expected_episode_version=expected_episode_version,
+            expected_client_save_seq=expected_client_save_seq,
+            source_storyboard_job_id=source_storyboard_job_id,
+            release_db_connection_before_provider=release_db_connection_before_provider,
+        )
+
+
+async def _generate_storyboard_impl(
+    db: AsyncSession,
+    script_id: str,
+    episode_id: str,
+    *,
+    expected_episode_version: int | None = None,
+    expected_client_save_seq: int | None = None,
+    source_storyboard_job_id: str | None = None,
+    release_db_connection_before_provider: bool = False,
+) -> dict:
+    """generate_storyboard 的实际执行体；调用方负责 LLM 选择 contextvar 作用域。"""
     # 1. 加载分集
     ep_result = await db.execute(
         select(Episode).where(

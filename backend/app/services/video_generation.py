@@ -82,9 +82,32 @@ _IDEMPOTENCY_CONFLICT_DETAIL = "幂等键已用于不同请求载荷"
 async def resolve_video_model(
     db: AsyncSession,
     configured_settings: Any | None = None,
+    *,
+    provider: str | None = None,
+    model: str | None = None,
 ) -> runtime_models.RuntimeVideoModel:
-    """保留服务内可替换入口，同时在调用时解析运行时模型。"""
+    """保留服务内可替换入口，同时在调用时解析运行时模型。
 
+    显式传入 provider（及可选 model）时按请求级覆盖解析；否则维持
+    服务端默认（database active 或 env 配置）。未知厂商或不支持视频
+    能力的厂商统一转为 400，避免把请求参数错误暴露成 500。
+    """
+
+    if provider or model:
+        from app.providers.registry import (
+            UnsupportedCapabilityError,
+            UnsupportedProviderError,
+        )
+
+        try:
+            return await runtime_models.resolve_request_video_model(
+                db,
+                configured_settings,
+                provider=provider,
+                model=model,
+            )
+        except (UnsupportedProviderError, UnsupportedCapabilityError) as exc:
+            raise BadRequestError(str(exc)) from None
     return await runtime_models.resolve_video_model(db, configured_settings)
 
 
@@ -108,6 +131,8 @@ async def create_video_job(
     user_id: str,
     idempotency_key: str | None = None,
     prompt: str | None = None,
+    provider: str | None = None,
+    model: str | None = None,
 ) -> "VideoGenerationJob":
     """创建视频生成任务 — 幂等去重 → 汇聚参考图/音频 → 落库 → reserve 积分 → 投递 worker。
 
@@ -119,6 +144,8 @@ async def create_video_job(
         user_id: 触发用户（积分扣减归属，按 user owner 维度账户）。
         idempotency_key: 可选幂等键（来自 Idempotency-Key 头）。
         prompt: 客户端显式视频提示词；缺省时回退镜头组 prompt。
+        provider: 请求级视频供应商；缺省走服务端默认（database active / env）。
+        model: 请求级视频模型；provider 显式且 model 缺省时用该厂商保底模型。
 
     Returns:
         VideoGenerationJob ORM 对象（重复创建时返回已存在任务）。
@@ -137,6 +164,10 @@ async def create_video_job(
     client_prompt = prompt.strip() if isinstance(prompt, str) else None
     if prompt is not None and not client_prompt:
         raise BadRequestError("视频提示词不能为空")
+    normalized_provider = (provider or "").strip() or None
+    normalized_model = (model or "").strip() or None
+    if normalized_model and not normalized_provider:
+        raise BadRequestError("请求级模型必须与 provider 一起提供")
     unit_id = f"group:{shot_group_id}"
     request_payload = {
         "script_id": script_id,
@@ -146,6 +177,9 @@ async def create_video_job(
     # 仅在客户端提供提示词时纳入哈希，缺省请求保持基础载荷结构。
     if client_prompt is not None:
         request_payload["prompt"] = client_prompt
+    if normalized_provider is not None:
+        request_payload["provider"] = normalized_provider
+        request_payload["model"] = normalized_model or ""
     request_hash = _request_hash(request_payload)
 
     # 1. 幂等去重（doc 08 §4.2）
@@ -251,7 +285,12 @@ async def create_video_job(
 
     # Provider/模型能力在创建时冻结。视频生成不再自动承接同场景前驱视频的
     # 尾帧，首帧仅保留为历史任务兼容字段，新的任务始终不传入该输入。
-    runtime_video_model = await resolve_video_model(db, settings)
+    runtime_video_model = await resolve_video_model(
+        db,
+        settings,
+        provider=normalized_provider,
+        model=normalized_model,
+    )
     reference_limits = reference_media_limits_for_provider(
         runtime_video_model.provider,
         runtime_video_model.model,
@@ -331,6 +370,9 @@ async def create_video_job(
     # 6. 构造 input_json 并落库任务
     input_json = {
         "model": model,
+        # 请求级显式供应商（规范化后的主 key）；缺省任务为空，worker 依旧
+        # 按任务行 provider_key 路由，兼容历史任务恢复链路。
+        "provider": normalized_provider,
         # prompt 保持为 worker 实际提交文本；source_prompt 单独保留适配前快照，
         # 让重试不受能力矩阵或 active 模板后续变更影响。
         "prompt": adapted.text,

@@ -114,3 +114,60 @@ async def resolve_video_model(
         reference_image_audit_required=provider == "volcengine",
         task_provider_key=raw_provider,
     )
+
+
+async def resolve_request_video_model(
+    db: AsyncSession,
+    configured_settings: Any | None = None,
+    *,
+    provider: str | None = None,
+    model: str | None = None,
+) -> RuntimeVideoModel:
+    """解析带请求级显式覆盖的视频模型；优先级为显式请求 > 服务端默认。
+
+    显式 provider 需通过 video 能力校验并规范化；model 缺省时回退该厂商
+    的 .env 保底模型。task_provider_key 使用 ``get_video_provider`` 认识的
+    稳定 key（与数据库 CHECK 约束对齐），保证任务行可持久化、worker 可路由。
+    """
+    normalized_provider = (provider or "").strip()
+    normalized_model = (model or "").strip()
+    if not normalized_provider and not normalized_model:
+        return await resolve_video_model(db, configured_settings)
+    if not normalized_provider:
+        raise ValueError("请求级视频路由必须显式传入 provider")
+    configured_settings = settings if configured_settings is None else configured_settings
+    vendor = require_capability(normalized_provider, "video")
+    fallback_models = {
+        "volcengine": configured_settings.seedance_model,
+        "neolink": configured_settings.seedance_model,
+        "bailian": configured_settings.dashscope_video_model,
+        "openai": configured_settings.openai_video_model,
+        "gemini": configured_settings.google_video_model,
+        "mgrouter": getattr(
+            configured_settings,
+            "mgrouter_video_model",
+            "AICC-Doubao-Seedance-2.0",
+        ),
+    }
+    effective_model = normalized_model or fallback_models[vendor]
+    # get_video_provider 的别名表中 jianyu/modelsai 映射 volcengine；数据库
+    # CHECK 约束接受 jianyu/modelsai/volcengine/doubao 等历史 key。这里统一
+    # 规范化到主 key，避免别名任务在恢复/取消链路无法路由。
+    task_provider_key = _STABLE_VIDEO_PROVIDER_KEYS.get(vendor, vendor)
+    return RuntimeVideoModel(
+        provider=vendor,
+        model=effective_model,
+        reference_image_audit_required=vendor == "volcengine",
+        task_provider_key=task_provider_key,
+    )
+
+
+# 规范化厂商名到数据库 CHECK 约束与 get_video_provider 均接受的任务 key。
+_STABLE_VIDEO_PROVIDER_KEYS = {
+    "volcengine": "volcengine",
+    "bailian": "bailian",
+    "openai": "openai",
+    "gemini": "gemini",
+    "neolink": "neolink",
+    "mgrouter": "mgrouter",
+}

@@ -525,6 +525,8 @@ async def create_pipeline_run(
                 input_client_save_seq=episode.client_save_seq,
                 reservation_id=reservation_id,
                 estimated=estimated,
+                llm_provider=body.provider,
+                llm_model=body.model,
             ),
             "mode": body.mode.value,
             "retry_of_run_id": retry_of_run_id,

@@ -17,6 +17,7 @@ from app.api.v1 import (
     pipeline_runs,
     project_members,
     prompt_templates,
+    provider_catalog,
     runtime_models,
     scene_auditions,
     scripts,
@@ -58,6 +59,8 @@ api_router.include_router(shots.router, tags=["分镜"])
 api_router.include_router(video_generation.router, tags=["视频生成"])
 # 当前部署实际使用的模型配置（不暴露密钥和服务地址）。
 api_router.include_router(runtime_models.router, tags=["运行时配置"])
+# 供应商目录：前端请求级 provider/model 选择器的数据源（不暴露密钥）。
+api_router.include_router(provider_catalog.router, tags=["供应商目录"])
 api_router.include_router(prompt_templates.router, tags=["提示词模板"])
 api_router.include_router(subject_candidates.router, tags=["主体候选"])
 api_router.include_router(scene_auditions.router, tags=["导演方案"])

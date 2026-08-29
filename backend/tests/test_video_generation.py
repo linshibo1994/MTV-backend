@@ -23,6 +23,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import Session
 
+from app.core.config import Settings
 from app.core.errors import BadRequestError, ConflictError, ForbiddenError
 from app.models.asset_entry import AssetEntry
 from app.models.credit import CreditAccount
@@ -814,6 +815,106 @@ def test_reference_aggregation_is_fail_closed_and_keeps_image_audio_names_aligne
         with pytest.raises(HTTPException) as exc_info:
             await aggregate_references(db, "missing")
         assert exc_info.value.status_code == 404
+
+    asyncio.run(scenario())
+
+
+def test_create_video_job_routes_by_request_level_provider_and_model(monkeypatch) -> None:
+    """请求级 provider/model 优先于 database active 配置并冻结进任务行。"""
+    async def scenario() -> None:
+        from app.services import video_generation
+
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        db = _AsyncSessionAdapter(raw)
+        # database 模式下 active 为 modelsai（volcengine）；请求显式 bailian 应覆盖。
+        monkeypatch.setattr(video_generation, "settings", Settings(_env_file=None))
+
+        async def fake_enqueue(db, **kwargs):
+            row = TaskDispatchOutbox(
+                id=f"dispatch-{kwargs['job_id'][:8]}",
+                task_type=kwargs["task_type"],
+                job_id=kwargs["job_id"],
+                attempt=kwargs["attempt"],
+                payload=kwargs["payload"],
+                status="pending",
+            )
+            db.add(row)
+            return row
+
+        monkeypatch.setattr("app.services.video_generation.enqueue_task", fake_enqueue)
+
+        from app.services.video_generation import create_video_job
+
+        job = await create_video_job(
+            db,
+            script_id=seeded.script.id,
+            episode_id=seeded.episode.episode_id,
+            shot_group_id=seeded.shot_group.shot_group_id,
+            user_id=seeded.user.user_id,
+            idempotency_key="idem-request-routing",
+            provider="dashscope",
+            model="wan3.0-video-prime",
+        )
+
+        assert job.provider_key == "bailian"
+        assert job.input_json["provider"] == "dashscope"
+        assert job.input_json["model"] == "wan3.0-video-prime"
+        # 幂等哈希纳入 provider/model，不同选择的同键请求会被拒绝。
+        request_hash = job.request_hash
+        assert request_hash is not None
+
+    asyncio.run(scenario())
+
+
+def test_create_video_job_request_provider_requires_model_with_provider(monkeypatch) -> None:
+    """只传 model 未传 provider 时返回 400，避免把未知模型发给默认厂商。"""
+    async def scenario() -> None:
+        from app.services import video_generation
+
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        db = _AsyncSessionAdapter(raw)
+        monkeypatch.setattr(video_generation, "settings", Settings(_env_file=None))
+
+        from app.services.video_generation import create_video_job
+
+        with pytest.raises(BadRequestError, match="provider"):
+            await create_video_job(
+                db,
+                script_id=seeded.script.id,
+                episode_id=seeded.episode.episode_id,
+                shot_group_id=seeded.shot_group.shot_group_id,
+                user_id=seeded.user.user_id,
+                idempotency_key="idem-model-without-provider",
+                model="wan3.0-video-prime",
+            )
+
+    asyncio.run(scenario())
+
+
+def test_create_video_job_request_provider_rejects_unknown_vendor(monkeypatch) -> None:
+    """未知供应商按 400 处理，而不是冒泡成 500。"""
+    async def scenario() -> None:
+        from app.services import video_generation
+
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        db = _AsyncSessionAdapter(raw)
+        monkeypatch.setattr(video_generation, "settings", Settings(_env_file=None))
+
+        from app.services.video_generation import create_video_job
+
+        with pytest.raises(BadRequestError, match="不支持的模型厂商"):
+            await create_video_job(
+                db,
+                script_id=seeded.script.id,
+                episode_id=seeded.episode.episode_id,
+                shot_group_id=seeded.shot_group.shot_group_id,
+                user_id=seeded.user.user_id,
+                idempotency_key="idem-unknown-provider",
+                provider="unknown-vendor",
+            )
 
     asyncio.run(scenario())
 

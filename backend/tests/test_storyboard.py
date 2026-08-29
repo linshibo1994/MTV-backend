@@ -955,7 +955,9 @@ async def test_storyboard_llm_call_uses_shared_provider_factory(monkeypatch) -> 
             assert user == "user"
             return {"scenes": []}
 
-    monkeypatch.setattr("app.providers.get_llm_provider", lambda: Provider())
+    monkeypatch.setattr(
+        "app.services.pipeline_context.get_llm_provider", lambda: Provider()
+    )
     assert await storyboard_service._call_llm("system", "user") == {"scenes": []}
 
 
@@ -975,7 +977,9 @@ async def test_storyboard_llm_call_passes_v2_schema_to_capable_provider(monkeypa
             assert response_schema == storyboard_service._PROVIDER_RESPONSE_SCHEMA
             return {"scenes": []}
 
-    monkeypatch.setattr("app.providers.get_llm_provider", lambda: Provider())
+    monkeypatch.setattr(
+        "app.services.pipeline_context.get_llm_provider", lambda: Provider()
+    )
     assert await storyboard_service._call_llm("system", "user") == {"scenes": []}
 
 

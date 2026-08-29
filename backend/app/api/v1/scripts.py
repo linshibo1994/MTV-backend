@@ -22,7 +22,7 @@
 import logging
 from typing import Any
 
-from fastapi import APIRouter, Depends, File, Query, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, Query, UploadFile, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import noload
@@ -187,6 +187,17 @@ async def upload_and_split_script(
     script_id: str,
     file: UploadFile = File(...),
     auto: bool = Query(True, description="是否立即启动五阶段 AI 流水线"),
+    *,
+    provider: str | None = Form(
+        None,
+        max_length=128,
+        description="请求级 LLM 供应商（仅 auto=true 时生效）",
+    ),
+    model: str | None = Form(
+        None,
+        max_length=128,
+        description="请求级 LLM 模型；缺省时使用该供应商的保底模型",
+    ),
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> ScriptUploadOut:
@@ -194,11 +205,17 @@ async def upload_and_split_script(
 
     首版只接受尚未产生分集的剧本，防止一次上传重写已有分镜、资产或视频数据。
     ``PipelineJob.run_id`` 同时作为兼容央视频轮询语义的 ``analysis_job_id``。
+    可选 Form 字段 provider/model 按请求路由流水线 LLM（贯穿 outbox payload）。
     """
     script = await script_crud.get_script(db, script_id)
     await check_script_access(db, user, script, action=Action.EDIT)
     if auto:
         await check_script_access(db, user, script, action=Action.RUN_AI)
+
+    normalized_provider = (provider or "").strip() or None
+    normalized_model = (model or "").strip() or None
+    if normalized_model and not normalized_provider:
+        raise ConflictError("请求级 LLM 模型必须与 provider 一起提供")
 
     document = await stage_script_document(file, max_bytes=settings.max_upload_bytes)
     storage_key = storage_key_for_write(f"upload_scripts/{script_id}/{new_id()}{document.suffix}")
@@ -254,7 +271,13 @@ async def upload_and_split_script(
         )
         if auto:
             # trigger_pipeline 在同一事务内提交源分集、阶段、积分预约、outbox 与任务记录。
-            pipeline_result = await trigger_pipeline(db, script_id, source_episode.episode_id)
+            pipeline_result = await trigger_pipeline(
+                db,
+                script_id,
+                source_episode.episode_id,
+                llm_provider=normalized_provider,
+                llm_model=normalized_model,
+            )
         else:
             await db.commit()
     except Exception:

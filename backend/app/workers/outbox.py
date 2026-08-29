@@ -56,7 +56,15 @@ def build_pipeline_canvas(
     group_factory=group,
     chord_factory=chord,
 ) -> object:
-    """构造可由假签名测试的 DAG，不连接 broker。"""
+    """构造可由假签名测试的 DAG，不连接 broker。
+
+    llm_provider/llm_model（请求级 LLM 路由）以关键字参数贯穿每个阶段
+    任务；历史 payload 不含这两个键时传 None，保持旧消息兼容。
+    """
+    llm_kwargs = {
+        "llm_provider": payload.get("llm_provider"),
+        "llm_model": payload.get("llm_model"),
+    }
     return chain_factory(
         split_task.s(
             payload["script_id"],
@@ -66,6 +74,7 @@ def build_pipeline_canvas(
             payload["estimated"],
             payload["dispatch_id"],
             payload["run_id"],
+            **llm_kwargs,
         ),
         extract_task.s(
             payload["episode_id"],
@@ -74,6 +83,7 @@ def build_pipeline_canvas(
             payload["estimated"],
             payload["dispatch_id"],
             payload["run_id"],
+            **llm_kwargs,
         ),
         merge_task.s(
             payload["episode_id"],
@@ -82,6 +92,7 @@ def build_pipeline_canvas(
             payload["estimated"],
             payload["dispatch_id"],
             payload["run_id"],
+            **llm_kwargs,
         ),
         chord_factory(
             group_factory(
@@ -92,6 +103,7 @@ def build_pipeline_canvas(
                     payload["estimated"],
                     payload["dispatch_id"],
                     payload["run_id"],
+                    **llm_kwargs,
                 ),
                 parents_task.s(
                     payload["episode_id"],
@@ -100,6 +112,7 @@ def build_pipeline_canvas(
                     payload["estimated"],
                     payload["dispatch_id"],
                     payload["run_id"],
+                    **llm_kwargs,
                 ),
             ),
             finalize_task.s(
@@ -110,6 +123,7 @@ def build_pipeline_canvas(
                 payload["estimated"],
                 payload["dispatch_id"],
                 payload["run_id"],
+                **llm_kwargs,
             ),
         ),
     )
@@ -153,6 +167,8 @@ def publish_outbox_payload(task_type: str, payload: dict) -> Any:
         return scene_audition_worker.generate_scene_audition_task.s(
             payload["job_id"],
             payload.get("attempt"),
+            payload.get("llm_provider"),
+            payload.get("llm_model"),
         ).apply_async()
     if task_type != "pipeline.dag":
         raise ValueError("未知 outbox task_type")

@@ -1,10 +1,12 @@
 """文生图 Provider 抽象与工厂路由。
 
 ImageGenProvider 协议统一文生图调用入口：
-generate(prompt, model, size, aspect, count, negative_prompt) -> list[ImageResult]。
+generate(prompt, model, size, aspect, count, negative_prompt, explicit_model)
+-> list[ImageResult]。
 
-get_image_provider(model) 路由策略（模型别名优先 + .env 未知模型回退）：
-  1. 调用方显式传入 provider -> 对应厂商。
+get_image_provider(model, provider=...) 路由策略（请求级 provider 优先 +
+模型别名 + .env 未知模型回退）：
+  1. 调用方显式传入 provider（请求级动态路由）-> 对应厂商。
   2. model 为已知别名 -> 对应厂商：
      - banana-2     -> Google Nano Banana (image_gen_google)
      - gpt-image-2  -> OpenAI GPT Image (image_gen_openai)
@@ -12,6 +14,9 @@ get_image_provider(model) 路由策略（模型别名优先 + .env 未知模型�
      - wan2.1-* / wanx-* / qwen-image* -> 阿里百炼通义万相 (image_gen_bailian)
   3. model 为未知别名/真实 id -> 按 settings.image_gen_provider 选厂商，model 作为真实 id。
   4. 缺对应 API key 由具体实现抛 RuntimeError，worker 捕获后 release 积分。
+
+显式请求模型经 explicit_model=True 透传；厂商实现据此跳过 IMAGE_GEN_MODEL
+的 env 覆盖，保证请求级选择不被部署默认模型替换。
 """
 
 from __future__ import annotations
@@ -207,6 +212,8 @@ class ImageGenProvider(Protocol):
     """文生图供应商协议 — 返回图片二进制数据列表。
 
     generate 一次请求可返回多张图片（count 张），供多张选一场景减少 API 往返。
+    ``explicit_model=True`` 表示 model 来自请求级显式选择，厂商实现不得用
+    IMAGE_GEN_MODEL 的 env 覆盖替换它。
     """
 
     async def generate(
@@ -217,6 +224,7 @@ class ImageGenProvider(Protocol):
         aspect: str,
         count: int = 1,
         negative_prompt: str | None = None,
+        explicit_model: bool = False,
     ) -> list[ImageResult]:
         """根据正反向提示词、尺寸和比例生成 count 张图片。"""
         ...
@@ -296,6 +304,7 @@ def get_image_provider(
 ) -> ImageGenProvider:
     """已知 model 别名优先；未知真实模型再按 .env provider 路由。
 
+    显式 provider 来自请求级动态路由（input_json["provider"]），优先级最高；
     缺少对应 API key 时由具体实现抛 RuntimeError，worker 捕获后 release 积分。
     """
     from app.core.config import settings

@@ -16,6 +16,15 @@ VideoPrompt = Annotated[
         max_length=MAX_VIDEO_PROMPT_LENGTH,
     ),
 ]
+# 请求级路由字段：显式传入 provider（及可选 model）时按请求路由视频厂商。
+ProviderOverride = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=128),
+]
+ModelOverride = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=128),
+]
 
 
 class VideoJobOut(BaseModel):
@@ -83,6 +92,14 @@ class VideoJobCreateIn(BaseModel):
         None,
         description="客户端可编辑的视频提示词；缺省时兼容旧客户端并回退镜头组 prompt",
     )
+    provider: ProviderOverride | None = Field(
+        None,
+        description="请求级视频供应商（如 bailian/volcengine）；缺省走服务端默认",
+    )
+    model: ModelOverride | None = Field(
+        None,
+        description="请求级视频模型；缺省时使用该供应商的保底模型",
+    )
 
 
 class ReferenceImageAuditIn(BaseModel):
@@ -145,6 +162,14 @@ class VideoJobBatchCreateIn(BaseModel):
     prompts: dict[str, VideoPrompt] | None = Field(
         None,
         description="每个镜头组的客户端可编辑视频提示词，键为 shot_group_id",
+    )
+    provider: ProviderOverride | None = Field(
+        None,
+        description="请求级视频供应商（如 bailian/volcengine）；缺省走服务端默认",
+    )
+    model: ModelOverride | None = Field(
+        None,
+        description="请求级视频模型；缺省时使用该供应商的保底模型",
     )
 
 

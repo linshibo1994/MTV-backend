@@ -279,7 +279,9 @@ async def test_scene_split_uses_dedicated_schema_and_system_prompt_for_strict_pr
             captured.update(system=system, user=user, response_schema=response_schema)
             return _split_payload()
 
-    monkeypatch.setattr("app.providers.get_llm_provider", lambda: StrictProvider())
+    monkeypatch.setattr(
+        "app.services.pipeline_context.get_llm_provider", lambda: StrictProvider()
+    )
     blocks = _script_blocks()
     plans, omitted = await storyboard_service._split_scenes_into_plans(
         _episode(),

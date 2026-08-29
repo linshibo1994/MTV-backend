@@ -72,6 +72,7 @@ class OpenAIImageGenProvider:
         aspect: str,
         count: int = 1,
         negative_prompt: str | None = None,
+        explicit_model: bool = False,
     ) -> list[ImageResult]:
         api_key = (
             settings.image_gen_api_key
@@ -84,9 +85,11 @@ class OpenAIImageGenProvider:
             raise ProviderConfigurationError(
                 "未配置 IMAGE_GEN_API_KEY（或 OPENAI_API_KEY），无法调用 GPT image 文生图"
             )
+        # 请求级显式模型不受 IMAGE_GEN_MODEL 的 env 覆盖影响。
         use_model = (
             settings.image_gen_model
-            if image_gen_model_override_applies_to("openai", configuration=settings)
+            if not explicit_model
+            and image_gen_model_override_applies_to("openai", configuration=settings)
             and settings.image_gen_model
             else model or settings.openai_image_model
         )

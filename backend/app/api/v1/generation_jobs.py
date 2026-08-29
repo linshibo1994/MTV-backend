@@ -56,7 +56,7 @@ def _sanitize_input_json(raw: dict[str, Any] | None) -> dict[str, Any] | None:
         sanitized["prompt"] = raw["prompt"]
     if "negative_prompt" in raw and isinstance(raw["negative_prompt"], str):
         sanitized["negative_prompt"] = raw["negative_prompt"]
-    for key in ("model", "size", "aspect"):
+    for key in ("model", "provider", "size", "aspect"):
         if isinstance(raw.get(key), str):
             sanitized[key] = raw[key]
     return sanitized or None

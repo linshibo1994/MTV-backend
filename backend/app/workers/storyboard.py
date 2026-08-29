@@ -195,6 +195,19 @@ async def _generate_storyboard_with_heartbeat(
     lease_token: str,
 ) -> dict:
     """在业务级超时内执行生成，并在 LLM 调用期间持续续租。"""
+    # 请求级 LLM 选择冻结在 job.detail.llm_selection；恢复后进入
+    # generate_storyboard 的 contextvar 作用域，_call_llm 动态路由。
+    # 历史任务与测试替身可能没有 detail 字段，统一按默认 LLM 处理。
+    raw_detail = getattr(job, "detail", None)
+    detail = raw_detail if isinstance(raw_detail, dict) else None
+    selection = detail.get("llm_selection") if detail is not None else None
+    llm_provider = None
+    llm_model = None
+    if isinstance(selection, dict):
+        raw_provider = selection.get("provider")
+        raw_model = selection.get("model")
+        llm_provider = raw_provider.strip() if isinstance(raw_provider, str) else None
+        llm_model = raw_model.strip() if isinstance(raw_model, str) else None
 
     stop_heartbeat = asyncio.Event()
     generation_task = asyncio.create_task(
@@ -206,6 +219,8 @@ async def _generate_storyboard_with_heartbeat(
             expected_client_save_seq=job.input_client_save_seq,
             source_storyboard_job_id=job.job_id,
             release_db_connection_before_provider=True,
+            llm_provider=llm_provider,
+            llm_model=llm_model,
         )
     )
     heartbeat_task = asyncio.create_task(

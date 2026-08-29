@@ -489,6 +489,26 @@ class CoverOut(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+class GenerateStoryboardIn(BaseModel):
+    """触发分镜生成的可选请求体 — 请求级 LLM 供应商/模型路由。
+
+    兼容旧客户端：body 可省略，provider/model 均缺省时走服务端默认 LLM。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    provider: str | None = Field(
+        default=None,
+        max_length=128,
+        description="请求级 LLM 供应商（bailian/deepseek/anthropic/gemini/neolink 等）",
+    )
+    model: str | None = Field(
+        default=None,
+        max_length=128,
+        description="请求级 LLM 模型；缺省时使用该供应商的保底模型",
+    )
+
+
 class GenerateStoryboardResponse(BaseModel):
     """触发分镜生成的响应。"""
 

@@ -15,8 +15,9 @@ from app.core.ids import new_id
 from app.models.episode import Episode
 from app.models.scene_audition import SceneAudition
 from app.models.task_dispatch_outbox import TaskDispatchOutbox
-from app.providers import LLMProvider, get_llm_provider
+from app.providers import LLMProvider
 from app.schemas.scene_audition import SceneAuditionPlanPayload
+from app.services.pipeline_context import get_llm_from_context
 
 _SYSTEM = """你是影视导演。请针对一个关键场次给出 2 到 3 个真正不同的视觉导演方案。
 每个方案必须回答 audience_knowledge_timing、alignment_target、performance_space、
@@ -215,7 +216,7 @@ async def generate_audition(
         await db.flush()
         return existing
 
-    llm = provider or get_llm_provider()
+    llm = provider or get_llm_from_context()
     raw = await llm.complete_json(
         _SYSTEM,
         json.dumps(
@@ -254,9 +255,14 @@ async def queue_audition(
     scene_no: int,
     expected_episode_version: int,
     scene_type: str,
+    llm_provider: str | None = None,
+    llm_model: str | None = None,
 ) -> SceneAudition:
-    """创建 draft 并与 Outbox 同事务入队；重复请求返回同版本记录。"""
+    """创建 draft 并与 Outbox 同事务入队；重复请求返回同版本记录。
 
+    llm_provider/llm_model 为请求级 LLM 路由选择，随 outbox payload 持久化，
+    worker 在执行前恢复 contextvar；未提供时走服务端默认 LLM。
+    """
     _validate_key_scene_type(scene_type)
     episode = (
         await db.execute(
@@ -346,12 +352,20 @@ async def queue_audition(
     if row.status == "draft":
         from app.services.task_dispatch import enqueue_task
 
+        normalized_provider = (llm_provider or "").strip() or None
+        normalized_model = (llm_model or "").strip() or None
         await enqueue_task(
             db,
             task_type="scene_audition.generate",
             job_id=row.id,
             attempt=dispatch_attempt,
-            payload={"audition_id": row.id, "attempt": dispatch_attempt},
+            payload={
+                "audition_id": row.id,
+                "attempt": dispatch_attempt,
+                # 请求级 LLM 选择随任务持久化；worker 恢复 contextvar 后路由。
+                "llm_provider": normalized_provider,
+                "llm_model": normalized_model,
+            },
         )
     return row
 
@@ -424,7 +438,7 @@ async def run_queued_audition(
     row.error_code = None
     row.error_message = None
     try:
-        llm = provider or get_llm_provider()
+        llm = provider or get_llm_from_context()
         raw = await llm.complete_json(
             _SYSTEM,
             json.dumps(

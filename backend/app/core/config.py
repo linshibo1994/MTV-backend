@@ -106,10 +106,12 @@ class Settings(BaseSettings):
     mgrouter_watermark: bool = False
     video_default_provider: str = "modelsai"
 
-    # ===== 统一能力×厂商适配层（每个能力独立配置厂商 URL+Key） =====
-    # 厂商切换：在 .env 设 *_PROVIDER 即可，无需改代码。
-    # 对应厂商：openai | deepseek | bailian | claude | gemini | neolink
-    # base_url 留空则使用 provider 内置默认值（见各 adapter 的 _DEFAULT_BASE_URL）。
+    # ===== 统一能力×厂商适配层（能力级凭证/模型覆盖，向后兼容） =====
+    # 请求级路由：前端每次请求可显式传入 provider+model，优先级为
+    # 显式请求模型 > 厂商 .env 保底模型 > 代码内置兜底。
+    # *_PROVIDER 字段保留为"服务端默认"回退链（存量部署兼容），不再承担
+    # 请求路由职责；厂商凭证请使用下方各厂商专属字段（DASHSCOPE_API_KEY
+    # / DEEPSEEK_API_KEY / ANTHROPIC_API_KEY 等）。
 
     # 文本 LLM —— 结构化单轮补全，用于 pipeline split/extract/merge/enrich/parents
     text_llm_provider: str = "openai"
@@ -131,6 +133,7 @@ class Settings(BaseSettings):
 
     # 视频生成 —— volcengine | neolink | bailian | openai | gemini | mgrouter
     # database 保持历史后台切换；env 让 VIDEO_GEN_* 成为权威配置。
+    # 请求显式传入 provider/model 时优先于两者。
     video_provider_selection_mode: Literal["database", "env"] = "database"
     video_gen_provider: str = "volcengine"
     video_gen_base_url: str = ""

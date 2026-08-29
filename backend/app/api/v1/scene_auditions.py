@@ -62,7 +62,11 @@ async def post_generate_scene_audition(
         db,
         script_id=script_id,
         episode_id=episode_id,
-        **payload.model_dump(),
+        scene_no=payload.scene_no,
+        expected_episode_version=payload.expected_episode_version,
+        scene_type=payload.scene_type,
+        llm_provider=payload.provider,
+        llm_model=payload.model,
     )
     await audit_log(
         db,

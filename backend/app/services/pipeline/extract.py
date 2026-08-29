@@ -15,13 +15,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.models.episode import Episode
 from app.models.pipeline_stage import PipelineStage
-from app.providers import get_llm_provider
 from app.schemas.pipeline_contracts import ExtractOutput, complete_json
 from app.services.pipeline import (
     commit_stage_progress,
     input_episode_is_current,
     set_stage,
 )
+from app.services.pipeline_context import get_llm_from_context
 
 logger = logging.getLogger(__name__)
 
@@ -186,7 +186,7 @@ async def run_extract(
     if isinstance(db, AsyncSession):
         await db.rollback()
     total = len(episode_snapshots)
-    provider = provider or get_llm_provider()
+    provider = provider or get_llm_from_context()
     semaphore = asyncio.Semaphore(settings.pipeline_extract_concurrency)
     progress_lock = asyncio.Lock()
     completed = _recover_completed_episodes(

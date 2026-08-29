@@ -13,22 +13,23 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_serializer, model_validator
 
 from app.providers.storage import public_urls_for_payload
 
-# 生图模型枚举：Google / OpenAI / NeoLink / 阿里百炼通义万相。
-ImageModelName = Literal[
-    "banana-2",
-    "gpt-image-2",
-    "gp-im-2",
-    "wan2.1-t2i-plus",
-    "wan2.1-t2i-turbo",
-    "wanx-v1",
-    "qwen-image",
-    "qwen-image-2.0",
+# 生图模型标识放开为自由字符串（请求级动态路由）：已知别名（banana-2/
+# gpt-image-2/gp-im-2/wan2.1-*/qwen-image* 等）仍按别名路由厂商，其余视为
+# 真实模型 ID，由显式 provider 或部署默认厂商决定去向。
+ImageModelName = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=128),
+]
+# 请求级路由字段：显式传入 provider（及可选 model）时按请求路由生图厂商。
+ProviderOverride = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=128),
 ]
 
 MAX_IMAGE_PROMPT_LENGTH = 32_000
@@ -61,6 +62,10 @@ class CreateJobIn(BaseModel):
         "", description="客户端确认的最终负向提示词；为空表示不附加负向约束"
     )
     model: ImageModelName = Field("qwen-image-2.0", description="生图模型")
+    provider: ProviderOverride | None = Field(
+        None,
+        description="请求级生图供应商（openai/gemini/bailian/neolink）；缺省按模型别名或服务端默认路由",
+    )
     size: str = Field("2k", description="尺寸，如 2k")
     aspect: str = Field("auto", description="比例；auto 按主体类型选择，或显式传入 16:9、3:4 等")
     count: int = Field(1, ge=1, le=4, description="生成张数（多张选一）")
@@ -89,6 +94,10 @@ class BatchCreateJobIn(BaseModel):
         description="每个主体的客户端确认负向提示词，键为 subject_id；缺失项为空",
     )
     model: ImageModelName = Field("qwen-image-2.0", description="生图模型")
+    provider: ProviderOverride | None = Field(
+        None,
+        description="请求级生图供应商（openai/gemini/bailian/neolink）；缺省按模型别名或服务端默认路由",
+    )
     size: str = Field("2k", description="尺寸，如 2k")
     aspect: str = Field("auto", description="比例；auto 按主体类型选择，或显式传入 16:9、3:4 等")
     count: int = Field(1, ge=1, le=4, description="每个主体生成张数（多张选一）")

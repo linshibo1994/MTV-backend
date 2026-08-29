@@ -49,6 +49,7 @@ from app.models.task_dispatch_outbox import TaskDispatchOutbox
 from app.models.user import User
 from app.schemas.shot import (
     CoverOut,
+    GenerateStoryboardIn,
     GenerateStoryboardResponse,
     ReferenceFramesOut,
     ShotGroupMergeIn,
@@ -171,14 +172,26 @@ def _require_idempotency_key(raw: str) -> str:
 
 
 def storyboard_request_hash(
-    *, script_id: str, episode_id: str, episode_version: int, client_save_seq: int
+    *,
+    script_id: str,
+    episode_id: str,
+    episode_version: int,
+    client_save_seq: int,
+    provider: str | None = None,
+    model: str | None = None,
 ) -> str:
-    """规范化客户端创建载荷，得到稳定幂等 hash。"""
+    """规范化客户端创建载荷，得到稳定幂等 hash。
+
+    provider/model 属于请求级 LLM 路由选择，纳入哈希可避免同一幂等键在
+    不同模型选择间产生静默复用（重放旧选择会与用户预期不符）。
+    """
     payload = {
         "episode_id": episode_id,
         "episode_version": episode_version,
         "client_save_seq": client_save_seq,
         "script_id": script_id,
+        "provider": (provider or "").strip() or None,
+        "model": (model or "").strip() or None,
     }
     canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return sha256(canonical.encode("utf-8")).hexdigest()
@@ -300,7 +313,8 @@ async def _get_authorized_storyboard_job(
     "/scripts/{script_id}/episodes/{episode_id}/generate-storyboard",
     response_model=GenerateStoryboardResponse,
     summary="触发分镜生成",
-    description="为指定分集触发 LLM-5 分镜生成 (异步 Celery 任务)。产出 场景->镜头组->镜头。",
+    description="为指定分集触发 LLM-5 分镜生成 (异步 Celery 任务)。产出 场景->镜头组->镜头。"
+    "可选 JSON body 传入 provider/model 按请求路由 LLM 供应商。",
 )
 async def generate_storyboard(
     script_id: str,
@@ -311,6 +325,7 @@ async def generate_storyboard(
         alias="Idempotency-Key",
         max_length=STORYBOARD_IDEMPOTENCY_KEY_MAX_LENGTH,
     ),
+    body: GenerateStoryboardIn | None = None,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> GenerateStoryboardResponse:
@@ -320,6 +335,8 @@ async def generate_storyboard(
 
     - episode_version: 客户端持有的乐观锁版本, 与服务端不一致时返回 409 冲突 (AC-SE03)。
     - 并发去重: 同一分集已有 pending/running 分镜任务时拒绝重复投递 (08§4.2)。
+    - 可选 body.provider/model: 请求级 LLM 路由，冻结进 job.detail 供 worker
+      在 contextvar 作用域内恢复；未提供时走服务端默认 LLM。
     """
     # 校验权限 + 分集归属 + 乐观锁版本
     script, episode = await _validate_script_episode(
@@ -332,11 +349,17 @@ async def generate_storyboard(
         raise ConflictError("分集无剧本内容, 无法生成分镜")
 
     idempotency_key = _require_idempotency_key(idempotency_key)
+    llm_provider = (body.provider or "").strip() if body is not None else ""
+    llm_model = (body.model or "").strip() if body is not None else ""
+    if llm_model and not llm_provider:
+        raise ConflictError("请求级 LLM 模型必须与 provider 一起提供")
     request_hash = storyboard_request_hash(
         script_id=script_id,
         episode_id=episode_id,
         episode_version=episode.episode_version,
         client_save_seq=episode.client_save_seq,
+        provider=llm_provider or None,
+        model=llm_model or None,
     )
     existing_job = await get_by_idempotency_key(db, episode_id, idempotency_key)
     if existing_job is not None:
@@ -410,7 +433,14 @@ async def generate_storyboard(
             commit=False,
         )
         job.reservation_id = reservation_id
-        job.detail = {"reservation_id": reservation_id}
+        # 请求级 LLM 选择冻结进 job.detail；worker 从 detail 恢复 contextvar。
+        job.detail = {
+            "reservation_id": reservation_id,
+            "llm_selection": {
+                "provider": llm_provider or None,
+                "model": llm_model or None,
+            },
+        }
         dispatch = await enqueue_task(
             db,
             task_type=STORYBOARD_OUTBOX_TASK_TYPE,

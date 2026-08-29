@@ -259,6 +259,7 @@ class BailianImageGenProvider:
         aspect: str,
         count: int = 1,
         negative_prompt: str | None = None,
+        explicit_model: bool = False,
     ) -> list[ImageResult]:
         api_key = (
             settings.image_gen_api_key
@@ -271,10 +272,12 @@ class BailianImageGenProvider:
             raise ProviderConfigurationError(
                 "未配置 IMAGE_GEN_API_KEY（或 DASHSCOPE_API_KEY），无法调用通义万相文生图"
             )
-        # 仅让当前生效厂商的显式模型覆盖画布任务模型，避免跨厂商串台。
+        # 仅让当前生效厂商的显式模型覆盖画布任务模型，避免跨厂商串台；
+        # 请求级显式模型（explicit_model）不受 env 覆盖影响。
         use_model = (
             settings.image_gen_model
-            if image_gen_model_override_applies_to("bailian", configuration=settings)
+            if not explicit_model
+            and image_gen_model_override_applies_to("bailian", configuration=settings)
             and settings.image_gen_model
             else model or "wan2.1-t2i-plus"
         )

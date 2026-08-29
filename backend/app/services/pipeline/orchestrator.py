@@ -123,9 +123,11 @@ def build_pipeline_outbox_payload(
     input_client_save_seq: int,
     reservation_id: str,
     estimated: int,
+    llm_provider: str | None = None,
+    llm_model: str | None = None,
 ) -> dict:
     """T3 暴露给共享 outbox publisher 的稳定载荷合约。"""
-    return {
+    payload = {
         "script_id": script_id,
         "episode_id": episode_id,
         "input_version": input_version,
@@ -133,6 +135,14 @@ def build_pipeline_outbox_payload(
         "reservation_id": reservation_id,
         "estimated": estimated,
     }
+    # 请求级 LLM 选择为可选扩展键；缺省时保持历史载荷形态。
+    normalized_provider = (llm_provider or "").strip() or None
+    normalized_model = (llm_model or "").strip() or None
+    if normalized_provider is not None:
+        payload["llm_provider"] = normalized_provider
+    if normalized_model is not None:
+        payload["llm_model"] = normalized_model
+    return payload
 
 
 async def _supersede_active_pipeline_runs(db: AsyncSession, script_id: str) -> int:
@@ -207,7 +217,12 @@ async def _estimate_cost(db: AsyncSession, script_id: str) -> int:
 
 
 async def trigger_pipeline(
-    db: AsyncSession, script_id: str, episode_id: str
+    db: AsyncSession,
+    script_id: str,
+    episode_id: str,
+    *,
+    llm_provider: str | None = None,
+    llm_model: str | None = None,
 ) -> dict:
     """触发剧本处理流水线。
 
@@ -217,6 +232,8 @@ async def trigger_pipeline(
       3. 预扣积分（reserve，source_type='pipeline'）；不足抛 InsufficientCreditsError
       4. 投递 Celery DAG：chain(split, extract, merge, group(enrich, parents))
     首次 PipelineJob 在本事务预建；显式 Celery 重试由 worker 创建新 attempt。
+    llm_provider/llm_model 为请求级 LLM 路由选择，写入 outbox payload 与
+    PipelineJob.detail（无 detail 列，故通过 outbox payload 贯穿 worker）。
     返回投递信息。
     """
     # 1. 并发保护：对同一剧本的触发串行化，避免 _is_running 检查与阶段重置之间产生竞态
@@ -289,6 +306,8 @@ async def trigger_pipeline(
             input_client_save_seq=input_client_save_seq,
             reservation_id=reservation_id,
             estimated=estimated,
+            llm_provider=llm_provider,
+            llm_model=llm_model,
         ),
     )
     for stage in STAGE_ORDER:

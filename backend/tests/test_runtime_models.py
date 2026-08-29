@@ -9,8 +9,123 @@ from app.services.runtime_models import (
     RuntimeModel,
     RuntimeVideoModel,
     resolve_env_video_model,
+    resolve_request_video_model,
     resolve_video_model,
 )
+
+
+@pytest.mark.asyncio
+async def test_resolve_request_video_model_overrides_everything() -> None:
+    """显式请求 provider/model 优先于 database active 与 env 默认。"""
+    from app.core.config import Settings
+
+    configured = Settings(
+        _env_file=None,
+        video_provider_selection_mode="env",
+        video_gen_provider="volcengine",
+        video_gen_model="env-model-must-not-win",
+    )
+
+    resolved = await resolve_request_video_model(
+        SimpleNamespace(),
+        configured,
+        provider="dashscope",
+        model="wan3.0-video-prime",
+    )
+
+    assert resolved == RuntimeVideoModel(
+        provider="bailian",
+        model="wan3.0-video-prime",
+        reference_image_audit_required=False,
+        task_provider_key="bailian",
+    )
+
+
+@pytest.mark.asyncio
+async def test_resolve_request_video_model_falls_back_to_vendor_default() -> None:
+    """model 缺省时使用该厂商的 .env 保底模型。"""
+    from app.core.config import Settings
+
+    configured = Settings(
+        _env_file=None,
+        dashscope_video_model="wanx2.1-t2v-turbo",
+    )
+
+    resolved = await resolve_request_video_model(
+        SimpleNamespace(),
+        configured,
+        provider="bailian",
+    )
+
+    assert resolved.provider == "bailian"
+    assert resolved.model == "wanx2.1-t2v-turbo"
+    assert resolved.task_provider_key == "bailian"
+
+
+@pytest.mark.asyncio
+async def test_resolve_request_video_model_normalizes_alias_to_stable_key() -> None:
+    """别名（如 dashscope/aicc）规范化为主 key，保证数据库与 worker 可路由。"""
+    from app.core.config import Settings
+
+    configured = Settings(_env_file=None)
+
+    bailian = await resolve_request_video_model(
+        SimpleNamespace(), configured, provider="dashscope", model="wan-custom"
+    )
+    assert bailian.task_provider_key == "bailian"
+
+    mgrouter = await resolve_request_video_model(
+        SimpleNamespace(), configured, provider="aicc"
+    )
+    assert mgrouter.task_provider_key == "mgrouter"
+    assert mgrouter.provider == "mgrouter"
+
+    volcengine = await resolve_request_video_model(
+        SimpleNamespace(), configured, provider="doubao"
+    )
+    assert volcengine.task_provider_key == "volcengine"
+    assert volcengine.provider == "volcengine"
+    assert volcengine.reference_image_audit_required is True
+
+
+@pytest.mark.asyncio
+async def test_resolve_request_video_model_rejects_non_video_vendor() -> None:
+    """不支持视频能力的厂商被能力校验拒绝。"""
+    from app.core.config import Settings
+    from app.providers.registry import UnsupportedCapabilityError
+
+    configured = Settings(_env_file=None)
+
+    with pytest.raises(UnsupportedCapabilityError):
+        await resolve_request_video_model(
+            SimpleNamespace(), configured, provider="deepseek", model="x"
+        )
+
+
+@pytest.mark.asyncio
+async def test_resolve_request_video_model_empty_falls_back_to_default(
+    monkeypatch,
+) -> None:
+    """provider/model 均缺省时回退服务端默认解析。"""
+    from app.services import runtime_models
+
+    monkeypatch.setattr(
+        runtime_models.video_crud,
+        "get_active_provider",
+        AsyncMock(return_value=SimpleNamespace(provider_key="bailian", model="wan2.6-i2v")),
+    )
+    configured = SimpleNamespace(
+        video_provider_selection_mode="database",
+        video_default_provider="modelsai",
+        video_gen_model="",
+        seedance_model="seedance-fallback",
+    )
+
+    resolved = await resolve_request_video_model(
+        SimpleNamespace(), configured, provider=None, model=None
+    )
+
+    assert resolved.provider == "bailian"
 
 
 @pytest.mark.asyncio

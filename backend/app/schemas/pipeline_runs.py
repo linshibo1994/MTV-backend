@@ -19,6 +19,9 @@ class PipelineRunCreateIn(BaseModel):
     episode_version: int = Field(ge=1)
     client_save_seq: int = Field(ge=0)
     failed_run_id: str | None = Field(default=None, min_length=1, max_length=36)
+    # 请求级 LLM 路由：显式 provider（及可选 model）时按请求动态构造 LLM。
+    provider: str | None = Field(default=None, min_length=1, max_length=128)
+    model: str | None = Field(default=None, min_length=1, max_length=128)
 
     @model_validator(mode="after")
     def validate_failed_run(self) -> "PipelineRunCreateIn":
@@ -26,6 +29,8 @@ class PipelineRunCreateIn(BaseModel):
             raise ValueError("失败重试必须提供 failed_run_id")
         if self.mode is PipelineRunMode.MANUAL_REEXTRACT and self.failed_run_id is not None:
             raise ValueError("手动重新提取不能提供 failed_run_id")
+        if self.model is not None and self.provider is None:
+            raise ValueError("请求级 LLM 模型必须与 provider 一起提供")
         return self
 
 

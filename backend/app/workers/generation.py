@@ -460,6 +460,7 @@ async def _provider_generate_with_heartbeat(
     job_id: str,
     lease_token: str,
     heartbeat_interval: float = 60.0,
+    explicit_model: bool = False,
 ) -> list[Any]:
     lost = asyncio.Event()
     generate_kwargs = {
@@ -468,6 +469,8 @@ async def _provider_generate_with_heartbeat(
         "size": size,
         "aspect": aspect,
         "count": count,
+        # 请求级显式模型：厂商实现据此跳过 IMAGE_GEN_MODEL 的 env 覆盖。
+        "explicit_model": explicit_model,
     }
     if negative_prompt:
         generate_kwargs["negative_prompt"] = negative_prompt
@@ -521,6 +524,7 @@ async def _generate_with_safety_softening(
     aspect: str,
     count: int,
     lease_token: str,
+    explicit_model: bool = False,
 ) -> tuple[list[Any], dict[str, object]]:
     """在同一任务 attempt 内完成最多三次供应商调用。
 
@@ -562,6 +566,7 @@ async def _generate_with_safety_softening(
                 count=count,
                 job_id=job.job_id,
                 lease_token=lease_token,
+                explicit_model=explicit_model,
             )
         except ImageSafetyRejectedError as exc:
             attempt_metrics["outcome"] = "rejected"
@@ -847,6 +852,8 @@ async def run_generation_once(
 
     prompt = input_json.get("prompt") or ""
     model = input_json.get("model", "qwen-image-2.0")
+    request_provider = input_json.get("provider")
+    request_provider = request_provider.strip() if isinstance(request_provider, str) else None
     size = input_json.get("size", "2k")
     aspect = input_json.get("aspect", "16:9")
     prompt, negative_prompt = _resolve_job_prompts(input_json, prompt)
@@ -869,7 +876,12 @@ async def run_generation_once(
     try:
         # 工厂本身也可能因 provider/storage 配置错误抛异常，必须与实际生成调用
         # 进入同一失败清算边界，避免任务停在 processing 等待租约重投。
-        provider = provider or get_image_provider(model)
+        # 请求级显式 provider 优先；model 显式时同样透传给厂商实现，
+        # 抑制 IMAGE_GEN_MODEL 的 env 覆盖（见各实现的 explicit_model）。
+        provider = provider or get_image_provider(
+            model,
+            provider=request_provider,
+        )
         storage = storage or get_storage()
         raw_results, safety_metrics = await _generate_with_safety_softening(
             db,
@@ -882,6 +894,7 @@ async def run_generation_once(
             aspect=aspect,
             count=count,
             lease_token=claim.lease_token,
+            explicit_model=bool((model or "").strip()),
         )
         normalized = [
             item

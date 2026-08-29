@@ -192,6 +192,7 @@ class NeolinkImageGenProvider:
         aspect: str,
         count: int = 1,
         negative_prompt: str | None = None,
+        explicit_model: bool = False,
     ) -> list[ImageResult]:
         api_key = (
             settings.image_gen_api_key
@@ -206,9 +207,11 @@ class NeolinkImageGenProvider:
             )
 
         configured_model = settings.image_gen_model.strip()
+        # 请求级显式模型不受 IMAGE_GEN_MODEL 的 env 覆盖影响。
         use_model = (
             configured_model
-            if image_gen_model_override_applies_to("neolink", configuration=settings)
+            if not explicit_model
+            and image_gen_model_override_applies_to("neolink", configuration=settings)
             and configured_model
             else (model or "").strip() or "gp-im-2"
         )

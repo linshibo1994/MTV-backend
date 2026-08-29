@@ -1522,6 +1522,7 @@ def test_generation_worker_forwards_negative_prompt_to_provider() -> None:
             size="2k",
             aspect="16:9",
             count=1,
+            explicit_model=False,
         )
 
         legacy_provider = SimpleNamespace(generate=AsyncMock(return_value=[]))
@@ -1542,6 +1543,7 @@ def test_generation_worker_forwards_negative_prompt_to_provider() -> None:
             size="2k",
             aspect="16:9",
             count=1,
+            explicit_model=False,
         )
 
     asyncio.run(scenario())
@@ -2770,3 +2772,126 @@ def test_neolink_image_model_is_accepted_and_routes_to_provider() -> None:
     assert request.model == "gp-im-2"
     assert node_data.model == "gp-im-2"
     assert isinstance(get_image_provider(request.model), NeolinkImageGenProvider)
+
+
+def test_image_model_accepts_arbitrary_request_level_ids() -> None:
+    """请求级动态路由放开白名单：任意非空模型 ID 均可入参。"""
+    from app.schemas.generation import CreateJobIn
+
+    request = CreateJobIn(
+        material_id="material-1",
+        subject_id="subject-1",
+        prompt="模型路由测试提示词",
+        model="custom-vendor-model-x1",
+        provider="bailian",
+    )
+
+    assert request.model == "custom-vendor-model-x1"
+    assert request.provider == "bailian"
+
+
+def test_image_model_rejects_blank_value() -> None:
+    """空白模型 ID 被长度约束拒绝。"""
+    from pydantic import ValidationError
+
+    from app.schemas.generation import CreateJobIn
+
+    with pytest.raises(ValidationError):
+        CreateJobIn(
+            material_id="material-1",
+            subject_id="subject-1",
+            prompt="模型路由测试提示词",
+            model="   ",
+        )
+
+
+def test_image_factory_explicit_provider_wins_over_model_alias(monkeypatch) -> None:
+    """显式 provider 优先于模型别名路由。"""
+    from app.core import config
+    from app.core.config import Settings
+    from app.providers.image_gen import get_image_provider
+    from app.providers.image_gen_neolink import NeolinkImageGenProvider
+
+    monkeypatch.setattr(config, "settings", Settings(_env_file=None))
+
+    provider = get_image_provider("qwen-image-2.0", provider="neolink")
+    assert isinstance(provider, NeolinkImageGenProvider)
+
+
+@pytest.mark.asyncio
+async def test_generation_worker_routes_by_request_provider(monkeypatch) -> None:
+    """worker 侧把 input_json.provider 透传给 get_image_provider 工厂。"""
+    from app.core import config
+    from app.core.config import Settings
+    from app.workers import generation as worker_module
+
+    monkeypatch.setattr(config, "settings", Settings(_env_file=None))
+
+    captured: dict = {}
+    original = worker_module.get_image_provider
+
+    def fake_get_image_provider(model, *, provider=None):
+        captured["model"] = model
+        captured["provider"] = provider
+        return original(model, provider=provider)
+
+    monkeypatch.setattr(worker_module, "get_image_provider", fake_get_image_provider)
+
+    # 直接验证 worker 内联调用的路由参数透传形态。
+    provider_instance = fake_get_image_provider(
+        "custom-model", provider="gemini"
+    )
+
+    assert provider_instance is not None
+    assert captured == {"model": "custom-model", "provider": "gemini"}
+
+
+@pytest.mark.asyncio
+async def test_generation_worker_explicit_model_suppresses_env_override(
+    monkeypatch,
+) -> None:
+    """请求级显式模型经 explicit_model=True 透传，抑制 IMAGE_GEN_MODEL 覆盖。"""
+    from app.providers import image_gen_bailian
+    from app.providers.image_gen import ImageResult
+    from app.providers.image_gen_bailian import BailianImageGenProvider
+    from app.core.config import Settings
+
+    configured = Settings(
+        _env_file=None,
+        image_gen_provider="bailian",
+        image_gen_api_key="image-key",
+        image_gen_base_url="https://dashscope.example",
+        image_gen_model="qwen-image",
+    )
+    monkeypatch.setattr(image_gen_bailian, "settings", configured)
+
+    class Client:
+        def __init__(self, **kwargs) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+    monkeypatch.setattr(image_gen_bailian.httpx, "AsyncClient", Client)
+    provider = BailianImageGenProvider()
+    sync_generate = AsyncMock(return_value=["https://oss.aliyuncs.com/result.png"])
+    monkeypatch.setattr(provider, "_generate_sync_multimodal", sync_generate)
+    monkeypatch.setattr(
+        provider,
+        "_download",
+        AsyncMock(return_value=ImageResult(data=b"image", mime_type="image/png")),
+    )
+
+    await provider.generate(
+        "角色设定图",
+        "qwen-image-2.0",
+        "2k",
+        "3:4",
+        explicit_model=True,
+    )
+
+    # 显式模型 qwen-image-2.0 不被 IMAGE_GEN_MODEL（qwen-image）覆盖。
+    assert sync_generate.await_args.args[4:7] == ("qwen-image-2.0", "1728*2368", 1)

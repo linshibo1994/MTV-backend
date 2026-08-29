@@ -102,6 +102,7 @@ class GoogleImageGenProvider:
         aspect: str,
         count: int = 1,
         negative_prompt: str | None = None,
+        explicit_model: bool = False,
     ) -> list[ImageResult]:
         normalized_size = (size or "1k").strip().upper()
         if normalized_size not in {"1K", "2K", "4K"}:
@@ -120,9 +121,11 @@ class GoogleImageGenProvider:
                 "未配置 IMAGE_GEN_API_KEY（或 GOOGLE_API_KEY/GEMINI_API_KEY），"
                 "无法调用 Gemini 图片生成"
             )
+        # 请求级显式模型不受 IMAGE_GEN_MODEL 的 env 覆盖影响。
         use_model = (
             settings.image_gen_model
-            if image_gen_model_override_applies_to("gemini", configuration=settings)
+            if not explicit_model
+            and image_gen_model_override_applies_to("gemini", configuration=settings)
             and settings.image_gen_model
             else (
                 model

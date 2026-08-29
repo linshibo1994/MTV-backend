@@ -14,9 +14,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.ids import new_id
 from app.models.episode import Episode
-from app.providers import get_llm_provider
 from app.schemas.pipeline_contracts import SplitOutput, complete_json
 from app.services.pipeline import input_episode_is_current, set_stage
+from app.services.pipeline_context import get_llm_from_context
 
 logger = logging.getLogger(__name__)
 
@@ -221,7 +221,7 @@ async def run_split(
     episodes_data = _split_by_explicit_episode_headers(script_text)
     local_split = episodes_data is not None
     if episodes_data is None:
-        provider = provider or get_llm_provider()
+        provider = provider or get_llm_from_context()
         contract = await complete_json(
             provider,
             _SYSTEM,

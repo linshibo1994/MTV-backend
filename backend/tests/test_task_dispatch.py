@@ -311,8 +311,8 @@ class _SignatureTask:
     def __init__(self, name: str) -> None:
         self.name = name
 
-    def s(self, *args):
-        return self.name, args
+    def s(self, *args, **kwargs):
+        return self.name, args, kwargs
 
 
 def test_pipeline_canvas_uses_chain_group_and_unique_finalizer_without_broker() -> None:
@@ -354,15 +354,67 @@ def test_pipeline_canvas_uses_chain_group_and_unique_finalizer_without_broker() 
     assert [item[0] for item in seen["group"]] == ["enrich", "parents"]
     assert seen["chord"][1][0] == "finalize"
     assert seen["chain"][-1][0] == "chord"
-    for _, args in (
+    for signature in (
         seen["chain"][0],
         seen["chain"][1],
         seen["chain"][2],
         *seen["group"],
     ):
+        args = signature[1]
         assert "dispatch" in args
         assert "run" in args
         assert "episode" in args
+        # 请求级 LLM 路由键贯穿每个阶段任务；历史 payload 未配置时为 None。
+        kwargs = signature[2]
+        assert kwargs == {"llm_provider": None, "llm_model": None}
+
+
+def test_pipeline_canvas_forwards_request_llm_selection_to_every_stage() -> None:
+    """请求级 provider/model 必须随 canvas 关键字参数贯穿全部阶段。"""
+    seen: dict[str, object] = {}
+
+    def fake_chain(*items):
+        seen["chain"] = items
+        return items
+
+    def fake_group(*items):
+        seen["group"] = items
+        return "group", items
+
+    def fake_chord(header, body):
+        seen["chord"] = (header, body)
+        return "chord", header, body
+
+    build_pipeline_canvas(
+        {
+            "script_id": "script",
+            "episode_id": "episode",
+            "input_version": 2,
+            "reservation_id": "reservation",
+            "estimated": 3,
+            "dispatch_id": "dispatch",
+            "run_id": "run",
+            "llm_provider": "bailian",
+            "llm_model": "qwen-max",
+        },
+        _SignatureTask("split"),
+        _SignatureTask("extract"),
+        _SignatureTask("merge"),
+        _SignatureTask("enrich"),
+        _SignatureTask("parents"),
+        _SignatureTask("finalize"),
+        chain_factory=fake_chain,
+        group_factory=fake_group,
+        chord_factory=fake_chord,
+    )
+    for signature in (
+        seen["chain"][0],
+        seen["chain"][1],
+        seen["chain"][2],
+        *seen["group"],
+        seen["chord"][1],
+    ):
+        assert signature[2] == {"llm_provider": "bailian", "llm_model": "qwen-max"}
 
 
 def test_broker_failure_persists_only_stable_sanitized_error() -> None:
