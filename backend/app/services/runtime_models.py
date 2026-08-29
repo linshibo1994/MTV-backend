@@ -149,7 +149,13 @@ async def resolve_request_video_model(
             "AICC-Doubao-Seedance-2.0",
         ),
     }
-    effective_model = normalized_model or fallback_models[vendor]
+    # 与 env 模式 resolve_env_video_model 保持一致：请求未显式指定 model 时，
+    # 优先使用服务端能力级默认 VIDEO_GEN_MODEL，再回退该厂商专属保底模型。
+    effective_model = (
+        normalized_model
+        or configured_settings.video_gen_model
+        or fallback_models[vendor]
+    )
     # get_video_provider 的别名表中 jianyu/modelsai 映射 volcengine；数据库
     # CHECK 约束接受 jianyu/modelsai/volcengine/doubao 等历史 key。这里统一
     # 规范化到主 key，避免别名任务在恢复/取消链路无法路由。
