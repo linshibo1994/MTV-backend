@@ -39,6 +39,7 @@ from app.services.storage_references import (
     enqueue_storage_deletes,
     normalize_storage_keys,
 )
+from app.services.subject_ordering import sort_scene_subjects
 from app.services.task_dispatch import cancel_outbox_task
 
 # =====================================================================
@@ -84,7 +85,7 @@ async def list_subjects(
         .limit(limit)
         .offset(offset)
     )
-    items = list((await db.execute(items_q)).scalars().all())
+    items = sort_scene_subjects(list((await db.execute(items_q)).scalars().all()))
     return items, int(total)
 
 
@@ -97,7 +98,7 @@ async def list_parent_subjects(
         .where(ParentSubject.script_id == script_id)
         .order_by(ParentSubject.created_at.asc())
     )
-    return list((await db.execute(q)).scalars().all())
+    return sort_scene_subjects(list((await db.execute(q)).scalars().all()))
 
 
 # =====================================================================

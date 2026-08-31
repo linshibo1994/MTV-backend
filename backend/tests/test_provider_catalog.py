@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
 
 import pytest
 
@@ -44,6 +43,10 @@ def test_provider_catalog_returns_expected_structure(monkeypatch) -> None:
     assert bailian_models["qwen-plus"].label == "通义千问 Plus"
     assert set(bailian_models["qwen-plus"].capabilities) == {"text", "chat"}
     assert set(bailian_models["wan2.1-t2i-plus"].capabilities) == {"image"}
+    assert set(bailian_models["qwen-image-3.0"].capabilities) == {"image"}
+    assert bailian_models["qwen-image-3.0"].label == "Qwen Image 3.0"
+    assert set(bailian_models["qwen-image-3.0-pro"].capabilities) == {"image"}
+    assert bailian_models["qwen-image-3.0-pro"].label == "Qwen Image 3.0 Pro"
     assert set(bailian_models["wan3.0-video-plus"].capabilities) == {"video"}
     # 未配置凭证时全部 unavailable。
     assert all(entry.available is False for entry in catalog.providers)
@@ -116,8 +119,8 @@ async def test_provider_catalog_api_returns_catalog_without_secrets(
 ) -> None:
     """登录后可读目录；响应不包含任何密钥或 base_url。"""
     from app.api.v1 import provider_catalog as api
-    from app.core.auth import get_current_user
     from app.core import config
+    from app.core.auth import get_current_user
 
     async def override_user():
         return SimpleNamespace(user_id="user-1", enabled=True, is_admin=False)

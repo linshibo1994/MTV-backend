@@ -49,6 +49,7 @@ from app.services.storage_references import (
     enqueue_storage_deletes,
     normalize_storage_keys,
 )
+from app.services.subject_ordering import sort_scene_subjects
 from app.services.task_dispatch import cancel_outbox_task
 from app.services.video_cleanup_policy import has_retryable_video_cleanup_debt
 
@@ -1601,6 +1602,7 @@ async def get_breakdown(
         for subject in subjects_result.scalars().all()
         if episode.episode_no in (subject.episode_nos or [])
     ]
+    subjects = sort_scene_subjects(subjects)
 
     scenes_result = await db.execute(
         select(Scene).where(Scene.episode_id == episode_id).order_by(Scene.scene_no.asc())
@@ -1643,7 +1645,7 @@ async def list_subjects(db: AsyncSession, script_id: str) -> list[Subject]:
         )
         .order_by(Subject.type.asc(), Subject.name.asc())
     )
-    return list(result.scalars().all())
+    return sort_scene_subjects(list(result.scalars().all()))
 
 
 async def list_parent_subjects(
@@ -1654,7 +1656,7 @@ async def list_parent_subjects(
         .where(ParentSubject.script_id == script_id)
         .order_by(ParentSubject.type.asc(), ParentSubject.name.asc())
     )
-    return list(result.scalars().all())
+    return sort_scene_subjects(list(result.scalars().all()))
 
 
 async def replace_subjects(

@@ -213,6 +213,69 @@ async def test_subject_list_does_not_expose_server_prompt_fields() -> None:
 
 
 @pytest.mark.asyncio
+async def test_subject_list_orders_scene_names_by_numeric_prefix() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    _create_tables(engine)
+    with Session(engine, expire_on_commit=False) as raw:
+        raw.add_all(
+            [
+                _script(),
+                _episode(1, "episode-1"),
+                Subject(
+                    id="scene-10",
+                    script_id="script-1",
+                    type="scene",
+                    name="场景 10：天台",
+                    description="天台",
+                    episode_nos=[1],
+                ),
+                Subject(
+                    id="scene-2",
+                    script_id="script-1",
+                    type="scene",
+                    name="场景 2：街道",
+                    description="街道",
+                    episode_nos=[1],
+                ),
+                Subject(
+                    id="scene-7",
+                    script_id="script-1",
+                    type="scene",
+                    name="场景 7：室内",
+                    description="室内",
+                    episode_nos=[1],
+                ),
+                Subject(
+                    id="scene-custom",
+                    script_id="script-1",
+                    type="scene",
+                    name="未命名场景",
+                    description="自定义场景",
+                    episode_nos=[1],
+                ),
+            ]
+        )
+        raw.commit()
+
+        async with AsyncClient(
+            transport=ASGITransport(app=_app(_AsyncSessionAdapter(raw), _owner())),
+            base_url="http://test",
+        ) as client:
+            response = await client.get(
+                "/scripts/script-1/asset-library/subjects",
+                params={"limit": 30, "offset": 0},
+            )
+
+        assert response.status_code == 200
+        assert [item["subject_name"] for item in response.json()["items"]] == [
+            "场景 2：街道",
+            "场景 7：室内",
+            "场景 10：天台",
+            "未命名场景",
+        ]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("input_type", "stored_type", "output_type"),
     [

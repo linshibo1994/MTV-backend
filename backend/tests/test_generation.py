@@ -2755,6 +2755,26 @@ def test_bailian_image_model_is_accepted_and_routes_to_provider() -> None:
         )
 
 
+@pytest.mark.parametrize("model", ["qwen-image-3.0", "qwen-image-3.0-pro"])
+def test_bailian_qwen_image_3_model_is_accepted_and_routes_to_provider(model: str) -> None:
+    from app.providers.image_gen import get_image_provider
+    from app.providers.image_gen_bailian import BailianImageGenProvider
+    from app.schemas.generation import CreateJobIn
+    from app.schemas.materials import SubjectImageNodeData
+
+    request = CreateJobIn(
+        material_id="material-1",
+        subject_id="subject-1",
+        prompt="模型路由测试提示词",
+        model=model,
+    )
+    node_data = SubjectImageNodeData(model=model)
+
+    assert request.model == model
+    assert node_data.model == model
+    assert isinstance(get_image_provider(request.model), BailianImageGenProvider)
+
+
 def test_neolink_image_model_is_accepted_and_routes_to_provider() -> None:
     from app.providers.image_gen import get_image_provider
     from app.providers.image_gen_neolink import NeolinkImageGenProvider
@@ -2851,10 +2871,10 @@ async def test_generation_worker_explicit_model_suppresses_env_override(
     monkeypatch,
 ) -> None:
     """请求级显式模型经 explicit_model=True 透传，抑制 IMAGE_GEN_MODEL 覆盖。"""
+    from app.core.config import Settings
     from app.providers import image_gen_bailian
     from app.providers.image_gen import ImageResult
     from app.providers.image_gen_bailian import BailianImageGenProvider
-    from app.core.config import Settings
 
     configured = Settings(
         _env_file=None,

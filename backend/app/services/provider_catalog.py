@@ -59,6 +59,8 @@ _RECOMMENDED_MODELS: dict[str, list[tuple[str, str, tuple[ProviderCapability, ..
         ("wan2.1-t2i-plus", "通义万相 2.1 文生图 Plus", ("image",)),
         ("qwen-image", "Qwen Image", ("image",)),
         ("qwen-image-2.0", "Qwen Image 2.0", ("image",)),
+        ("qwen-image-3.0", "Qwen Image 3.0", ("image",)),
+        ("qwen-image-3.0-pro", "Qwen Image 3.0 Pro", ("image",)),
         ("wanx2.1-t2v-turbo", "通义万相 2.1 文生视频 Turbo", ("video",)),
         ("wanx2.1-i2v-turbo", "通义万相 2.1 图生视频 Turbo", ("video",)),
         ("wan2.5-i2v-plus", "通义万相 2.5 图生视频 Plus", ("video",)),

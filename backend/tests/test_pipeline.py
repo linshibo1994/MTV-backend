@@ -4357,6 +4357,30 @@ def test_breakdown_returns_real_episode_subject_scene_group_and_shot_rows() -> N
                         episode_nos=[1],
                         is_active=False,
                     ),
+                    Subject(
+                        id="subject-scene-10",
+                        script_id="script-1",
+                        type="scene",
+                        name="场景 10：天台",
+                        episode_nos=[1],
+                        is_active=True,
+                    ),
+                    Subject(
+                        id="subject-scene-2",
+                        script_id="script-1",
+                        type="scene",
+                        name="场景 2：街道",
+                        episode_nos=[1],
+                        is_active=True,
+                    ),
+                    Subject(
+                        id="subject-scene-7",
+                        script_id="script-1",
+                        type="scene",
+                        name="场景 7：室内",
+                        episode_nos=[1],
+                        is_active=True,
+                    ),
                     Scene(
                         id="scene-1",
                         episode_id="episode-1",
@@ -4419,7 +4443,12 @@ def test_breakdown_returns_real_episode_subject_scene_group_and_shot_rows() -> N
                 _AsyncSessionAdapter(raw_session), "script-1", "episode-1"
             )
             assert data["episode"].episode_id == "episode-1"
-            assert [row.id for row in data["subjects"]] == ["subject-1"]
+            assert [row.id for row in data["subjects"]] == [
+                "subject-1",
+                "subject-scene-2",
+                "subject-scene-7",
+                "subject-scene-10",
+            ]
             assert [row.id for row in data["scenes"]] == ["scene-1"]
             assert [row.shot_group_id for row in data["shot_groups"]] == ["group-1"]
             assert [row.shot_id for row in data["shots"]] == ["shot-1"]

@@ -1533,6 +1533,9 @@ async def test_google_image_provider_rejects_unsupported_image_size(monkeypatch)
         ("qwen-image-2.0", "2k", "3:4", "1728*2368"),
         ("qwen-image-2.0", "2k", "16:9", "2688*1536"),
         ("qwen-image", "1k", "3:4", "1104*1472"),
+        ("qwen-image-3.0", "1k", "3:4", "864*1152"),
+        ("qwen-image-3.0", "2k", "16:9", "2048*1152"),
+        ("qwen-image-3.0-pro", "2k", "3:2", "2048*1365"),
     ],
 )
 def test_bailian_size_mapping_uses_effective_model_capabilities(
@@ -1551,6 +1554,8 @@ def test_bailian_size_mapping_uses_effective_model_capabilities(
     [
         ("qwen-image-2.0", "4k", "仅支持 1K 或 2K"),
         ("qwen-image", "2k", "仅支持固定预设尺寸"),
+        ("qwen-image-3.0", "4k", "仅支持 1K 或 2K"),
+        ("qwen-image-3.0-pro", "4k", "仅支持 1K 或 2K"),
         ("qwen-image-2.0", "8k", "仅支持 1K、2K 或 4K"),
     ],
 )
@@ -1564,6 +1569,248 @@ def test_bailian_size_mapping_rejects_unsupported_tiers(
 
     with pytest.raises(ProviderConfigurationError, match=message):
         _map_size(model, size, "3:4")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model", ["qwen-image-3.0", "qwen-image-3.0-pro"])
+async def test_bailian_qwen_image_3_sync_contract(monkeypatch, model: str) -> None:
+    """3.0/pro 同步调用使用 multimodal endpoint 与 messages 请求体。"""
+    from app.providers import image_gen_bailian
+    from app.providers.image_gen import ImageResult
+    from app.providers.image_gen_bailian import BailianImageGenProvider
+
+    monkeypatch.setattr(
+        image_gen_bailian,
+        "settings",
+        _settings(
+            image_gen_provider="bailian",
+            image_gen_api_key="image-key",
+            image_gen_base_url="https://dashscope.example",
+        ),
+    )
+    calls: dict[str, object] = {}
+
+    class Response:
+        status_code = 200
+        headers: dict[str, str] = {}
+
+        @staticmethod
+        def json():
+            return {
+                "output": {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": [
+                                    {"image": "https://oss.aliyuncs.com/qwen3.png"}
+                                ]
+                            }
+                        }
+                    ]
+                }
+            }
+
+    class Client:
+        def __init__(self, **kwargs):
+            calls["client"] = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def post(self, url, *, headers, json):
+            calls["post"] = {"url": url, "headers": headers, "json": json}
+            return Response()
+
+    monkeypatch.setattr(image_gen_bailian.httpx, "AsyncClient", Client)
+    # 同步接口仅用于已确认支持同步调用的兼容网关；生产默认走异步。
+    provider = BailianImageGenProvider(use_async_for_qwen3=False)
+    monkeypatch.setattr(
+        provider,
+        "_download",
+        AsyncMock(return_value=ImageResult(data=b"image", mime_type="image/png")),
+    )
+
+    result = await provider.generate(
+        "客户端提示词",
+        model,
+        "2k",
+        "16:9",
+        negative_prompt="不要文字",
+    )
+
+    assert result[0].data == b"image"
+    post = calls["post"]
+    assert isinstance(post, dict)
+    assert post["url"] == (
+        "https://dashscope.example/api/v1/services/aigc/"
+        "multimodal-generation/generation"
+    )
+    assert post["headers"]["Authorization"] == "Bearer image-key"
+    assert "X-DashScope-Async" not in post["headers"]
+    assert post["json"] == {
+        "model": model,
+        "input": {
+            "messages": [
+                {"role": "user", "content": [{"text": "客户端提示词"}]}
+            ]
+        },
+        "parameters": {
+            "size": "2048*1152",
+            "n": 1,
+            "prompt_extend": False,
+            "watermark": False,
+            "negative_prompt": "不要文字",
+        },
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model", ["qwen-image-3.0", "qwen-image-3.0-pro"])
+async def test_bailian_qwen_image_3_async_contract(monkeypatch, model: str) -> None:
+    """3.0/pro 异步调用使用 image-generation endpoint 并轮询 choices 结果。"""
+    from app.providers.image_gen_bailian import BailianImageGenProvider
+
+    calls: dict[str, object] = {}
+
+    class Response:
+        status_code = 200
+        headers: dict[str, str] = {}
+
+        @staticmethod
+        def json():
+            return {"output": {"task_id": "qwen3-task"}}
+
+    class Client:
+        async def post(self, url, *, headers, json):
+            calls["post"] = {"url": url, "headers": headers, "json": json}
+            return Response()
+
+    provider = BailianImageGenProvider()
+    poll = AsyncMock(return_value=["https://oss.aliyuncs.com/qwen3.png"])
+    monkeypatch.setattr(provider, "_poll", poll)
+
+    client = Client()
+    urls = await provider._generate_qwen3_async(
+        client,
+        "https://dashscope.example",
+        "image-key",
+        "客户端提示词",
+        model,
+        "2048*1152",
+        2,
+        "不要文字",
+    )
+
+    assert urls == ["https://oss.aliyuncs.com/qwen3.png"]
+    post = calls["post"]
+    assert isinstance(post, dict)
+    assert post["url"] == (
+        "https://dashscope.example/api/v1/services/aigc/"
+        "image-generation/generation"
+    )
+    assert post["headers"]["X-DashScope-Async"] == "enable"
+    assert post["json"]["model"] == model
+    assert post["json"]["input"]["messages"][0]["content"] == [
+        {"text": "客户端提示词"}
+    ]
+    assert post["json"]["parameters"]["size"] == "2048*1152"
+    assert post["json"]["parameters"]["n"] == 2
+    assert post["json"]["parameters"]["negative_prompt"] == "不要文字"
+    poll.assert_awaited_once_with(
+        client,
+        "https://dashscope.example",
+        "image-key",
+        "qwen3-task",
+    )
+
+
+@pytest.mark.asyncio
+async def test_bailian_qwen_image_3_generate_defaults_to_async_contract(
+    monkeypatch,
+) -> None:
+    """Provider 默认走 3.0 官方异步 endpoint，兼容仅异步账号。"""
+    from app.providers import image_gen_bailian
+    from app.providers.image_gen import ImageResult
+    from app.providers.image_gen_bailian import BailianImageGenProvider
+
+    monkeypatch.setattr(
+        image_gen_bailian,
+        "settings",
+        _settings(
+            image_gen_provider="bailian",
+            image_gen_api_key="image-key",
+            image_gen_base_url="https://dashscope.example",
+        ),
+    )
+    calls: dict[str, object] = {}
+
+    class Response:
+        status_code = 200
+        headers: dict[str, str] = {}
+
+        @staticmethod
+        def json():
+            return {"output": {"task_id": "qwen3-task"}}
+
+    class Client:
+        def __init__(self, **kwargs):
+            calls["client"] = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def post(self, url, *, headers, json):
+            calls["post"] = {"url": url, "headers": headers, "json": json}
+            return Response()
+
+    monkeypatch.setattr(image_gen_bailian.httpx, "AsyncClient", Client)
+    provider = BailianImageGenProvider()
+    monkeypatch.setattr(
+        provider,
+        "_poll",
+        AsyncMock(return_value=["https://oss.aliyuncs.com/qwen3.png"]),
+    )
+    monkeypatch.setattr(
+        provider,
+        "_download",
+        AsyncMock(return_value=ImageResult(data=b"image", mime_type="image/png")),
+    )
+
+    result = await provider.generate("提示词", "qwen-image-3.0", "2k", "16:9")
+
+    assert result[0].data == b"image"
+    post = calls["post"]
+    assert isinstance(post, dict)
+    assert post["url"].endswith("/api/v1/services/aigc/image-generation/generation")
+    assert post["headers"]["X-DashScope-Async"] == "enable"
+
+
+def test_bailian_qwen_image_3_poll_extracts_choices_image_url() -> None:
+    from app.providers.image_gen_bailian import _extract_task_urls
+
+    payload = {
+        "output": {
+            "task_status": "SUCCEEDED",
+            "choices": [
+                {
+                    "message": {
+                        "content": [
+                            {"type": "text", "text": "完成"},
+                            {"type": "image", "image": "https://oss.example/qwen3.png"},
+                        ]
+                    }
+                }
+            ],
+        }
+    }
+
+    assert _extract_task_urls(payload) == ["https://oss.example/qwen3.png"]
 
 
 def test_bailian_disables_prompt_extension_for_all_client_prompts() -> None:

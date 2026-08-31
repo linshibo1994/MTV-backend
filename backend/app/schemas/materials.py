@@ -137,6 +137,8 @@ class SubjectImageNodeData(CanvasNodeData):
         "wanx-v1",
         "qwen-image",
         "qwen-image-2.0",
+        "qwen-image-3.0",
+        "qwen-image-3.0-pro",
     ] | None = None
     size: str | None = None
     aspect: str | None = None

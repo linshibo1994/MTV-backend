@@ -1,13 +1,17 @@
 """阿里百炼文生图 Provider。
 
 非 OpenAI 兼容协议，按模型选择原生 DashScope REST 接口：
-- qwen-image-2.0 系列走同步多模态生成接口
+- qwen-image-2.0 走同步多模态生成接口
   POST {base_url}/api/v1/services/aigc/multimodal-generation/generation
-- 提交 POST {base_url}/api/v1/services/aigc/text2image/image-synthesis
-  请求头必带 X-DashScope-Async: enable（缺则报错 current user api does not support
-  synchronous calls）
+- qwen-image-3.0 系列默认走官方异步接口
+  POST {base_url}/api/v1/services/aigc/image-generation/generation
+  请求头必带 X-DashScope-Async: enable；同步多模态接口仅保留为显式兼容路径
+- 旧通义万相模型提交 POST {base_url}/api/v1/services/aigc/text2image/image-synthesis
+  并必带 X-DashScope-Async: enable
 - 轮询 GET {base_url}/api/v1/tasks/{task_id}，状态 PENDING/RUNNING/SUCCEEDED/FAILED/UNKNOWN
-- 成功后 results[].url 为 OSS 临时链接（24h 过期），立即下载为 bytes 返回
+- 旧模型成功后 output.results[].url，Qwen Image 3.0 成功后
+  output.choices[].message.content[].image，均为 OSS 临时链接（24h 过期）
+  并立即下载为 bytes 返回
 - size 格式用星号分隔（1024*1024），非 OpenAI 的 1024x1024
 
 模型：qwen-image-2.0 / wan2.1-t2i-plus / wan2.1-t2i-turbo / wanx-v1 等。
@@ -40,6 +44,15 @@ _POLL_TIMEOUT = 300  # 5 分钟
 _RETRYABLE_SUBMIT_STATUSES = {429}
 _MAX_SUBMIT_ATTEMPTS = 5
 _MAX_RETRY_DELAY_SECONDS = 20.0
+
+# 官方 Qwen Image 3.0 模型。只有这两个精确 ID 走 3.0 契约，避免把
+# 目录外的相似自定义模型误判为新接口。
+_QWEN_IMAGE_3_MODELS = frozenset({"qwen-image-3.0", "qwen-image-3.0-pro"})
+
+
+def _is_qwen_image_3(model: str) -> bool:
+    """判断模型是否为官方 Qwen Image 3.0 标识。"""
+    return (model or "").strip().lower() in _QWEN_IMAGE_3_MODELS
 
 
 def _raise_if_safety_rejected(payload: object) -> None:
@@ -96,6 +109,39 @@ _QWEN_IMAGE_2_SIZE_BY_TIER: dict[str, dict[str, str]] = {
     },
 }
 
+# Qwen Image 3.0 的 size 不是旧版固定预设，而是任意合法的 width*height：
+# 总像素范围 512*512 到 2048*2048，比例范围 1:8 到 8:1。产品层使用
+# 1K/2K 档位，因此这里选取官方常见尺寸；所有尺寸都满足接口上限。
+# 3:2/2:3 与 21:9 的数值参考百炼生态中公开的 Qwen Image 预设。
+_QWEN_IMAGE_3_SIZE_BY_TIER: dict[str, dict[str, str]] = {
+    "1k": {
+        "16:9": "1280*720",
+        "9:16": "720*1280",
+        "1:1": "1024*1024",
+        "4:3": "1152*864",
+        "3:4": "864*1152",
+        "3:2": "1328*880",
+        "2:3": "880*1328",
+        "5:4": "1120*896",
+        "4:5": "896*1120",
+        "21:9": "1512*648",
+    },
+    "2k": {
+        "16:9": "2048*1152",
+        "9:16": "1152*2048",
+        "1:1": "2048*2048",
+        "4:3": "2048*1536",
+        "3:4": "1536*2048",
+        "3:2": "2048*1365",
+        "2:3": "1365*2048",
+        "5:4": "2048*1632",
+        "4:5": "1632*2048",
+        # 21:9 在 2048 长边限制下无法达到 2.25M 像素阈值，但该尺寸仍
+        # 满足官方 512^2~2048^2 与 1:8~8:1 的接口约束。
+        "21:9": "2048*880",
+    },
+}
+
 # 旧 qwen-image / qwen-image-plus / qwen-image-max 只支持这五种固定预设。
 _LEGACY_QWEN_PRESET_SIZE_BY_ASPECT: dict[str, str] = {
     "16:9": "1664*928",
@@ -142,6 +188,19 @@ def _map_size(model: str, size: str, aspect: str) -> str:
     normalized_size = _normalize_size_tier(size)
     normalized_aspect = _normalize_aspect(aspect)
 
+    if normalized_model in _QWEN_IMAGE_3_MODELS:
+        if normalized_size == "4k":
+            raise ProviderConfigurationError(
+                f"{model} 图片尺寸仅支持 1K 或 2K，不支持 4K"
+            )
+        try:
+            return _QWEN_IMAGE_3_SIZE_BY_TIER[normalized_size][normalized_aspect]
+        except KeyError as exc:
+            supported = "、".join(_QWEN_IMAGE_3_SIZE_BY_TIER[normalized_size])
+            raise ProviderConfigurationError(
+                f"{model} 不支持比例 {normalized_aspect}；支持：{supported}"
+            ) from exc
+
     if normalized_model.startswith("qwen-image-2.0"):
         if normalized_size == "4k":
             raise ProviderConfigurationError("Qwen Image 2.0 图片尺寸仅支持 1K 或 2K，不支持 4K")
@@ -181,8 +240,13 @@ def _map_size(model: str, size: str, aspect: str) -> str:
 
 
 def _uses_sync_multimodal_api(model: str) -> bool:
-    """Qwen Image 2.0 仅支持同步多模态生成接口。"""
-    return model.strip().lower().startswith("qwen-image-2.0")
+    """Qwen Image 2.0 的默认路径是同步多模态生成接口。
+
+    Qwen Image 3.0 的 HTTP 文档要求异步提交，因此不在默认分支中返回 True；
+    仅当调用方显式关闭 ``use_async_for_qwen3`` 时，才使用兼容同步路径。
+    """
+    normalized_model = model.strip().lower()
+    return normalized_model.startswith("qwen-image-2.0")
 
 
 def _should_extend_prompt(prompt: str) -> bool:
@@ -193,9 +257,15 @@ def _should_extend_prompt(prompt: str) -> bool:
 def _extract_multimodal_urls(payload: dict) -> list[str]:
     """从同步多模态响应中提取图片 URL，并兼容网关的常见包装格式。"""
     output = payload.get("output") or {}
+    if not isinstance(output, dict):
+        return []
     urls: list[str] = []
     for choice in output.get("choices") or []:
+        if not isinstance(choice, dict):
+            continue
         message = choice.get("message") or {}
+        if not isinstance(message, dict):
+            continue
         for item in message.get("content") or []:
             if not isinstance(item, dict):
                 continue
@@ -205,6 +275,51 @@ def _extract_multimodal_urls(payload: dict) -> list[str]:
             if isinstance(candidate, str) and candidate:
                 urls.append(candidate)
     return urls
+
+
+def _extract_task_urls(payload: dict) -> list[str]:
+    """从异步轮询响应提取图片 URL，兼容旧万相与 Qwen Image 3.0。"""
+    output = payload.get("output") or {}
+    if not isinstance(output, dict):
+        return []
+    urls: list[str] = []
+
+    # 旧 text2image/image-synthesis 契约：output.results[].url。
+    for result in output.get("results") or []:
+        if not isinstance(result, dict):
+            continue
+        candidate = result.get("url")
+        if isinstance(candidate, str) and candidate:
+            urls.append(candidate)
+    if urls:
+        return urls
+
+    # Qwen Image 3.0 image-generation 契约：与同步响应相同的 choices 结构。
+    return _extract_multimodal_urls(payload)
+
+
+def _multimodal_request_body(
+    *,
+    model: str,
+    prompt: str,
+    size: str,
+    count: int,
+    negative_prompt: str | None,
+) -> dict:
+    """构造 Qwen Image 2/3 共用的 messages 请求体。"""
+    parameters: dict[str, object] = {
+        "size": size,
+        "n": count,
+        "prompt_extend": _should_extend_prompt(prompt),
+        "watermark": False,
+    }
+    if negative_prompt:
+        parameters["negative_prompt"] = negative_prompt
+    return {
+        "model": model,
+        "input": {"messages": [{"role": "user", "content": [{"text": prompt}]}]},
+        "parameters": parameters,
+    }
 
 
 def _retry_delay_seconds(response: httpx.Response, attempt: int) -> float:
@@ -250,6 +365,16 @@ async def _post_with_transient_retry(
 
 class BailianImageGenProvider:
     """阿里百炼通义万相文生图实现（httpx 直连，零额外依赖）。"""
+
+    def __init__(self, *, use_async_for_qwen3: bool = True) -> None:
+        """初始化 Provider。
+
+        Qwen Image 3.0/3.0 Pro 默认提交到官方异步 endpoint。部分百炼账号或
+        网关拒绝同步调用（会返回 ``current user api does not support
+        synchronous calls``），因此异步是生产默认值；传入 False 仅用于已确认
+        支持同步调用的兼容网关。旧版万相始终沿用其原生异步接口。
+        """
+        self.use_async_for_qwen3 = use_async_for_qwen3
 
     async def generate(
         self,
@@ -297,9 +422,35 @@ class BailianImageGenProvider:
             wanx_size,
         )
         n = max(count, 1)
+        if _is_qwen_image_3(use_model) and n > 6:
+            raise ProviderConfigurationError("Qwen Image 3.0 单次最多生成 6 张图片")
 
         async with httpx.AsyncClient(timeout=60.0) as http:
-            if _uses_sync_multimodal_api(use_model):
+            if _is_qwen_image_3(use_model):
+                if self.use_async_for_qwen3:
+                    urls = await self._generate_qwen3_async(
+                        http,
+                        base_url,
+                        api_key,
+                        prompt,
+                        use_model,
+                        wanx_size,
+                        n,
+                        negative_prompt,
+                    )
+                else:
+                    # 仅供已确认支持同步调用的兼容网关使用；官方生产默认走异步。
+                    urls = await self._generate_sync_multimodal(
+                        http,
+                        base_url,
+                        api_key,
+                        prompt,
+                        use_model,
+                        wanx_size,
+                        n,
+                        negative_prompt,
+                    )
+            elif _uses_sync_multimodal_api(use_model):
                 urls = await self._generate_sync_multimodal(
                     http,
                     base_url,
@@ -336,24 +487,18 @@ class BailianImageGenProvider:
         count: int,
         negative_prompt: str | None,
     ) -> list[str]:
-        """调用 Qwen Image 2.0 同步多模态生成接口。"""
+        """调用 Qwen Image 2.0（或显式兼容模式下的 3.0）同步接口。"""
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         }
-        parameters: dict[str, object] = {
-            "size": size,
-            "n": count,
-            "prompt_extend": _should_extend_prompt(prompt),
-            "watermark": False,
-        }
-        if negative_prompt:
-            parameters["negative_prompt"] = negative_prompt
-        body = {
-            "model": model,
-            "input": {"messages": [{"role": "user", "content": [{"text": prompt}]}]},
-            "parameters": parameters,
-        }
+        body = _multimodal_request_body(
+            model=model,
+            prompt=prompt,
+            size=size,
+            count=count,
+            negative_prompt=negative_prompt,
+        )
         submit = await _post_with_transient_retry(
             http,
             f"{base_url}/api/v1/services/aigc/multimodal-generation/generation",
@@ -361,12 +506,58 @@ class BailianImageGenProvider:
             body=body,
         )
         _classify_response_safety(submit)
-        if submit.status_code != 200:
+        if submit.status_code not in {200, 202}:
             raise RuntimeError(f"百炼 Qwen Image 文生图失败 status={submit.status_code}")
         urls = _extract_multimodal_urls(submit.json())
         if not urls:
             raise RuntimeError("百炼 Qwen Image 文生图未返回图片 URL")
         return urls
+
+    async def _generate_qwen3_async(
+        self,
+        http: httpx.AsyncClient,
+        base_url: str,
+        api_key: str,
+        prompt: str,
+        model: str,
+        size: str,
+        count: int,
+        negative_prompt: str | None,
+    ) -> list[str]:
+        """调用 Qwen Image 3.0 官方异步接口并轮询任务结果。
+
+        3.0 异步接口与旧通义万相接口的关键差异是 endpoint 和 input 结构：
+        必须使用 ``image-generation/generation``，且请求体仍是 messages。
+        """
+        if not _is_qwen_image_3(model):
+            raise ProviderConfigurationError(
+                "Qwen Image 3.0 异步接口仅适用于 qwen-image-3.0 或 qwen-image-3.0-pro"
+            )
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "X-DashScope-Async": "enable",
+        }
+        body = _multimodal_request_body(
+            model=model,
+            prompt=prompt,
+            size=size,
+            count=count,
+            negative_prompt=negative_prompt,
+        )
+        submit = await _post_with_transient_retry(
+            http,
+            f"{base_url}/api/v1/services/aigc/image-generation/generation",
+            headers=headers,
+            body=body,
+        )
+        _classify_response_safety(submit)
+        if submit.status_code not in {200, 202}:
+            raise RuntimeError(f"百炼 Qwen Image 3.0 异步提交失败 status={submit.status_code}")
+        task_id = (submit.json().get("output") or {}).get("task_id")
+        if not task_id:
+            raise RuntimeError("百炼 Qwen Image 3.0 异步提交未返回 task_id")
+        return await self._poll(http, base_url, api_key, task_id)
 
     async def _generate_legacy_async(
         self,
@@ -431,12 +622,22 @@ class BailianImageGenProvider:
             payload = resp.json()
             _raise_if_safety_rejected(payload)
             data = payload.get("output") or {}
+            if not isinstance(data, dict):
+                raise RuntimeError(f"百炼图片轮询响应格式无效 task_id={task_id}")
             status = (data.get("task_status") or "").upper()
             if status == "SUCCEEDED":
-                results = data.get("results") or []
-                return [r["url"] for r in results if r.get("url")]
-            if status in ("FAILED", "UNKNOWN"):
-                raise RuntimeError(f"通义万相文生图任务失败 task_id={task_id} status={status}")
+                urls = _extract_task_urls(payload)
+                if not urls:
+                    raise RuntimeError(
+                        f"百炼图片任务成功但未返回图片 URL task_id={task_id}"
+                    )
+                return urls
+            if status in ("FAILED", "CANCELED", "UNKNOWN"):
+                code = data.get("code") or payload.get("code")
+                suffix = f" code={code}" if isinstance(code, str) and code else ""
+                raise RuntimeError(
+                    f"通义万相文生图任务失败 task_id={task_id} status={status}{suffix}"
+                )
             if asyncio.get_event_loop().time() > deadline:
                 raise RuntimeError(f"通义万相文生图轮询超时 task_id={task_id}")
             await asyncio.sleep(_POLL_INTERVAL)
