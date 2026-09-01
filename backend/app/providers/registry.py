@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Literal, cast
 
 ProviderCapability = Literal["text", "chat", "image", "video"]
-PromptSyntax = Literal["plain", "ark_content", "aicc_content"]
+PromptSyntax = Literal["plain", "ark_content"]
 ProviderName = Literal[
     "openai",
     "openai_compatible",
@@ -23,7 +23,7 @@ ProviderName = Literal[
     "deepseek",
     "volcengine",
     "neolink",
-    "mgrouter",
+    "entpilot",
 ]
 
 _ALIASES: dict[str, ProviderName] = {
@@ -52,10 +52,10 @@ _ALIASES: dict[str, ProviderName] = {
     "modelsai": "volcengine",
     "neolink": "neolink",
     "neo-link": "neolink",
-    "mgrouter": "mgrouter",
-    "mg-router": "mgrouter",
-    "aicc": "mgrouter",
-    "aicc-seedance": "mgrouter",
+    "entpilot": "entpilot",
+    "ent-pilot": "entpilot",
+    "seedance-entpilot": "entpilot",
+    "ka-ent-pilot": "entpilot",
 }
 
 _CAPABILITIES: dict[ProviderCapability, frozenset[ProviderName]] = {
@@ -83,7 +83,7 @@ _CAPABILITIES: dict[ProviderCapability, frozenset[ProviderName]] = {
     ),
     "image": frozenset({"openai", "gemini", "bailian", "neolink"}),
     "video": frozenset(
-        {"openai", "gemini", "bailian", "volcengine", "neolink", "mgrouter"}
+        {"openai", "gemini", "bailian", "volcengine", "neolink", "entpilot"}
     ),
 }
 
@@ -181,7 +181,7 @@ def _base_prompt_capability(provider: ProviderName) -> ProviderPromptCapability:
         raise ProviderConfigurationError(f"视频提示词能力矩阵未声明厂商 {provider}")
     config = cast(dict[str, object], raw_config)
     prompt_syntax = config.get("prompt_syntax")
-    if prompt_syntax not in {"plain", "ark_content", "aicc_content"}:
+    if prompt_syntax not in {"plain", "ark_content"}:
         raise ProviderConfigurationError(f"厂商 {provider} 的 prompt_syntax 无效")
     return ProviderPromptCapability(
         provider=provider,
@@ -238,7 +238,6 @@ def _apply_model_prompt_override(
         if "prompt_syntax" in updates and updates["prompt_syntax"] not in {
             "plain",
             "ark_content",
-            "aicc_content",
         }:
             raise ProviderConfigurationError("模型覆盖字段 prompt_syntax 无效")
         return ProviderPromptCapability(

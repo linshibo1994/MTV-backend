@@ -31,13 +31,27 @@ def test_provider_catalog_returns_expected_structure(monkeypatch) -> None:
         "openai",
         "anthropic",
         "gemini",
-        "mgrouter",
+        "entpilot",
     }
     by_key = {entry.key: entry for entry in catalog.providers}
     # 能力标签与 registry 一致。
     assert set(by_key["bailian"].capabilities) == {"text", "chat", "image", "video"}
     assert set(by_key["deepseek"].capabilities) == {"text", "chat"}
     assert set(by_key["volcengine"].capabilities) == {"video"}
+    assert set(by_key["entpilot"].capabilities) == {"video"}
+    entpilot_models = {model.id: model for model in by_key["entpilot"].models}
+    assert set(entpilot_models) == {
+        "seedance-2.0-1080p",
+        "seedance-2.0-480p",
+        "seedance-2.0-4k",
+        "seedance-2.0-720p",
+        "seedance-2.0-fast-480p",
+        "seedance-2.0-fast-720p",
+        "seedance-2.5-1080p",
+        "seedance-2.5-480p",
+        "seedance-2.5-720p",
+    }
+    assert by_key["entpilot"].label == "EntPilot Seedance"
     # 推荐模型带中文 label 与能力分组。
     bailian_models = {model.id: model for model in by_key["bailian"].models}
     assert bailian_models["qwen-plus"].label == "通义千问 Plus"
@@ -63,9 +77,12 @@ def test_provider_catalog_marks_available_and_default_model(monkeypatch) -> None
         _settings(
             dashscope_api_key="dashscope-key",
             deepseek_api_key="deepseek-key",
+            entpilot_api_key="entpilot-key",
             text_llm_provider="bailian",
             text_llm_api_key="dashscope-key",
             text_llm_model="kimi/custom-model",
+            video_gen_provider="entpilot",
+            video_gen_model="seedance-2.5-720p",
         ),
     )
     catalog = build_provider_catalog()
@@ -73,6 +90,7 @@ def test_provider_catalog_marks_available_and_default_model(monkeypatch) -> None
 
     assert by_key["bailian"].available is True
     assert by_key["deepseek"].available is True
+    assert by_key["entpilot"].available is True
     assert by_key["openai"].available is False
 
     # .env 显式配置的 text_llm_model（厂商匹配 bailian 时回填链生效前提之外，
@@ -82,6 +100,44 @@ def test_provider_catalog_marks_available_and_default_model(monkeypatch) -> None
     assert by_key["bailian"].default_model is not None
     deepseek_models = {model.id: model for model in by_key["deepseek"].models}
     assert deepseek_models["deepseek-v4-flash"].is_default is True
+    entpilot_models = {model.id: model for model in by_key["entpilot"].models}
+    assert entpilot_models["seedance-2.5-720p"].is_default is True
+    assert by_key["entpilot"].default_model == "seedance-2.5-720p"
+
+
+def test_provider_catalog_accepts_explicit_generic_entpilot_key(monkeypatch) -> None:
+    """显式使用通用 VIDEO_GEN_API_KEY 时，EntPilot 仍应标记为可用。"""
+    from app.core import config
+    from app.services.provider_catalog import build_provider_catalog
+
+    monkeypatch.setattr(
+        config,
+        "settings",
+        _settings(
+            video_gen_provider="entpilot",
+            video_gen_api_key="generic-entpilot-key",
+        ),
+    )
+
+    catalog = build_provider_catalog()
+    entpilot = next(item for item in catalog.providers if item.key == "entpilot")
+    assert entpilot.available is True
+
+
+def test_provider_catalog_uses_explicit_generic_model_with_default_provider(monkeypatch) -> None:
+    """仅显式填写通用模型时，目录默认值要与 EntPilot 运行时一致。"""
+    from app.core import config
+    from app.services.provider_catalog import build_provider_catalog
+
+    monkeypatch.setattr(
+        config,
+        "settings",
+        _settings(video_gen_model="seedance-2.5-720p"),
+    )
+
+    catalog = build_provider_catalog()
+    entpilot = next(item for item in catalog.providers if item.key == "entpilot")
+    assert entpilot.default_model == "seedance-2.5-720p"
 
 
 def test_provider_catalog_env_default_model_merges_into_recommended(monkeypatch) -> None:
@@ -103,6 +159,28 @@ def test_provider_catalog_env_default_model_merges_into_recommended(monkeypatch)
     deepseek_ids = [model.id for model in by_key["deepseek"].models]
     assert deepseek_ids.count("deepseek-v4-pro") == 1
     assert by_key["deepseek"].default_model == "deepseek-v4-pro"
+
+
+def test_provider_catalog_normalizes_entpilot_alias_for_default_model(monkeypatch) -> None:
+    """VIDEO_GEN_PROVIDER 使用公开别名时，EntPilot 仍应标记通用默认模型。"""
+    from app.core import config
+    from app.services.provider_catalog import build_provider_catalog
+
+    monkeypatch.setattr(
+        config,
+        "settings",
+        _settings(
+            entpilot_api_key="entpilot-key",
+            video_gen_provider="ent-pilot",
+            video_gen_model="seedance-2.5-720p",
+        ),
+    )
+
+    catalog = build_provider_catalog()
+    entpilot = next(item for item in catalog.providers if item.key == "entpilot")
+    models = {item.id: item for item in entpilot.models}
+    assert entpilot.default_model == "seedance-2.5-720p"
+    assert models["seedance-2.5-720p"].is_default is True
 
 
 @pytest.mark.asyncio

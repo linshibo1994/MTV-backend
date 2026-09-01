@@ -9,11 +9,14 @@ MAX_REFERENCE_IMAGES = 9
 MAX_REFERENCE_AUDIOS = 3
 MAX_REFERENCE_VIDEOS = 3
 MAX_REFERENCE_MEDIA = 12
+MAX_ENTPILOT_20_REFERENCE_MEDIA = (
+    MAX_REFERENCE_IMAGES + MAX_REFERENCE_AUDIOS + MAX_REFERENCE_VIDEOS
+)
 CONTINUATION_FIRST_FRAME_IMAGES = 1
 # 自动镜头组合产生的后续图生组使用该 JSON 标记，而不是篡改用户在工作台
 # 上设置的 ``is_continuation``。它只表达该组应从严格直接前驱取得首帧。
 CONTINUATION_FROM_PREDECESSOR_KEY = "continuation_from_predecessor"
-REFERENCE_VIDEO_SUPPORTED_PROVIDERS = frozenset({"volcengine", "neolink"})
+REFERENCE_VIDEO_SUPPORTED_PROVIDERS = frozenset({"volcengine", "neolink", "entpilot"})
 
 IMAGE_MATERIAL_KEYS = ("character", "background", "prop", "other")
 VIDEO_MATERIAL_KEY = "video"
@@ -123,19 +126,28 @@ def reference_media_limits_for_provider(
 
     provider_key = str(provider or "").strip().lower()
     model_name = str(model or "").strip().lower()
-    if provider_key in REFERENCE_VIDEO_SUPPORTED_PROVIDERS:
-        return ReferenceMediaLimits()
-    if provider_key == "mgrouter":
-        # AICC 的首帧是互斥输入：存在首帧时不能同时提交普通图或声音；
-        # 无首帧时参考声音还必须至少搭配一张普通参考图。
+    if provider_key == "entpilot":
+        # EntPilot 的 Seedance 2.0/2.0 Fast 与 2.5 线路限额不同；
+        # 首帧模式均与普通参考媒体互斥，音频可独立提交。
+        if model_name.startswith("seedance-2.5-"):
+            return ReferenceMediaLimits(
+                images=30,
+                audios=10,
+                videos=10,
+                total=50,
+                first_frame_exclusive=True,
+            )
         return ReferenceMediaLimits(
             images=9,
             audios=3,
-            videos=0,
-            total=12,
+            videos=3,
+            # SD 2.0 只限制各类素材数量，未额外限制混合总数；
+            # 最小等价总上限为 9 + 3 + 3 = 15。
+            total=MAX_ENTPILOT_20_REFERENCE_MEDIA,
             first_frame_exclusive=True,
-            audio_requires_reference_image=True,
         )
+    if provider_key in REFERENCE_VIDEO_SUPPORTED_PROVIDERS:
+        return ReferenceMediaLimits()
     if provider_key == "gemini":
         # Veo 使用一张输入首帧和最多三张额外参考图，不支持音频/视频参考。
         return ReferenceMediaLimits(images=4, audios=0, videos=0, total=4)
@@ -193,7 +205,7 @@ def effective_reference_media_limits_for_group(
 ) -> ReferenceMediaLimits:
     """返回镜头组实际可编辑、可提交的参考素材额度。
 
-    一般供应商的首帧只占用图片和总数名额；MGRouter 则使用独占首帧输入槽。
+    一般供应商的首帧只占用图片和总数名额；EntPilot 则使用独占首帧输入槽。
     因此同一运行时模型下，不同镜头组也可能拥有不同的有效额度。
     """
 
@@ -428,7 +440,7 @@ def trim_automatic_reference_selection(
             total += 1
 
     seen_audio: set[str] = set()
-    # MGRouter 的声音引用必须搭配至少一张普通参考图；首帧不算普通图。
+    # 供应商若要求声音引用搭配普通参考图，在这里过滤自动组合产物。
     # 自动组合不能保留一个随后必定被编辑/创建接口拒绝的声音引用。
     may_keep_audio = not effective_limits.audio_requires_reference_image or bool(seen_images)
     if may_keep_audio:
@@ -468,6 +480,7 @@ __all__ = [
     "MAX_REFERENCE_AUDIOS",
     "MAX_REFERENCE_IMAGES",
     "MAX_REFERENCE_MEDIA",
+    "MAX_ENTPILOT_20_REFERENCE_MEDIA",
     "MAX_REFERENCE_VIDEOS",
     "ReferenceMediaCounts",
     "ReferenceMediaLimits",

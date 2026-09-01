@@ -8,6 +8,7 @@ import pytest
 from app.services.runtime_models import (
     RuntimeModel,
     RuntimeVideoModel,
+    resolve_default_video_model,
     resolve_env_video_model,
     resolve_request_video_model,
     resolve_video_model,
@@ -48,7 +49,9 @@ async def test_resolve_request_video_model_falls_back_to_vendor_default() -> Non
 
     configured = Settings(
         _env_file=None,
+        video_gen_provider="bailian",
         dashscope_video_model="wanx2.1-t2v-turbo",
+        video_gen_model="",
     )
 
     resolved = await resolve_request_video_model(
@@ -63,8 +66,45 @@ async def test_resolve_request_video_model_falls_back_to_vendor_default() -> Non
 
 
 @pytest.mark.asyncio
+async def test_entpilot_request_does_not_reuse_other_provider_generic_model() -> None:
+    """显式 EntPilot 未传模型时不能接收遗留的 Doubao 通用模型。"""
+
+    configured = SimpleNamespace(
+        video_gen_provider="volcengine",
+        video_gen_model="doubao-seedance-2-0-260128",
+        entpilot_video_model="seedance-2.5-720p",
+    )
+
+    resolved = await resolve_request_video_model(
+        SimpleNamespace(),
+        configured,
+        provider="entpilot",
+    )
+
+    assert resolved.provider == "entpilot"
+    assert resolved.model == "seedance-2.5-720p"
+
+
+def test_entpilot_env_and_default_resolution_ignore_stale_generic_model() -> None:
+    """env/default 两条回退链都使用 EntPilot 专属模型。"""
+
+    configured = SimpleNamespace(
+        video_gen_provider="entpilot",
+        video_gen_model="doubao-seedance-2-0-260128",
+        entpilot_video_model="seedance-2.0-480p",
+        video_default_provider="entpilot",
+    )
+
+    env_model = resolve_env_video_model(configured)
+    default_model = resolve_default_video_model(configured)
+
+    assert env_model.model == "seedance-2.0-480p"
+    assert default_model.model == "seedance-2.0-480p"
+
+
+@pytest.mark.asyncio
 async def test_resolve_request_video_model_normalizes_alias_to_stable_key() -> None:
-    """别名（如 dashscope/aicc）规范化为主 key，保证数据库与 worker 可路由。"""
+    """别名（如 dashscope/ent-pilot）规范化为主 key，保证数据库与 worker 可路由。"""
     from app.core.config import Settings
 
     configured = Settings(_env_file=None)
@@ -74,11 +114,11 @@ async def test_resolve_request_video_model_normalizes_alias_to_stable_key() -> N
     )
     assert bailian.task_provider_key == "bailian"
 
-    mgrouter = await resolve_request_video_model(
-        SimpleNamespace(), configured, provider="aicc"
+    entpilot = await resolve_request_video_model(
+        SimpleNamespace(), configured, provider="ent-pilot"
     )
-    assert mgrouter.task_provider_key == "mgrouter"
-    assert mgrouter.provider == "mgrouter"
+    assert entpilot.task_provider_key == "entpilot"
+    assert entpilot.provider == "entpilot"
 
     volcengine = await resolve_request_video_model(
         SimpleNamespace(), configured, provider="doubao"
@@ -178,24 +218,25 @@ async def test_resolve_video_model_skips_audit_for_bailian(monkeypatch) -> None:
     assert resolved.reference_image_audit_required is False
 
 
-def test_resolve_env_video_model_normalizes_aicc_without_volcengine_audit() -> None:
+def test_resolve_env_video_model_normalizes_entpilot_without_volcengine_audit() -> None:
     from app.core.config import Settings
 
     configured = Settings(
         _env_file=None,
         video_provider_selection_mode="env",
-        video_gen_provider="aicc",
-        mgrouter_api_key="test-key",
+        video_gen_provider="entpilot",
+        entpilot_api_key="test-key",
+        entpilot_video_model="seedance-2.5-720p",
         video_gen_model="",
     )
 
     resolved = resolve_env_video_model(configured)
 
     assert resolved == RuntimeVideoModel(
-        provider="mgrouter",
-        model="AICC-Doubao-Seedance-2.0",
+        provider="entpilot",
+        model="seedance-2.5-720p",
         reference_image_audit_required=False,
-        task_provider_key="mgrouter",
+        task_provider_key="entpilot",
     )
 
 
@@ -208,7 +249,7 @@ def test_resolve_env_video_model_uses_neolink_seedance_without_volcengine_audit(
         video_gen_provider="neolink",
         neolink_api_key="test-key",
         neolink_base_url="https://neolink.com/api",
-        video_gen_model="AICC-Doubao-Seedance-2.0",
+        video_gen_model="legacy-video-model",
     )
 
     resolved = resolve_env_video_model(configured)

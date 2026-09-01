@@ -177,7 +177,7 @@ class ActiveProviderUpdateIn(BaseModel):
     """切换视频供应商（管理员）入参。"""
 
     provider_key: Literal[
-        "jianyu", "modelsai", "neolink", "bailian", "openai", "gemini", "mgrouter"
+        "jianyu", "modelsai", "neolink", "bailian", "openai", "gemini", "entpilot"
     ] = Field(..., description="供应商 key")
     job_type: str = Field(default="all_reference", description="任务类型，默认 all_reference")
 

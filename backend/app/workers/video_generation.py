@@ -1951,13 +1951,22 @@ async def run_video_generation_once(
         async def _on_submission_uncertain() -> None:
             await _persist_submission_state("submission_uncertain")
 
+        # 历史任务可能没有冻结 model；EntPilot 不能回退到旧的 Doubao
+        # 模型名，否则适配器会按白名单拒绝恢复任务。
+        if job_provider_key == "entpilot":
+            fallback_model = (
+                str(getattr(settings, "entpilot_video_model", "") or "").strip()
+                or "seedance-2.0-720p"
+            )
+        else:
+            fallback_model = settings.video_gen_model or settings.seedance_model
         request = VideoGenerationRequest(
             prompt=input_json.get("prompt", ""),
             reference_images=input_json.get("reference_images", []) or [],
             reference_image_names=input_json.get("reference_image_names", []) or [],
             reference_audios=input_json.get("reference_audios", []) or [],
             reference_audio_names=input_json.get("reference_audio_names", []) or [],
-            model=input_json.get("model") or settings.video_gen_model or settings.seedance_model,
+            model=input_json.get("model") or fallback_model,
             job_id=job_id,
             reference_videos=input_json.get("reference_videos", []) or [],
             reference_video_names=input_json.get("reference_video_names", []) or [],
@@ -1971,7 +1980,7 @@ async def run_video_generation_once(
         )
         # 历史任务的 input_json 可能在统一限额上线前创建。尚未持久化远端
         # task id 时必须在 Worker 再做一次按实际首帧计算的校验，不能让
-        # MGRouter 静默丢弃普通图片或声音后继续提交。
+        # EntPilot 等供应商若不支持对应媒体，必须在提交前明确拒绝，不能静默丢弃。
         if not provider_task_id:
             provider_name = require_capability(job_provider_key, "video")
             provider_reference_images = [

@@ -93,22 +93,22 @@ async def resolve_video_model(
     能力的厂商统一转为 400，避免把请求参数错误暴露成 500。
     """
 
-    if provider or model:
-        from app.providers.registry import (
-            UnsupportedCapabilityError,
-            UnsupportedProviderError,
-        )
+    from app.providers.registry import (
+        UnsupportedCapabilityError,
+        UnsupportedProviderError,
+    )
 
-        try:
+    try:
+        if provider or model:
             return await runtime_models.resolve_request_video_model(
                 db,
                 configured_settings,
                 provider=provider,
                 model=model,
             )
-        except (UnsupportedProviderError, UnsupportedCapabilityError) as exc:
-            raise BadRequestError(str(exc)) from None
-    return await runtime_models.resolve_video_model(db, configured_settings)
+        return await runtime_models.resolve_video_model(db, configured_settings)
+    except (UnsupportedProviderError, UnsupportedCapabilityError, ValueError) as exc:
+        raise BadRequestError(str(exc)) from None
 
 
 # 跨模块依赖（T2 积分服务可能未就绪，统一从 PLAN 路径 import）

@@ -53,7 +53,7 @@ class VideoGenerationJob(TimestampMixin, Base):
         CheckConstraint(
             "provider_key IN "
             "('jianyu', 'modelsai', 'volcengine', 'doubao', 'neolink', 'bailian', 'openai', "
-            "'gemini', 'mgrouter')",
+            "'gemini', 'entpilot')",
             name="ck_video_jobs_provider_key",
         ),
         CheckConstraint("job_type IN ('all_reference')", name="ck_video_jobs_job_type"),
@@ -91,7 +91,7 @@ class VideoGenerationJob(TimestampMixin, Base):
     unit_id: Mapped[str] = mapped_column(String(64), nullable=False)
     unit_runtime_key: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
 
-    # jianyu | modelsai | neolink | bailian | openai | gemini | mgrouter
+    # jianyu | modelsai | neolink | bailian | openai | gemini | entpilot
     provider_key: Mapped[str] = mapped_column(String(32), nullable=False)
     # all_reference（可扩展）
     job_type: Mapped[str] = mapped_column(String(32), nullable=False)

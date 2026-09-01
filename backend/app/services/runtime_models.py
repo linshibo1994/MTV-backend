@@ -35,6 +35,131 @@ class RuntimeVideoModel(RuntimeModel):
     task_provider_key: str
 
 
+_DATABASE_VIDEO_PROVIDER_KEYS = frozenset(
+    {
+        "jianyu",
+        "modelsai",
+        "volcengine",
+        "doubao",
+        "neolink",
+        "bailian",
+        "openai",
+        "gemini",
+        "entpilot",
+    }
+)
+_ENTPILOT_VIDEO_MODELS = frozenset(
+    {
+        "seedance-2.0-1080p",
+        "seedance-2.0-480p",
+        "seedance-2.0-4k",
+        "seedance-2.0-720p",
+        "seedance-2.0-fast-480p",
+        "seedance-2.0-fast-720p",
+        "seedance-2.5-1080p",
+        "seedance-2.5-480p",
+        "seedance-2.5-720p",
+    }
+)
+
+
+def _validate_video_model(provider: str, model: str) -> str:
+    """在创建任务前校验供应商专属模型清单。"""
+
+    normalized = str(model or "").strip()
+    if provider == "entpilot" and normalized.lower() not in _ENTPILOT_VIDEO_MODELS:
+        raise ValueError(f"EntPilot 不支持视频模型: {normalized or '<空>'}")
+    return normalized
+
+
+def _video_fallback_models(configured_settings: Any) -> dict[str, str]:
+    """按规范化视频供应商返回专属环境保底模型。"""
+
+    return {
+        "volcengine": getattr(configured_settings, "seedance_model", ""),
+        "neolink": getattr(configured_settings, "seedance_model", ""),
+        "bailian": getattr(configured_settings, "dashscope_video_model", ""),
+        "openai": getattr(configured_settings, "openai_video_model", ""),
+        "gemini": getattr(configured_settings, "google_video_model", ""),
+        "entpilot": getattr(
+            configured_settings,
+            "entpilot_video_model",
+            "seedance-2.0-720p",
+        ),
+    }
+
+
+def _configured_video_provider(configured_settings: Any) -> str | None:
+    """返回 ``VIDEO_GEN_PROVIDER`` 的规范化值，配置无效时保持不可用。"""
+
+    raw_provider = str(getattr(configured_settings, "video_gen_provider", "") or "").strip()
+    if not raw_provider:
+        return None
+    try:
+        return require_capability(raw_provider, "video")
+    except Exception:  # noqa: BLE001 - 仅用于判断通用模型是否属于当前厂商
+        return None
+
+
+def _video_model_for_provider(configured_settings: Any, provider: str) -> str:
+    """按目标供应商选择模型，避免复用其他供应商遗留的通用模型。"""
+
+    # NeoLink 的历史契约始终使用 SEEDANCE_MODEL，即使 VIDEO_GEN_MODEL 已填写。
+    if provider == "neolink":
+        return str(
+            getattr(configured_settings, "seedance_model", "")
+            or getattr(configured_settings, "video_gen_model", "")
+            or ""
+        ).strip()
+
+    generic_model = str(getattr(configured_settings, "video_gen_model", "") or "").strip()
+    if generic_model and _configured_video_provider(configured_settings) == provider:
+        # 旧部署可能保留 ``doubao-*`` 或其他未接入值，即使 provider 已切到
+        # EntPilot；这里只复用适配器已接入的精确清单，避免任务提交后才失败。
+        if provider != "entpilot" or generic_model.lower() in _ENTPILOT_VIDEO_MODELS:
+            return generic_model
+
+    fallback_models = _video_fallback_models(configured_settings)
+    fallback = str(fallback_models.get(provider, "") or "").strip()
+    if provider == "entpilot" and fallback.lower() not in _ENTPILOT_VIDEO_MODELS:
+        # EntPilot 只接受公开的九个 Seedance 模型；配置遗留值时回退到
+        # 可提交的默认模型，避免任务创建后才因白名单校验失败。
+        return "seedance-2.0-720p"
+    return fallback
+
+
+def _task_provider_key(raw_provider: str, normalized_provider: str) -> str:
+    """保留数据库允许的历史 key；未知别名统一成规范 key。"""
+
+    if raw_provider in _DATABASE_VIDEO_PROVIDER_KEYS:
+        return raw_provider
+    return _STABLE_VIDEO_PROVIDER_KEYS.get(normalized_provider, normalized_provider)
+
+
+def _default_video_runtime_model(configured_settings: Any) -> RuntimeVideoModel:
+    """解析没有数据库 active 行时的服务端视频默认。"""
+
+    raw_provider = str(getattr(configured_settings, "video_default_provider", "entpilot"))
+    provider = require_capability(raw_provider, "video")
+    model = _validate_video_model(
+        provider,
+        _video_model_for_provider(configured_settings, provider),
+    )
+    return RuntimeVideoModel(
+        provider=provider,
+        model=model,
+        reference_image_audit_required=provider == "volcengine",
+        task_provider_key=_task_provider_key(raw_provider, provider),
+    )
+
+
+def resolve_default_video_model(configured_settings: Any | None = None) -> RuntimeVideoModel:
+    """返回没有数据库 active 配置时实际采用的视频供应商和模型。"""
+
+    configured_settings = settings if configured_settings is None else configured_settings
+    return _default_video_runtime_model(configured_settings)
+
+
 def resolve_text_llm_model(configured_settings: Any | None = None) -> RuntimeModel:
     configured_settings = settings if configured_settings is None else configured_settings
     return RuntimeModel(
@@ -63,22 +188,9 @@ def resolve_env_video_model(configured_settings: Any | None = None) -> RuntimeVi
     """解析 ``env`` 模式创建视频任务会采用的配置。"""
     configured_settings = settings if configured_settings is None else configured_settings
     provider = require_capability(configured_settings.video_gen_provider, "video")
-    fallback_models = {
-        "volcengine": configured_settings.seedance_model,
-        "neolink": configured_settings.seedance_model,
-        "bailian": configured_settings.dashscope_video_model,
-        "openai": configured_settings.openai_video_model,
-        "gemini": configured_settings.google_video_model,
-        "mgrouter": getattr(
-            configured_settings,
-            "mgrouter_video_model",
-            "AICC-Doubao-Seedance-2.0",
-        ),
-    }
-    model = (
-        configured_settings.seedance_model
-        if provider == "neolink"
-        else configured_settings.video_gen_model or fallback_models[provider]
+    model = _validate_video_model(
+        provider,
+        _video_model_for_provider(configured_settings, provider),
     )
     return RuntimeVideoModel(
         provider=provider,
@@ -102,17 +214,17 @@ async def resolve_video_model(
 
     provider_cfg = await video_crud.get_active_provider(db, "all_reference")
     if provider_cfg is None:
-        raw_provider = configured_settings.video_default_provider
-        model = configured_settings.video_gen_model or configured_settings.seedance_model
+        return _default_video_runtime_model(configured_settings)
     else:
         raw_provider = provider_cfg.provider_key
         model = provider_cfg.model
     provider = require_capability(raw_provider, "video")
+    model = _validate_video_model(provider, model)
     return RuntimeVideoModel(
         provider=provider,
         model=model,
         reference_image_audit_required=provider == "volcengine",
-        task_provider_key=raw_provider,
+        task_provider_key=_task_provider_key(raw_provider, provider),
     )
 
 
@@ -137,24 +249,11 @@ async def resolve_request_video_model(
         raise ValueError("请求级视频路由必须显式传入 provider")
     configured_settings = settings if configured_settings is None else configured_settings
     vendor = require_capability(normalized_provider, "video")
-    fallback_models = {
-        "volcengine": configured_settings.seedance_model,
-        "neolink": configured_settings.seedance_model,
-        "bailian": configured_settings.dashscope_video_model,
-        "openai": configured_settings.openai_video_model,
-        "gemini": configured_settings.google_video_model,
-        "mgrouter": getattr(
-            configured_settings,
-            "mgrouter_video_model",
-            "AICC-Doubao-Seedance-2.0",
-        ),
-    }
-    # 与 env 模式 resolve_env_video_model 保持一致：请求未显式指定 model 时，
-    # 优先使用服务端能力级默认 VIDEO_GEN_MODEL，再回退该厂商专属保底模型。
-    effective_model = (
-        normalized_model
-        or configured_settings.video_gen_model
-        or fallback_models[vendor]
+    # 请求未显式指定 model 时，只有通用模型声明的供应商就是目标供应商才可
+    # 复用它；否则回退该供应商专属字段，避免 EntPilot 收到旧 Doubao 模型名。
+    effective_model = _validate_video_model(
+        vendor,
+        normalized_model or _video_model_for_provider(configured_settings, vendor),
     )
     # get_video_provider 的别名表中 jianyu/modelsai 映射 volcengine；数据库
     # CHECK 约束接受 jianyu/modelsai/volcengine/doubao 等历史 key。这里统一
@@ -175,5 +274,5 @@ _STABLE_VIDEO_PROVIDER_KEYS = {
     "openai": "openai",
     "gemini": "gemini",
     "neolink": "neolink",
-    "mgrouter": "mgrouter",
+    "entpilot": "entpilot",
 }

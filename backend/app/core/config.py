@@ -17,6 +17,7 @@ _DEFAULT_NEOLINK_BASE_URL = "https://neolink.com/api"
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
     _explicit_fields: frozenset[str] = PrivateAttr(default_factory=frozenset)
+    _fallback_fields: frozenset[str] = PrivateAttr(default_factory=frozenset)
 
     # 应用
     app_env: Literal["dev", "test", "prod", "production"] = "dev"
@@ -94,17 +95,16 @@ class Settings(BaseSettings):
     # NeoLink Seedance（火山内容生成兼容协议；模型复用 SEEDANCE_MODEL）
     neolink_api_key: str = ""
     neolink_base_url: str = _DEFAULT_NEOLINK_BASE_URL
-    # mgrouter AICC Seedance（火山内容生成兼容协议）
-    mgrouter_api_key: str = ""
-    mgrouter_base_url: str = "https://mgrouter.com/api/v3"
-    mgrouter_video_model: str = "AICC-Doubao-Seedance-2.0"
-    mgrouter_resolution: Literal["480p", "720p", "1080p"] = "720p"
-    mgrouter_ratio: Literal[
-        "adaptive", "21:9", "16:9", "4:3", "1:1", "3:4", "9:16"
-    ] = "adaptive"
-    mgrouter_generate_audio: bool = True
-    mgrouter_watermark: bool = False
-    video_default_provider: str = "modelsai"
+    # EntPilot Seedance 2.0/2.5（异步 /v1/videos 接口）
+    entpilot_api_key: str = ""
+    entpilot_base_url: str = "https://ka.ent-pilot.com"
+    entpilot_video_model: str = "seedance-2.0-720p"
+    entpilot_ratio: Literal[
+        "adaptive", "auto", "21:9", "16:9", "4:3", "1:1", "3:4", "9:16"
+    ] = "16:9"
+    entpilot_generate_audio: bool = True
+    # 新部署默认使用 EntPilot；历史数据库 active 配置仍优先于该回退值。
+    video_default_provider: str = "entpilot"
 
     # ===== 统一能力×厂商适配层（能力级凭证/模型覆盖，向后兼容） =====
     # 请求级路由：前端每次请求可显式传入 provider+model，优先级为
@@ -131,11 +131,11 @@ class Settings(BaseSettings):
     image_gen_api_key: str = ""
     image_gen_model: str = ""
 
-    # 视频生成 —— volcengine | neolink | bailian | openai | gemini | mgrouter
+    # 视频生成 —— volcengine | neolink | bailian | openai | gemini | entpilot
     # database 保持历史后台切换；env 让 VIDEO_GEN_* 成为权威配置。
     # 请求显式传入 provider/model 时优先于两者。
     video_provider_selection_mode: Literal["database", "env"] = "database"
-    video_gen_provider: str = "volcengine"
+    video_gen_provider: str = "entpilot"
     video_gen_base_url: str = ""
     video_gen_api_key: str = ""
     video_gen_model: str = ""
@@ -193,6 +193,7 @@ class Settings(BaseSettings):
         # 在回退赋值前保存真实输入字段；Pydantic 对 validator 内 setattr 也会更新
         # model_fields_set，因此不能在工厂阶段直接用 model_fields_set 判断显式配置。
         self._explicit_fields = frozenset(self.model_fields_set)
+        fallback_fields: set[str] = set()
 
         self.text_llm_provider = self.text_llm_provider.strip().lower()
         self.chat_llm_provider = self.chat_llm_provider.strip().lower()
@@ -337,31 +338,30 @@ class Settings(BaseSettings):
                 self.google_video_model,
                 "",
             ),
-            "mgrouter": (
-                self.mgrouter_api_key,
-                self.mgrouter_video_model,
-                self.mgrouter_base_url,
+            "entpilot": (
+                self.entpilot_api_key,
+                self.entpilot_video_model,
+                self.entpilot_base_url,
             ),
-            "mg-router": (
-                self.mgrouter_api_key,
-                self.mgrouter_video_model,
-                self.mgrouter_base_url,
-            ),
-            "aicc": (
-                self.mgrouter_api_key,
-                self.mgrouter_video_model,
-                self.mgrouter_base_url,
+            "ent-pilot": (
+                self.entpilot_api_key,
+                self.entpilot_video_model,
+                self.entpilot_base_url,
             ),
         }
         video_default = video_defaults.get(self.video_gen_provider)
         if video_default is not None:
             default_key, default_model, default_base_url = video_default
-            if not self.video_gen_api_key:
+            if not self.video_gen_api_key and default_key:
                 self.video_gen_api_key = default_key
-            if not self.video_gen_model:
+                fallback_fields.add("video_gen_api_key")
+            if not self.video_gen_model and default_model:
                 self.video_gen_model = default_model
-            if not self.video_gen_base_url:
+                fallback_fields.add("video_gen_model")
+            if not self.video_gen_base_url and default_base_url:
                 self.video_gen_base_url = default_base_url
+                fallback_fields.add("video_gen_base_url")
+        self._fallback_fields = frozenset(fallback_fields)
         return self
 
     @model_validator(mode="after")
@@ -405,7 +405,7 @@ class Settings(BaseSettings):
             "image_gen_base_url",
             "video_gen_base_url",
             "neolink_base_url",
-            "mgrouter_base_url",
+            "entpilot_base_url",
             "dashscope_base_url",
             "anthropic_base_url",
         ):
@@ -493,7 +493,7 @@ class Settings(BaseSettings):
 
     def is_explicitly_configured(self, field_name: str) -> bool:
         """判断字段是否来自环境变量或 Settings 显式入参，而不是类默认值。"""
-        return field_name in self._explicit_fields
+        return field_name in self._explicit_fields and field_name not in self._fallback_fields
 
 
 def _normalize_cors_origin(origin: str, *, allow_wildcard: bool) -> str:

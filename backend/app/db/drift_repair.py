@@ -91,6 +91,21 @@ _RETIRED_ART_STYLE_COLUMNS = (
 )
 _LEGACY_ALEMBIC_REVISION_REPLACEMENTS = {"e8a1f2b3c4d5": "d4b7e1c9a362"}
 
+# MGROUTER 已下线。基线迁移不能重写，因此已 stamp 的数据库需要在本模块中
+# 幂等地把存量 provider key 迁移到 EntPilot，并替换两张视频表上的 CHECK 约束。
+_RETIRED_VIDEO_PROVIDER_KEY = "mgrouter"
+_ENTPILOT_VIDEO_PROVIDER_KEY = "entpilot"
+_ENTPILOT_DEFAULT_VIDEO_MODEL = "seedance-2.0-720p"
+_VIDEO_PROVIDER_KEY_CONSTRAINTS: tuple[tuple[str, str], ...] = (
+    ("video_provider_configs", "ck_video_provider_configs_provider_key"),
+    ("video_generation_jobs", "ck_video_jobs_provider_key"),
+)
+_VIDEO_PROVIDER_KEY_CHECK_SQL = (
+    "CHECK (provider_key IN "
+    "('jianyu', 'modelsai', 'volcengine', 'doubao', 'neolink', 'bailian', "
+    "'openai', 'gemini', 'entpilot'))"
+)
+
 
 @dataclass(frozen=True, slots=True)
 class _RetiredDataArtifact:
@@ -280,6 +295,204 @@ def _existing_constraints(conn: Connection, table: str) -> set[str]:
         for constraint in inspect(conn).get_check_constraints(table)
         if isinstance(name := constraint.get("name"), str)
     }
+
+
+def _existing_constraint_definitions(conn: Connection, table: str) -> dict[str, str]:
+    """返回 CHECK 约束定义，供已发布基线的约束内容收敛使用。"""
+
+    return {
+        name: str(constraint.get("sqltext") or "")
+        for constraint in inspect(conn).get_check_constraints(table)
+        if isinstance(name := constraint.get("name"), str)
+    }
+
+
+def _provider_key_constraint_is_current(definition: str | None) -> bool:
+    """判断 provider key 约束是否已移除下线的 MGROUTER 并包含 EntPilot。"""
+
+    normalized = " ".join((definition or "").lower().split())
+    return (
+        bool(normalized)
+        and _RETIRED_VIDEO_PROVIDER_KEY not in normalized
+        and _ENTPILOT_VIDEO_PROVIDER_KEY in normalized
+    )
+
+
+def _detect_video_provider_constraint_drift(
+    conn: Connection,
+    existing: set[str],
+) -> list[str]:
+    """检测两张视频表上的 provider key 约束是否仍是旧基线定义。"""
+
+    missing: list[str] = []
+    for table, constraint_name in _VIDEO_PROVIDER_KEY_CONSTRAINTS:
+        if table not in existing:
+            continue
+        definitions = _existing_constraint_definitions(conn, table)
+        if not _provider_key_constraint_is_current(definitions.get(constraint_name)):
+            missing.append(constraint_name)
+    return missing
+
+
+def _migrate_retired_video_provider_data(conn: Connection, existing: set[str]) -> None:
+    """迁移存量 MGROUTER 配置/任务，避免新约束拒绝旧行。"""
+
+    if "video_provider_configs" in existing:
+        # 若 EntPilot 行已由人工配置创建，先合并 active 状态并删除旧行，
+        # 避免 provider_key + job_type 唯一约束冲突；没有目标行时再直接改 key。
+        conn.execute(
+            text(
+                """
+                UPDATE video_provider_configs AS target
+                SET is_active = target.is_active OR EXISTS (
+                    SELECT 1
+                    FROM video_provider_configs AS legacy
+                    WHERE legacy.provider_key = :legacy_key
+                      AND legacy.job_type = target.job_type
+                      AND legacy.is_active = TRUE
+                )
+                WHERE target.provider_key = :new_key
+                """
+            ),
+            {
+                "legacy_key": _RETIRED_VIDEO_PROVIDER_KEY,
+                "new_key": _ENTPILOT_VIDEO_PROVIDER_KEY,
+            },
+        )
+        conn.execute(
+            text(
+                """
+                DELETE FROM video_provider_configs AS legacy
+                WHERE legacy.provider_key = :legacy_key
+                  AND EXISTS (
+                      SELECT 1
+                      FROM video_provider_configs AS target
+                      WHERE target.provider_key = :new_key
+                        AND target.job_type = legacy.job_type
+                  )
+                """
+            ),
+            {
+                "legacy_key": _RETIRED_VIDEO_PROVIDER_KEY,
+                "new_key": _ENTPILOT_VIDEO_PROVIDER_KEY,
+            },
+        )
+        conn.execute(
+            text(
+                """
+                UPDATE video_provider_configs
+                SET provider_key = :new_key,
+                    -- MGROUTER 的模型命名空间与 EntPilot 不兼容；旧行即使
+                    -- 使用了自定义模型，也必须落到新供应商的合法模型清单。
+                    model = :default_model
+                WHERE provider_key = :legacy_key
+                """
+            ),
+            {
+                "legacy_key": _RETIRED_VIDEO_PROVIDER_KEY,
+                "new_key": _ENTPILOT_VIDEO_PROVIDER_KEY,
+                "default_model": _ENTPILOT_DEFAULT_VIDEO_MODEL,
+            },
+        )
+
+    if "video_generation_jobs" not in existing:
+        return
+
+    # 任务 JSON 是恢复/审计时的快照；只迁移明确指向旧供应商的路由字段，
+    # 不改写提示词、媒体引用或已完成任务的结果地址。先按外层 provider_key
+    # 归一化模型，再改写外层 key，避免丢失“这是旧任务”的判定依据。
+    for column in ("input_json", "output_json", "metrics"):
+        conn.execute(
+            text(
+                f"""
+                UPDATE video_generation_jobs
+                SET {column} = jsonb_set(
+                    {column}, '{{model}}', '"seedance-2.0-720p"'::jsonb, TRUE
+                )
+                WHERE jsonb_typeof({column}) = 'object'
+                  AND (
+                      provider_key = :legacy_key
+                      OR {column}->>'provider' IN ('mgrouter', 'aicc')
+                      OR {column}->>'provider_key' IN ('mgrouter', 'aicc')
+                  )
+                """
+            ),
+            {"legacy_key": _RETIRED_VIDEO_PROVIDER_KEY},
+        )
+        conn.execute(
+            text(
+                f"""
+                UPDATE video_generation_jobs
+                SET {column} = jsonb_set(
+                    {column}, '{{provider}}', '"entpilot"'::jsonb, TRUE
+                )
+                WHERE jsonb_typeof({column}) = 'object'
+                  AND {column}->>'provider' IN ('mgrouter', 'aicc')
+                """
+            )
+        )
+        conn.execute(
+            text(
+                f"""
+                UPDATE video_generation_jobs
+                SET {column} = jsonb_set(
+                    {column}, '{{provider_key}}', '"entpilot"'::jsonb, TRUE
+                )
+                WHERE jsonb_typeof({column}) = 'object'
+                  AND {column}->>'provider_key' IN ('mgrouter', 'aicc')
+                """
+            )
+        )
+
+    conn.execute(
+        text(
+            """
+            UPDATE video_generation_jobs
+            SET provider_key = :new_key
+            WHERE provider_key = :legacy_key
+            """
+        ),
+        {
+            "legacy_key": _RETIRED_VIDEO_PROVIDER_KEY,
+            "new_key": _ENTPILOT_VIDEO_PROVIDER_KEY,
+        },
+    )
+
+
+def _repair_video_provider_key_constraints(
+    conn: Connection,
+    existing: set[str],
+) -> list[str]:
+    """先解除旧约束，再迁移数据，最后幂等补回新的 CHECK 约束。
+
+    PostgreSQL 会在 UPDATE 语句执行时立即校验 CHECK 约束；因此不能在旧约束
+    仍拒绝 ``entpilot`` 的窗口内直接把 ``mgrouter`` 行改名。
+    """
+
+    constraints_to_rebuild: list[tuple[str, str]] = []
+    for table, constraint_name in _VIDEO_PROVIDER_KEY_CONSTRAINTS:
+        if table not in existing:
+            continue
+        definitions = _existing_constraint_definitions(conn, table)
+        if _provider_key_constraint_is_current(definitions.get(constraint_name)):
+            continue
+        # DROP 与后续数据迁移处于同一事务；若任一步失败，事务回滚后仍保留旧约束。
+        conn.execute(text(f"ALTER TABLE {table} DROP CONSTRAINT IF EXISTS {constraint_name}"))
+        constraints_to_rebuild.append((table, constraint_name))
+
+    _migrate_retired_video_provider_data(conn, existing)
+
+    still_missing: list[str] = []
+    for table, constraint_name in constraints_to_rebuild:
+        conn.execute(
+            text(
+                f"ALTER TABLE {table} ADD CONSTRAINT {constraint_name} "
+                f"{_VIDEO_PROVIDER_KEY_CHECK_SQL}"
+            )
+        )
+        if constraint_name not in _existing_constraints(conn, table):
+            still_missing.append(constraint_name)
+    return still_missing
 
 
 def _detect_missing_tables(conn: Connection, existing: set[str]) -> list[str]:
@@ -546,6 +759,10 @@ def _detect(conn: Connection) -> DriftReport:
         if item not in missing_columns:
             missing_columns.append(item)
 
+    for constraint_name in _detect_video_provider_constraint_drift(conn, existing):
+        if constraint_name not in missing_constraints:
+            missing_constraints.append(constraint_name)
+
     retired_tables = _detect_retired_art_style_tables(existing)
     retired_columns = _detect_retired_art_style_columns(conn, existing)
     retired_data = _detect_retired_art_style_data(conn, existing)
@@ -580,6 +797,7 @@ def run_repair() -> DriftReport:
             _repair_missing_tables(conn, missing_tables)
             _repair_known_drift_columns(conn)
             _repair_known_drift_constraints(conn)
+            _repair_video_provider_key_constraints(conn, _existing_tables(conn))
             _repair_retired_art_style_artifacts(conn, _existing_tables(conn))
         # owner 数据回填独立事务：DDL 已提交，回填失败不回滚 schema 修复。
         if "project_members" in _existing_tables_from_engine(engine):

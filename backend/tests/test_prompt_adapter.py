@@ -63,7 +63,7 @@ def test_prompt_capability_wan30_models_use_extended_prompt_limit() -> None:
 def test_prompt_capability_exposes_provider_syntax() -> None:
     assert get_prompt_capability("volcengine").prompt_syntax == "ark_content"
     assert get_prompt_capability("neolink").prompt_syntax == "ark_content"
-    assert get_prompt_capability("mgrouter").prompt_syntax == "aicc_content"
+    assert get_prompt_capability("entpilot").prompt_syntax == "ark_content"
     assert get_prompt_capability("openai").prompt_syntax == "plain"
 
 

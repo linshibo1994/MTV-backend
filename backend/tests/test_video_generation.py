@@ -459,8 +459,8 @@ def test_create_bailian_i2v_rejects_reserved_but_unavailable_first_frame() -> No
     asyncio.run(scenario())
 
 
-def test_create_video_job_does_not_use_mgrouter_first_frame_quota() -> None:
-    """MGRouter 任务不再为同场景前驱尾帧预留独占首帧槽。"""
+def test_create_video_job_does_not_use_entpilot_first_frame_quota() -> None:
+    """新任务不再为同场景前驱尾帧预留首帧槽。"""
 
     async def scenario() -> None:
         from app.services.video_generation import create_video_job
@@ -470,8 +470,8 @@ def test_create_video_job_does_not_use_mgrouter_first_frame_quota() -> None:
         provider = raw.scalar(
             select(VideoProviderConfig).where(VideoProviderConfig.is_active.is_(True))
         )
-        provider.provider_key = "mgrouter"
-        provider.model = "AICC-Doubao-Seedance-2.0"
+        provider.provider_key = "entpilot"
+        provider.model = "seedance-2.0-480p"
         raw.commit()
         db = _AsyncSessionAdapter(raw)
 
@@ -481,7 +481,7 @@ def test_create_video_job_does_not_use_mgrouter_first_frame_quota() -> None:
             episode_id=seeded.episode.episode_id,
             shot_group_id=seeded.shot_group.shot_group_id,
             user_id=seeded.user.user_id,
-            idempotency_key="mgrouter-without-first-frame",
+            idempotency_key="entpilot-without-first-frame",
         )
 
         assert job.status == "starting"
@@ -2385,7 +2385,7 @@ def test_video_provider_seed_includes_all_routable_vendors(monkeypatch) -> None:
                 dashscope_video_model="wan-test",
                 openai_video_model="sora-test",
                 google_video_model="veo-google-test",
-                mgrouter_video_model="AICC-Seedance-Test",
+                entpilot_video_model="seedance-2.5-720p",
                 video_default_provider="modelsai",
             ),
         )
@@ -2403,13 +2403,13 @@ def test_video_provider_seed_includes_all_routable_vendors(monkeypatch) -> None:
             "bailian",
             "openai",
                 "gemini",
-                "mgrouter",
+                "entpilot",
                 "neolink",
             }
         gemini = next(row for row in rows if row.provider_key == "gemini")
         assert gemini.model == "veo-google-test"
-        mgrouter = next(row for row in rows if row.provider_key == "mgrouter")
-        assert mgrouter.model == "AICC-Seedance-Test"
+        entpilot = next(row for row in rows if row.provider_key == "entpilot")
+        assert entpilot.model == "seedance-2.5-720p"
         assert sum(row.is_active for row in rows) == 1
 
     asyncio.run(scenario())
@@ -2986,7 +2986,7 @@ def test_check_materials_requires_explicit_bailian_i2v_reference_image(monkeypat
     asyncio.run(scenario())
 
 
-def test_check_materials_does_not_reserve_mgrouter_first_frame(monkeypatch) -> None:
+def test_check_materials_does_not_reserve_entpilot_first_frame(monkeypatch) -> None:
     async def scenario() -> None:
         from app.api.v1 import video_generation as api
         from app.services.reference_aggregator import AggregatedReferences
@@ -3014,10 +3014,10 @@ def test_check_materials_does_not_reserve_mgrouter_first_frame(monkeypatch) -> N
             "resolve_video_model",
             AsyncMock(
                 return_value=RuntimeVideoModel(
-                    provider="mgrouter",
-                    model="AICC-Doubao-Seedance-2.0",
+                    provider="entpilot",
+                    model="seedance-2.0-480p",
                     reference_image_audit_required=False,
-                    task_provider_key="mgrouter",
+                    task_provider_key="entpilot",
                 )
             ),
         )
@@ -3035,6 +3035,67 @@ def test_check_materials_does_not_reserve_mgrouter_first_frame(monkeypatch) -> N
             "videos": 0,
             "total": 2,
             "reserves_first_frame": False,
+        }
+        assert result["reference_violations"] == []
+        assert result["ready"] is True
+
+    asyncio.run(scenario())
+
+
+def test_check_materials_uses_request_provider_and_model_for_limits(monkeypatch) -> None:
+    """素材预检必须按前端当前选择的模型计算限额。"""
+
+    async def scenario() -> None:
+        from app.api.v1 import video_generation as api
+        from app.services.reference_aggregator import AggregatedReferences
+        from app.services.runtime_models import RuntimeVideoModel
+
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        db = _AsyncSessionAdapter(raw)
+        monkeypatch.setattr(
+            api,
+            "_load_and_check_script",
+            AsyncMock(return_value=seeded.script),
+        )
+        monkeypatch.setattr(
+            "app.services.reference_aggregator.aggregate_references",
+            AsyncMock(
+                return_value=AggregatedReferences(
+                    reference_images=[{"storage_key": f"image-{index}"} for index in range(10)],
+                    reference_audios=[{"storage_key": f"audio-{index}"} for index in range(4)],
+                    reference_videos=[{"storage_key": f"video-{index}"} for index in range(4)],
+                )
+            ),
+        )
+        captured: dict[str, object] = {}
+
+        async def resolve_request_model(*args, **kwargs):
+            captured.update(kwargs)
+            return RuntimeVideoModel(
+                provider="entpilot",
+                model="seedance-2.5-720p",
+                reference_image_audit_required=False,
+                task_provider_key="entpilot",
+            )
+
+        monkeypatch.setattr(
+            "app.services.video_generation.resolve_video_model",
+            resolve_request_model,
+        )
+
+        result = await api.check_materials(
+            shot_group_id=seeded.shot_group.shot_group_id,
+            script_id=seeded.script.id,
+            provider="ent-pilot",
+            model="seedance-2.5-720p",
+            db=db,
+            user=seeded.user,
+        )
+
+        assert captured == {
+            "provider": "ent-pilot",
+            "model": "seedance-2.5-720p",
         }
         assert result["reference_violations"] == []
         assert result["ready"] is True
@@ -3509,7 +3570,7 @@ def test_worker_honors_frozen_no_first_frame_capability(monkeypatch) -> None:
     asyncio.run(scenario())
 
 
-def test_worker_ignores_legacy_mgrouter_first_frame_references() -> None:
+def test_worker_ignores_legacy_entpilot_first_frame_references() -> None:
     """历史任务也不能再将首帧与普通参考图一同提交。"""
 
     async def scenario() -> None:
@@ -3518,13 +3579,13 @@ def test_worker_ignores_legacy_mgrouter_first_frame_references() -> None:
         job = _add_worker_job(
             raw,
             seeded,
-            job_id="job-legacy-mgrouter-first-frame",
-            reservation_id="reservation-legacy-mgrouter-first-frame",
+            job_id="job-legacy-entpilot-first-frame",
+            reservation_id="reservation-legacy-entpilot-first-frame",
         )
-        job.provider_key = "mgrouter"
+        job.provider_key = "entpilot"
         job.input_json = {
             **job.input_json,
-            "model": "AICC-Doubao-Seedance-2.0",
+            "model": "seedance-2.0-480p",
             "reference_images": [
                 {
                     "storage_key": "generate_images/reference/character.png",
@@ -3542,8 +3603,8 @@ def test_worker_ignores_legacy_mgrouter_first_frame_references() -> None:
                 provider_called = True
                 assert request.first_frame is None
                 return SimpleNamespace(
-                    video_storage_key="generate_images/video/legacy-mgrouter.mp4",
-                    provider_job_id="legacy-mgrouter-job",
+                    video_storage_key="generate_images/video/legacy-entpilot.mp4",
+                    provider_job_id="legacy-entpilot-job",
                     metrics={},
                 )
 
@@ -3562,6 +3623,47 @@ def test_worker_ignores_legacy_mgrouter_first_frame_references() -> None:
         assert refreshed.status == "succeeded"
         assert refreshed.error_type is None
         assert reservation.status == "captured"
+
+    asyncio.run(scenario())
+
+
+def test_worker_recovers_entpilot_job_without_frozen_model() -> None:
+    """迁移后的历史 EntPilot 任务缺少 model 时使用 EntPilot 专属默认值。"""
+
+    async def scenario() -> None:
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        job = _add_worker_job(
+            raw,
+            seeded,
+            job_id="job-legacy-entpilot-model",
+            reservation_id="reservation-legacy-entpilot-model",
+        )
+        job.provider_key = "entpilot"
+        job.input_json = {key: value for key, value in job.input_json.items() if key != "model"}
+        raw.commit()
+        db = _AsyncSessionAdapter(raw)
+        seen_requests = []
+
+        class Provider:
+            async def generate(self, request, on_progress=None):
+                seen_requests.append(request)
+                return SimpleNamespace(
+                    video_storage_key="generate_images/video/legacy-entpilot-model.mp4",
+                    provider_job_id="legacy-entpilot-model-task",
+                    metrics={},
+                )
+
+        from app.workers.video_generation import run_video_generation_once
+
+        await run_video_generation_once(
+            db,
+            job.job_id,
+            owner="worker",
+            provider=Provider(),
+        )
+
+        assert seen_requests[0].model == "seedance-2.0-720p"
 
     asyncio.run(scenario())
 
@@ -5466,7 +5568,7 @@ async def test_video_batch_rejects_derived_idempotency_overflow_before_creation(
         ("sora", "", "openai", "sora-env-test"),
         ("google", "", "gemini", "veo-env-test"),
         ("google", "explicit-video-model", "gemini", "explicit-video-model"),
-        ("aicc", "", "mgrouter", "aicc-env-test"),
+        ("ent-pilot", "", "entpilot", "seedance-2.5-720p"),
     ],
 )
 async def test_active_provider_env_mode_get_returns_effective_config_without_db(
@@ -5491,7 +5593,7 @@ async def test_active_provider_env_mode_get_returns_effective_config_without_db(
         dashscope_video_model="wan-env-test",
         openai_video_model="sora-env-test",
         google_video_model="veo-env-test",
-        mgrouter_video_model="aicc-env-test",
+        entpilot_video_model="seedance-2.5-720p",
     )
     get_database_provider = AsyncMock(
         return_value=SimpleNamespace(
@@ -5588,7 +5690,7 @@ def test_active_provider_initial_seed_is_committed(monkeypatch) -> None:
 
         out = await api.get_active_provider(db=db, user=seeded.user)
 
-        assert out.provider_key == "modelsai"
+        assert out.provider_key == "entpilot"
         assert db.commit_count == 1
         assert raw.scalar(select(VideoProviderConfig).where(VideoProviderConfig.is_active.is_(True))) is not None
         engine.dispose()
@@ -5627,7 +5729,7 @@ def test_active_provider_switch_seeds_gemini_for_existing_database(monkeypatch) 
     asyncio.run(scenario())
 
 
-def test_active_provider_switch_seeds_mgrouter_for_existing_database(monkeypatch) -> None:
+def test_active_provider_switch_seeds_entpilot_for_existing_database(monkeypatch) -> None:
     async def scenario() -> None:
         from app.api.v1 import video_generation as api
         from app.schemas.video import ActiveProviderUpdateIn
@@ -5639,16 +5741,16 @@ def test_active_provider_switch_seeds_mgrouter_for_existing_database(monkeypatch
         monkeypatch.setattr(api, "audit_log", AsyncMock())
 
         out = await api.set_active_provider(
-            body=ActiveProviderUpdateIn(provider_key="mgrouter"),
+            body=ActiveProviderUpdateIn(provider_key="entpilot"),
             db=db,
             user=SimpleNamespace(user_id=seeded.user.user_id, is_admin=True),
         )
 
-        assert out.provider_key == "mgrouter"
-        assert out.model == "AICC-Doubao-Seedance-2.0"
+        assert out.provider_key == "entpilot"
+        assert out.model == "seedance-2.0-720p"
         assert raw.scalar(
             select(VideoProviderConfig).where(
-                VideoProviderConfig.provider_key == "mgrouter",
+                VideoProviderConfig.provider_key == "entpilot",
                 VideoProviderConfig.is_active.is_(True),
             )
         ) is not None
@@ -5702,8 +5804,8 @@ def test_video_provider_and_job_type_constraints_are_declared() -> None:
     assert "ck_video_provider_configs_job_type" in provider_checks
     assert "'gemini'" in job_checks["ck_video_jobs_provider_key"]
     assert "'gemini'" in provider_checks["ck_video_provider_configs_provider_key"]
-    assert "'mgrouter'" in job_checks["ck_video_jobs_provider_key"]
-    assert "'mgrouter'" in provider_checks["ck_video_provider_configs_provider_key"]
+    assert "'entpilot'" in job_checks["ck_video_jobs_provider_key"]
+    assert "'entpilot'" in provider_checks["ck_video_provider_configs_provider_key"]
     assert "'neolink'" in job_checks["ck_video_jobs_provider_key"]
     assert "'neolink'" in provider_checks["ck_video_provider_configs_provider_key"]
 
@@ -5716,12 +5818,12 @@ def test_active_provider_schema_accepts_canonical_gemini() -> None:
     assert payload.provider_key == "gemini"
 
 
-def test_active_provider_schema_accepts_canonical_mgrouter() -> None:
+def test_active_provider_schema_accepts_canonical_entpilot() -> None:
     from app.schemas.video import ActiveProviderUpdateIn
 
-    payload = ActiveProviderUpdateIn(provider_key="mgrouter")
+    payload = ActiveProviderUpdateIn(provider_key="entpilot")
 
-    assert payload.provider_key == "mgrouter"
+    assert payload.provider_key == "entpilot"
 
 
 def test_active_provider_schema_accepts_canonical_neolink() -> None:

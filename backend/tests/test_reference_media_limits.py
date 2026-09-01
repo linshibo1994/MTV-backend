@@ -95,16 +95,20 @@ def test_limit_violation_list_reports_each_exceeded_category() -> None:
         ("volcengine", "doubao-seedance", ReferenceMediaLimits(9, 3, 3, 12)),
         ("neolink", "doubao-seedance", ReferenceMediaLimits(9, 3, 3, 12)),
         (
-            "mgrouter",
-            "AICC-Doubao-Seedance-2.0",
+            "entpilot",
+            "seedance-2.0-480p",
             ReferenceMediaLimits(
                 9,
                 3,
-                0,
-                12,
+                3,
+                15,
                 first_frame_exclusive=True,
-                audio_requires_reference_image=True,
             ),
+        ),
+        (
+            "entpilot",
+            "seedance-2.5-720p",
+            ReferenceMediaLimits(30, 10, 10, 50, first_frame_exclusive=True),
         ),
         ("gemini", "veo-3", ReferenceMediaLimits(4, 0, 0, 4)),
         ("openai", "sora-2", ReferenceMediaLimits(1, 0, 0, 1)),
@@ -311,8 +315,8 @@ async def test_video_workbench_disables_continuation_frame_for_text_to_video_mod
     }
 
 
-def test_mgrouter_first_frame_group_uses_exclusive_effective_quota() -> None:
-    limits = reference_media_limits_for_provider("mgrouter", "AICC-Doubao-Seedance-2.0")
+def test_entpilot_first_frame_group_uses_exclusive_effective_quota() -> None:
+    limits = reference_media_limits_for_provider("entpilot", "seedance-2.0-480p")
     effective_limits = effective_reference_media_limits_for_group(
         limits,
         reserve_first_frame=True,
@@ -324,7 +328,7 @@ def test_mgrouter_first_frame_group_uses_exclusive_effective_quota() -> None:
         "videos": 0,
         "total": 1,
         "continuation_first_frame_images": 0,
-        "audio_requires_reference_image": True,
+        "audio_requires_reference_image": False,
         "requires_input_image": False,
     }
     with pytest.raises(ReferenceMediaLimitExceeded, match="参考图最多支持 1 个"):
@@ -357,8 +361,8 @@ def test_mgrouter_first_frame_group_uses_exclusive_effective_quota() -> None:
     assert all(not items for items in audio.values())
 
 
-def test_automatic_merge_drops_mgrouter_audio_without_normal_reference_image() -> None:
-    limits = reference_media_limits_for_provider("mgrouter", "AICC-Doubao-Seedance-2.0")
+def test_automatic_merge_keeps_entpilot_audio_without_normal_reference_image() -> None:
+    limits = reference_media_limits_for_provider("entpilot", "seedance-2.0-480p")
 
     materials, audio = trim_automatic_reference_selection(
         {"character": [], "background": [], "prop": [], "other": [], "video": []},
@@ -367,7 +371,7 @@ def test_automatic_merge_drops_mgrouter_audio_without_normal_reference_image() -
     )
 
     assert all(not items for items in materials.values())
-    assert all(not items for items in audio.values())
+    assert [item["name"] for item in audio["characters"]] == ["audio-0", "audio-1"]
 
 
 def test_bailian_i2v_requires_an_image_or_first_frame() -> None:

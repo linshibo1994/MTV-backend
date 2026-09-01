@@ -62,8 +62,8 @@
       "supports_first_frame": true,
       "model_overrides": []
     },
-    "mgrouter": {
-      "prompt_syntax": "aicc_content",
+    "entpilot": {
+      "prompt_syntax": "ark_content",
       "max_prompt_characters": null,
       "supports_motion_phrases": true,
       "supports_character_reference": true,

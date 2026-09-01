@@ -49,7 +49,11 @@ from app.schemas.video import (
 )
 from app.services.audit import best_effort_log as audit_log
 from app.services.reference_aggregator import AggregatedReferences
-from app.services.runtime_models import resolve_env_video_model, resolve_video_model
+from app.services.runtime_models import (
+    resolve_default_video_model,
+    resolve_env_video_model,
+    resolve_video_model,
+)
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -445,6 +449,8 @@ async def cancel_video_generation_job(
 async def check_materials(
     shot_group_id: str = Query(..., description="镜头组 ID"),
     script_id: str = Query(..., description="剧本 ID"),
+    provider: str | None = Query(None, description="请求级视频供应商"),
+    model: str | None = Query(None, description="请求级视频模型"),
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> dict:
@@ -470,7 +476,28 @@ async def check_materials(
 
     from app.services.reference_aggregator import aggregate_references
 
-    runtime_video_model = await resolve_video_model(db, settings)
+    # 直接调用 Python 函数（例如后台任务/测试）时，带有 Query 默认值的参数
+    # 可能仍是 ``fastapi.Query`` 对象；只把真正的字符串视为请求级覆盖。
+    provider_override = provider if isinstance(provider, str) else None
+    model_override = model if isinstance(model, str) else None
+    if model_override and not provider_override:
+        raise BadRequestError("请求级模型必须与 provider 一起提供")
+    if provider_override or model_override:
+        # 与创建任务使用同一请求级路由解析，确保预检和实际 worker 的供应商/模型一致。
+        from app.services.video_generation import resolve_video_model as resolve_request_model
+
+        try:
+            runtime_video_model = await resolve_request_model(
+                db,
+                settings,
+                provider=provider_override,
+                model=model_override,
+            )
+        except ValueError as exc:
+            raise BadRequestError(str(exc)) from None
+    else:
+        # 保留模块级入口，便于既有调用方和测试替换服务端默认解析。
+        runtime_video_model = await resolve_video_model(db, settings)
     reference_limits = reference_media_limits_for_provider(
         runtime_video_model.provider,
         runtime_video_model.model,
@@ -608,10 +635,11 @@ async def get_active_provider(
 
     cfg = await video_crud.get_active_provider(db, "all_reference", commit_on_seed=True)
     if cfg is None:
+        fallback = resolve_default_video_model(settings)
         return ActiveProviderOut(
-            provider_key=settings.video_default_provider,
+            provider_key=fallback.task_provider_key,
             job_type="all_reference",
-            model=settings.seedance_model,
+            model=fallback.model,
         )
     return ActiveProviderOut.model_validate(cfg)
 
@@ -628,7 +656,7 @@ async def set_active_provider(
 ) -> ActiveProviderOut:
     """切换激活视频供应商 — 仅管理员可操作。
 
-    支持豆包别名 jianyu/modelsai、mgrouter AICC、阿里百炼 bailian、OpenAI Sora 与 Gemini Veo。
+    支持豆包别名 jianyu/modelsai、EntPilot Seedance、阿里百炼 bailian、OpenAI Sora 与 Gemini Veo。
     """
     if not user.is_admin:
         raise ForbiddenError("仅管理员可切换视频供应商")

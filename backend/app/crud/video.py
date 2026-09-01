@@ -1021,6 +1021,19 @@ async def ensure_provider_configs(db: AsyncSession) -> None:
     """
     from app.core.config import settings
 
+    # 存量部署可能已经有一个激活供应商。补齐新供应商时不能再次把默认项
+    # 标成 active，否则后续 scalar_one_or_none 会看到多个激活行。
+    active_result = await db.execute(
+        select(VideoProviderConfig.id).where(
+            VideoProviderConfig.job_type == "all_reference",
+            VideoProviderConfig.is_active.is_(True),
+        ).limit(1)
+    )
+    has_active = active_result.scalar_one_or_none() is not None
+    default_provider = str(settings.video_default_provider or "").strip().lower()
+    if default_provider in {"ent-pilot", "seedance-entpilot", "ka-ent-pilot"}:
+        default_provider = "entpilot"
+
     provider_models = {
         "jianyu": settings.seedance_model,
         "modelsai": settings.seedance_model,
@@ -1028,7 +1041,7 @@ async def ensure_provider_configs(db: AsyncSession) -> None:
         "bailian": settings.dashscope_video_model,
         "openai": settings.openai_video_model,
         "gemini": settings.google_video_model,
-        "mgrouter": settings.mgrouter_video_model,
+        "entpilot": settings.entpilot_video_model,
     }
     for key, model in provider_models.items():
         existing = await get_provider_by_key(db, key, "all_reference")
@@ -1037,7 +1050,9 @@ async def ensure_provider_configs(db: AsyncSession) -> None:
                 provider_key=key,
                 job_type="all_reference",
                 model=model,
-                is_active=(key == settings.video_default_provider),
+                is_active=(not has_active and key == default_provider),
             )
             db.add(cfg)
+            if cfg.is_active:
+                has_active = True
     await db.flush()

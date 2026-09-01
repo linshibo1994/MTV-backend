@@ -15,7 +15,7 @@ class VideoProviderConfig(UUIDPKMixin, Base):
         CheckConstraint(
             "provider_key IN "
             "('jianyu', 'modelsai', 'volcengine', 'doubao', 'neolink', 'bailian', 'openai', "
-            "'gemini', 'mgrouter')",
+            "'gemini', 'entpilot')",
             name="ck_video_provider_configs_provider_key",
         ),
         CheckConstraint(
@@ -24,7 +24,7 @@ class VideoProviderConfig(UUIDPKMixin, Base):
         ),
     )
 
-    # jianyu | modelsai | neolink | bailian | openai | gemini | mgrouter
+    # jianyu | modelsai | neolink | bailian | openai | gemini | entpilot
     provider_key: Mapped[str] = mapped_column(String(32), nullable=False)
     # all_reference（可扩展）
     job_type: Mapped[str] = mapped_column(String(32), nullable=False)
