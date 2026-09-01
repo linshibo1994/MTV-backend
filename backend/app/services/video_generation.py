@@ -295,6 +295,11 @@ async def create_video_job(
         runtime_video_model.provider,
         runtime_video_model.model,
     )
+    # 镜头组历史默认值允许 3 秒，但 EntPilot Seedance 的普通任务要求至少 4 秒。
+    # 仅在任务快照层归一，保留旧镜头组数据和全局编辑契约的兼容性。
+    effective_duration_seconds = shot_group.duration_seconds
+    if runtime_video_model.provider == "entpilot" and effective_duration_seconds == 3:
+        effective_duration_seconds = 4
     supports_first_frame = reference_limits.supports_first_frame
     is_continuation = bool(getattr(shot_group, "is_continuation", False))
 
@@ -346,7 +351,7 @@ async def create_video_job(
             prompt_text = compose_video_prompt(
                 prompt_text,
                 shots=structured_prompt_shots,
-                duration_seconds=shot_group.duration_seconds,
+                duration_seconds=effective_duration_seconds,
             )
         except ValueError:
             # 历史人工写入的未知结构不能阻断视频主链；只跳过增强，不记录正文。
@@ -410,7 +415,7 @@ async def create_video_job(
         "missing_subjects": aggregated.missing_subjects,
         "missing_audio": aggregated.missing_audio,
         "missing_videos": aggregated.missing_videos,
-        "duration_seconds": shot_group.duration_seconds,
+        "duration_seconds": effective_duration_seconds,
         "is_continuation": is_continuation,
         "awaits_predecessor_frame": False,
         "continuation_dependency": None,

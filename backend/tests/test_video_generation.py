@@ -491,6 +491,52 @@ def test_create_video_job_does_not_use_entpilot_first_frame_quota() -> None:
     asyncio.run(scenario())
 
 
+def test_create_entpilot_video_job_normalizes_three_second_duration(monkeypatch) -> None:
+    """EntPilot 普通任务将历史 3 秒镜头快照归一为文档要求的 4 秒。"""
+
+    async def scenario() -> None:
+        from app.services import video_generation
+
+        _, raw = _make_db()
+        seeded = _seed(raw)
+        seeded.shot_group.duration_seconds = 3
+        provider = raw.scalar(
+            select(VideoProviderConfig).where(VideoProviderConfig.is_active.is_(True))
+        )
+        provider.provider_key = "entpilot"
+        provider.model = "seedance-2.5-720p"
+        raw.commit()
+        db = _AsyncSessionAdapter(raw)
+
+        async def fake_enqueue(db, **kwargs):
+            row = TaskDispatchOutbox(
+                id="dispatch-entpilot-duration",
+                task_type=kwargs["task_type"],
+                job_id=kwargs["job_id"],
+                attempt=kwargs["attempt"],
+                payload=kwargs["payload"],
+                status="pending",
+            )
+            db.add(row)
+            return row
+
+        monkeypatch.setattr(video_generation, "_credits_reserve", None)
+        monkeypatch.setattr(video_generation, "enqueue_task", fake_enqueue)
+
+        job = await video_generation.create_video_job(
+            db,
+            script_id=seeded.script.id,
+            episode_id=seeded.episode.episode_id,
+            shot_group_id=seeded.shot_group.shot_group_id,
+            user_id=seeded.user.user_id,
+            idempotency_key="entpilot-duration-normalization",
+        )
+
+        assert job.input_json["duration_seconds"] == 4
+
+    asyncio.run(scenario())
+
+
 def test_create_video_job_rejects_reference_video_for_unsupported_provider() -> None:
     async def scenario() -> None:
         from app.services.video_generation import create_video_job
