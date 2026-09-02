@@ -13,9 +13,11 @@ from app.core.errors import ConflictError, NotFoundError
 from app.core.permissions import Action, check_script_access
 from app.models.pipeline_job import PipelineJob
 from app.models.script import Script
+from app.models.task_dispatch_outbox import TaskDispatchOutbox
 from app.models.user import User
 from app.schemas.script import AnalysisJobOut, AnalysisJobStageOut
 from app.services.pipeline import STAGE_ORDER
+from app.services.pipeline.orchestrator import PIPELINE_DAG_TASK_TYPE
 
 router = APIRouter(prefix="/analysis-jobs", tags=["分析任务"])
 
@@ -34,6 +36,18 @@ async def _load_access_script(db: AsyncSession, script_id: str) -> Script:
     return script
 
 
+def _selection_from_outbox_payload(payload: object) -> tuple[str | None, str | None]:
+    """仅投影分析任务可公开的模型选择，绝不返回完整 Outbox 载荷。"""
+
+    if not isinstance(payload, dict):
+        return None, None
+    provider = payload.get("llm_provider")
+    if not isinstance(provider, str) or not provider.strip():
+        return None, None
+    model = payload.get("llm_model")
+    return provider.strip(), model.strip() if isinstance(model, str) and model.strip() else None
+
+
 @router.get("/{analysis_job_id}", response_model=AnalysisJobOut)
 async def get_analysis_job(
     analysis_job_id: str,
@@ -46,6 +60,7 @@ async def get_analysis_job(
             select(
                 PipelineJob.script_id,
                 PipelineJob.episode_id,
+                PipelineJob.dispatch_id,
                 PipelineJob.stage,
                 PipelineJob.status,
                 PipelineJob.attempt,
@@ -64,8 +79,23 @@ async def get_analysis_job(
     script_id = jobs[0].script_id
     if any(job.script_id != script_id for job in jobs):
         raise ConflictError("分析任务数据异常")
+    dispatch_id = jobs[0].dispatch_id
+    if any(job.dispatch_id != dispatch_id for job in jobs):
+        raise ConflictError("分析任务投递数据异常")
     script = await _load_access_script(db, script_id)
     await check_script_access(db, user, script, action=Action.READ)
+    payload = (
+        await db.execute(
+            select(TaskDispatchOutbox.payload)
+            .where(
+                TaskDispatchOutbox.id == dispatch_id,
+                TaskDispatchOutbox.task_type == PIPELINE_DAG_TASK_TYPE,
+                TaskDispatchOutbox.job_id == analysis_job_id,
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    provider, model = _selection_from_outbox_payload(payload)
 
     latest: dict[str, Any] = {}
     for job in jobs:
@@ -114,6 +144,8 @@ async def get_analysis_job(
         id=analysis_job_id,
         script_id=script_id,
         source_episode_id=jobs[0].episode_id,
+        provider=provider,
+        model=model,
         status=job_status,
         current_stage=current_stage.stage if current_stage is not None else None,
         stages=stages,

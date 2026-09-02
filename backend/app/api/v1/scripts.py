@@ -30,7 +30,7 @@ from sqlalchemy.orm import noload
 from app.core.auth import get_current_user
 from app.core.config import settings
 from app.core.database import get_db
-from app.core.errors import ConflictError, ForbiddenError, NotFoundError
+from app.core.errors import BadRequestError, ConflictError, ForbiddenError, NotFoundError
 from app.core.ids import new_id
 from app.core.permissions import Action, check_script_access
 from app.core.storyboard_fields import storyboard_fields_from_shot
@@ -38,6 +38,7 @@ from app.crud import script as script_crud
 from app.models.episode import Episode
 from app.models.script import Script
 from app.models.user import User
+from app.providers.registry import ProviderError, require_capability
 from app.providers.storage import get_storage, storage_key_for_write
 from app.schemas.script import (
     BreakdownOut,
@@ -216,6 +217,11 @@ async def upload_and_split_script(
     normalized_model = (model or "").strip() or None
     if normalized_model and not normalized_provider:
         raise ConflictError("请求级 LLM 模型必须与 provider 一起提供")
+    if normalized_provider:
+        try:
+            normalized_provider = require_capability(normalized_provider, "text")
+        except ProviderError as exc:
+            raise BadRequestError(str(exc)) from exc
 
     document = await stage_script_document(file, max_bytes=settings.max_upload_bytes)
     storage_key = storage_key_for_write(f"upload_scripts/{script_id}/{new_id()}{document.suffix}")

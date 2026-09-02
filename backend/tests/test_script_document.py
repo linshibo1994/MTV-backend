@@ -14,7 +14,7 @@ from fastapi import HTTPException
 from starlette.datastructures import UploadFile
 
 from app.api.v1 import analysis_jobs, scripts
-from app.core.errors import ConflictError, NotFoundError
+from app.core.errors import BadRequestError, ConflictError, NotFoundError
 from app.schemas.script import ScriptUploadOut
 from app.services.script_document import (
     StagedScriptDocument,
@@ -99,7 +99,20 @@ class _Rows:
         return self.values
 
 
-async def test_upload_endpoint_creates_source_episode_stores_file_and_triggers_pipeline(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("provider", "model", "expected_provider", "expected_model"),
+    [
+        (None, None, None, None),
+        ("dashscope", "kimi/custom-model", "bailian", "kimi/custom-model"),
+    ],
+)
+async def test_upload_endpoint_creates_source_episode_stores_file_and_triggers_pipeline(
+    monkeypatch,
+    provider: str | None,
+    model: str | None,
+    expected_provider: str | None,
+    expected_model: str | None,
+) -> None:
     from app.providers import storage as storage_module
 
     monkeypatch.setattr(
@@ -143,8 +156,8 @@ async def test_upload_endpoint_creates_source_episode_stores_file_and_triggers_p
         "script-1",
         UploadFile(BytesIO(b"ignored"), filename="完整剧本.txt"),
         True,
-        provider=None,
-        model=None,
+        provider=provider,
+        model=model,
         db=db,
         user=SimpleNamespace(user_id="user-1"),
     )
@@ -161,10 +174,59 @@ async def test_upload_endpoint_creates_source_episode_stores_file_and_triggers_p
         db,
         "script-1",
         result.source_episode_id,
-        llm_provider=None,
-        llm_model=None,
+        llm_provider=expected_provider,
+        llm_model=expected_model,
     )
     assert db.rollback.await_count == 0
+
+
+@pytest.mark.parametrize("provider", ["unknown-provider", "volcengine"])
+async def test_upload_endpoint_rejects_non_text_provider_before_staging(
+    monkeypatch, provider: str
+) -> None:
+    now = datetime.now(UTC)
+    script = SimpleNamespace(id="script-1", owner_user_id="user-1", updated_at=now)
+    stage = AsyncMock()
+    monkeypatch.setattr(scripts.script_crud, "get_script", AsyncMock(return_value=script))
+    monkeypatch.setattr(scripts, "check_script_access", AsyncMock())
+    monkeypatch.setattr(scripts, "stage_script_document", stage)
+
+    with pytest.raises(BadRequestError) as exc_info:
+        await scripts.upload_and_split_script(
+            "script-1",
+            UploadFile(BytesIO(b"ignored"), filename="完整剧本.txt"),
+            True,
+            provider=provider,
+            model="custom-model",
+            db=SimpleNamespace(),
+            user=SimpleNamespace(user_id="user-1"),
+        )
+
+    assert exc_info.value.status_code == 400
+    stage.assert_not_awaited()
+
+
+async def test_upload_endpoint_preserves_model_without_provider_contract(monkeypatch) -> None:
+    now = datetime.now(UTC)
+    script = SimpleNamespace(id="script-1", owner_user_id="user-1", updated_at=now)
+    stage = AsyncMock()
+    monkeypatch.setattr(scripts.script_crud, "get_script", AsyncMock(return_value=script))
+    monkeypatch.setattr(scripts, "check_script_access", AsyncMock())
+    monkeypatch.setattr(scripts, "stage_script_document", stage)
+
+    with pytest.raises(ConflictError) as exc_info:
+        await scripts.upload_and_split_script(
+            "script-1",
+            UploadFile(BytesIO(b"ignored"), filename="完整剧本.txt"),
+            True,
+            provider=None,
+            model="custom-model",
+            db=SimpleNamespace(),
+            user=SimpleNamespace(user_id="user-1"),
+        )
+
+    assert exc_info.value.status_code == 409
+    stage.assert_not_awaited()
 
 
 async def test_upload_endpoint_rejects_existing_episodes_and_does_not_store(monkeypatch) -> None:
@@ -258,13 +320,26 @@ async def test_upload_endpoint_persists_cleanup_when_remote_delete_fails(monkeyp
     db.commit.assert_awaited_once()
 
 
-async def test_analysis_job_uses_latest_attempt_for_each_pipeline_stage(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("payload", "expected_provider", "expected_model"),
+    [
+        ({"llm_provider": "bailian", "llm_model": "qwen-max"}, "bailian", "qwen-max"),
+        ({}, None, None),
+    ],
+)
+async def test_analysis_job_uses_latest_attempt_for_each_pipeline_stage(
+    monkeypatch,
+    payload: dict[str, str],
+    expected_provider: str | None,
+    expected_model: str | None,
+) -> None:
     now = datetime.now(UTC)
     jobs = [
         SimpleNamespace(
             run_id="run-1",
             script_id="script-1",
             episode_id="episode-1",
+            dispatch_id="dispatch-1",
             stage=stage,
             status="done",
             attempt=2 if stage == "split" else 1,
@@ -280,6 +355,7 @@ async def test_analysis_job_uses_latest_attempt_for_each_pipeline_stage(monkeypa
             run_id="run-1",
             script_id="script-1",
             episode_id="episode-1",
+            dispatch_id="dispatch-1",
             stage="split",
             status="failed",
             attempt=1,
@@ -288,7 +364,7 @@ async def test_analysis_job_uses_latest_attempt_for_each_pipeline_stage(monkeypa
             updated_at=now,
         )
     )
-    db = SimpleNamespace(execute=AsyncMock(return_value=_Rows(jobs)))
+    db = SimpleNamespace(execute=AsyncMock(side_effect=[_Rows(jobs), _Result(payload)]))
     script = SimpleNamespace(id="script-1")
     monkeypatch.setattr(
         analysis_jobs,
@@ -304,6 +380,8 @@ async def test_analysis_job_uses_latest_attempt_for_each_pipeline_stage(monkeypa
     assert result.status == "succeeded"
     assert result.current_stage is None
     assert [stage.status for stage in result.stages] == ["done"] * 5
+    assert result.provider == expected_provider
+    assert result.model == expected_model
 
 
 async def test_analysis_job_rejects_unknown_run() -> None:

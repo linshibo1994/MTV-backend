@@ -121,6 +121,8 @@ class AnalysisJobOut(BaseModel):
     id: str
     script_id: str
     source_episode_id: str | None = None
+    provider: str | None = None
+    model: str | None = None
     status: str
     current_stage: str | None = None
     stages: list[AnalysisJobStageOut]
