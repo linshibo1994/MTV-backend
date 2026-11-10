@@ -1,4 +1,4 @@
-# MTV Backend（智绘 Flow App 后端）
+# MTV Backend（MTV App 后端）
 
 AI 影视制作流水线后端服务，覆盖「剧本与分集 → 主体及资产库 → 创作画布 → 分镜 → 视频片段 → 时间线成片」的完整链路。后端基于 FastAPI 提供 HTTP API，使用 Celery 承载耗时的生成与渲染任务，并通过 PostgreSQL、Redis 持久化业务数据与任务状态。
 
